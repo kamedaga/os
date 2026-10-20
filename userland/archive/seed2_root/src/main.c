@@ -1,3 +1,4 @@
+#error "Archived syscall ABI is unsupported; migrate to current shared ABI before enabling this target"
 #include "fs_protocol.h"
 #include "exec_elf.h"
 

@@ -6,6 +6,8 @@ const process_abi = abi_root.process_abi;
 const runtime_abi = abi_root.runtime_abi;
 const vm_abi = abi_root.vm_abi;
 
+// Ordinary dispatch owns K for every stateful IPC handler. The dedicated
+// entry has its own read-only tryLock admission and never uses this policy.
 pub fn needsKernelStateLock(nr: u64) bool {
     if (nr == runtime_abi.syscall_nanosleep) return false;
     if (nr == fd_abi.syscall_vmo_revoke) return true;

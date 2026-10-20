@@ -1,9 +1,11 @@
 #ifndef PACHAOS_ABI_H
 #define PACHAOS_ABI_H
 
+/* Internal completion waits defer signals; timeout and teardown still apply. */
+#define PACHAOS_WAIT_UNINTERRUPTIBLE (1ull << 1)
+
 #include <stdint.h>
 
-#define PACHAOS_FD_TABLE_LIMIT 4096
 /* VMO_CREATE only: zero-filled pages are allocated on access; faults can OOM. */
 #define PACHAOS_VMO_CREATE_ZERO_ON_DEMAND (1u << 4)
 
@@ -87,7 +89,11 @@ enum {
     PACHAOS_SYSCALL_IPC_RECV = 73,
     PACHAOS_SYSCALL_IPC_CALL = 74,
     PACHAOS_SYSCALL_IPC_REPLY = 75,
-    PACHAOS_SYSCALL_IPC_RECV_WAIT = 76,
+    PACHAOS_SYSCALL_IPC_REPLY_RECV = 76,
+    PACHAOS_SYSCALL_IPC_REPLY_EXTRACT = 77,
+    PACHAOS_SYSCALL_IPC_RECV_WAIT = 78,
+    PACHAOS_SYSCALL_IPC_NOTIFY = 79,
+    PACHAOS_SYSCALL_IPC_NOTIFY_WAIT = 80,
 };
 
 typedef struct pachaos_system_info {
@@ -104,6 +110,8 @@ typedef struct pachaos_system_info {
 #define PACHAOS_THREAD_EXIT_CLEAR_TID (1ull << 0)
 #define PACHAOS_PROCESS_MEMORY_BARRIER_FLAG_NONE 0ull
 #define PACHAOS_PROCESS_MEMORY_BARRIER_KNOWN_FLAGS_MASK PACHAOS_PROCESS_MEMORY_BARRIER_FLAG_NONE
+
+#define PACHAOS_IPC_NOTIFY_WAIT_NOTIFY_PEER (1ull << 0)
 
 #define PACHAOS_PROCESS_SIGNAL_CTL_REGISTER 1ull
 #define PACHAOS_PROCESS_SIGNAL_CTL_SET_MASK 2ull

@@ -10,7 +10,8 @@ pub const Requirements = struct {
 };
 
 fn visitSources(pages: []const u64, context: anytype, comptime visit: anytype) !void {
-    try platform.visitRamCacheIdentityAliases(pages, context, visit);
+    try platform.validateRamCachePages(pages);
+    try platform.visitRamCacheDirectAliases(pages, context, visit);
     try vm.visitRamCacheProcessAliases(pages, context, visit);
 }
 
@@ -27,8 +28,14 @@ pub fn measure(pages: []const u64) !Requirements {
                 .identity => |identity| blk: {
                     self.result.splits = try std.math.add(usize, self.result.splits, 1);
                     var n: usize = 0;
-                    for (self.pages) |pa| if (pa >= identity.base and pa - identity.base < (1 << 21)) {
+                    var last_chunk: ?u64 = null;
+                    if (identity.size == .page) return error.Invalid;
+                    for (self.pages) |pa| if (pa >= identity.base and pa - identity.base < identity.size.bytes()) {
                         n += 1;
+                        if (identity.size == .huge and last_chunk != pa >> 21) {
+                            self.result.splits = try std.math.add(usize, self.result.splits, 1);
+                            last_chunk = pa >> 21;
+                        }
                     };
                     break :blk n;
                 },
@@ -58,7 +65,6 @@ pub fn collect(pages: []const u64, storage: []paging.AliasSource) ![]paging.Alia
 
 pub const Split = union(enum) {
     kernel: vm.RamCacheKernelSplit,
-    process: vm.RamCachePrivateSplit,
 
     fn mapping(self: *const Split) *const paging.IdentitySplit {
         return switch (self.*) {
@@ -153,7 +159,10 @@ fn sourceLessThan(_: void, left: paging.AliasSource, right: paging.AliasSource) 
 /// entry are not safe to silently merge. Deduplication here makes the later
 /// leaf capture linear even with a private identity copy in every process.
 fn uniqueSources(sources: []paging.AliasSource) ![]paging.AliasSource {
-    std.mem.sort(paging.AliasSource, sources, {}, sourceLessThan);
+    // Alias order has no stable-order contract. Heap sort needs constant
+    // workspace, unlike mem.sort's element-size-dependent stack scratch.
+    // Equal addresses still reach the ambiguity check below before capture.
+    std.sort.heap(paging.AliasSource, sources, {}, sourceLessThan);
     var used: usize = 0;
     for (sources) |source| {
         if (used != 0 and sourceAddress(sources[used - 1]) == sourceAddress(source)) {
@@ -184,15 +193,27 @@ pub fn prepare(pages: []const u64, sources: []paging.AliasSource, leaf_storage: 
         .leaf => |pointer| try capture(leaf_storage, &leaf_count, pointer, pages),
         .identity => |identity| {
             if (split_count == split_storage.len) return error.NoSpace;
-            split_storage[split_count] = if (identity.private_owner != null)
-                .{ .process = try vm.reserveRamCachePrivateSplit(source) }
-            else
-                .{ .kernel = try vm.reserveRamCacheKernelSplit(source) };
+            split_storage[split_count] = .{ .kernel = try vm.reserveRamCacheKernelSplit(source) };
             const split = split_storage[split_count].mapping();
             split_count += 1;
+            var last_chunk: ?u64 = null;
+            var leaf_table = split.table;
             for (pages) |pa| {
-                if (pa < identity.base or pa - identity.base >= (1 << 21)) continue;
-                try capture(leaf_storage, &leaf_count, &split.table[@intCast((pa - identity.base) / 4096)], pages);
+                if (pa < identity.base or pa - identity.base >= identity.size.bytes()) continue;
+                if (identity.size == .huge and last_chunk != pa >> 21) {
+                    if (split_count == split_storage.len) return error.NoSpace;
+                    const chunk = pa & ~@as(u64, (1 << 21) - 1);
+                    const va = identity.alias_va orelse return error.Invalid;
+                    split_storage[split_count] = .{ .kernel = try vm.reserveRamCacheKernelSplit(.{ .identity = .{
+                        .directory = &split.table[@intCast((chunk - identity.base) >> 21)],
+                        .base = chunk,
+                        .alias_va = va + (chunk - identity.base),
+                    } }) };
+                    leaf_table = split_storage[split_count].mapping().table;
+                    split_count += 1;
+                    last_chunk = pa >> 21;
+                }
+                try capture(leaf_storage, &leaf_count, &leaf_table[@intCast((pa >> 12) & 511)], pages);
             }
         },
     };
@@ -251,4 +272,21 @@ test "RAM cache preparation deduplicates 512 pages across 24 alias sets" {
     }
     entries[0] = 0;
     try std.testing.expectError(error.Unsupported, prepare(pages, sources, leaves, &splits));
+}
+
+test "RAM cache source heap ordering handles empty sorted reversed and all equal aliases" {
+    var entries: [513]u64 = @splat(0);
+    var sources: [513]paging.AliasSource = undefined;
+    try std.testing.expectEqual(@as(usize, 0), (try uniqueSources(sources[0..0])).len);
+    for ([_]bool{ false, true }) |reverse| {
+        for (&sources, 0..) |*source, index| source.* = .{ .leaf = &entries[if (reverse) sources.len - 1 - index else index] };
+        const normalized = try uniqueSources(&sources);
+        try std.testing.expectEqual(sources.len, normalized.len);
+        for (normalized, 0..) |source, index| try std.testing.expectEqual(@intFromPtr(&entries[index]), sourceAddress(source));
+    }
+    for (&sources) |*source| source.* = .{ .leaf = &entries[0] };
+    try std.testing.expectEqual(@as(usize, 1), (try uniqueSources(&sources)).len);
+    // A late conflicting interpretation must not disappear amid duplicates.
+    sources[sources.len - 1] = .{ .identity = .{ .directory = &entries[0], .base = 0x200000 } };
+    try std.testing.expectError(error.AmbiguousAlias, uniqueSources(&sources));
 }

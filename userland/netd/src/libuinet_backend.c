@@ -75,7 +75,7 @@ static const uint8_t k_netd_smoke_peer_mac[6] = { 0x52, 0x55, 0x00, 0xaa, 0xbb, 
 #define k_netd_smoke_peer_ip (netd_network_config_get()->gateway)
 
 static uinet_if_t g_libuinet_if;
-static int g_filed_endpoint_fd;
+static pacha_fd_t g_filed_endpoint_fd;
 static struct uinet_socket *g_libuinet_udp_echo;
 static struct uinet_socket *g_libuinet_tcp_listener;
 static struct uinet_socket *g_libuinet_tcp_connections[NETD_TCP_ECHO_MAX_CONNECTIONS];
@@ -96,7 +96,7 @@ struct netd_libuinet_api_socket {
     uint8_t notify_pending;
     uint8_t listening;
     uint8_t reserved[2];
-    int notify_fd;
+    pacha_fd_t notify_fd;
     struct uinet_socket *socket;
 };
 static struct netd_libuinet_api_socket g_libuinet_api_sockets[NETD_SOCKET_API_MAX_SOCKETS];
@@ -116,7 +116,7 @@ _Static_assert(sizeof(struct netd_libuinet_sts_callout) <= 80,
                "libuinet STS callout exceeds opaque storage");
 
 static struct netd_libuinet_sts_callout *g_libuinet_sts_pending;
-static int g_libuinet_sts_timer_fd = -1;
+static pacha_fd_t g_libuinet_sts_timer_fd = -1;
 static int g_libuinet_sts_error;
 
 static void netd_libuinet_notify_sockets(void)
@@ -1490,7 +1490,7 @@ int netd_filed_close_handle(uint64_t handle)
     return status ? status : response.result < 0 ? (int)response.result : 0;
 }
 
-static int netd_filed_file_vmo(uint64_t handle, uint64_t offset,
+static pacha_fd_t netd_filed_file_vmo(uint64_t handle, uint64_t offset,
     uint64_t length, uint64_t *out_loaded)
 {
     if (!handle || !length || !out_loaded || offset > INT64_MAX) return -EINVAL;
@@ -1498,7 +1498,7 @@ static int netd_filed_file_vmo(uint64_t handle, uint64_t offset,
     kb2_fs_request_t request = {.opcode = KB2_FILESYSTEM_OP_FILE_VMO,
         .handle = handle, .offset = (int64_t)offset, .length = length};
     kb2_fs_response_t response;
-    int fd = -1;
+    pacha_fd_t fd = -1;
     size_t count = 1;
     int status = filedfs_call(g_filed_endpoint_fd, &request, NULL, NULL, NULL, 0,
         NULL, 0, &response, NULL, 0, &fd, &count);
@@ -1548,8 +1548,8 @@ static int netd_read_file_alloc(const char *path, unsigned char **out_data, size
            path,
            (unsigned long long)handle,
            NETD_CA_BUNDLE_MAX_BYTES);
-    int vmo_fd = netd_filed_file_vmo(handle, 0, NETD_CA_BUNDLE_MAX_BYTES, &loaded);
-    printf("[netd] filed file_vmo done path=%s status=%d loaded=%llu\n",
+    pacha_fd_t vmo_fd = netd_filed_file_vmo(handle, 0, NETD_CA_BUNDLE_MAX_BYTES, &loaded);
+    printf("[netd] filed file_vmo done path=%s status=%ld loaded=%llu\n",
            path,
            vmo_fd >= 16 ? 0 : vmo_fd,
            (unsigned long long)loaded);
@@ -2407,7 +2407,7 @@ int netd_libuinet_start(struct netd_runtime *runtime)
         netd_network_config_get() == NULL) {
         return 7;
     }
-    g_filed_endpoint_fd = (int)runtime->cfg->filed_endpoint_fd;
+    g_filed_endpoint_fd = (pacha_fd_t)runtime->cfg->filed_endpoint_fd;
     g_libuinet_state = NETD_LIBUINET_UNLINKED;
     g_libuinet_rx_frames = 0;
     g_libuinet_rx_drops = 0;
@@ -2618,7 +2618,7 @@ int netd_libuinet_socket_open(
     uint64_t domain,
     uint64_t type,
     uint64_t protocol,
-    int notify_fd,
+    pacha_fd_t notify_fd,
     uint64_t *out_handle)
 {
     if (out_handle == NULL || notify_fd < 16) {
@@ -2874,7 +2874,7 @@ int netd_libuinet_socket_listen(uint64_t handle, uint32_t backlog)
 #endif
 }
 
-int netd_libuinet_socket_accept(uint64_t handle, int notify_fd,
+int netd_libuinet_socket_accept(uint64_t handle, pacha_fd_t notify_fd,
     uint64_t *out_handle, uint32_t *out_peer_addr_be,
     uint16_t *out_peer_port_be, uint32_t *out_local_addr_be,
     uint16_t *out_local_port_be)

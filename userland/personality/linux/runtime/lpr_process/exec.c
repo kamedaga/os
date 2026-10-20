@@ -7,7 +7,7 @@
 
 enum { LPR_EXEC_BACKEND_SNAPSHOT_BYTES = 256u };
 
-int64_t lpr_linux_wait_process_fd(uint64_t process_fd, uint64_t *out_exit_code)
+int64_t lpr_linux_wait_process_fd(uint64_t process_fd, uint64_t *out_exit_code, unsigned *wait_not_ready __attribute__((unused)))
 {
     if (process_fd < 16) {
         return -LPR_LINUX_ECHILD;
@@ -36,11 +36,11 @@ int64_t lpr_linux_wait_process_fd(uint64_t process_fd, uint64_t *out_exit_code)
         lpr_wait_deadline_t deadline;
         lpr_wait_graph_init(&graph);
         int64_t fd_wait_status = lpr_wait_graph_add_native(
-            &graph, (int)(uint32_t)process_fd, PACHA_FD_EVENT_READABLE);
+            &graph, (pacha_fd_t)process_fd, PACHA_FD_EVENT_READABLE);
         if (fd_wait_status == 0)
             fd_wait_status = lpr_wait_deadline_init(&deadline, -1);
         if (fd_wait_status == 0)
-            fd_wait_status = lpr_wait_graph_block(&graph, &deadline);
+            fd_wait_status = lpr_wait_graph_block(&graph, &deadline, wait_not_ready);
         if (fd_wait_status != 0) {
             lpr_trace_process_event("wait_error", process_fd, 0, fd_wait_status);
             return fd_wait_status;
@@ -268,12 +268,12 @@ static uint64_t lpr_exec_backend_record_bytes(uint8_t ops_id)
 static int lpr_transaction_track_lease(
     lpr_exec_transaction_t *transaction,
     uint32_t pin_index,
-    int fd);
+    pacha_fd_t fd);
 
 static uint32_t lpr_exec_backend_native_fds(
     uint8_t ops_id,
     const void *state,
-    int32_t out_fds[2])
+    pacha_fd_t out_fds[2])
 {
     if (out_fds == 0) return 0;
     out_fds[0] = -1;
@@ -281,7 +281,7 @@ static uint32_t lpr_exec_backend_native_fds(
     if (state == 0) return 0;
     uint32_t count = 0;
 #define LPR_EXEC_ADD_NATIVE(value) do { \
-    const int32_t native_fd__ = (value); \
+    const pacha_fd_t native_fd__ = (value); \
     if (native_fd__ >= 16 && count < 2) out_fds[count++] = native_fd__; \
 } while (0)
     switch (ops_id) {
@@ -339,7 +339,7 @@ static uint32_t lpr_exec_backend_native_fds(
 static void lpr_fork_close_displaced_capabilities(
     uint8_t ops_id, const void *original, const void *prepared)
 {
-    int32_t old_fds[2], new_fds[2];
+    pacha_fd_t old_fds[2], new_fds[2];
     const uint32_t old_count = lpr_exec_backend_native_fds(ops_id, original, old_fds);
     const uint32_t new_count = lpr_exec_backend_native_fds(ops_id, prepared, new_fds);
     for (uint32_t i = 0; i < old_count; ++i) {
@@ -409,7 +409,7 @@ static uint32_t lpr_exec_manifest_capability_count(uint8_t ops_id, const void *s
     if (ops_id == LPR_FD_OPS_UNIX) return 1;
     if (ops_id == LPR_FD_OPS_FILED)
         return ((const lpr_filed_backend_t *)state)->handle != 0;
-    int32_t native_fds[2];
+    pacha_fd_t native_fds[2];
     uint32_t count = lpr_exec_backend_native_fds(ops_id, state, native_fds);
     if (lpr_backend_needs_transfer_lease(ops_id, state)) {
         /* PRIME exports already have an original-owner lease. Preparing the
@@ -425,8 +425,8 @@ static uint32_t lpr_exec_manifest_capability_count(uint8_t ops_id, const void *s
 static int lpr_duplicate_manifest_capability(
     lpr_exec_transaction_t *transaction,
     uint32_t pin_index,
-    int source_fd,
-    int32_t *out_fd)
+    pacha_fd_t source_fd,
+    pacha_fd_t *out_fd)
 {
     if (transaction == 0 || out_fd == 0 || source_fd < 16)
         return -LPR_LINUX_EBADF;
@@ -447,12 +447,12 @@ static int lpr_duplicate_manifest_capability(
      * views deliberately carry DUP and TRANSFER, but no flag-management
      * authority. */
     const int status = lpr_transaction_track_lease(
-        transaction, pin_index, (int)duplicate);
+        transaction, pin_index, (pacha_fd_t)duplicate);
     if (status != 0) {
         (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)duplicate);
         return status;
     }
-    *out_fd = (int32_t)duplicate;
+    *out_fd = (pacha_fd_t)duplicate;
     return 0;
 }
 
@@ -597,8 +597,8 @@ static int lpr_prepare_backend_record(
         return status;
     }
     if (lpr_backend_needs_transfer_lease(ops_id, original_state)) {
-        int lease_fd = -1;
-        int remote_lease_fd = -1;
+        pacha_fd_t lease_fd = -1;
+        pacha_fd_t remote_lease_fd = -1;
         status = ops_id == LPR_FD_OPS_FILED ?
             lpr_filed_lease_pair(&lease_fd, &remote_lease_fd) :
             lpr_native_wait_pair(&lease_fd, &remote_lease_fd);
@@ -679,10 +679,10 @@ static int lpr_prepare_backend_record(
                     (const lpr_filed_backend_t *)original_state, status);
             if (lease_fd >= 16)
                 (void)lpr_close_native_fd_if_open(
-                    (uint64_t)(uint32_t)lease_fd);
+                    (uint64_t)lease_fd);
             if (remote_lease_fd >= 16)
                 (void)lpr_close_native_fd_if_open(
-                    (uint64_t)(uint32_t)remote_lease_fd);
+                    (uint64_t)remote_lease_fd);
             return status;
         }
         switch (ops_id) {
@@ -858,7 +858,7 @@ static int lpr_prepare_manifest_impl(
     const int binding_status = lpr_prepare_manifest_filesystem(exec);
     if (binding_status) return (int)binding_status;
     if (lpr_cwd_handle != 0) {
-        int remote_lease_fd = -1;
+        pacha_fd_t remote_lease_fd = -1;
         int status = lpr_filed_lease_pair(
             &transaction->cwd_lease_fd,
             &remote_lease_fd);
@@ -873,9 +873,9 @@ static int lpr_prepare_manifest_impl(
             &transaction->cwd_handle);
         if (dup_status != 0 || transaction->cwd_handle == 0) {
             (void)lpr_close_native_fd_if_open(
-                (uint64_t)(uint32_t)transaction->cwd_lease_fd);
+                (uint64_t)transaction->cwd_lease_fd);
             (void)lpr_close_native_fd_if_open(
-                (uint64_t)(uint32_t)remote_lease_fd);
+                (uint64_t)remote_lease_fd);
             transaction->cwd_lease_fd = -1;
             transaction->cwd_handle = 0;
             lpr_manifest_diag("cwd-transfer");
@@ -925,7 +925,7 @@ static int lpr_prepare_manifest_impl(
         return (int)lpr_pacha_status_to_errno(mapped);
     }
     lpr_zero_bytes((void *)(uintptr_t)mapped, map_bytes);
-    transaction->manifest_fd = (int)manifest_fd;
+    transaction->manifest_fd = (pacha_fd_t)manifest_fd;
     transaction->map_bytes = map_bytes;
     transaction->manifest = (lpr_manifest_t *)(uintptr_t)mapped;
     lpr_manifest_entry_t *snapshot_entries =
@@ -940,6 +940,10 @@ static int lpr_prepare_manifest_impl(
     uint64_t entry_count = 0;
     lpr_fd_table_lock(&lpr_control_fd_table);
     const uint64_t snapshot_generation = lpr_control_fd_table.generation;
+    /* Snapshot admission together with entries, so concurrent prlimit cannot
+     * split soft/hard across different policy states. */
+    const uint64_t nofile_soft = lpr_control_fd_table.nofile_soft;
+    const uint64_t nofile_hard = lpr_control_fd_table.nofile_hard;
     for (uint64_t fd = 0; fd < capacity; ++fd) {
         const int preserve = fork_snapshot ?
             lpr_fork_local_fd_preserve_unlocked(fd) :
@@ -1035,6 +1039,8 @@ static int lpr_prepare_manifest_impl(
     lpr_manifest_t *manifest = transaction->manifest;
     manifest->transaction_id = lpr_next_request_id(&lpr_request_id);
     manifest->generation = snapshot_generation;
+    manifest->nofile_soft = nofile_soft;
+    manifest->nofile_hard = nofile_hard;
     manifest->linux_pid = (uint64_t)(uint32_t)lpr_linux_current_pid;
     manifest->linux_ppid = (uint64_t)(uint32_t)lpr_linux_current_ppid;
     manifest->linux_sid = (uint64_t)(uint32_t)lpr_linux_current_sid;
@@ -1070,7 +1076,7 @@ static int lpr_prepare_manifest_impl(
         struct pacha_fd_info info;
         lpr_memset(&info, 0, sizeof(info));
         if (!lpr_native_fd_info(
-                (uint64_t)(uint32_t)transaction->cwd_lease_fd, &info))
+                (uint64_t)transaction->cwd_lease_fd, &info))
         {
             lpr_exec_unpin(transaction);
             lpr_destroy_exec_transaction(transaction);
@@ -1079,7 +1085,7 @@ static int lpr_prepare_manifest_impl(
         capabilities[capability_cursor] = (lpr_manifest_capability_t){
             .ordinal = (uint32_t)capability_cursor,
             .flags = LPR_MANIFEST_CAPABILITY_CWD_LEASE,
-            .native_fd = (uint64_t)(uint32_t)transaction->cwd_lease_fd,
+            .native_fd = (uint64_t)transaction->cwd_lease_fd,
             .rights = info.rights,
         };
         capability_cursor++;
@@ -1102,7 +1108,7 @@ static int lpr_prepare_manifest_impl(
             lpr_destroy_exec_transaction(transaction);
             return prepare_status;
         }
-        int32_t native_fds[2];
+        pacha_fd_t native_fds[2];
         const uint32_t native_fd_count =
             lpr_exec_backend_native_fds(pin->ops_id, record, native_fds);
         ofds[i].generation = pin->ofd_generation;
@@ -1117,17 +1123,17 @@ static int lpr_prepare_manifest_impl(
         ofds[i].capability_count = (uint16_t)native_fd_count;
         record_cursor += bytes;
         for (uint32_t ni = 0; ni < native_fd_count; ++ni) {
-            const int32_t native_fd = native_fds[ni];
+            const pacha_fd_t native_fd = native_fds[ni];
             struct pacha_fd_info info;
             lpr_memset(&info, 0, sizeof(info));
-            if (!lpr_native_fd_info((uint64_t)(uint32_t)native_fd, &info)) {
+            if (!lpr_native_fd_info((uint64_t)native_fd, &info)) {
                 lpr_exec_unpin(transaction);
                 lpr_destroy_exec_transaction(transaction);
                 return -LPR_LINUX_EBADF;
             }
             capabilities[capability_cursor] = (lpr_manifest_capability_t){
                 .ordinal = (uint32_t)capability_cursor,
-                .native_fd = (uint64_t)(uint32_t)native_fd,
+                .native_fd = (uint64_t)native_fd,
                 .rights = info.rights,
             };
             capability_cursor++;
@@ -1144,7 +1150,7 @@ static int lpr_prepare_manifest_impl(
     }
     if (lpr_supervisor_enabled && !fork_snapshot) {
         void *page = 0;
-        const int page_fd = lpr_create_standalone_wire_page(&page);
+        const pacha_fd_t page_fd = lpr_create_standalone_wire_page(&page);
 #if defined(LPR_BOOT_DIAGNOSTICS) && LPR_BOOT_DIAGNOSTICS
         lpr_boot_diagnostic_emit("exec-supervisor-prepare-enter", page_fd,
             transaction->manifest_fd, 0, 0, 0);
@@ -1215,7 +1221,7 @@ static void *lpr_fork_manifest_record(
 static int lpr_transaction_track_lease(
     lpr_exec_transaction_t *transaction,
     uint32_t pin_index,
-    int fd)
+    pacha_fd_t fd)
 {
     if (transaction == 0 || fd < 16 || transaction->prepared_leases == 0 ||
         transaction->prepared_lease_count >= transaction->prepared_lease_capacity)
@@ -1241,7 +1247,7 @@ void lpr_fork_transaction_rollback(lpr_exec_transaction_t *transaction)
     transaction->fork_state = LPR_FORK_ROLLED_BACK;
     if (transaction->cwd_lease_fd >= 16)
         (void)lpr_close_native_fd_if_open(
-            (uint64_t)(uint32_t)transaction->cwd_lease_fd);
+            (uint64_t)transaction->cwd_lease_fd);
     transaction->cwd_lease_fd = -1;
     transaction->cwd_handle = 0;
 }
@@ -1366,7 +1372,7 @@ int lpr_fork_transaction_commit_child(lpr_exec_transaction_t *transaction)
     if (transaction->cwd_handle != 0) {
         if (lpr_cwd_lease_fd >= 16)
             (void)lpr_close_native_fd_if_open(
-                (uint64_t)(uint32_t)lpr_cwd_lease_fd);
+                (uint64_t)lpr_cwd_lease_fd);
         lpr_cwd_handle = transaction->cwd_handle;
         lpr_cwd_lease_handle = transaction->cwd_handle;
         lpr_cwd_lease_fd = transaction->cwd_lease_fd;
@@ -1394,7 +1400,7 @@ int lpr_fork_transaction_commit_parent(lpr_exec_transaction_t *transaction)
     transaction->prepared_lease_count = 0;
     if (transaction->cwd_lease_fd >= 16)
         (void)lpr_close_native_fd_if_open(
-            (uint64_t)(uint32_t)transaction->cwd_lease_fd);
+            (uint64_t)transaction->cwd_lease_fd);
     transaction->cwd_handle = 0;
     transaction->cwd_lease_fd = -1;
     transaction->fork_prepared_count = 0;
@@ -1469,7 +1475,7 @@ void lpr_destroy_exec_transaction(lpr_exec_transaction_t *transaction)
     }
     if (transaction->cwd_lease_fd >= 16)
         (void)lpr_close_native_fd_if_open(
-            (uint64_t)(uint32_t)transaction->cwd_lease_fd);
+            (uint64_t)transaction->cwd_lease_fd);
     transaction->cwd_lease_fd = -1;
     transaction->cwd_handle = 0;
     transaction->manifest_fd = -1;
@@ -1486,7 +1492,7 @@ static void lpr_close_cwd_state(void)
      * a detached numeric handle through the generic RPC fallback. */
     const int64_t status = lpr_filed_endpoint_ready();
     const uint64_t handle = lpr_cwd_handle;
-    const int lease = lpr_cwd_lease_fd;
+    const pacha_fd_t lease = lpr_cwd_lease_fd;
     lpr_cwd_handle = lpr_cwd_lease_handle = 0;
     lpr_cwd_lease_fd = -1;
     if (lease >= 16) (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)lease);
@@ -1529,7 +1535,7 @@ void lpr_linux_prepare_process_exit(uint64_t exit_code)
 }
 
 static int lpr_restore_exec_bootstrap_fd(
-    int backup_fd,
+    pacha_fd_t backup_fd,
     const struct pacha_fd_info *backup_info)
 {
     if (backup_fd < 16 || backup_info == 0) return -LPR_LINUX_EBADF;
@@ -1562,7 +1568,7 @@ static int lpr_restore_exec_bootstrap_fd(
     return 0;
 }
 
-int lpr_install_exec_bootstrap_fd(int bootstrap_fd)
+int lpr_install_exec_bootstrap_fd(pacha_fd_t bootstrap_fd)
 {
     /* A dynamic donor is consumed only on success. Failure always leaves
      * it with the caller, including failures after replacing the slot. */
@@ -1626,7 +1632,7 @@ int lpr_install_exec_bootstrap_fd(int bootstrap_fd)
             (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, (uint64_t)(uint32_t)dup_fd);
         }
         const int restore_status = lpr_restore_exec_bootstrap_fd(
-            (int)(uint32_t)backup_fd, &backup_info);
+            (pacha_fd_t)backup_fd, &backup_info);
         (void)lpr_pacha_syscall1(
             PACHAOS_SYSCALL_FD_CLOSE, (uint64_t)(uint32_t)backup_fd);
         return restore_status != 0 ? restore_status : -LPR_LINUX_EIO;
@@ -1640,7 +1646,7 @@ int lpr_install_exec_bootstrap_fd(int bootstrap_fd)
     if (flag_status != 0) {
         (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, LPR_BOOTSTRAP_FD);
         const int restore_status = lpr_restore_exec_bootstrap_fd(
-            (int)(uint32_t)backup_fd, &backup_info);
+            (pacha_fd_t)backup_fd, &backup_info);
         (void)lpr_pacha_syscall1(
             PACHAOS_SYSCALL_FD_CLOSE, (uint64_t)(uint32_t)backup_fd);
         return restore_status != 0 ? restore_status :
@@ -1659,8 +1665,8 @@ static void exec_put64(uint8_t *p, uint64_t value)
 }
 
 int64_t lpr_filed_exec_self(filed_exec_path_t *exec,
-    const lpr_exec_transaction_t *transaction, int *out_process_fd,
-    int *out_thread_fd, int *out_manifest_fd)
+    const lpr_exec_transaction_t *transaction, pacha_fd_t *out_process_fd,
+    pacha_fd_t *out_thread_fd, pacha_fd_t *out_manifest_fd)
 {
     if (!exec || !transaction || transaction->manifest_fd < 16 ||
         !out_process_fd || !out_thread_fd || !out_manifest_fd)
@@ -1710,7 +1716,7 @@ int64_t lpr_filed_exec_self(filed_exec_path_t *exec,
     kb2_fs_request_t request = {.opcode = KB2_FILESYSTEM_OP_EXEC_SELF,
         .handle = exec->dir_handle, .flags = exec->flags};
     kb2_fs_response_t response;
-    int returned[3];
+    pacha_fd_t returned[3];
 #if defined(LPR_BOOT_DIAGNOSTICS) && LPR_BOOT_DIAGNOSTICS
     lpr_boot_diagnostic_emit("exec-filed-call-enter", bytes,
         transaction->manifest_fd, request.opcode, 0, 0);

@@ -39,13 +39,13 @@ long pacha_syscall4(uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t
     }
     return 1;
 }
-int pacha_ipc_send(int fd, const struct pacha_ipc_msg *message)
+int pacha_ipc_send(pacha_fd_t fd, const struct pacha_ipc_msg *message)
 {
     assert(fd >= 16 && message && !message->word0 && !message->fd_count);
     ++sends;
     return send_error;
 }
-int pacha_fd_close(int fd) { assert(fd >= 16); ++closes; return close_error; }
+int pacha_fd_close(pacha_fd_t fd) { assert(fd >= 16); ++closes; return close_error; }
 
 static void pending(struct gpud_drm_service *service, uint64_t session,
     uint64_t correlation, int fd)

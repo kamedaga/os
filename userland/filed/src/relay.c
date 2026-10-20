@@ -26,13 +26,13 @@ struct filed_session {
     struct filed_session *next;
     struct filed_client *client;
     struct ph_fs_channel_config config;
-    int vmo_fd, doorbell_fd;
+    pacha_fd_t vmo_fd, doorbell_fd;
     int attached, remote_released;
 };
 struct filed_lease {
     struct filed_lease *next;
     uint64_t id, handle, client;
-    int fd;
+    pacha_fd_t fd;
 };
 static int authorize(filed_runtime_t *rt,const kb2_fs_request_t *r)
 {
@@ -75,7 +75,7 @@ static int relay(filed_runtime_t *rt,const kb2_fs_request_t *input,
     return status;
 }
 static int make_file_vmo(filed_runtime_t *rt,const kb2_fs_request_t *r,
-                         kb2_fs_response_t *response,int *fd)
+                         kb2_fs_response_t *response,pacha_fd_t *fd)
 {
     if (r->flags & ~(uint64_t)(FILED_FILE_VMO_WRITE|FILED_FILE_VMO_EXEC) ||
         r->offset < 0 || !r->length || r->length > SIZE_MAX-4095)
@@ -105,7 +105,7 @@ static int make_file_vmo(filed_runtime_t *rt,const kb2_fs_request_t *r,
 #ifdef FILED_INTERNAL_MICROBENCH
     FILED_BENCH_STAGE(filed_bench_snapshot_cycles,0,bench_stage);
 #endif
-    int vmo=pacha_vmo_create(mapped,rights,0);
+    pacha_fd_t vmo=pacha_vmo_create(mapped,rights,0);
     if (vmo<16) return vmo;
 #ifdef FILED_INTERNAL_MICROBENCH
     FILED_BENCH_STAGE(filed_bench_snapshot_cycles,1,bench_stage);
@@ -178,8 +178,8 @@ static int route_device(filed_runtime_t *rt,const kb2_fs_request_t *request,
     return 0;
 }
 static int exec_request(filed_runtime_t *rt,const kb2_fs_request_t *r,
-    const uint8_t *bytes,const int *sources,size_t source_count,
-    int *fds,size_t *fd_count)
+    const uint8_t *bytes,const pacha_fd_t *sources,size_t source_count,
+    pacha_fd_t *fds,size_t *fd_count)
 {
     if (!r->path.length || r->data.length < KB2_FILESYSTEM_EXEC_PAYLOAD_SIZE)
         return -EINVAL;
@@ -197,7 +197,7 @@ static int exec_request(filed_runtime_t *rt,const kb2_fs_request_t *r,
         (request.inherit_handle_count && !(request.flags & FILED_EXEC_INHERIT_HANDLES))) {
         status=-EINVAL; goto done;
     }
-    int bootstrap=request.flags & FILED_EXEC_BOOTSTRAP_FD ?
+    pacha_fd_t bootstrap=request.flags & FILED_EXEC_BOOTSTRAP_FD ?
         sources[request.inherit_fd_count] : -1;
     /* Inherited handles are references in this authenticated Linux client.
      * Duplicates share struct file offsets; there is no userspace f_pos. */
@@ -239,7 +239,7 @@ static int exec_request(filed_runtime_t *rt,const kb2_fs_request_t *r,
     uint64_t handle=0;
     if (!status) status=filed_storage_exec_open(rt,r->handle,
         (const char *)bytes+r->path.offset,&handle);
-    int process=-1,thread=-1;
+    pacha_fd_t process=-1,thread=-1;
     if (!status && r->opcode==KB2_FILESYSTEM_OP_EXEC_SELF) {
         if (!(request.flags & FILED_EXEC_LINUX_LPR) || source_count!=1 ||
             !(request.flags & FILED_EXEC_BOOTSTRAP_FD) ||
@@ -250,7 +250,7 @@ static int exec_request(filed_runtime_t *rt,const kb2_fs_request_t *r,
     } else if (!status) status=filed_exec_handle(rt,handle,&request,sources,
         request.inherit_fd_count,bootstrap,&process,&thread);
     if (handle) (void)filed_storage_exec_close(rt,handle);
-    int bootstrap_copy=-1;
+    pacha_fd_t bootstrap_copy=-1;
     int bootstrap_copy_failed=0;
     if (!status && r->opcode==KB2_FILESYSTEM_OP_EXEC_SELF) {
         /* DUP attenuates explicitly: zero is not inherited authority. The
@@ -317,7 +317,7 @@ static int reserve_session(filed_runtime_t *rt,uint64_t minimum,
     return 0;
 }
 static int attach_session(filed_runtime_t *rt,const kb2_fs_request_t *r,
-                           const int *sources,size_t count)
+                           const pacha_fd_t *sources,size_t count)
 {
     if (!rt->actor) return -EPERM;
     if (count!=2 || !r->second_handle || sources[0]==sources[1]) return -EINVAL;
@@ -388,7 +388,7 @@ static int detach_session(filed_runtime_t *rt,const kb2_fs_request_t *r,
 }
 static int dispatch_wire(filed_runtime_t *rt,const kb2_fs_request_t *r,
     const uint8_t *bytes,size_t size,uint8_t *out,size_t capacity,size_t *used,
-    const int *sources,size_t source_count,int *fds,size_t *fd_count)
+    const pacha_fd_t *sources,size_t source_count,pacha_fd_t *fds,size_t *fd_count)
 {
     kb2_fs_response_t response={.opcode=r->opcode,.generation=r->generation,
         .sequence=r->sequence};
@@ -431,7 +431,7 @@ static int dispatch_wire(filed_runtime_t *rt,const kb2_fs_request_t *r,
         break;
     }
     case KB2_FILESYSTEM_OP_SERVICE_BIND: {
-        int *target=NULL;
+        pacha_fd_t *target=NULL;
         switch(r->mode) {
         case FILED_SERVICE_NETD_SOCKET: target=&rt->netd_socket_endpoint_fd; break;
         case FILED_SERVICE_TERMD_TTY: target=&rt->termd_tty_endpoint_fd; break;
@@ -517,32 +517,30 @@ static int retained_source(uint32_t opcode,int status)
         opcode==KB2_FILESYSTEM_OP_SESSION_ATTACH ||
         opcode==KB2_FILESYSTEM_OP_TRANSFER_DUP);
 }
-int filed_receive(filed_runtime_t *rt,int endpoint)
+int filed_receive(filed_runtime_t *rt,pacha_fd_t endpoint)
 {
     struct pacha_ipc_fd incoming[PACHA_IPC_MAX_TRANSFER_FDS]={{0}};
     struct pacha_ipc_msg message={.fds=incoming,.fd_capacity=PACHA_IPC_MAX_TRANSFER_FDS};
     int status=pacha_ipc_recv(endpoint,&message);
     if (status) return status;
-    int reply=-1;
+    pacha_fd_t reply=PACHA_IPC_REPLY_IMPLICIT;
     struct pacha_fd_info info;
-    if (message.fd_count && !pacha_fd_get_info((int)incoming[message.fd_count-1].fd,&info) &&
-        info.kind==PACHA_FD_KIND_REPLY) reply=(int)incoming[message.fd_count-1].fd;
     void *mapping=NULL;
     uint8_t *snapshot=NULL,*output=NULL;
     size_t mapped=0,used=0;
-    int fds[3]={-1,-1,-1}; size_t fd_count=0;
+    pacha_fd_t fds[3]={-1,-1,-1}; size_t fd_count=0;
     kb2_fs_request_t request={0};
     status=-EINVAL;
-    if (reply>=16 && message.fd_count>=2 &&
+    if (message.fd_count>=1 &&
         message.word1>=KB2_FILESYSTEM_REQUEST_SIZE &&
         message.word2>=KB2_FILESYSTEM_RESPONSE_SIZE &&
         message.word1<=SIZE_MAX && message.word2<=SIZE_MAX &&
-        !pacha_fd_get_info((int)incoming[0].fd,&info) &&
+        !pacha_fd_get_info((pacha_fd_t)incoming[0].fd,&info) &&
         info.kind==PACHA_FD_KIND_VMO &&
         info.size>=message.word1 && info.size>=message.word2 &&
         info.size<=SIZE_MAX) {
         mapped=(size_t)info.size;
-        mapping=pacha_mmap((int)incoming[0].fd,mapped,PACHA_PROT_READ|PACHA_PROT_WRITE,
+        mapping=pacha_mmap((pacha_fd_t)incoming[0].fd,mapped,PACHA_PROT_READ|PACHA_PROT_WRITE,
                             PACHA_MMAP_SHARED,0);
         snapshot=malloc((size_t)message.word1);
         output=malloc((size_t)message.word2);
@@ -551,9 +549,9 @@ int filed_receive(filed_runtime_t *rt,int endpoint)
             if (!kb2_fs_request_decode(snapshot,(size_t)message.word1,message.word1,&request) &&
                 request.opcode==message.word0 && request.sequence==message.word3 &&
                 !kb2_fs_request_validate_paths(snapshot,(size_t)message.word1,&request)) {
-                int sources[PACHA_IPC_MAX_TRANSFER_FDS];
-                size_t source_count=(size_t)message.fd_count-2;
-                for (size_t i=0;i<source_count;++i) sources[i]=(int)incoming[i+1].fd;
+                pacha_fd_t sources[PACHA_IPC_MAX_TRANSFER_FDS];
+                size_t source_count=(size_t)message.fd_count-1;
+                for (size_t i=0;i<source_count;++i) sources[i]=(pacha_fd_t)incoming[i+1].fd;
                 status=dispatch_wire(rt,&request,snapshot,(size_t)message.word1,
                     output,(size_t)message.word2,&used,sources,source_count,fds,&fd_count);
                 if (!status) memcpy(mapping,output,used);
@@ -566,7 +564,7 @@ int filed_receive(filed_runtime_t *rt,int endpoint)
         if (kb2_fs_response_decode(output,used,&response)) result=-EPROTO;
         else result=(int)response.result;
     }
-    if (reply>=16) {
+    {
         struct pacha_ipc_fd outbound[3]={{0}};
         for (size_t i=0;i<fd_count;++i) {
             uint64_t rights=0;
@@ -603,6 +601,8 @@ int filed_receive(filed_runtime_t *rt,int endpoint)
             .word3=message.word3,.fds=outbound,.fd_count=fd_count};
         int reply_status=pacha_ipc_reply(reply,&response);
         if (reply_status) {
+            const struct pacha_ipc_msg failed = {0};
+            (void)pacha_ipc_reply(PACHA_IPC_REPLY_IMPLICIT, &failed);
             for(size_t i=0;i<fd_count;++i)
                 if (fds[i]>=16) (void)pacha_fd_close(fds[i]);
             status=reply_status;
@@ -613,8 +613,8 @@ int filed_receive(filed_runtime_t *rt,int endpoint)
     int keep=retained_source(request.opcode,result) ||
         (request.opcode==KB2_FILESYSTEM_OP_SESSION_ATTACH && !rt->storage_generation);
     for(size_t i=0;i<message.fd_count;++i)
-        if (!(keep && i>0 && i+1<message.fd_count))
-            (void)pacha_fd_close((int)incoming[i].fd);
+        if (!(keep && i>0))
+            (void)pacha_fd_close((pacha_fd_t)incoming[i].fd);
     return status;
 }
 int filed_sessions_release_client(filed_runtime_t *rt,struct filed_client *client)
@@ -636,15 +636,12 @@ static int lease_receive(filed_runtime_t *rt,struct filed_lease *lease)
     struct pacha_ipc_msg request={.fds=fds,.fd_capacity=PACHA_IPC_MAX_TRANSFER_FDS};
     int status=pacha_ipc_recv(lease->fd,&request);
     if(status) return status;
-    int reply=-1;
-    struct pacha_fd_info info;
-    if(request.fd_count==1 && !pacha_fd_get_info((int)fds[0].fd,&info) &&
-        info.kind==PACHA_FD_KIND_REPLY) reply=(int)fds[0].fd;
+    pacha_fd_t reply=PACHA_IPC_REPLY_IMPLICIT;
     uint64_t handle=0;
     status=-EINVAL;
     struct filed_client *client=rt->clients;
     while(client && client->id!=request.word2) client=client->next;
-    if(reply>=16 && client && request.word0==FILED_LEASE_MAGIC && request.word1==lease->id) {
+    if(request.fd_count==0 && client && request.word0==FILED_LEASE_MAGIC && request.word1==lease->id) {
         if(lease->client==client->id) { handle=lease->handle; status=0; }
         else if(lease->client!=1) status=-EPERM;
         else {
@@ -670,12 +667,12 @@ static int lease_receive(filed_runtime_t *rt,struct filed_lease *lease)
             }
         }
     }
-    if(reply>=16) {
+    {
         struct pacha_ipc_msg response={.word0=FILED_LEASE_MAGIC,
             .word1=(uint64_t)(int64_t)status,.word2=handle,.word3=request.word3};
         (void)pacha_ipc_reply(reply,&response);
     }
-    for(size_t i=0;i<request.fd_count;++i) (void)pacha_fd_close((int)fds[i].fd);
+    for(size_t i=0;i<request.fd_count;++i) (void)pacha_fd_close((pacha_fd_t)fds[i].fd);
     return 0;
 }
 static int retire_lease(filed_runtime_t *rt,struct filed_lease *lease)
@@ -721,18 +718,18 @@ int filed_runtime_serve(filed_runtime_t *rt)
         for(size_t i=0;i<count;++i) {
             if(!poll[i].revents) continue;
             rt->actor=NULL;
-            if(poll[i].fd==rt->client_endpoint_fd) status=filed_receive(rt,poll[i].fd);
-            else if(poll[i].fd==rt->unix_path_fd) status=filed_unix_path_receive(rt);
+            if(poll[i].fd==(uint64_t)rt->client_endpoint_fd) status=filed_receive(rt,poll[i].fd);
+            else if(poll[i].fd==(uint64_t)rt->unix_path_fd) status=filed_unix_path_receive(rt);
             else {
                 struct filed_client *client=rt->clients;
-                while(client && client->fd!=poll[i].fd) client=client->next;
+                while(client && (uint64_t)client->fd!=poll[i].fd) client=client->next;
                 if(client) {
                     if(poll[i].revents & PACHA_FD_EVENT_HANGUP) status=filed_client_release(rt,client);
                     else { rt->actor=client; status=filed_receive(rt,client->fd); }
                 } else {
                     {
                         struct filed_lease **cursor=&rt->leases;
-                        while(*cursor && (*cursor)->fd!=poll[i].fd) cursor=&(*cursor)->next;
+                        while(*cursor && (uint64_t)(*cursor)->fd!=poll[i].fd) cursor=&(*cursor)->next;
                         if(*cursor) {
                             struct filed_lease *lease=*cursor;
                             if(poll[i].revents & PACHA_FD_EVENT_HANGUP) {

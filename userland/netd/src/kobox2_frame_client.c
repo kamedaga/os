@@ -5,7 +5,7 @@
 #include <errno.h>
 #include <string.h>
 
-static int wait_reply(struct ph_ipc *ipc, int process_fd,
+static int wait_reply(struct ph_ipc *ipc, pacha_fd_t process_fd,
     uint64_t operation, uint64_t correlation)
 {
     for (;;) {
@@ -33,7 +33,7 @@ static int wait_reply(struct ph_ipc *ipc, int process_fd,
 }
 
 static int request(struct netd_kobox2_frame_client *client,
-    struct ph_ipc *ipc, int process_fd, uint64_t operation, int attach_fd)
+    struct ph_ipc *ipc, pacha_fd_t process_fd, uint64_t operation, pacha_fd_t attach_fd)
 {
     if (!client || !client->shared || !ipc ||
         client->generation != ipc->generation || process_fd < 16)
@@ -64,13 +64,13 @@ static int request(struct netd_kobox2_frame_client *client,
 }
 
 int netd_kobox2_frame_open(struct netd_kobox2_frame_client *client,
-    struct ph_ipc *ipc, int process_fd, uint64_t generation)
+    struct ph_ipc *ipc, pacha_fd_t process_fd, uint64_t generation)
 {
     if (!client || client->shared || !ipc || !generation ||
         generation != ipc->generation) return -EINVAL;
     const uint64_t rights = PACHA_FD_RIGHT_INSPECT | PACHA_FD_RIGHT_CLOSE |
         PACHA_FD_RIGHT_TRANSFER | PACHA_FD_RIGHT_MAP_READ | PACHA_FD_RIGHT_MAP_WRITE;
-    int fd = pacha_vmo_create(PH_NET_FRAME_SHARED_BYTES, rights, 0);
+    pacha_fd_t fd = pacha_vmo_create(PH_NET_FRAME_SHARED_BYTES, rights, 0);
     if (fd < 16) return fd < 0 ? fd : -ENOMEM;
     void *mapped = pacha_mmap(fd, PH_NET_FRAME_SHARED_BYTES,
         PACHA_PROT_READ | PACHA_PROT_WRITE, PACHA_MMAP_SHARED, 0);
@@ -90,7 +90,7 @@ int netd_kobox2_frame_open(struct netd_kobox2_frame_client *client,
 }
 
 int netd_kobox2_frame_info(struct netd_kobox2_frame_client *client,
-    struct ph_ipc *ipc, int process_fd, struct kobox_linux_net_info *info)
+    struct ph_ipc *ipc, pacha_fd_t process_fd, struct kobox_linux_net_info *info)
 {
     if (!info) return -EINVAL;
     int result = request(client, ipc, process_fd, PH_NET_FRAME_INFO, -1);
@@ -99,7 +99,7 @@ int netd_kobox2_frame_info(struct netd_kobox2_frame_client *client,
 }
 
 int netd_kobox2_frame_read(struct netd_kobox2_frame_client *client,
-    struct ph_ipc *ipc, int process_fd, const struct kobox_linux_net_frame **frames,
+    struct ph_ipc *ipc, pacha_fd_t process_fd, const struct kobox_linux_net_frame **frames,
     size_t *count)
 {
     if (!frames || !count) return -EINVAL;
@@ -112,7 +112,7 @@ int netd_kobox2_frame_read(struct netd_kobox2_frame_client *client,
 }
 
 int netd_kobox2_frame_write(struct netd_kobox2_frame_client *client,
-    struct ph_ipc *ipc, int process_fd, const void *frame, size_t length)
+    struct ph_ipc *ipc, pacha_fd_t process_fd, const void *frame, size_t length)
 {
     if (!client || !client->shared || !frame ||
         length < 14 || length > KOBOX_NET_FRAME_MAX) return -EMSGSIZE;

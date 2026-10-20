@@ -1,3 +1,4 @@
+#include <pacha/abi.h>
 /* SPDX-License-Identifier: MIT */
 #ifndef PACHA_INSTALLER_TTY_H
 #define PACHA_INSTALLER_TTY_H
@@ -7,10 +8,10 @@
 #include <termios.h>
 
 struct installer_tty {
-    int endpoint_fd;
-    int page_fd;
-    int notify_fd;
-    int timeout_fd;
+    pacha_fd_t endpoint_fd;
+    pacha_fd_t page_fd;
+    pacha_fd_t notify_fd;
+    pacha_fd_t timeout_fd;
     void *page;
     uint64_t request_id;
     uint64_t handle;
@@ -19,7 +20,7 @@ struct installer_tty {
 };
 
 /* This is a client of the existing Linux termd PTY, not a new TTY stack. */
-int installer_tty_open(struct installer_tty *tty, int termd_fd,
+int installer_tty_open(struct installer_tty *tty, pacha_fd_t termd_fd,
     unsigned pts_index, FILE **output);
 int installer_tty_get_size(struct installer_tty *tty,
     unsigned *rows, unsigned *columns);

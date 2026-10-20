@@ -59,7 +59,7 @@ int main(int argc,char **argv,char **envp)
     void *snapshot=mmap(NULL,length,PROT_READ,MAP_PRIVATE,file,0);
     CHECK(snapshot!=MAP_FAILED && !memcmp(snapshot,data,length));
     CHECK(!munmap(snapshot,length));
-    /* Shared page-cache export is intentionally not implemented in phase 3;
+    /* Shared page-cache export is unsupported;
      * successful private snapshots must not masquerade as MAP_SHARED. */
     void *unsupported=mmap(NULL,length,PROT_READ,MAP_SHARED,file,0);
     CHECK(unsupported==MAP_FAILED && errno==EOPNOTSUPP);

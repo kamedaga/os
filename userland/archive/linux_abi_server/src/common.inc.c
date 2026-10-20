@@ -1,3 +1,4 @@
+#error "Archived IPC ABI is unsupported; migrate synchronous CALL/reply before enabling this target"
 typedef unsigned char u8;
 typedef unsigned short u16;
 typedef unsigned int u32;

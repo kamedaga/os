@@ -61,7 +61,7 @@ int lpr_load_manifest(void)
     }
     const lpr_manifest_t *mapped_manifest =
         (const lpr_manifest_t *)(uintptr_t)mapped;
-    int cwd_lease_fd = -1;
+    pacha_fd_t cwd_lease_fd = -1;
     const int manifest_ok =
         lpr_manifest_validate(mapped_manifest, lpr_process_manifest.byte_size);
     if (manifest_ok && mapped_manifest->cwd_handle != 0) {
@@ -71,8 +71,9 @@ int lpr_load_manifest(void)
         const lpr_manifest_capability_t *cwd_capability =
             &capabilities[mapped_manifest->cwd_capability_index];
         if ((cwd_capability->flags & LPR_MANIFEST_CAPABILITY_CWD_LEASE) != 0 &&
-            cwd_capability->native_fd <= INT32_MAX)
-            cwd_lease_fd = (int)(uint32_t)cwd_capability->native_fd;
+            cwd_capability->native_fd >= 16 &&
+            cwd_capability->native_fd < PACHAOS_THREAD_SELF_FD)
+            cwd_lease_fd = (pacha_fd_t)cwd_capability->native_fd;
     }
     const int install_ok = manifest_ok &&
         (mapped_manifest->cwd_handle == 0 || cwd_lease_fd >= 16) &&
@@ -82,7 +83,8 @@ int lpr_load_manifest(void)
             (const lpr_manifest_capability_t *)((const uint8_t *)mapped_manifest +
                 mapped_manifest->capability_offset);
         for (uint64_t i = 0; i < mapped_manifest->capability_count; ++i)
-            if (capabilities[i].native_fd <= INT32_MAX)
+            if (capabilities[i].native_fd >= 16 &&
+                capabilities[i].native_fd < PACHAOS_THREAD_SELF_FD)
                 (void)lpr_close_native_fd_if_open(
                     capabilities[i].native_fd);
     }
@@ -94,12 +96,25 @@ int lpr_load_manifest(void)
         LPR_BOOT_FAILURE("bootstrap-fds-invalid", manifest_ok);
         if (cwd_lease_fd >= 16)
             (void)lpr_close_native_fd_if_open(
-                (uint64_t)(uint32_t)cwd_lease_fd);
+                (uint64_t)cwd_lease_fd);
         goto invalid;
     }
     const int bootstrap_status = lpr_install_exec_bootstrap_fd(LPR_BOOTSTRAP_FD);
     if (bootstrap_status != 0) {
         LPR_BOOT_FAILURE("bootstrap-fd-install-failed", bootstrap_status);
+        goto invalid;
+    }
+    /* An empty inherited FD list never triggers lazy table initialization.
+     * Initialize before applying NOFILE so the initial hard ceiling exists and
+     * the first subsequent open cannot overwrite the inherited limits. */
+    lpr_fd_arrays_init();
+    /* Import inherited entries and the bootstrap capability first: lowering
+     * NOFILE must not reject FDs that were already open before exec. */
+    const uint64_t nofile[] = {
+        lpr_process_manifest.nofile_soft, lpr_process_manifest.nofile_hard,
+    };
+    if (lpr_fd_table_prlimit(&lpr_control_fd_table, nofile, 0) != 0) {
+        LPR_BOOT_FAILURE("bootstrap-nofile-invalid", nofile[1]);
         goto invalid;
     }
     lpr_linux_signal_mask =
@@ -123,14 +138,14 @@ int lpr_load_manifest(void)
         lpr_supervisor_token = lpr_process_manifest.supervisor_token;
         lpr_supervisor_enabled = 1;
         void *activation_page = 0;
-        const int activation_fd = lpr_create_standalone_wire_page(&activation_page);
+        const pacha_fd_t activation_fd = lpr_create_standalone_wire_page(&activation_page);
 #if defined(LPR_BOOT_DIAGNOSTICS) && LPR_BOOT_DIAGNOSTICS
         lpr_boot_diagnostic_emit("bootstrap-activate-enter", activation_fd,
             lpr_process_manifest.supervisor_bootstrap_fd, 0, 0, 0);
 #endif
         int64_t activation_status = activation_fd < 16 ? activation_fd :
             lpr_process_client_activate(&lpr_request_id, lpr_pacha_status_to_errno,
-                (int)lpr_process_manifest.supervisor_bootstrap_fd, lpr_supervisor_token,
+                (pacha_fd_t)lpr_process_manifest.supervisor_bootstrap_fd, lpr_supervisor_token,
                 activation_fd, activation_page);
         if (activation_fd >= 16) lpr_destroy_standalone_wire_page(activation_fd, activation_page);
 #if defined(LPR_BOOT_DIAGNOSTICS) && LPR_BOOT_DIAGNOSTICS
@@ -329,7 +344,7 @@ int lpr_linux_process_register(
     int32_t linux_ppid,
     int32_t linux_sid,
     int32_t linux_pgrp,
-    int process_fd)
+    pacha_fd_t process_fd)
 {
     if (linux_pid <= 0 || process_fd < 16) {
         return -LPR_LINUX_EINVAL;

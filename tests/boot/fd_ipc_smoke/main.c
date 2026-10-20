@@ -271,6 +271,23 @@ static int expect_fd_readable(const char *label, int fd) {
     return 1;
 }
 
+/* A synchronous CALL cannot receive its own request. The separate server
+ * owns the incoming reply right and exits only after replying. */
+static pacha_fd_t call_endpoint;
+static unsigned char call_server_stack[65536] __attribute__((aligned(4096)));
+__attribute__((used,noreturn)) static void call_server(void) {
+    struct pacha_ipc_msg request = {0};
+    int status = pacha_ipc_recv_wait(call_endpoint, &request, PACHA_FD_WAIT_FOREVER);
+    if (!status && request.word0 == 101 && request.fd_count == 0) {
+        struct pacha_ipc_msg response = {.word0 = 303, .word1 = 404};
+        status = pacha_ipc_reply((pacha_fd_t)-1, &response);
+    } else status = -1;
+    (void)pacha_syscall3(PACHA_THREAD_SYSCALL_EXIT, (uint64_t)(status != 0), 0, 0);
+    __builtin_trap();
+}
+extern void call_server_entry(void);
+__asm__(".text\n.global call_server_entry\ncall_server_entry: call call_server; ud2\n");
+
 void fd_ipc_boot_smoke_main(void) {
     log_text("[fd_ipc_boot_smoke] start\n");
 
@@ -324,32 +341,23 @@ void fd_ipc_boot_smoke_main(void) {
         .word0 = 101,
         .word1 = 202,
     };
-    const int client_reply = pacha_ipc_call(endpoint, &send_msg);
-    if (client_reply < 16) {
-        log_hex("[fd_ipc_boot_smoke] call failed=", (u64)(long long)client_reply);
-        return;
-    }
-
-    struct pacha_ipc_fd recv_fds[1] = {0};
-    recv_msg = (struct pacha_ipc_msg){
-        .fds = recv_fds,
-        .fd_capacity = 1,
-    };
-    if (!expect_ok("[fd_ipc_boot_smoke] call recv failed\n", pacha_ipc_recv(endpoint, &recv_msg))) return;
-    if (!expect_u64("[fd_ipc_boot_smoke] call word0 mismatch\n", recv_msg.word0, 101)) return;
-    if (!expect_u64("[fd_ipc_boot_smoke] call fd_count mismatch\n", recv_msg.fd_count, 1)) return;
-
-    const int server_reply = (int)recv_fds[0].fd;
-    send_msg = (struct pacha_ipc_msg){
-        .word0 = 303,
-        .word1 = 404,
-    };
-    if (!expect_ok("[fd_ipc_boot_smoke] reply failed\n", pacha_ipc_reply(server_reply, &send_msg))) return;
-
+    call_endpoint = endpoint;
+    const pacha_fd_t server = pacha_thread_create(PACHA_PROCESS_SELF_FD,
+        (uintptr_t)call_server_entry, (uintptr_t)(call_server_stack + sizeof(call_server_stack)),
+        0, 0, PACHA_FD_RIGHT_START | PACHA_FD_RIGHT_WAIT | PACHA_FD_RIGHT_POLL | PACHA_FD_RIGHT_CLOSE);
+    if (server < 16 || !expect_ok("[fd_ipc_boot_smoke] server start failed\n", pacha_thread_start(server))) return;
     recv_msg = (struct pacha_ipc_msg){0};
-    if (!expect_ok("[fd_ipc_boot_smoke] reply recv failed\n", pacha_ipc_recv(client_reply, &recv_msg))) return;
+    if (!expect_ok("[fd_ipc_boot_smoke] synchronous call failed\n",
+        (int)pacha_ipc_message_syscall(PACHA_IPC_SYSCALL_CALL, endpoint, (struct pacha_ipc_msg *)(uintptr_t)((uintptr_t)&send_msg), (struct pacha_ipc_msg *)(uintptr_t)((uintptr_t)&recv_msg), PACHA_FD_WAIT_FOREVER, PACHA_WAIT_UNINTERRUPTIBLE, 0))) return;
     if (!expect_u64("[fd_ipc_boot_smoke] reply word0 mismatch\n", recv_msg.word0, 303)) return;
     if (!expect_u64("[fd_ipc_boot_smoke] reply word1 mismatch\n", recv_msg.word1, 404)) return;
+    struct pacha_pollfd server_wait = {.fd = server, .events = PACHA_FD_EVENT_READABLE};
+    if (pacha_fd_wait_many(&server_wait, 1, PACHA_FD_WAIT_FOREVER) != 1) return;
+    uint64_t server_status[4] = {0};
+    if (!expect_ok("[fd_ipc_boot_smoke] server wait failed\n",
+        (int)pacha_syscall2(PACHA_THREAD_SYSCALL_WAIT, server, (uintptr_t)server_status))) return;
+    if (!expect_u64("[fd_ipc_boot_smoke] server exit failed\n", server_status[1], 0)) return;
+    (void)pacha_fd_close(server);
 
     struct pacha_ipc_fast_channel fast = {0};
     if (!expect_ok("[fd_ipc_boot_smoke] fast init failed\n", pacha_ipc_fast_channel_init_local(&fast, endpoint, PACHA_IPC_FAST_F_PREFER_PKEY, 1))) return;

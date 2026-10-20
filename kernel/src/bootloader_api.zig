@@ -9,3 +9,10 @@ pub const kernel_runtime = @import("kernel_runtime.zig");
 pub const kernel_vm = @import("memory/kernel_vm.zig");
 pub const pmm = @import("memory/pmm.zig");
 pub const x86_platform = @import("arch/x86_64/platform.zig");
+
+pub const boot_scratch = @import("boot/boot_scratch.zig");
+
+pub const addresses = @import("memory/addresses.zig");
+
+pub const direct_map = @import("arch/x86_64/direct_map.zig");
+pub const boot_direct_map = @import("arch/x86_64/boot_direct_map.zig");

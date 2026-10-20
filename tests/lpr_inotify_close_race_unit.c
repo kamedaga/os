@@ -55,7 +55,7 @@ int64_t lpr_linux_getcwd(uint64_t out, uint64_t bytes)
 {
     assert(bytes >= 10); strcpy((char *)(uintptr_t)out, "/real/cwd"); return 10;
 }
-int64_t lpr_linux_newfstatat(uint64_t dir, uint64_t path, uint64_t raw, uint64_t flags)
+int64_t lpr_linux_newfstatat(uint64_t dir, uint64_t path, uint64_t raw, uint64_t flags, unsigned *wait_not_ready __attribute__((unused)))
 {
     (void)dir; (void)path; (void)flags;
     if (close_on_stat) { close_on_stat = 0; close_and_reuse(); }
@@ -71,13 +71,13 @@ int64_t lpr_pacha_syscall3(uint64_t nr, uint64_t fd, uint64_t buf, uint64_t byte
     return 0;
 }
 void lpr_wait_graph_init(lpr_wait_graph_t *g) { memset(g, 0, sizeof(*g)); }
-int64_t lpr_wait_graph_add_native(lpr_wait_graph_t *g, int fd, uint64_t events)
+int64_t lpr_wait_graph_add_native(lpr_wait_graph_t *g, pacha_fd_t fd, uint64_t events)
 {
     (void)g; assert(fd == 60 && events == 1 && drops == 0); return 0;
 }
 int64_t lpr_wait_deadline_init(lpr_wait_deadline_t *d, int64_t timeout)
 { (void)d; assert(timeout == -1); return 0; }
-int64_t lpr_wait_graph_block(lpr_wait_graph_t *g, const lpr_wait_deadline_t *d)
+int64_t lpr_wait_graph_block(lpr_wait_graph_t *g, const lpr_wait_deadline_t *d, unsigned *wait_not_ready __attribute__((unused)))
 { (void)g; (void)d; return -LPR_LINUX_EINTR; }
 
 static lpr_inotify_instance_t *setup(void)
@@ -103,21 +103,21 @@ static lpr_inotify_instance_t *setup(void)
 int main(void)
 {
     setup(); close_on_drain = 1;
-    assert(lpr_linux_inotify_poll_events(3, 1) == 0 && drops == 1);
+    assert(lpr_linux_inotify_poll_events(3, 1, 0) == 0 && drops == 1);
 
     lpr_inotify_instance_t *instance = setup();
     instance->watches[0] = (lpr_inotify_watch_t){.active=1, .wd=7, .mask=LPR_IN_MODIFY};
     close_on_stat = 1;
     lpr_linux_inotify_event_t out;
-    assert(lpr_linux_inotify_read(3, (uintptr_t)&out, sizeof(out)) == sizeof(out));
+    assert(lpr_linux_inotify_read(3, (uintptr_t)&out, sizeof(out), 0) == sizeof(out));
     assert(out.wd == 7 && out.mask == LPR_IN_MODIFY && drops == 1);
 
     setup(); event.flags = 0; close_on_drain = 1;
-    assert(lpr_linux_inotify_read(3, (uintptr_t)&out, sizeof(out)) == -LPR_LINUX_EINTR);
+    assert(lpr_linux_inotify_read(3, (uintptr_t)&out, sizeof(out), 0) == -LPR_LINUX_EINTR);
     assert(drops == 1); /* Wait kept the original timer, despite FD reuse. */
 
     setup(); close_on_stat = 1;
-    assert(lpr_linux_inotify_add_watch(3, (uintptr_t)"/file", LPR_IN_MODIFY) == 1);
+    assert(lpr_linux_inotify_add_watch(3, (uintptr_t)"/file", LPR_IN_MODIFY, 0) == 1);
     assert(drops == 1);
 
     instance = setup(); instance->watches[0].active = 1; instance->watches[0].wd = 7;
@@ -125,12 +125,12 @@ int main(void)
     assert(lpr_linux_inotify_rm_watch(3, 7) == 0 && drops == 1);
 
     setup();
-    assert(lpr_linux_inotify_add_watch(3, (uintptr_t)"", LPR_IN_MODIFY) == -LPR_LINUX_ENOENT);
-    assert(lpr_linux_inotify_add_watch(3, (uintptr_t)"link/../file", LPR_IN_MODIFY) == 1);
+    assert(lpr_linux_inotify_add_watch(3, (uintptr_t)"", LPR_IN_MODIFY, 0) == -LPR_LINUX_ENOENT);
+    assert(lpr_linux_inotify_add_watch(3, (uintptr_t)"link/../file", LPR_IN_MODIFY, 0) == 1);
     assert(!strcmp(((lpr_inotify_instance_t *)(uintptr_t)event.counter)->watches[0].path,
         "/real/cwd/link/../file"));
-    assert(lpr_linux_inotify_read(3, 0, sizeof(out)) == -LPR_LINUX_EFAULT);
-    assert(lpr_linux_inotify_add_watch(3, 0, LPR_IN_MODIFY) == -LPR_LINUX_EFAULT);
+    assert(lpr_linux_inotify_read(3, 0, sizeof(out), 0) == -LPR_LINUX_EFAULT);
+    assert(lpr_linux_inotify_add_watch(3, 0, LPR_IN_MODIFY, 0) == -LPR_LINUX_EFAULT);
     assert(lpr_linux_inotify_rm_watch(3, UINT64_MAX) == -LPR_LINUX_EINVAL);
     assert(objects[entries[3].ofd_index].pin_count == 0);
     assert(!lpr_linux_inotify_active(UINT64_MAX));

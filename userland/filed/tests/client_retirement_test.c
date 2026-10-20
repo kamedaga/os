@@ -38,7 +38,7 @@ int filed_storage_owner_client_release(struct filed_storage_owner *owner,uint64_
     return lost_release==(int)releases ? -EIO : 0;
 }
 
-int pacha_fd_close(int fd)
+int pacha_fd_close(pacha_fd_t fd)
 {
     assert(fd==60 || (fd>=90 && fd<=93));
     assert(retiring->revoked);

@@ -354,11 +354,11 @@ static int load_plan(
         PACHA_FD_RIGHT_MAP_INTO |
         PACHA_FD_RIGHT_SET_CONTEXT;
     LPR_EXEC_STAGE_BEGIN(stage_start, stage_start_cycles);
-    const int process_fd = pacha_process_create(process_rights, 0, grants, grant_count);
+    const pacha_fd_t process_fd = pacha_process_create(process_rights, 0, grants, grant_count);
     LPR_EXEC_STAGE_RECORD("process_create", stage_start, stage_start_cycles);
     if (process_fd < 16) {
         fprintf(stderr,
-            "[filed] linux-lpr: load plan stage=process_create result=%d\n",
+            "[filed] linux-lpr: load plan stage=process_create result=%ld\n",
             process_fd);
         status = -12;
         goto cleanup;
@@ -556,12 +556,12 @@ static int filed_exec_linux_lpr_handle_mode(
     struct filed_runtime *runtime,
     filed_handle_id_t handle_id,
     const filed_exec_path_t *request,
-    const int *inherit_fds,
+    const pacha_fd_t *inherit_fds,
     uint64_t inherit_fd_count,
-    int bootstrap_fd,
+    pacha_fd_t bootstrap_fd,
     int start_thread,
-    int *out_process_fd,
-    int *out_thread_fd)
+    pacha_fd_t *out_process_fd,
+    pacha_fd_t *out_thread_fd)
 {
     lpr_exec_file_t file;
     lpr_exec_meta_t meta;
@@ -727,11 +727,11 @@ int filed_exec_linux_lpr_handle(
     struct filed_runtime *runtime,
     filed_handle_id_t handle_id,
     const filed_exec_path_t *request,
-    const int *inherit_fds,
+    const pacha_fd_t *inherit_fds,
     uint64_t inherit_fd_count,
-    int bootstrap_fd,
-    int *out_process_fd,
-    int *out_thread_fd)
+    pacha_fd_t bootstrap_fd,
+    pacha_fd_t *out_process_fd,
+    pacha_fd_t *out_thread_fd)
 {
     return filed_exec_linux_lpr_handle_mode(
         runtime,
@@ -749,8 +749,8 @@ int filed_exec_linux_lpr_prepare_self(
     struct filed_runtime *runtime,
     filed_handle_id_t handle_id,
     const filed_exec_path_t *request,
-    int *out_process_fd,
-    int *out_thread_fd)
+    pacha_fd_t *out_process_fd,
+    pacha_fd_t *out_thread_fd)
 {
     if (request == NULL) {
         return -22;

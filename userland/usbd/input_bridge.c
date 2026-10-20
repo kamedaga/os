@@ -7,7 +7,7 @@
 #include <string.h>
 
 static int wait_reply(struct usbd_input_bridge *bridge, struct ph_ipc *ipc,
-    int process_fd, uint64_t operation,
+    pacha_fd_t process_fd, uint64_t operation,
     uint64_t correlation) {
     for (;;) {
         struct ph_ipc_packet reply = {0};
@@ -42,7 +42,7 @@ static int wait_reply(struct usbd_input_bridge *bridge, struct ph_ipc *ipc,
                 (info.rights & rights) != rights ||
                 (info.rights & PACHA_FD_RIGHT_WRITE)) result = -EPROTO;
             else {
-                bridge->event_fd = (int)reply.fds[0].fd;
+                bridge->event_fd = (pacha_fd_t)reply.fds[0].fd;
                 reply.fds[0].fd = PH_IPC_NO_FD;
             }
         } else if (reply.fd_count) result = -EPROTO;
@@ -52,7 +52,7 @@ static int wait_reply(struct usbd_input_bridge *bridge, struct ph_ipc *ipc,
 }
 
 static int request(struct usbd_input_bridge *bridge, struct ph_ipc *ipc,
-    int process_fd, uint64_t operation, int attach_fd) {
+    pacha_fd_t process_fd, uint64_t operation, pacha_fd_t attach_fd) {
     if (!bridge || !bridge->shared || !ipc ||
         bridge->generation != ipc->generation || process_fd < 16)
         return -EINVAL;
@@ -80,12 +80,12 @@ static int request(struct usbd_input_bridge *bridge, struct ph_ipc *ipc,
 }
 
 int usbd_input_bridge_open(struct usbd_input_bridge *bridge,
-    struct ph_ipc *ipc, int process_fd, uint64_t generation) {
+    struct ph_ipc *ipc, pacha_fd_t process_fd, uint64_t generation) {
     if (!bridge || bridge->shared || !ipc || !generation ||
         generation != ipc->generation) return -EINVAL;
     const uint64_t rights = PACHA_FD_RIGHT_INSPECT | PACHA_FD_RIGHT_CLOSE |
         PACHA_FD_RIGHT_TRANSFER | PACHA_FD_RIGHT_MAP_READ | PACHA_FD_RIGHT_MAP_WRITE;
-    int fd = pacha_vmo_create(PH_USB_INPUT_SHARED_BYTES, rights, 0);
+    pacha_fd_t fd = pacha_vmo_create(PH_USB_INPUT_SHARED_BYTES, rights, 0);
     if (fd < 16) return fd < 0 ? fd : -ENOMEM;
     void *mapped = pacha_mmap(fd, PH_USB_INPUT_SHARED_BYTES,
         PACHA_PROT_READ | PACHA_PROT_WRITE, PACHA_MMAP_SHARED, 0);
@@ -105,7 +105,7 @@ int usbd_input_bridge_open(struct usbd_input_bridge *bridge,
 }
 
 int usbd_input_bridge_snapshot(struct usbd_input_bridge *bridge,
-    struct ph_ipc *ipc, int process_fd,
+    struct ph_ipc *ipc, pacha_fd_t process_fd,
     const struct kobox_linux_input_device_info **devices,
     size_t *count, uint64_t *next_sequence) {
     if (!devices || !count || !next_sequence) return -EINVAL;
@@ -122,7 +122,7 @@ int usbd_input_bridge_snapshot(struct usbd_input_bridge *bridge,
 }
 
 int usbd_input_bridge_read(struct usbd_input_bridge *bridge,
-    struct ph_ipc *ipc, int process_fd,
+    struct ph_ipc *ipc, pacha_fd_t process_fd,
     const struct kobox_linux_input_record **records,
     size_t *count, uint64_t *overwritten) {
     if (!records || !count || !overwritten) return -EINVAL;

@@ -7,7 +7,23 @@ const global: u64 = 1 << 8;
 const accessed_dirty: u64 = (1 << 5) | (1 << 6);
 const nx: u64 = 1 << 63;
 const address_mask: u64 = 0x000f_ffff_ffff_f000;
-const large_bytes: u64 = 1 << 21;
+pub const LeafSize = enum(u6) {
+    page = 12,
+    large = 21,
+    huge = 30,
+
+    pub fn bytes(self: LeafSize) u64 {
+        return @as(u64, 1) << @intFromEnum(self);
+    }
+
+    pub fn child(self: LeafSize) SplitError!LeafSize {
+        return switch (self) {
+            .huge => .large,
+            .large => .page,
+            .page => error.Invalid,
+        };
+    }
+};
 
 pub const SplitError = error{ Invalid, Unsupported };
 
@@ -16,15 +32,10 @@ pub const AliasSource = union(enum) {
     identity: struct {
         directory: *u64,
         base: u64,
-        // Private splits belong to the process PT store; null means a
-        // persistent kernel identity split. Scratch does not own either one
-        // after publication.
-        private_owner: ?struct {
-            space_index: usize,
-            pml4: u16,
-            pdp: u16,
-            pd: u16,
-        } = null,
+        size: LeafSize = .large,
+        // Null retains the low identity alias. A direct-map alias has the
+        // same physical base but a different page-table ownership tuple.
+        alias_va: ?u64 = null,
     },
 };
 
@@ -85,30 +96,44 @@ pub const IdentitySplit = struct {
     table_paddr: u64,
 
     pub fn validateSource(old: u64, identity_base: u64) SplitError!void {
-        if ((identity_base & (large_bytes - 1)) != 0) return error.Invalid;
+        return validateSourceSized(old, identity_base, .large);
+    }
+
+    pub fn validateSourceSized(old: u64, physical_base: u64, size: LeafSize) SplitError!void {
+        _ = try size.child();
+        const large_bytes = size.bytes();
+        if ((physical_base & (large_bytes - 1)) != 0) return error.Invalid;
         if ((old & (present | large)) != (present | large) or
             (old & (user | global)) != 0 or
             (old & ~(address_mask | nx | 0xfff)) != 0) return error.Unsupported;
-        if ((old & address_mask & ~(large_bytes - 1)) != identity_base or
+        if ((old & address_mask & ~(large_bytes - 1)) != physical_base or
             (old & address_mask & (large_bytes - 1) & ~@as(u64, 1 << 12)) != 0)
             return error.Invalid;
     }
 
     pub fn prepare(directory: *u64, identity_base: u64, table: *align(4096) [512]u64, table_paddr: u64) SplitError!IdentitySplit {
+        return prepareSized(directory, identity_base, .large, table, table_paddr);
+    }
+
+    /// Physical base is independent of the alias VA. A caller may prepare a
+    /// 1 GiB -> 2 MiB -> 4 KiB chain while all tables are still unpublished.
+    /// Ownership and the all-CPU invalidation barrier remain the caller's job.
+    pub fn prepareSized(directory: *u64, physical_base: u64, size: LeafSize, table: *align(4096) [512]u64, table_paddr: u64) SplitError!IdentitySplit {
+        const child_size = try size.child();
         const old = @atomicLoad(u64, directory, .acquire);
         if (table_paddr == 0 or (table_paddr & 4095) != 0 or
             (table_paddr & ~address_mask) != 0) return error.Invalid;
         const table_address = @intFromPtr(table);
         if (@intFromPtr(directory) >= table_address and
             @intFromPtr(directory) - table_address < 4096) return error.Invalid;
-        try validateSource(old, identity_base);
-        // Large-leaf PAT is bit 12, but that bit becomes an address bit in a
-        // 4 KiB PTE. Keep the memory type at bit 7 instead, without widening
-        // supervisor RW/NX or losing software flags.
+        try validateSourceSized(old, physical_base, size);
+        // PAT stays at bit 12 for 2 MiB children, but moves to bit 7 for
+        // 4 KiB children. Never copy a leaf's cache bits into its new parent.
+        const pat = old & (1 << 12);
         const flags = (old & (nx | 0xfff) & ~large) |
-            (if ((old & (1 << 12)) != 0) large else 0);
+            (if (child_size == .page) (if (pat != 0) large else @as(u64, 0)) else large | pat);
         for (table, 0..) |*entry, i|
-            entry.* = identity_base + @as(u64, @intCast(i)) * 4096 | flags;
+            entry.* = physical_base + @as(u64, @intCast(i)) * child_size.bytes() | flags;
         return .{ .directory = directory, .previous = old, .table = table, .table_paddr = table_paddr };
     }
 
@@ -168,7 +193,7 @@ test "identity split invalid inputs never mutate live directory or scratch" {
     }
     directory = base | 0x83;
     try std.testing.expectError(error.Invalid, IdentitySplit.prepare(&directory, base + 4096, &table, 0x2000));
-    try std.testing.expectError(error.Invalid, IdentitySplit.prepare(&directory, base + large_bytes, &table, 0x2000));
+    try std.testing.expectError(error.Invalid, IdentitySplit.prepare(&directory, base + LeafSize.large.bytes(), &table, 0x2000));
     try std.testing.expectError(error.Invalid, IdentitySplit.prepare(&table[0], base, &table, 0x2000));
     for (table) |entry| try std.testing.expectEqual(@as(u64, 0xdead), entry);
     try std.testing.expectEqual(base | 0x83, directory);

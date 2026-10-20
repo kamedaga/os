@@ -31,7 +31,7 @@ static enum kobox_package_result open_snapshot(void *context, const void *input,
     struct pacha_fd_info info = {0};
     struct ph_package_snapshot *snapshot = NULL;
 
-    if (!item || item->capability.fd < 16 || item->capability.fd >= PACHA_FD_TABLE_LIMIT)
+    if (!item || item->capability.fd < 16 || item->capability.fd >= PACHA_THREAD_SELF_FD)
         return KOBOX_PACKAGE_INVALID;
     if (!item->size || item->size > maximum || item->size > SIZE_MAX - PH_PACKAGE_PAGE + 1)
         return KOBOX_PACKAGE_TOO_LARGE;

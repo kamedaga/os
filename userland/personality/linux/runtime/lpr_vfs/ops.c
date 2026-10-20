@@ -105,7 +105,7 @@ int64_t lpr_filed_dup_handle(uint64_t handle, uint64_t fd_flags, uint64_t *out_h
 
 
 int64_t lpr_filed_transfer_dup_handle(
-    uint64_t handle, uint64_t fd_flags, int lease_fd, uint64_t *out_handle)
+    uint64_t handle, uint64_t fd_flags, pacha_fd_t lease_fd, uint64_t *out_handle)
 {
     if (!out_handle || !handle || lease_fd < 16) return -LPR_LINUX_EINVAL;
     *out_handle = 0;
@@ -294,9 +294,11 @@ static int64_t filed_open_handle_at(uint64_t dirfd, const char *path,
     kb2_fs_request_t request = {.opcode = KB2_FILESYSTEM_OP_OPENAT2,
         .handle = dir_handle, .flags = flags,
         .mode = (flags & (LPR_LINUX_O_CREAT | 020000000ull)) ? mode : 0,
+        .mask = route_stat ? 0x7ffu : 0, /* STATX_BASIC_STATS */
         .umask = lpr_linux_umask_value};
     kb2_fs_response_t response;
-    int64_t opened = lpr_fs_call(&request, path, 0, 0, 0, 0, 0, &response, -1, 0);
+    int64_t opened = lpr_fs_call(&request, path, 0, 0, 0, route_stat,
+        route_stat ? KB2_FILESYSTEM_STATX_SIZE : 0, &response, -1, 0);
     if (out_kind && route_stat &&
         (opened == -LPR_LINUX_ENXIO || opened == -LPR_LINUX_ENODEV)) {
         /* Only a side-effect-free device/service lookup may follow a direct
@@ -314,6 +316,10 @@ static int64_t filed_open_handle_at(uint64_t dirfd, const char *path,
         }
     }
     if (opened) return opened;
+    if (route_stat && response.data_length != KB2_FILESYSTEM_STATX_SIZE) {
+        if (response.handle) (void)lpr_filed_close_handle(response.handle);
+        return -LPR_LINUX_EIO;
+    }
     *out_handle = response.handle;
     if (out_kind) *out_kind = response.service;
     return 0;
@@ -451,13 +457,13 @@ int64_t lpr_linux_openat_once(
     uint64_t path_raw,
     uint64_t flags,
     uint64_t mode,
-    uint64_t *out_kind)
+    uint64_t *out_kind, unsigned *wait_not_ready __attribute__((unused)))
 {
     if (out_kind != 0) {
         *out_kind = 0;
     }
     const char *path = (const char *)(uintptr_t)path_raw;
-    const int64_t proc_snapshot_fd = lpr_linux_proc_snapshot_open(path, flags);
+    const int64_t proc_snapshot_fd = lpr_linux_proc_snapshot_open(path, flags, wait_not_ready);
     if (proc_snapshot_fd != -LPR_LINUX_ENOENT) {
         return proc_snapshot_fd;
     }
@@ -531,18 +537,22 @@ int64_t lpr_linux_openat_once(
         (void)lpr_filed_close_handle(handle);
         return fd;
     }
-    lpr_linux_stat_t st;
-    lpr_memset(&st, 0, sizeof(st));
-    if (lpr_linux_fstat((uint64_t)(uint32_t)fd, (uint64_t)(uintptr_t)&st) == 0 &&
-        (st.st_mode & LPR_LINUX_S_IFMT) == LPR_LINUX_S_IFCHR &&
-        (st.st_rdev == ((1ull << 8u) | 3ull) ||
-            st.st_rdev == ((1ull << 8u) | 5ull) ||
-            st.st_rdev == ((1ull << 8u) | 8ull) ||
-            st.st_rdev == ((1ull << 8u) | 9ull)))
+    /* Classify the opened inode, including aliases and symlinks, using the
+     * OPEN reply. A pathname guess is insufficient, while a separate FSTAT
+     * imposed another complete IPC/scheduling round trip on every open. */
+    uint32_t opened_mode = route_stat[KB2_FILESYSTEM_STATX_MODE_OFFSET] |
+        (uint32_t)route_stat[KB2_FILESYSTEM_STATX_MODE_OFFSET + 1] << 8;
+    uint32_t major = 0, minor = 0;
+    for (unsigned i = 0; i < 4; ++i) {
+        major |= (uint32_t)route_stat[KB2_FILESYSTEM_STATX_RDEV_MAJOR_OFFSET + i] << (8 * i);
+        minor |= (uint32_t)route_stat[KB2_FILESYSTEM_STATX_RDEV_MINOR_OFFSET + i] << (8 * i);
+    }
+    if ((opened_mode & LPR_LINUX_S_IFMT) == LPR_LINUX_S_IFCHR && major == 1 &&
+        (minor == 3 || minor == 5 || minor == 8 || minor == 9))
     {
         const int64_t close_status = lpr_linux_close((uint64_t)(uint32_t)fd);
         if (close_status != 0) return close_status;
-        const uint64_t device_id = (1ull << 32u) | (st.st_rdev & 0xffu);
+        const uint64_t device_id = (1ull << 32u) | minor;
         const int install = lpr_control_install_fd(
             (uint64_t)(uint32_t)fd, LPR_FD_OPS_DEVICE, flags, device_id, 0);
         if (install != 0) return install;
@@ -553,7 +563,7 @@ int64_t lpr_linux_openat_once(
         }
         device->active = 1;
         device->major = 1;
-        device->minor = (uint8_t)st.st_rdev;
+        device->minor = (uint8_t)minor;
         device->flags = (uint32_t)flags;
     }
     if (out_kind != 0) {
@@ -624,11 +634,11 @@ int lpr_resolve_final_symlink_path(const char *path, const char *target, char *o
     return 1;
 }
 
-int64_t lpr_linux_openat(uint64_t dirfd, uint64_t path_raw, uint64_t flags, uint64_t mode)
+int64_t lpr_linux_openat(uint64_t dirfd, uint64_t path_raw, uint64_t flags, uint64_t mode, unsigned *wait_not_ready __attribute__((unused)))
 {
     /* Linux namei follows symlinks within its namespace. Personality path
      * concatenation cannot reproduce mount, dirfd or symlink escape rules. */
-    return lpr_linux_openat_once(dirfd, path_raw, flags, mode, 0);
+    return lpr_linux_openat_once(dirfd, path_raw, flags, mode, 0, wait_not_ready);
 }
 
 
@@ -670,7 +680,7 @@ int64_t lpr_supervisor_cwd_set(uint64_t handle, const char *path)
         return 0;
     }
     void *page = 0;
-    const int page_fd = lpr_create_standalone_wire_page(&page);
+    const pacha_fd_t page_fd = lpr_create_standalone_wire_page(&page);
     if (page_fd < 0) {
         return page_fd;
     }
@@ -704,13 +714,13 @@ int64_t lpr_cwd_install(uint64_t handle)
     if (binding_status) return binding_status;
     const uint64_t old_handle = lpr_cwd_handle;
     const uint64_t old_lease_handle = lpr_cwd_lease_handle;
-    const int old_lease_fd = lpr_cwd_lease_fd;
+    const pacha_fd_t old_lease_fd = lpr_cwd_lease_fd;
     const int root = handle == 0;
     uint64_t installed_handle = 0;
     uint64_t installed_escrow = 0;
-    int installed_lease_fd = -1;
+    pacha_fd_t installed_lease_fd = -1;
     if (!root) {
-        int remote_lease_fd = -1;
+        pacha_fd_t remote_lease_fd = -1;
         int status = lpr_filed_lease_pair(
             &installed_lease_fd,
             &remote_lease_fd);
@@ -725,9 +735,9 @@ int64_t lpr_cwd_install(uint64_t handle)
         }
         if (status != 0 || installed_handle == 0) {
             (void)lpr_close_native_fd_if_open(
-                (uint64_t)(uint32_t)installed_lease_fd);
+                (uint64_t)installed_lease_fd);
             (void)lpr_close_native_fd_if_open(
-                (uint64_t)(uint32_t)remote_lease_fd);
+                (uint64_t)remote_lease_fd);
             (void)lpr_filed_close_handle(handle);
             return status != 0 ? status : -LPR_LINUX_EIO;
         }
@@ -754,7 +764,7 @@ int64_t lpr_cwd_install(uint64_t handle)
             (void)lpr_filed_close_handle(lpr_cwd_handle);
             if (lpr_cwd_lease_fd >= 16)
                 (void)lpr_close_native_fd_if_open(
-                    (uint64_t)(uint32_t)lpr_cwd_lease_fd);
+                    (uint64_t)lpr_cwd_lease_fd);
         }
         lpr_cwd_handle = old_handle;
         lpr_cwd_lease_handle = old_lease_handle;
@@ -765,7 +775,7 @@ int64_t lpr_cwd_install(uint64_t handle)
         (void)lpr_filed_close_handle(old_handle);
         if (old_lease_fd >= 16)
             (void)lpr_close_native_fd_if_open(
-                (uint64_t)(uint32_t)old_lease_fd);
+                (uint64_t)old_lease_fd);
     }
     return 0;
 }
@@ -790,7 +800,7 @@ int64_t lpr_linux_chdir(uint64_t path_raw)
     return lpr_cwd_install(handle);
 }
 
-int64_t lpr_linux_fchdir(uint64_t fd)
+int64_t lpr_linux_fchdir(uint64_t fd, unsigned *wait_not_ready __attribute__((unused)))
 {
     if (!lpr_fd_is_filed(fd)) {
         return -LPR_LINUX_EBADF;
@@ -798,7 +808,7 @@ int64_t lpr_linux_fchdir(uint64_t fd)
     const int64_t binding_status = lpr_filed_endpoint_ready();
     if (binding_status) return binding_status;
     lpr_linux_stat_t st;
-    const int64_t stat_status = lpr_linux_fstat(fd, (uint64_t)(uintptr_t)&st);
+    const int64_t stat_status = lpr_linux_fstat(fd, (uint64_t)(uintptr_t)&st, wait_not_ready);
     if (stat_status != 0) {
         return stat_status;
     }
@@ -885,7 +895,7 @@ int64_t lpr_pacha_nanosleep(const struct pachaos_timespec *req)
 static int64_t lpr_linux_relative_sleep(
     uint64_t clock_id,
     const struct pachaos_timespec *req,
-    uint64_t rem_raw)
+    uint64_t rem_raw, unsigned *wait_not_ready __attribute__((unused)))
 {
     struct pachaos_timespec remaining = *req;
     for (;;) {
@@ -895,6 +905,7 @@ static int64_t lpr_linux_relative_sleep(
 
         status = lpr_pacha_nanosleep(&remaining);
         if (status != -LPR_LINUX_EAGAIN) return status;
+        if (wait_not_ready) *wait_not_ready = 1;
 
         struct pachaos_timespec now;
         status = lpr_pacha_clock_gettime(clock_id, &now);
@@ -923,13 +934,13 @@ static int64_t lpr_linux_relative_sleep(
          * only the remaining duration. */
         status = lpr_linux_dispatch_pending_signals_with_result(-LPR_LINUX_EINTR);
         if (status != 0) return status;
-        lpr_linux_deliver_native_pending_frame(-LPR_LINUX_EINTR);
+        lpr_linux_deliver_native_pending_frame_after_wait(-LPR_LINUX_EINTR, wait_not_ready);
     }
 }
 
 static int64_t lpr_linux_absolute_sleep(
     uint64_t clock_id,
-    const struct pachaos_timespec *deadline)
+    const struct pachaos_timespec *deadline, unsigned *wait_not_ready __attribute__((unused)))
 {
     for (;;) {
         struct pachaos_timespec now;
@@ -942,24 +953,25 @@ static int64_t lpr_linux_absolute_sleep(
         lpr_timespec_subtract(deadline, &now, &relative);
         status = lpr_pacha_nanosleep(&relative);
         if (status != -LPR_LINUX_EAGAIN) return status;
+        if (wait_not_ready) *wait_not_ready = 1;
 
         status = lpr_linux_dispatch_pending_signals_with_result(-LPR_LINUX_EINTR);
         if (status != 0) return status;
-        lpr_linux_deliver_native_pending_frame(-LPR_LINUX_EINTR);
+        lpr_linux_deliver_native_pending_frame_after_wait(-LPR_LINUX_EINTR, wait_not_ready);
     }
 }
 
-int64_t lpr_linux_nanosleep(uint64_t req_raw, uint64_t rem_raw)
+int64_t lpr_linux_nanosleep(uint64_t req_raw, uint64_t rem_raw, unsigned *wait_not_ready __attribute__((unused)))
 {
     const struct pachaos_timespec *req = (const struct pachaos_timespec *)(uintptr_t)req_raw;
     const int64_t valid = lpr_linux_validate_timespec(req);
     if (valid != 0) {
         return valid;
     }
-    return lpr_linux_relative_sleep(LPR_LINUX_CLOCK_MONOTONIC, req, rem_raw);
+    return lpr_linux_relative_sleep(LPR_LINUX_CLOCK_MONOTONIC, req, rem_raw, wait_not_ready);
 }
 
-int64_t lpr_linux_clock_nanosleep(uint64_t clock_id, uint64_t flags, uint64_t req_raw, uint64_t rem_raw)
+int64_t lpr_linux_clock_nanosleep(uint64_t clock_id, uint64_t flags, uint64_t req_raw, uint64_t rem_raw, unsigned *wait_not_ready __attribute__((unused)))
 {
     if (clock_id != LPR_LINUX_CLOCK_REALTIME && clock_id != LPR_LINUX_CLOCK_MONOTONIC) {
         return -LPR_LINUX_EINVAL;
@@ -973,8 +985,8 @@ int64_t lpr_linux_clock_nanosleep(uint64_t clock_id, uint64_t flags, uint64_t re
         return valid;
     }
     if ((flags & LPR_LINUX_TIMER_ABSTIME) == 0) {
-        return lpr_linux_relative_sleep(LPR_LINUX_CLOCK_MONOTONIC, req, rem_raw);
+        return lpr_linux_relative_sleep(LPR_LINUX_CLOCK_MONOTONIC, req, rem_raw, wait_not_ready);
     }
 
-    return lpr_linux_absolute_sleep(clock_id, req);
+    return lpr_linux_absolute_sleep(clock_id, req, wait_not_ready);
 }

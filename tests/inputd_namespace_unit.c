@@ -33,7 +33,7 @@ static int create(const char *path, int kind, struct entry **out)
     if (out) *out = e;
     return 0;
 }
-int pacha_vmo_create(uint64_t bytes, uint64_t rights, uint32_t flags)
+pacha_fd_t pacha_vmo_create(uint64_t bytes, uint64_t rights, uint32_t flags)
 {
     assert(!page && bytes >= 4096 && !(bytes & 4095) && flags == 0);
     assert(rights == (PACHA_FD_RIGHT_INSPECT | PACHA_FD_RIGHT_CLOSE |
@@ -42,7 +42,7 @@ int pacha_vmo_create(uint64_t bytes, uint64_t rights, uint32_t flags)
     page_fds++;
     return 32;
 }
-void *pacha_mmap(int fd, uint64_t length, uint64_t prot, uint64_t flags, uint64_t offset)
+void *pacha_mmap(pacha_fd_t fd, uint64_t length, uint64_t prot, uint64_t flags, uint64_t offset)
 {
     assert(fd == 32 && length == page_bytes && offset == 0);
     assert(prot == (PACHA_PROT_READ | PACHA_PROT_WRITE) && flags == PACHA_MMAP_SHARED);
@@ -53,15 +53,15 @@ int pacha_munmap(void *address, uint64_t length)
     assert(address == page && length == page_bytes);
     return 0;
 }
-int pacha_fd_close(int fd)
+int pacha_fd_close(pacha_fd_t fd)
 {
     if (fd == 32) { assert(page_fds); page_fds--; free(page); page = NULL; }
     else { assert(fd == 33 && replies); replies--; }
     return 0;
 }
-int pacha_fd_get_info(int fd, struct pacha_fd_info *info)
+int pacha_fd_get_info(pacha_fd_t fd, struct pacha_fd_info *info)
 { (void)fd; (void)info; assert(0); return -EIO; }
-int pacha_ipc_call(int fd, const struct pacha_ipc_msg *message)
+int pacha_ipc_call(pacha_fd_t fd, const struct pacha_ipc_msg *message, struct pacha_ipc_msg *response, uint64_t timeout, int *sent)
 {
     assert(fd == 240 && message->fd_count == 1 && message->fds[0].fd == 32);
     kb2_fs_request_t r;
@@ -129,16 +129,12 @@ int pacha_ipc_call(int fd, const struct pacha_ipc_msg *message)
     default: assert(0);
     }
     assert(!kb2_fs_response_encode(page, page_bytes, &last_reply));
-    replies++;
-    return 33;
-}
-int pacha_ipc_recv_wait(int fd, struct pacha_ipc_msg *message, uint64_t timeout)
-{
-    assert(fd == 33 && timeout == PACHA_FD_WAIT_FOREVER);
-    message->word0 = last_reply.opcode;
-    message->word1 = (uint64_t)last_reply.result;
-    message->word2 = KB2_FILESYSTEM_RESPONSE_SIZE;
-    message->word3 = last_reply.sequence + inject_bad_reply;
+    if (sent) *sent = 1;
+    assert(timeout == PACHA_FD_WAIT_FOREVER);
+    response->word0 = last_reply.opcode;
+    response->word1 = (uint64_t)last_reply.result;
+    response->word2 = KB2_FILESYSTEM_RESPONSE_SIZE;
+    response->word3 = last_reply.sequence + inject_bad_reply;
     inject_bad_reply = 0;
     return 0;
 }

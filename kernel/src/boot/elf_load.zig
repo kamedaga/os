@@ -15,14 +15,13 @@ const elf_pf_x: u32 = 1 << 0;
 const elf_pf_w: u32 = 1 << 1;
 const elf_pf_r: u32 = 1 << 2;
 
-fn protForLoadPage(loaded: elf_loader.Image, page_index: usize) ?kernel.VmaProt {
+fn protForLoadPage(loaded: elf_loader.Image, image_bytes: []const u8, page_index: usize) ?kernel.VmaProt {
     const page_start = @as(u64, @intCast(page_index)) * kernel.native_page_size;
     const page_end = page_start + kernel.native_page_size;
     var flags: u32 = 0;
     var covered = false;
-    var i: usize = 0;
-    while (i < loaded.load_segment_len) : (i += 1) {
-        const seg = loaded.load_segments[i];
+    var segments = loaded.segments(image_bytes);
+    while (segments.next() catch return null) |seg| {
         const seg_end, const overflow = @addWithOverflow(seg.vaddr, seg.mem_size);
         if (overflow != 0) return null;
         if (seg.vaddr >= page_end or seg_end <= page_start) continue;
@@ -85,11 +84,19 @@ pub fn loadUserElfIntoProcessPages(
         return null;
     }
 
-    const load_window = boot_scratch.allocate(required_bytes) orelse {
+    const staging = boot_scratch.reserveTemporary(required_bytes) catch {
         log_util.logRequiredBytes("loadUserElfIntoProcessPages: scratch alloc failed bytes=", required_bytes);
         return null;
     };
-    defer boot_scratch.free(load_window);
+    var loan: boot_scratch.Borrow = .{};
+    staging.borrowInto(&loan) catch @panic("ELF staging borrow rejected");
+    // All fallible returns unwind this scope. A fatal parent must release its
+    // own input allocation after this function returns, not rely on halt unwind.
+    defer {
+        loan.end() catch @panic("ELF staging borrow end rejected");
+        staging.release() catch @panic("ELF staging release rejected");
+    }
+    const load_window = loan.bytes() catch @panic("ELF staging view rejected");
 
     @memset(load_window[0..required_bytes], 0);
     const loaded = elf_loader.loadToSinglePage(image_bytes, boot_static.user_elf_base_va, load_window[0..required_bytes]) catch |err| {
@@ -98,7 +105,7 @@ pub fn loadUserElfIntoProcessPages(
     };
 
     const required_pages = required_bytes / 4096;
-    const page0_prot = protForLoadPage(loaded, 0) orelse {
+    const page0_prot = protForLoadPage(loaded, image_bytes, 0) orelse {
         log_util.logMessage("loadUserElfIntoProcessPages: invalid page 0 protections");
         return null;
     };
@@ -154,7 +161,7 @@ pub fn loadUserElfIntoProcessPages(
             return null;
         };
         const map_va = boot_static.user_va + (@as(u64, @intCast(page_index)) * 4096);
-        const page_prot = protForLoadPage(loaded, page_index) orelse {
+        const page_prot = protForLoadPage(loaded, image_bytes, page_index) orelse {
             log_util.logIndexedError("loadUserElfIntoProcessPages: invalid page protections idx=", page_index, error.InvalidProtection);
             if (extra_vmo_fd) |fd| _ = state.closeFdWithFreeList(principal, fd, free_list) catch {};
             return null;
@@ -226,16 +233,9 @@ pub fn loadUserElfIntoProcessPagesOrHalt(
 // ---------------------------------------------------------------------------
 
 pub fn computeUserElfRequiredBytesFromParsed(parsed: elf_loader.Image) ?usize {
-    var max_end: u64 = 0;
-    var i: usize = 0;
-    while (i < parsed.load_segment_len) : (i += 1) {
-        const seg = parsed.load_segments[i];
-        const seg_end, const overflow = @addWithOverflow(seg.vaddr, seg.mem_size);
-        if (overflow != 0) return null;
-        if (seg_end > max_end) max_end = seg_end;
-    }
-    if (max_end == 0) max_end = 4096;
-    const aligned_end = kernel_vm.pageAlignUp(max_end);
+    const max_end = @max(parsed.memory_end, 4096);
+    const rounded = std.math.add(u64, max_end, 4095) catch return null;
+    const aligned_end = rounded & ~@as(u64, 4095);
     if (aligned_end > @import("std").math.maxInt(usize)) return null;
     return @intCast(aligned_end);
 }

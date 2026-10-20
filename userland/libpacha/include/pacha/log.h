@@ -4,6 +4,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include "pacha/abi.h"
 
 /* Private userland IPC wire. It deliberately does not extend the kernel ABI. */
 #define PACHA_LOG_WIRE_MAGIC UINT64_C(0x31474f4c48434150)
@@ -20,6 +21,6 @@ enum pacha_log_source {
 
 /* SEND-only endpoint granted by the service launcher. No filesystem or
  * kernel log dependency is introduced in the producer. */
-int pacha_log_emit(int endpoint_fd, unsigned source, const char *text, size_t length);
+int pacha_log_emit(pacha_fd_t endpoint_fd, unsigned source, const char *text, size_t length);
 
 #endif

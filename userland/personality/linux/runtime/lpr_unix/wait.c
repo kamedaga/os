@@ -8,12 +8,12 @@ static int current(const struct lpr_unix_waiter *waiter)
     return waiter && waiter->client && waiter->process_token &&
         waiter->process_token == lpr_supervisor_token &&
         waiter->client->process_token == waiter->process_token &&
-        waiter->client->fd >= 16 && waiter->client->fd < PACHAOS_FD_TABLE_LIMIT;
+        waiter->client->fd >= 16 && waiter->client->fd < PACHAOS_THREAD_SELF_FD;
 }
 
-static void close_receive(int fd)
+static void close_receive(pacha_fd_t fd)
 {
-    if (fd >= 16 && fd < PACHAOS_FD_TABLE_LIMIT)
+    if (fd >= 16 && fd < PACHAOS_THREAD_SELF_FD)
         (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, (uint64_t)(uint32_t)fd);
 }
 
@@ -120,14 +120,14 @@ int lpr_unix_waiter_watch(struct lpr_unix_waiter *waiter, uint64_t socket, uint6
     const uint64_t rights = PACHA_FD_RIGHT_INSPECT | PACHA_FD_RIGHT_CLOSE |
         PACHA_FD_RIGHT_RECV | PACHA_FD_RIGHT_WAIT | PACHA_FD_RIGHT_POLL;
     if (count != 1 || !request.result || request.result > UINT32_MAX ||
-        cap.fd < 16 || cap.fd >= PACHAOS_FD_TABLE_LIMIT ||
+        cap.fd < 16 || cap.fd >= PACHAOS_THREAD_SELF_FD ||
         lpr_pacha_syscall2(PACHAOS_SYSCALL_FD_GET_INFO, cap.fd, (uint64_t)(uintptr_t)&info) != 0 ||
         info.kind != PACHA_FD_KIND_CHANNEL || info.rights != rights ||
         info.flags != (PACHA_FD_FLAG_PRIVATE | PACHA_FD_FLAG_CLOEXEC)) {
-        if (count) close_receive((int)cap.fd);
+        if (count) close_receive((pacha_fd_t)cap.fd);
         return -EPROTO;
     }
-    waiter->fd = (int)cap.fd;
+    waiter->fd = (pacha_fd_t)cap.fd;
     waiter->id = (uint32_t)request.result;
 registered:
     waiter->watches[slot].socket = socket;
@@ -152,7 +152,7 @@ int lpr_unix_waiter_unwatch(struct lpr_unix_waiter *waiter, uint64_t socket)
 static int healthy(struct lpr_unix_waiter *waiter)
 {
     if (!current(waiter)) return -ENOTCONN;
-    if (!waiter->id || waiter->fd < 16 || waiter->fd >= PACHAOS_FD_TABLE_LIMIT) return -EINVAL;
+    if (!waiter->id || waiter->fd < 16 || waiter->fd >= PACHAOS_THREAD_SELF_FD) return -EINVAL;
     struct pacha_pollfd leaves[2] = {
         { .fd = waiter->client->fd, .events = PACHA_FD_EVENT_HANGUP, .revents = UINT64_MAX },
         { .fd = waiter->fd, .events = PACHA_FD_EVENT_HANGUP, .revents = UINT64_MAX },
@@ -173,12 +173,11 @@ static int healthy(struct lpr_unix_waiter *waiter)
 int lpr_unix_waiter_drain(struct lpr_unix_waiter *waiter)
 {
     if (!current(waiter)) return -ENOTCONN;
-    if (!waiter->id || waiter->fd < 16 || waiter->fd >= PACHAOS_FD_TABLE_LIMIT) return -EINVAL;
+    if (!waiter->id || waiter->fd < 16 || waiter->fd >= PACHAOS_THREAD_SELF_FD) return -EINVAL;
     int status;
     for (unsigned i = 0; i < 256; i++) {
         struct pacha_ipc_msg message = {0};
-        const int64_t raw = lpr_pacha_syscall2(PACHAOS_SYSCALL_IPC_RECV,
-            (uint64_t)(uint32_t)waiter->fd, (uint64_t)(uintptr_t)&message);
+        const int64_t raw = lpr_ipc_message(PACHAOS_SYSCALL_IPC_RECV, (uint64_t)(uint32_t)waiter->fd, 0, (uint64_t)(uintptr_t)((uint64_t)(uintptr_t)&message), 0, 0, 0);
         /* Nonblocking IPC_RECV reports EMPTY, not the NOT_READY used by
          * interrupted waits. Treating EMPTY as a retry bypasses arm/sleep. */
         if (raw == PACHA_SYSCALL_ERR_EMPTY || raw == -PACHA_SYSCALL_ERR_EMPTY)
@@ -206,7 +205,7 @@ int lpr_unix_waiter_add_graph(struct lpr_unix_waiter *waiter, lpr_wait_graph_t *
 int64_t lpr_unix_waiter_wait(struct lpr_unix_waiter *waiter,
     struct unix_wait_bank *bank, const uint64_t *first_changes,
     const uint64_t *second_changes, int (*ready)(void *), void *context,
-    const lpr_wait_deadline_t *deadline)
+    const lpr_wait_deadline_t *deadline, unsigned *wait_not_ready __attribute__((unused)))
 {
     if (!bank || !first_changes || !second_changes || !ready || !deadline) return -EINVAL;
     if (!current(waiter)) return -ENOTCONN;
@@ -229,7 +228,7 @@ int64_t lpr_unix_waiter_wait(struct lpr_unix_waiter *waiter,
         lpr_wait_graph_t graph;
         lpr_wait_graph_init(&graph);
         status = lpr_unix_waiter_add_graph(waiter, &graph);
-        if (status == 0) status = lpr_wait_graph_block(&graph, deadline);
+        if (status == 0) status = lpr_wait_graph_block(&graph, deadline, wait_not_ready);
         if (status == 0) status = healthy(waiter);
     } else if (status > 0) status = 0;
     unix_wait_disarm(bank, &registration);

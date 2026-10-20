@@ -147,15 +147,14 @@ long native_test_raw(long n,long a,long b,long c,long d,long e,long f)
         assert(a==SMOKE_FILED_ENDPOINT);
         struct __pachaos_ipc_msg *message=(void *)b;
         assert(message->fd_count==1 && message->fds);
-        struct resource *reply=new_resource();
-        dispatch_mock(resource((long)message->fds[0].fd),message,reply);
-        return reply->fd;
-    }
-    case PACHAOS_SYSCALL_IPC_RECV_WAIT: {
-        struct __pachaos_ipc_msg *message=(void *)b;
-        struct __pachaos_ipc_fd *fds=message->fds;
-        uint64_t count=message->fd_capacity;
-        *message=resource(a)->reply; message->fds=fds; message->fd_capacity=count; return 0;
+        struct resource result={0};
+        dispatch_mock(resource((long)message->fds[0].fd),message,&result);
+        assert(d == -1 && e == PACHAOS_WAIT_UNINTERRUPTIBLE);
+        struct __pachaos_ipc_msg *reply=(void *)c;
+        struct __pachaos_ipc_fd *fds=reply->fds;
+        uint64_t capacity=reply->fd_capacity;
+        *reply=result.reply; reply->fds=fds; reply->fd_capacity=capacity;
+        return 0;
     }
     default: abort();
     }

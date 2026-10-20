@@ -95,7 +95,7 @@ enum {
 
 static int valid_fd(uint64_t fd, uint64_t kind, uint64_t rights, uint64_t size) {
     struct pacha_fd_info info = {0};
-    return fd >= 16 && fd < PACHA_FD_TABLE_LIMIT &&
+    return fd >= 16 && fd < PACHA_THREAD_SELF_FD &&
         !pacha_syscall2(PACHA_FD_SYSCALL_GET_INFO, fd, (uintptr_t)&info) &&
         info.kind == kind && (info.rights & rights) == rights && (!size || info.size == size);
 }
@@ -104,14 +104,14 @@ static int valid_aux_fd(const struct pacha_ipc_fd *fd, uint64_t size) {
     const uint64_t rights = PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_MAP_READ |
         PACHA_FD_RIGHT_MAP_WRITE;
     struct pacha_fd_info info = {0};
-    return fd && fd->fd >= 16 && fd->fd < PACHA_FD_TABLE_LIMIT &&
+    return fd && fd->fd >= 16 && fd->fd < PACHA_THREAD_SELF_FD &&
         fd->rights == rights && !fd->flags && !fd->transfer_flags &&
         !pacha_syscall2(PACHA_FD_SYSCALL_GET_INFO, fd->fd, (uintptr_t)&info) &&
         info.kind == PACHA_FD_KIND_VMO && info.rights == rights &&
         !info.flags && info.size == size;
 }
 
-static int wait_fence(struct gpud_drm_service *service, int fd) {
+static int wait_fence(struct gpud_drm_service *service, pacha_fd_t fd) {
     for (;;) {
         int error = gpud_drm_service_pump_events(service);
         if (error)
@@ -142,7 +142,7 @@ static int wait_fence(struct gpud_drm_service *service, int fd) {
 struct gpud_drm_pending_fence {
     struct gpud_drm_pending_fence *next;
     uint64_t session, correlation;
-    int fd;
+    pacha_fd_t fd;
 };
 
 static int retire_fence(struct gpud_drm_service *service,
@@ -192,11 +192,11 @@ static int complete_fences(struct gpud_drm_service *service,
     return 0;
 }
 
-int gpud_drm_service_bind(struct gpud_drm_service *service, int endpoint_fd) {
+int gpud_drm_service_bind(struct gpud_drm_service *service, pacha_fd_t endpoint_fd) {
     const uint64_t rights = PACHA_FD_RIGHT_INSPECT | PACHA_FD_RIGHT_CLOSE |
         PACHA_FD_RIGHT_RECV | PACHA_FD_RIGHT_WAIT | PACHA_FD_RIGHT_POLL;
     if (!service || service->endpoint_fd || !service->files.generation ||
-        endpoint_fd < 16 || endpoint_fd >= PACHA_FD_TABLE_LIMIT)
+        endpoint_fd < 16 || endpoint_fd >= PACHA_THREAD_SELF_FD)
         return -EINVAL;
     if (!valid_fd(endpoint_fd, PACHA_FD_KIND_ENDPOINT, rights, 0))
         return -EACCES;
@@ -436,7 +436,7 @@ struct gpud_drm_reply_transfer {
     struct pacha_ipc_fd fds[2];
     struct gpud_drm_object_lease *lease;
     uint64_t object_id;
-    int owner_fd, client_fd;
+    pacha_fd_t owner_fd, client_fd;
     size_t count;
     unsigned int prime_owner;
 };
@@ -566,15 +566,15 @@ static int adopt_mapping(struct gpud_drm_service *service,
         return error;
     const uint64_t rights = mapping_root_rights(translation->mapping_rights);
     struct pacha_fd_info info = {0};
-    int valid = received.fd >= 16 && received.fd < PACHA_FD_TABLE_LIMIT &&
+    int valid = received.fd >= 16 && received.fd < PACHA_THREAD_SELF_FD &&
         received.rights == rights && received.flags == PACHA_FD_FLAG_CLOEXEC &&
         !received.transfer_flags &&
-        !pacha_fd_get_info((int)received.fd, &info) &&
+        !pacha_fd_get_info((pacha_fd_t)received.fd, &info) &&
         info.kind == PACHA_FD_KIND_VMO && info.size == translation->mapping_length &&
         info.rights == rights && info.flags == PACHA_FD_FLAG_CLOEXEC;
     if (!valid) {
-        if (received.fd >= 16 && received.fd < PACHA_FD_TABLE_LIMIT)
-            (void)pacha_fd_close((int)received.fd);
+        if (received.fd >= 16 && received.fd < PACHA_THREAD_SELF_FD)
+            (void)pacha_fd_close((pacha_fd_t)received.fd);
         return -EPROTO;
     }
     *slot = (struct gpud_drm_mapping){
@@ -585,7 +585,7 @@ static int adopt_mapping(struct gpud_drm_service *service,
         .gem_handle = translation->mapping_handle,
         .rights = translation->mapping_rights,
         .cache_policy = translation->mapping_cache_policy,
-        .view_fd = (int)received.fd,
+        .view_fd = (pacha_fd_t)received.fd,
     };
     const size_t occupied_prefix = (size_t)(slot - service->mappings) + 1;
     if (occupied_prefix > service->mapping_high_water) {
@@ -1162,21 +1162,21 @@ static int adopt_prime(struct gpud_drm_service *service, uint64_t token,
         KB2_GPU_SPAN_RIGHT_READ | KB2_GPU_SPAN_RIGHT_WRITE;
     const uint64_t root_rights = mapping_root_rights(span_rights);
     struct pacha_fd_info info = {0};
-    const int valid = received.fd >= 16 && received.fd < PACHA_FD_TABLE_LIMIT &&
+    const int valid = received.fd >= 16 && received.fd < PACHA_THREAD_SELF_FD &&
         received.rights == root_rights &&
         received.flags == PACHA_FD_FLAG_CLOEXEC && !received.transfer_flags &&
-        !pacha_fd_get_info((int)received.fd, &info) &&
+        !pacha_fd_get_info((pacha_fd_t)received.fd, &info) &&
         info.kind == PACHA_FD_KIND_VMO && info.size && !(info.size & 4095u) &&
         info.rights == root_rights && info.flags == PACHA_FD_FLAG_CLOEXEC;
     if (!valid) {
-        if (received.fd >= 16 && received.fd < PACHA_FD_TABLE_LIMIT)
-            (void)pacha_fd_close((int)received.fd);
+        if (received.fd >= 16 && received.fd < PACHA_THREAD_SELF_FD)
+            (void)pacha_fd_close((pacha_fd_t)received.fd);
         return -EPROTO;
     }
     *slot = (struct gpud_drm_prime) {
         .token = token,
         .length = info.size,
-        .view_fd = (int)received.fd,
+        .view_fd = (pacha_fd_t)received.fd,
     };
     struct pacha_ipc_channel_pair pair = {.a = -1, .b = -1};
     error = pacha_ipc_channel_create(&pair,
@@ -1318,7 +1318,7 @@ static int prime_acquire_request(struct gpud_drm_service *service,
         return -EMFILE;
     *lease = (struct gpud_drm_object_lease) {
         .object_id = token,
-        .fd = (int)fd,
+        .fd = (pacha_fd_t)fd,
     };
     service->received.fds[1].fd = PH_IPC_NO_FD;
     return 0;
@@ -1426,10 +1426,10 @@ static int dispatch_request(struct gpud_drm_service *service,
     if (inline_ioctl && header->op != GPUD_DRM_OP_HANDLE_IOCTL)
         return -EINVAL;
     if (header->op == GPUD_DRM_OP_HELLO)
-        return header->payload_size || count != 2 ? -EINVAL : (*result = 1, 0);
+        return header->payload_size || count != 1 ? -EINVAL : (*result = 1, 0);
     if (header->op == GPUD_DRM_OP_OPEN_NODE) {
         const gpud_drm_open_request_t *request = payload;
-        if (header->payload_size != sizeof(gpud_drm_open_request_t) || count != 3 ||
+        if (header->payload_size != sizeof(gpud_drm_open_request_t) || count != 2 ||
             !valid_fd(service->received.fds[1].fd, PACHA_FD_KIND_CHANNEL,
                 PH_IPC_CHANNEL_RIGHTS | PACHA_FD_RIGHT_CLOSE, 0))
             return -EINVAL;
@@ -1455,7 +1455,7 @@ static int dispatch_request(struct gpud_drm_service *service,
         if (!error) {
             *watch = (struct gpud_drm_watch){.handle = *result,
                 .device_minor = request->device_minor,
-                .fd = (int)service->received.fds[1].fd};
+                .fd = (pacha_fd_t)service->received.fds[1].fd};
             service->received.fds[1].fd = PH_IPC_NO_FD;
             if (request->device_minor == 0)
                 primary_opened(service, *result);
@@ -1470,26 +1470,26 @@ static int dispatch_request(struct gpud_drm_service *service,
         if (header->payload_size != sizeof(*request) ||
             (request->fd_flags & ~GPUD_DRM_IOCTL_FD_MASK) ||
             (inline_ioctl && !gpud_drm_ioctl_can_inline(request)) ||
-            count != (inline_ioctl ? 1u : 2u) + transferred)
+            count != (inline_ioctl ? 0u : 1u) + transferred)
             return -EINVAL;
         return ioctl_request(service, payload);
     }
     if (header->op == GPUD_DRM_OP_HANDLE_MMAP) {
         const gpud_drm_mmap_request_t *request = payload;
-        if (header->payload_size != sizeof(*request) || count != 2)
+        if (header->payload_size != sizeof(*request) || count != 1)
             return -EINVAL;
         return mmap_request(service, request, transfer, result);
     }
     if (header->op == GPUD_DRM_OP_HANDLE_POLL) {
         const gpud_drm_handle_request_t *request = payload;
-        if (header->payload_size != sizeof(*request) || count != 2 ||
+        if (header->payload_size != sizeof(*request) || count != 1 ||
             request->arg0 > UINT32_MAX || request->arg1 || request->arg2)
             return -EINVAL;
         return event_request(service, header->op, payload, result);
     }
     if (header->op == GPUD_DRM_OP_HANDLE_READ) {
         const gpud_drm_read_request_t *request = payload;
-        if (header->payload_size != sizeof(*request) || count != 2 ||
+        if (header->payload_size != sizeof(*request) || count != 1 ||
             !request->capacity || request->capacity > GPUD_DRM_EVENT_READ_BYTES ||
             request->data_size)
             return -EINVAL;
@@ -1497,7 +1497,7 @@ static int dispatch_request(struct gpud_drm_service *service,
     }
     if (header->op == GPUD_DRM_OP_PRIME_EXPORT) {
         if (header->payload_size != sizeof(gpud_drm_prime_export_request_t) ||
-            count != 2)
+            count != 1)
             return -EINVAL;
         return prime_export_request(service, payload, transfer, result);
     }
@@ -1505,16 +1505,16 @@ static int dispatch_request(struct gpud_drm_service *service,
         const gpud_drm_prime_import_request_t *request = payload;
         if (header->payload_size != sizeof(*request))
             return -EINVAL;
-        if (!request->token || count == 3)
+        if (!request->token || count == 2)
             return -EOPNOTSUPP;
-        if (count != 2)
+        if (count != 1)
             return -EINVAL;
         return prime_import_request(service, request, result);
     }
     if (header->op == GPUD_DRM_OP_PRIME_RELEASE ||
         header->op == GPUD_DRM_OP_PRIME_ACQUIRE) {
         const gpud_drm_prime_token_request_t *request = payload;
-        const size_t expected = header->op == GPUD_DRM_OP_PRIME_ACQUIRE ? 3 : 2;
+        const size_t expected = header->op == GPUD_DRM_OP_PRIME_ACQUIRE ? 2 : 1;
         if (header->payload_size != sizeof(*request) || !request->token ||
             count != expected)
             return -EINVAL;
@@ -1527,15 +1527,14 @@ static int dispatch_request(struct gpud_drm_service *service,
         if (header->payload_size != sizeof(*request) || request->arg0 || request->arg1 || request->arg2)
             return -EINVAL;
         if (header->op == GPUD_DRM_OP_HANDLE_DUP) {
-            if (count != 2 && count != 3)
+            if (count != 1 && count != 2)
                 return -EOPNOTSUPP;
             struct gpud_drm_watch *watch = NULL;
             struct gpud_drm_watch *source = find_watch(
                 service, request->handle);
-            if (count == 3) {
+            if (count == 2) {
                 uint64_t fd = service->received.fds[1].fd;
                 if (fd == service->received.fds[0].fd ||
-                    fd == service->received.fds[2].fd ||
                     !valid_fd(fd, PACHA_FD_KIND_CHANNEL,
                         PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_WAIT | PACHA_FD_RIGHT_POLL, 0))
                     return -EINVAL;
@@ -1550,13 +1549,13 @@ static int dispatch_request(struct gpud_drm_service *service,
                 if (watch) {
                     *watch = (struct gpud_drm_watch){.handle = request->handle,
                         .device_minor = source ? source->device_minor : 0,
-                        .fd = (int)service->received.fds[1].fd, .transferred = 1};
+                        .fd = (pacha_fd_t)service->received.fds[1].fd, .transferred = 1};
                     service->received.fds[1].fd = PH_IPC_NO_FD;
                 }
             }
             return error;
         }
-        if (count != 2)
+        if (count != 1)
             return -EOPNOTSUPP;
         int error = gpud_drm_file_close(
             &service->files, generation, request->handle);
@@ -1867,16 +1866,14 @@ static int bind_request_page(struct gpud_drm_service *service,
     const struct pacha_ipc_msg *message) {
     const int auxiliary = message->word1 == GPUD_DRM_AUX_REUSE_BYTES;
     if ((message->word1 && !auxiliary) || message->word2 || message->word3 || message->flags ||
-        message->fd_count != 3u + auxiliary ||
+        message->fd_count != 2u + auxiliary ||
         !valid_fd(message->fds[0].fd, PACHA_FD_KIND_VMO,
             PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_MAP_READ | PACHA_FD_RIGHT_MAP_WRITE,
             GPUD_DRM_PAGE_BYTES) ||
         !valid_fd(message->fds[1].fd, PACHA_FD_KIND_CHANNEL,
             PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_RECV | PACHA_FD_RIGHT_POLL |
                 PACHA_FD_RIGHT_WAIT, 0) ||
-        (auxiliary && !valid_aux_fd(&message->fds[2], GPUD_DRM_AUX_REUSE_BYTES)) ||
-        !valid_fd(message->fds[2u + auxiliary].fd, PACHA_FD_KIND_REPLY,
-            PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_SEND, 0)) return -EPROTO;
+        (auxiliary && !valid_aux_fd(&message->fds[2], GPUD_DRM_AUX_REUSE_BYTES))) return -EPROTO;
     struct gpud_drm_connection *connection = calloc(1, sizeof(*connection));
     int status = connection ? 0 : -ENOMEM;
     if (connection) {
@@ -1888,7 +1885,7 @@ static int bind_request_page(struct gpud_drm_service *service,
             status = -ENOMEM;
         } else {
             connection->page = (void *)(uintptr_t)address;
-            connection->fd = (int)message->fds[1].fd;
+            connection->fd = (pacha_fd_t)message->fds[1].fd;
             connection->next = service->connections;
             service->connections = connection;
             service->received.fds[1].fd = PH_IPC_NO_FD;
@@ -1908,10 +1905,10 @@ static int bind_request_page(struct gpud_drm_service *service,
     }
     const struct pacha_ipc_msg reply = {
         .word0 = GPUD_DRM_BIND_PAGE_REPLY_MAGIC, .word1 = (uint64_t)status};
-    return pacha_ipc_reply((int)message->fds[2u + auxiliary].fd, &reply) ? -EIO : 0;
+    return pacha_ipc_reply(PACHA_IPC_REPLY_IMPLICIT, &reply) ? -EIO : 0;
 }
 
-static int receive_request(struct gpud_drm_service *service, int endpoint_fd,
+static int receive_request(struct gpud_drm_service *service, pacha_fd_t endpoint_fd,
     struct gpud_drm_connection *connection) {
     void *bound_page = connection ? connection->page : NULL;
     if (!service || service->endpoint_fd < 16 || !service->backend_client)
@@ -1920,8 +1917,7 @@ static int receive_request(struct gpud_drm_service *service, int endpoint_fd,
         return service->error;
     struct pacha_ipc_msg message = {.fds = service->received.fds,
         .fd_capacity = PACHA_IPC_MAX_TRANSFER_FDS};
-    long native = pacha_syscall2(
-        PACHA_IPC_SYSCALL_RECV, endpoint_fd, (uintptr_t)&message);
+    long native = pacha_ipc_message_syscall(PACHA_IPC_SYSCALL_RECV, endpoint_fd, 0, (struct pacha_ipc_msg *)(uintptr_t)((uintptr_t)&message), 0, 0, 0);
     if (native)
         return native == PACHA_SYSCALL_ERR_EMPTY || native == PACHA_SYSCALL_ERR_NOT_READY ?
             -EAGAIN : (service->error = -EIO);
@@ -1938,11 +1934,9 @@ static int receive_request(struct gpud_drm_service *service, int endpoint_fd,
         goto cleanup;
     }
     if (message.word0 == GPUD_DRM_INLINE_IOCTL_REQUEST_MAGIC) {
-        /* Only the kernel-created reply capability is accepted. In particular,
-         * this path cannot smuggle auxiliary memory or fence capabilities. */
-        if (bound_page || message.fd_count != 1 || message.flags ||
-            !valid_fd(message.fds[0].fd, PACHA_FD_KIND_REPLY,
-                PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_SEND, 0))
+        /* Inline calls carry no explicit capabilities; auxiliary memory and
+         * fence capabilities require the page request path. */
+        if (bound_page || message.fd_count != 0 || message.flags)
             goto cleanup;
         gpud_drm_ioctl_request_t request = {
             .handle = message.word1, .request = message.word2,
@@ -1968,14 +1962,14 @@ static int receive_request(struct gpud_drm_service *service, int endpoint_fd,
         };
         if (!status)
             memcpy(&reply.word3, request.data, request.data_size);
-        error = pacha_ipc_reply((int)message.fds[0].fd, &reply) ? -EIO : 0;
+        error = pacha_ipc_reply(PACHA_IPC_REPLY_IMPLICIT, &reply) ? -EIO : 0;
         goto cleanup;
     }
     const int bound_aux = message.word1 == GPUD_DRM_REQUEST_BOUND_AUX;
     if (bound_aux && (!connection || !connection->aux)) goto cleanup;
     if (bound_page) {
         const size_t placeholders = 1u + bound_aux;
-        if (!message.fd_count || message.fd_count > PACHA_IPC_MAX_TRANSFER_FDS - placeholders)
+        if (message.fd_count > PACHA_IPC_MAX_TRANSFER_FDS - placeholders)
             goto cleanup;
         /* Preserve attachment indices for ioctl/fence validation. These slots
          * borrow connection-owned mappings, not untrusted numeric tokens. */
@@ -1986,12 +1980,12 @@ static int receive_request(struct gpud_drm_service *service, int endpoint_fd,
         service->received.fd_count = message.fd_count;
         service->request_aux = bound_aux ? connection->aux : NULL;
     }
-    if (message.fd_count < 2)
+    if (message.fd_count < 1)
         goto cleanup;
-    uint64_t page_fd = message.fds[0].fd, reply_fd = message.fds[message.fd_count - 1].fd;
+    uint64_t page_fd = message.fds[0].fd;
+    pacha_fd_t reply_fd = PACHA_IPC_REPLY_IMPLICIT;
     if ((!bound_page && !valid_fd(page_fd, PACHA_FD_KIND_VMO,
-            PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_MAP_READ | PACHA_FD_RIGHT_MAP_WRITE, GPUD_DRM_PAGE_BYTES)) ||
-        !valid_fd(reply_fd, PACHA_FD_KIND_REPLY, PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_SEND, 0))
+            PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_MAP_READ | PACHA_FD_RIGHT_MAP_WRITE, GPUD_DRM_PAGE_BYTES)))
         goto cleanup;
     const uint64_t map_start = rpc_profile_now();
     long address = bound_page ? (long)(uintptr_t)bound_page :
@@ -2052,10 +2046,14 @@ static int receive_request(struct gpud_drm_service *service, int endpoint_fd,
         .word3 = header.request_id,
         .fds = transfer.count ? transfer.fds : NULL,
         .fd_count = transfer.count};
-    error = pacha_ipc_reply((int)reply_fd, &reply) ? -EIO : 0;
+    error = pacha_ipc_reply((pacha_fd_t)reply_fd, &reply) ? -EIO : 0;
     if (!error && transfer.count)
         finish_reply_transfer(&transfer);
 cleanup:
+    if (error) {
+        const struct pacha_ipc_msg failed = {.word1 = (uint64_t)(int64_t)error};
+        (void)pacha_ipc_reply(PACHA_IPC_REPLY_IMPLICIT, &failed);
+    }
     service->request_aux = NULL;
     if (transfer.count) {
         int canceled = cancel_reply_transfer(service, &transfer);
@@ -2109,13 +2107,12 @@ int gpud_drm_service_receive(struct gpud_drm_service *service) {
         receive_connection(service);
 }
 
-int gpud_drm_service_reject_unavailable(int endpoint_fd) {
+int gpud_drm_service_reject_unavailable(pacha_fd_t endpoint_fd) {
     if (endpoint_fd < 16) return -EINVAL;
     struct ph_ipc_packet packet = {0};
     struct pacha_ipc_msg message = {.fds = packet.fds,
         .fd_capacity = PACHA_IPC_MAX_TRANSFER_FDS};
-    long native = pacha_syscall2(PACHA_IPC_SYSCALL_RECV,
-        endpoint_fd, (uintptr_t)&message);
+    long native = pacha_ipc_message_syscall(PACHA_IPC_SYSCALL_RECV, endpoint_fd, 0, (struct pacha_ipc_msg *)(uintptr_t)((uintptr_t)&message), 0, 0, 0);
     if (native == PACHA_SYSCALL_ERR_EMPTY || native == PACHA_SYSCALL_ERR_NOT_READY)
         return -EAGAIN;
     if (native) return -EIO;
@@ -2124,36 +2121,31 @@ int gpud_drm_service_reject_unavailable(int endpoint_fd) {
     /* A malformed or canceled client request must not terminate the
      * optional GPU owner while it is waiting for the manual probe. */
     int error = 0;
+    int replied = 0;
     if (message.word0 == GPUD_DRM_BIND_PAGE_REQUEST_MAGIC &&
-        (message.fd_count == 3 || message.fd_count == 4) && !message.flags &&
+        (message.fd_count == 2 || message.fd_count == 3) && !message.flags &&
         (message.word1 == 0 || message.word1 == GPUD_DRM_AUX_REUSE_BYTES) &&
-        message.fd_count == 3u + (message.word1 != 0) &&
+        message.fd_count == 2u + (message.word1 != 0) &&
         !message.word2 && !message.word3) {
-        size_t reply_index = message.fd_count - 1;
-        if (valid_fd(packet.fds[reply_index].fd, PACHA_FD_KIND_REPLY,
-                PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_SEND, 0)) {
+        {
             const struct pacha_ipc_msg reply = {
                 .word0 = GPUD_DRM_BIND_PAGE_REPLY_MAGIC,
                 .word1 = (uint64_t)(int64_t)-ENODEV,
             };
-            (void)pacha_ipc_reply((int)packet.fds[reply_index].fd, &reply);
+            replied = pacha_ipc_reply(PACHA_IPC_REPLY_IMPLICIT, &reply) == 0;
         }
     } else if (message.word0 == GPUD_DRM_INLINE_IOCTL_REQUEST_MAGIC &&
-        message.fd_count == 1 && !message.flags &&
-        valid_fd(packet.fds[0].fd, PACHA_FD_KIND_REPLY,
-            PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_SEND, 0)) {
+        message.fd_count == 0 && !message.flags) {
         const struct pacha_ipc_msg reply = {
             .word0 = GPUD_DRM_INLINE_IOCTL_REPLY_MAGIC,
             .word1 = (uint64_t)(int64_t)-ENODEV, .word2 = message.word2,
         };
-        (void)pacha_ipc_reply((int)packet.fds[0].fd, &reply);
+        replied = pacha_ipc_reply(PACHA_IPC_REPLY_IMPLICIT, &reply) == 0;
     } else if (message.word0 == PACHA_SERVICE_REQUEST_MAGIC &&
-        message.fd_count >= 2 && !message.flags && !message.word1 && !message.word2 &&
+        message.fd_count >= 1 && !message.flags && !message.word1 && !message.word2 &&
         valid_fd(packet.fds[0].fd, PACHA_FD_KIND_VMO,
             PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_MAP_READ | PACHA_FD_RIGHT_MAP_WRITE,
-            GPUD_DRM_PAGE_BYTES) &&
-        valid_fd(packet.fds[message.fd_count - 1].fd, PACHA_FD_KIND_REPLY,
-            PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_SEND, 0)) {
+            GPUD_DRM_PAGE_BYTES)) {
         long address = pacha_syscall6(PACHA_VM_SYSCALL_MMAP, packet.fds[0].fd,
             0, GPUD_DRM_PAGE_BYTES, PACHA_PROT_READ | PACHA_PROT_WRITE,
             PACHA_MMAP_SHARED, 0);
@@ -2170,13 +2162,17 @@ int gpud_drm_service_reject_unavailable(int endpoint_fd) {
                     .word1 = (uint64_t)(int64_t)-ENODEV,
                     .word3 = request.request_id,
                 };
-                (void)pacha_ipc_reply(
-                    (int)packet.fds[message.fd_count - 1].fd, &reply);
+                replied = pacha_ipc_reply(
+                    PACHA_IPC_REPLY_IMPLICIT, &reply) == 0;
             }
             if (pacha_syscall2(PACHA_VM_SYSCALL_MUNMAP,
                     (uintptr_t)address, GPUD_DRM_PAGE_BYTES))
                 error = -EIO;
         }
+    }
+    if (!replied) {
+        const struct pacha_ipc_msg failed = {.word1 = (uint64_t)(int64_t)-EPROTO};
+        (void)pacha_ipc_reply(PACHA_IPC_REPLY_IMPLICIT, &failed);
     }
     int release = ph_ipc_packet_release(&packet);
     return release ? release : error;

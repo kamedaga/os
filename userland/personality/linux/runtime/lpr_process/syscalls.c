@@ -22,7 +22,7 @@ enum {
     LPR_PR_GET_PDEATHSIG = 2u,
 };
 
-_Static_assert(offsetof(lpr_thread_record_t, unix_context) == 72u, "thread launch prefix size");
+_Static_assert(offsetof(lpr_thread_record_t, unix_context) == 80u, "thread launch prefix size");
 
 /* Linux musl's x86_64 __unmapself switches directly from SYS_munmap to
  * SYS_exit without touching its former stack.  LPR's zpoline dispatch needs
@@ -184,7 +184,7 @@ const struct lpr_linux_user_frame *lpr_fork_child_bootstrap(void)
     }
     if (lpr_supervisor_pending_child_token) {
         void *page = 0;
-        const int page_fd = lpr_create_standalone_wire_page(&page);
+        const pacha_fd_t page_fd = lpr_create_standalone_wire_page(&page);
         const int64_t status = page_fd < 16 ? page_fd :
             lpr_process_client_activate(&lpr_request_id, lpr_pacha_status_to_errno,
                 transaction->supervisor_bootstrap_fd, lpr_supervisor_pending_child_token, page_fd, page);
@@ -245,13 +245,13 @@ static lpr_thread_record_t *lpr_thread_record_find(uint32_t tid)
     return 0;
 }
 
-static int lpr_thread_open_signal_fd(void)
+static pacha_fd_t lpr_thread_open_signal_fd(void)
 {
     const int64_t fd = lpr_pacha_syscall4(PACHAOS_SYSCALL_FD_DUP,
         PACHAOS_THREAD_SELF_FD, 16,
         PACHA_FD_RIGHT_PROCESS_SIGNAL | PACHA_FD_RIGHT_CLOSE,
         PACHA_FD_FLAG_PRIVATE | PACHA_FD_FLAG_CLOEXEC);
-    return fd >= 16 ? (int)fd : (fd ? lpr_pacha_status_to_errno(fd) : -LPR_LINUX_EIO);
+    return fd >= 16 ? (pacha_fd_t)fd : (fd ? lpr_pacha_status_to_errno(fd) : -LPR_LINUX_EIO);
 }
 
 static int lpr_thread_find_or_create_current(lpr_thread_record_t **out)
@@ -269,7 +269,7 @@ static int lpr_thread_find_or_create_current(lpr_thread_record_t **out)
             lpr_state_unlock(&lpr_state.threads.lock_word);
             return -LPR_LINUX_EINVAL;
         }
-        const int signal_fd = lpr_thread_open_signal_fd();
+        const pacha_fd_t signal_fd = lpr_thread_open_signal_fd();
         if (signal_fd < 0) {
             lpr_state_unlock(&lpr_state.threads.lock_word);
             return signal_fd;
@@ -506,7 +506,7 @@ void lpr_clone_thread_bootstrap(lpr_thread_record_t *record)
     }
     const uint32_t tid = (uint32_t)raw_tid;
     lpr_signal_thread_state_t *signal_state = lpr_signal_thread_state_current();
-    const int signal_fd = lpr_thread_open_signal_fd();
+    const pacha_fd_t signal_fd = lpr_thread_open_signal_fd();
     if (signal_fd < 0) {
         lpr_clone_thread_bootstrap_abort("signal-capability", signal_fd);
     }
@@ -533,11 +533,11 @@ void lpr_clone_thread_bootstrap(lpr_thread_record_t *record)
         (uint64_t)(uintptr_t)&record->started,
         1u);
     while (__atomic_load_n(&record->parent_ready, __ATOMIC_ACQUIRE) == 0u) {
-        (void)lpr_pacha_syscall3(
+        (void)lpr_pacha_syscall4(
             PACHAOS_SYSCALL_FUTEX_WAIT,
             (uint64_t)(uintptr_t)&record->parent_ready,
             0u,
-            0u);
+            0u, PACHA_WAIT_UNINTERRUPTIBLE);
     }
     int (*start_function)(void *) =
         (int (*)(void *))(uintptr_t)record->start_function;
@@ -632,11 +632,11 @@ static int64_t lpr_linux_clone_thread(
         (uint64_t)(uint32_t)thread_fd);
 
     while (__atomic_load_n(&record->started, __ATOMIC_ACQUIRE) == 0u) {
-        (void)lpr_pacha_syscall3(
+        (void)lpr_pacha_syscall4(
             PACHAOS_SYSCALL_FUTEX_WAIT,
             (uint64_t)(uintptr_t)&record->started,
             0u,
-            0u);
+            0u, PACHA_WAIT_UNINTERRUPTIBLE);
     }
     const uint32_t tid = record->tid;
     __atomic_store_n(&record->parent_ready, 1u, __ATOMIC_RELEASE);
@@ -706,7 +706,7 @@ static int64_t lpr_linux_clone_frame_impl(const struct lpr_linux_user_frame *use
     uint64_t child_token = 0;
     if (lpr_supervisor_enabled) {
         void *page = 0;
-        const int page_fd = lpr_create_standalone_wire_page(&page);
+        const pacha_fd_t page_fd = lpr_create_standalone_wire_page(&page);
         if (page_fd < 0) {
             lpr_destroy_exec_transaction(&fork_transaction);
             return lpr_fork_fail("wire_page", page_fd);
@@ -906,7 +906,7 @@ int64_t lpr_linux_getpgid(uint64_t pid_raw)
     }
     if (lpr_supervisor_enabled) {
         void *page = 0;
-        const int page_fd = lpr_create_standalone_wire_page(&page);
+        const pacha_fd_t page_fd = lpr_create_standalone_wire_page(&page);
         if (page_fd < 0) {
             return page_fd;
         }
@@ -942,7 +942,7 @@ int64_t lpr_linux_setpgid(uint64_t pid_raw, uint64_t pgid_raw)
     }
     if (lpr_supervisor_enabled) {
         void *page = 0;
-        const int page_fd = lpr_create_standalone_wire_page(&page);
+        const pacha_fd_t page_fd = lpr_create_standalone_wire_page(&page);
         if (page_fd < 0) {
             return page_fd;
         }
@@ -985,7 +985,7 @@ int64_t lpr_linux_setsid(void)
     lpr_linux_process_state_init();
     if (lpr_supervisor_enabled) {
         void *page = 0;
-        const int page_fd = lpr_create_standalone_wire_page(&page);
+        const pacha_fd_t page_fd = lpr_create_standalone_wire_page(&page);
         if (page_fd < 0) {
             return page_fd;
         }
@@ -1023,7 +1023,7 @@ int64_t lpr_linux_getsid(uint64_t pid_raw)
     }
     if (lpr_supervisor_enabled) {
         void *page = 0;
-        const int page_fd = lpr_create_standalone_wire_page(&page);
+        const pacha_fd_t page_fd = lpr_create_standalone_wire_page(&page);
         if (page_fd < 0) {
             return page_fd;
         }
@@ -1079,7 +1079,7 @@ int64_t lpr_linux_prctl(uint64_t option,
     }
 
     void *page = 0;
-    const int page_fd = lpr_create_standalone_wire_page(&page);
+    const pacha_fd_t page_fd = lpr_create_standalone_wire_page(&page);
     if (page_fd < 0) {
         return page_fd;
     }
@@ -1290,7 +1290,7 @@ int64_t lpr_linux_rt_sigprocmask(uint64_t how, uint64_t set_raw, uint64_t oldset
     return dispatch_pending ? lpr_linux_dispatch_pending_signals_with_result(0) : 0;
 }
 
-int64_t lpr_linux_wait4(uint64_t pid, uint64_t status_raw, uint64_t options, uint64_t rusage)
+int64_t lpr_linux_wait4(uint64_t pid, uint64_t status_raw, uint64_t options, uint64_t rusage, unsigned *wait_not_ready __attribute__((unused)))
 {
     (void)rusage;
     if ((options & ~(LPR_LINUX_WNOHANG | LPR_LINUX_WUNTRACED | LPR_LINUX_WCONTINUED)) != 0) {
@@ -1301,7 +1301,7 @@ int64_t lpr_linux_wait4(uint64_t pid, uint64_t status_raw, uint64_t options, uin
     lpr_trace_process_event("wait4_request", (uint64_t)(uint32_t)requested, options, 0);
     if (lpr_supervisor_enabled) {
         void *page = 0;
-        const int page_fd = lpr_create_standalone_wire_page(&page);
+        const pacha_fd_t page_fd = lpr_create_standalone_wire_page(&page);
         if (page_fd < 0) {
             return page_fd;
         }
@@ -1383,7 +1383,7 @@ int64_t lpr_linux_wait4(uint64_t pid, uint64_t status_raw, uint64_t options, uin
             return 0;
         }
     } else {
-        status = lpr_linux_wait_process_fd((uint64_t)(uint32_t)selected->process_fd, &exit_code);
+        status = lpr_linux_wait_process_fd((uint64_t)(uint32_t)selected->process_fd, &exit_code, wait_not_ready);
     }
     if (status != 0) {
         return status;
@@ -1445,9 +1445,9 @@ int64_t lpr_linux_execve(uint64_t path_raw, uint64_t argv_raw, uint64_t envp_raw
         lpr_exec_values_destroy(&exec);
         return status;
     }
-    int process_fd = -1;
-    int thread_fd = -1;
-    int bootstrap_fd = -1;
+    pacha_fd_t process_fd = -1;
+    pacha_fd_t thread_fd = -1;
+    pacha_fd_t bootstrap_fd = -1;
     const int64_t exec_status =
         lpr_filed_exec_self(&exec, &transaction, &process_fd, &thread_fd, &bootstrap_fd);
 #if defined(LPR_BOOT_DIAGNOSTICS) && LPR_BOOT_DIAGNOSTICS

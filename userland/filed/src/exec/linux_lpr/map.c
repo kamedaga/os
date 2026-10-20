@@ -96,7 +96,7 @@ void lpr_exec_map_dump_metrics(void)
     }
 }
 
-static int fill_vmo(int vmo_fd, const void *initial_bytes, uint64_t initial_size, uint64_t map_size)
+static int fill_vmo(pacha_fd_t vmo_fd, const void *initial_bytes, uint64_t initial_size, uint64_t map_size)
 {
     if (initial_size == 0) {
         return 0;
@@ -113,7 +113,7 @@ static int fill_vmo(int vmo_fd, const void *initial_bytes, uint64_t initial_size
     return 0;
 }
 
-static int create_segment_vmo(uint64_t map_size, int *out_vmo_fd, unsigned char **out_mapped)
+static int create_segment_vmo(uint64_t map_size, pacha_fd_t *out_vmo_fd, unsigned char **out_mapped)
 {
     if (out_vmo_fd == NULL || out_mapped == NULL || map_size == 0 || map_size > SIZE_MAX) {
         return -22;
@@ -130,7 +130,7 @@ static int create_segment_vmo(uint64_t map_size, int *out_vmo_fd, unsigned char 
         PACHA_FD_RIGHT_MAP_WRITE |
         PACHA_FD_RIGHT_MAP_EXEC;
     uint64_t metric_start = lpr_exec_map_now_cycles();
-    const int vmo_fd = pacha_vmo_create(map_size, rights, 0);
+    const pacha_fd_t vmo_fd = pacha_vmo_create(map_size, rights, 0);
     lpr_exec_map_metric_time_cycles(
         "segment_vmo_create_syscall",
         metric_start,
@@ -185,9 +185,9 @@ static int build_zpoline_page(unsigned char *page, uint64_t handler_va)
     return 0;
 }
 
-static int zpoline_page_vmo(uint64_t handler_va)
+static pacha_fd_t zpoline_page_vmo(uint64_t handler_va)
 {
-    static int cached_vmo_fd = -1;
+    static pacha_fd_t cached_vmo_fd = -1;
     static uint64_t cached_handler_va = 0;
 
     if (handler_va == 0) {
@@ -215,7 +215,7 @@ static int zpoline_page_vmo(uint64_t handler_va)
         PACHA_FD_RIGHT_MAP_READ |
         PACHA_FD_RIGHT_MAP_WRITE |
         PACHA_FD_RIGHT_MAP_EXEC;
-    const int vmo_fd = pacha_vmo_create(LPR_ZPOLINE_PAGE_SIZE, rights, 0);
+    const pacha_fd_t vmo_fd = pacha_vmo_create(LPR_ZPOLINE_PAGE_SIZE, rights, 0);
     if (vmo_fd < 16) {
         return -12;
     }
@@ -229,9 +229,9 @@ static int zpoline_page_vmo(uint64_t handler_va)
     return cached_vmo_fd;
 }
 
-int lpr_exec_install_low_layout(int process_fd, uint64_t syscall_entry_va)
+int lpr_exec_install_low_layout(pacha_fd_t process_fd, uint64_t syscall_entry_va)
 {
-    const int vmo_fd = zpoline_page_vmo(syscall_entry_va);
+    const pacha_fd_t vmo_fd = zpoline_page_vmo(syscall_entry_va);
     if (vmo_fd < 16) {
         return vmo_fd;
     }
@@ -349,7 +349,7 @@ void lpr_exec_pending_map_batch_discard(lpr_exec_pending_map_batch_t *batch)
     free(batch->close_fds);
     memset(batch, 0, sizeof(*batch));
 }
-int lpr_exec_pending_map_batch_commit(int process_fd, lpr_exec_pending_map_batch_t *batch)
+int lpr_exec_pending_map_batch_commit(pacha_fd_t process_fd, lpr_exec_pending_map_batch_t *batch)
 {
     if (!batch || process_fd < 16) return -22;
     int status = 0;
@@ -364,7 +364,7 @@ int lpr_exec_pending_map_batch_commit(int process_fd, lpr_exec_pending_map_batch
     lpr_exec_pending_map_batch_discard(batch);
     return status;
 }
-static int append_map(lpr_exec_pending_map_batch_t *batch, int vmo,
+static int append_map(lpr_exec_pending_map_batch_t *batch, pacha_fd_t vmo,
                       uint64_t target, uint64_t length, uint64_t offset,
                       uint64_t protection)
 {
@@ -388,8 +388,8 @@ static int append_map(lpr_exec_pending_map_batch_t *batch, int vmo,
     if (protection & PACHA_PROT_WRITE) rights |= PACHA_FD_RIGHT_MAP_WRITE;
     if (protection & PACHA_PROT_EXEC) rights |= PACHA_FD_RIGHT_MAP_EXEC;
     long duplicate = pacha_fd_fcntl(vmo, PACHA_FD_FCNTL_DUP, 16, rights);
-    if (duplicate < 16) return duplicate < 0 ? (int)duplicate : -1;
-    int copy = (int)duplicate;
+    if (duplicate < 16) return duplicate < 0 ? (pacha_fd_t)duplicate : -1;
+    pacha_fd_t copy = duplicate;
     batch->entries[batch->count] = (struct pacha_process_map_batch_entry){
         .vmo_fd = (uint64_t)copy, .target_va = target, .size = length,
         .prot = protection, .vmo_offset = offset,
@@ -440,7 +440,7 @@ static int prepare_image(const lpr_exec_image_t *image, uint64_t dyn_base,
     if (pages > SIZE_MAX / sizeof(uint64_t)) return -75;
     uint64_t *protections = calloc((size_t)pages, sizeof(*protections));
     if (!protections) return -12;
-    int vmo = -1;
+    pacha_fd_t vmo = -1;
     unsigned char *mapped = NULL;
     status = create_segment_vmo(span, &vmo, &mapped);
     if (status) { free(protections); return status; }
@@ -511,7 +511,7 @@ int lpr_exec_prepare_file_into_map_batch(filed_runtime_t *runtime,
     free(image.bytes);
     return status;
 }
-int lpr_exec_load_image_into_process(int process_fd, const lpr_exec_image_t *image,
+int lpr_exec_load_image_into_process(pacha_fd_t process_fd, const lpr_exec_image_t *image,
     uint64_t dyn_base, int patch_text, lpr_exec_loaded_t *loaded)
 {
     lpr_exec_pending_map_batch_t batch;
@@ -521,7 +521,7 @@ int lpr_exec_load_image_into_process(int process_fd, const lpr_exec_image_t *ima
     else lpr_exec_pending_map_batch_discard(&batch);
     return status;
 }
-int lpr_exec_load_image_with_low_layout_into_process(int process_fd,
+int lpr_exec_load_image_with_low_layout_into_process(pacha_fd_t process_fd,
     const lpr_exec_image_t *image, uint64_t dyn_base, int patch_text,
     uint64_t syscall_entry_offset, lpr_exec_loaded_t *loaded)
 {
@@ -534,7 +534,7 @@ int lpr_exec_load_image_with_low_layout_into_process(int process_fd,
     if (syscall_entry_offset > UINT64_MAX - loaded->base) return -75;
     return lpr_exec_install_low_layout(process_fd, loaded->base + syscall_entry_offset);
 }
-int lpr_exec_load_file_into_process(filed_runtime_t *runtime, int process_fd,
+int lpr_exec_load_file_into_process(filed_runtime_t *runtime, pacha_fd_t process_fd,
     const lpr_exec_file_t *file, const lpr_exec_meta_t *meta, uint64_t dyn_base,
     int patch_text, lpr_exec_loaded_t *loaded)
 {

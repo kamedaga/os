@@ -161,7 +161,7 @@ static void thread_start(struct ph_task *task, void (*entry)(void), uintptr_t st
     PH_CHECK(thread_fd >= 16);
 
     /* Publish the handle before START: the new thread can run immediately. */
-    task->fd = (int)thread_fd;
+    task->fd = (pacha_fd_t)thread_fd;
     PH_OK(pacha_syscall1(PACHA_THREAD_SYSCALL_START, thread_fd));
 }
 

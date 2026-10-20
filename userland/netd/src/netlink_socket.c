@@ -25,7 +25,7 @@ typedef struct netd_netlink_socket_state {
     uint8_t notify_pending;
     uint16_t queue_head;
     uint16_t queue_len;
-    int notify_fd;
+    pacha_fd_t notify_fd;
     netd_netlink_message_t queue[NETD_NETLINK_QUEUE_CAPACITY];
 } netd_netlink_socket_state_t;
 
@@ -92,7 +92,7 @@ static int notify(netd_netlink_socket_state_t *socket)
     return status;
 }
 
-int netd_netlink_socket_open(uint64_t type, uint64_t protocol, int notify_fd, uint64_t *out_handle)
+int netd_netlink_socket_open(uint64_t type, uint64_t protocol, pacha_fd_t notify_fd, uint64_t *out_handle)
 {
     if (out_handle == NULL || notify_fd < 16 ||
         (type != NETD_SOCK_DGRAM && type != NETD_SOCK_RAW) ||

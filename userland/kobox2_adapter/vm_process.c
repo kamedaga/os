@@ -23,14 +23,14 @@ int ph_vm_native_error(long status) {
     }
 }
 
-void ph_vm_event_signal(int fd) {
+void ph_vm_event_signal(pacha_fd_t fd) {
     const uint64_t one = 1;
 
     PH_CHECK(pacha_syscall3(PACHA_FD_SYSCALL_WRITE, fd,
         (uintptr_t)&one, sizeof(one)) == sizeof(one));
 }
 
-void ph_vm_event_consume(int fd) {
+void ph_vm_event_consume(pacha_fd_t fd) {
     uint64_t count;
 
     PH_CHECK(pacha_syscall3(PACHA_FD_SYSCALL_READ, fd,
@@ -38,7 +38,7 @@ void ph_vm_event_consume(int fd) {
     PH_CHECK(count == 1);
 }
 
-void ph_vm_map_anonymous(int process_fd, uint64_t address, size_t length) {
+void ph_vm_map_anonymous(pacha_fd_t process_fd, uint64_t address, size_t length) {
     long mapped = pacha_syscall6(PACHA_PROCESS_SYSCALL_MAP, process_fd, 0,
         address, length, PACHA_PROT_READ | PACHA_PROT_WRITE,
         PACHA_PROCESS_MAP_ANONYMOUS | PACHA_PROCESS_MAP_PRIVATE);
@@ -65,7 +65,7 @@ static unsigned segment_protection(unsigned flags) {
     return protection;
 }
 
-uint64_t ph_vm_load_bootstrap(int process_fd, const void *file, size_t file_size) {
+uint64_t ph_vm_load_bootstrap(pacha_fd_t process_fd, const void *file, size_t file_size) {
     Elf64_Ehdr header;
     bool entry_executable = false;
     uint64_t previous_end = PH_VM_CLIENT_IMAGE_BASE;

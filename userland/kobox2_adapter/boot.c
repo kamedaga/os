@@ -18,7 +18,7 @@ static void (*service_main)(const struct kobox_linux_task_report *, void *);
 static void *service_context;
 
 #if PH_SANDBOX_AMDGPU
-static int gpu_log_fd;
+static pacha_fd_t gpu_log_fd;
 static atomic_flag gpu_log_lock = ATOMIC_FLAG_INIT;
 static char gpu_log_line[256];
 static size_t gpu_log_used;
@@ -114,7 +114,7 @@ static void gpu_log_copy(const char *text, size_t length) {
 }
 #endif
 
-void ph_boot_set_log_fd(int fd) {
+void ph_boot_set_log_fd(pacha_fd_t fd) {
 #if PH_SANDBOX_AMDGPU
     gpu_log_fd = fd >= 16 ? fd : 0;
 #else
@@ -378,7 +378,7 @@ _Noreturn void ph_boot_run(const void *core, size_t size,
     PH_OK(pacha_syscall1(PACHA_THREAD_SYSCALL_SET_FS_BASE, (uintptr_t)&boot_task));
     boot_task.fault_stack = ph_alloc(PH_THREAD_STACK_SIZE);
     ph_thread_setup(&boot_task);
-    boot_task.fd = (int)pacha_syscall4(PACHA_FD_SYSCALL_DUP, PACHA_THREAD_SELF_FD, 16,
+    boot_task.fd = (pacha_fd_t)pacha_syscall4(PACHA_FD_SYSCALL_DUP, PACHA_THREAD_SELF_FD, 16,
         PACHA_FD_RIGHT_WAIT | PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_PROCESS_SIGNAL, 0);
     PH_CHECK(boot_task.fd >= 16);
 

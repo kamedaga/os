@@ -8,7 +8,7 @@
 struct media_reader {
     struct ph_block_client *block;
     struct ph_ipc *ipc;
-    int process_fd;
+    pacha_fd_t process_fd;
     const kb2_block_disk_t *disk;
 };
 
@@ -32,7 +32,7 @@ static int read_at(void *context, uint64_t offset, void *buffer, size_t bytes) {
 }
 
 int usbd_media_probe(struct ph_block_client *block, struct ph_ipc *ipc,
-    int process_fd, const kb2_block_disk_t *disk, int *is_install_media) {
+    pacha_fd_t process_fd, const kb2_block_disk_t *disk, int *is_install_media) {
     if (!block || !ipc || !disk || !is_install_media) return -EINVAL;
     *is_install_media = 0;
     struct media_reader reader = {.block = block, .ipc = ipc,
@@ -45,7 +45,7 @@ int usbd_media_probe(struct ph_block_client *block, struct ph_ipc *ipc,
 }
 
 int usbd_media_verify_blank(struct ph_block_client *block, struct ph_ipc *ipc,
-    int process_fd, const kb2_block_disk_t *disk) {
+    pacha_fd_t process_fd, const kb2_block_disk_t *disk) {
     if (!block || !ipc || !disk) return -EINVAL;
     struct media_reader reader = {.block = block, .ipc = ipc,
         .process_fd = process_fd, .disk = disk};

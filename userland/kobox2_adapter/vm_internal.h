@@ -2,6 +2,7 @@
 #ifndef PACHA_KOBOX_VM_INTERNAL_H
 #define PACHA_KOBOX_VM_INTERNAL_H
 
+#include <pacha/abi.h>
 #include "host.h"
 #include "vm.h"
 #include "vm_client_control.h"
@@ -20,14 +21,14 @@ struct ph_vm_space {
     const void *bootstrap_file;
     size_t bootstrap_size;
     const struct ph_exec_image *exec_image;
-    int process_fd;
-    int thread_fd;
-    int kick_fd;
-    int event_fd;
-    int control_fd;
+    pacha_fd_t process_fd;
+    pacha_fd_t thread_fd;
+    pacha_fd_t kick_fd;
+    pacha_fd_t event_fd;
+    pacha_fd_t control_fd;
     /* Parent-only capabilities: target max_prot must not exceed Linux PTE
      * permissions even if the child directly invokes native MPROTECT. */
-    int ram_grant_fds[8];
+    pacha_fd_t ram_grant_fds[8];
     struct ph_vm_client_control *control;
     struct ph_task *monitor;
     uint64_t pid;
@@ -68,11 +69,11 @@ uint64_t ph_vm_guest_fault_error(const struct ph_vm_space *space);
 bool ph_vm_read_executable(const struct ph_vm_space *space, uint64_t address,
     void *bytes, size_t length);
 bool ph_exec_capture_syscall_fault(struct ph_vm_space *space);
-uint64_t ph_vm_load_bootstrap(int process_fd, const void *file, size_t file_size);
-void ph_vm_map_anonymous(int process_fd, uint64_t address, size_t length);
+uint64_t ph_vm_load_bootstrap(pacha_fd_t process_fd, const void *file, size_t file_size);
+void ph_vm_map_anonymous(pacha_fd_t process_fd, uint64_t address, size_t length);
 int ph_vm_native_error(long status);
-void ph_vm_event_signal(int fd);
-void ph_vm_event_consume(int fd);
+void ph_vm_event_signal(pacha_fd_t fd);
+void ph_vm_event_consume(pacha_fd_t fd);
 
 /* Caller holds the space lock for idle validation and command publication. */
 uint64_t ph_vm_lock_space(struct ph_vm_space *space);

@@ -1,3 +1,4 @@
+#include "lpr_ipc_mock.h"
 /* Exercise public LPR mmap and the actual FILE_VMO RPC/codec. The native VM
  * mock retains the real capability ceiling: private COW permits WRITE from
  * MAP_READ, but neither mmap nor mprotect may invent EXEC authority. */
@@ -13,7 +14,7 @@
 #include "../userland/personality/linux/runtime/lpr_linux_syscall.h"
 
 int64_t lpr_linux_mmap(uint64_t addr,uint64_t len,uint64_t prot,
-                       uint64_t flags,uint64_t fd,uint64_t offset);
+                       uint64_t flags,uint64_t fd,uint64_t offset, unsigned *wait_not_ready __attribute__((unused)));
 
 lpr_state_t lpr_state;
 #if defined(LPR_BOOT_DIAGNOSTICS) && LPR_BOOT_DIAGNOSTICS
@@ -53,7 +54,7 @@ int64_t lpr_drm_mmap(uint64_t f,uint64_t a,uint64_t n,uint64_t p,uint64_t g,uint
 { (void)f;(void)a;(void)n;(void)p;(void)g;(void)o;assert(0);return -1; }
 int lpr_memfd_write_is_sealed(uint8_t flags) { (void)flags; return 0; }
 /* Stat is an explicit operation-local fixture input, not an image cache. */
-int64_t lpr_linux_fstat(uint64_t fd,uint64_t out)
+int64_t lpr_linux_fstat(uint64_t fd,uint64_t out, unsigned *wait_not_ready __attribute__((unused)))
 { assert(fd==3); if(stat_error)return stat_error; *(lpr_linux_stat_t *)(uintptr_t)out=(lpr_linux_stat_t){.st_size=(int64_t)file_bytes}; return 0; }
 int lpr_fd_table_pin(lpr_fd_table_t *t,lpr_linux_fd_t fd,lpr_fd_pin_t *p)
 { assert(t==&lpr_control_fd_table && fd==3); *p=(lpr_fd_pin_t){.fd=fd,.ops_id=LPR_FD_OPS_FILED,.effective_rights=LPR_FD_RIGHT_MMAP}; ++pins; return 0; }
@@ -115,7 +116,7 @@ int64_t lpr_pacha_syscall1(uint64_t nr,uint64_t fd)
 { assert(nr==PACHAOS_SYSCALL_FD_CLOSE && (fd==40 || fd==41 || fd==60 || fd==70)); return 0; }
 static int64_t unit_ipc_call(uint64_t fd,struct pacha_ipc_msg *msg);
 static int64_t unit_ipc_recv(uint64_t fd,struct pacha_ipc_msg *msg);
-int64_t lpr_pacha_syscall2(uint64_t nr,uint64_t a,uint64_t b)
+static int64_t fixture_prepare_request(uint64_t nr,uint64_t a,uint64_t b)
 {
     if(nr==PACHAOS_SYSCALL_LOG) { assert(b<=256); ++logs; return log_result; }
     if(nr==PACHAOS_SYSCALL_IPC_CALL)
@@ -155,8 +156,8 @@ static int64_t unit_ipc_recv(uint64_t fd,struct pacha_ipc_msg *msg)
     if(!snapshot_error) { msg->fd_count=1; caps[0]=(struct pacha_ipc_fd){.fd=60,.rights=snapshot_rights}; }
     return 0;
 }
-int64_t lpr_pacha_syscall4(uint64_t nr,uint64_t fd,uint64_t raw,uint64_t timeout,uint64_t flags)
-{ assert(nr==PACHAOS_SYSCALL_IPC_RECV_WAIT && timeout==UINT64_MAX && !flags); return unit_ipc_recv(fd,(void *)(uintptr_t)raw); }
+static int64_t fixture_finish_request(uint64_t nr,uint64_t fd,uint64_t raw,uint64_t timeout,uint64_t flags)
+{ assert(nr==PACHAOS_SYSCALL_IPC_RECV_WAIT && timeout==UINT64_MAX && flags == PACHA_WAIT_UNINTERRUPTIBLE); return unit_ipc_recv(fd,(void *)(uintptr_t)raw); }
 
 int64_t lpr_drm_native_mmap(uint64_t fd,uint64_t addr,uint64_t n,uint64_t p,uint64_t f,uint64_t o)
 {
@@ -201,15 +202,16 @@ static void reset(void)
 }
 
 static int64_t checked_mmap(uint64_t address,uint64_t length,uint64_t prot,
-    uint64_t flags,uint64_t fd,uint64_t offset)
+    uint64_t flags,uint64_t fd,uint64_t offset, unsigned *wait_not_ready)
 {
+    (void)wait_not_ready;
     expected_snapshot_offset=offset<file_bytes ? offset : 0;
     const uint64_t image=lpr_page_align_up(file_bytes);
     expected_snapshot_bytes=offset<file_bytes ? lpr_page_align_up(length) :
         (file_bytes<4096 ? file_bytes : 4096);
     if(offset<file_bytes && expected_snapshot_bytes>image-offset)
         expected_snapshot_bytes=image-offset;
-    return lpr_linux_mmap(address,length,prot,flags,fd,offset);
+    return lpr_linux_mmap(address,length,prot,flags,fd,offset, 0);
 }
 #define lpr_linux_mmap checked_mmap
 int main(void)
@@ -217,7 +219,7 @@ int main(void)
     reset();
     /* musl maps a read-only whole image, then remaps a nonzero-offset RX
      * PT_LOAD with MAP_FIXED. The first mapping must not acquire EXEC. */
-    int64_t base=lpr_linux_mmap(0,0x4a000,1,2,3,0);
+    int64_t base=lpr_linux_mmap(0,0x4a000,1,2,3,0, 0);
     assert(base>=4096 && !exec_snapshots);
 #ifndef LPR_MMAP_OLD_SOURCE
     /* The zero tail may not turn a read-only file reservation into an
@@ -228,15 +230,15 @@ int main(void)
 #ifdef LPR_MMAP_OLD_SOURCE
     expected_flags=0;
 #endif
-    int64_t text=lpr_linux_mmap((uint64_t)base+0xe000,0x25000,5,0x12,3,0xe000);
+    int64_t text=lpr_linux_mmap((uint64_t)base+0xe000,0x25000,5,0x12,3,0xe000, 0);
     fprintf(stderr,"LPR_PRIVATE_RX_RESULT=%lld EXEC_GRANTS=%u ANON=%u\n",(long long)text,exec_snapshots,anon_maps);
     assert(text==base+0xe000 && patches==1 && exec_snapshots==1 && !fallback_reads);
     reset();
-    assert(lpr_linux_mmap(0,4096,3,2,3,0)>=4096);
+    assert(lpr_linux_mmap(0,4096,3,2,3,0, 0)>=4096);
     assert(!exec_snapshots && !patches && !anon_maps);
     assert(snapshot_bytes==4096);
     reset(); file_bytes=256ull*1024*1024;
-    assert(lpr_linux_mmap(0,8192,1,2,3,128ull*1024*1024)>=4096);
+    assert(lpr_linux_mmap(0,8192,1,2,3,128ull*1024*1024, 0)>=4096);
     assert(snapshots==1 && snapshot_bytes==8192 && !exec_snapshots);
     for(unsigned scenario=0;scenario<5;++scenario) {
         reset(); expected_flags=FILED_FILE_VMO_EXEC;
@@ -244,39 +246,67 @@ int main(void)
         uint64_t offset=scenario==2 ? file_bytes : 0;
         uint64_t length=scenario==3 ? file_bytes+4096 : 4096;
         if(scenario==4)stat_error=-LPR_LINUX_EIO;
-        int64_t result=lpr_linux_mmap(0,length,5,2,3,offset);
+        int64_t result=lpr_linux_mmap(0,length,5,2,3,offset, 0);
         assert(result==(scenario==0 ? -LPR_LINUX_EACCES : -LPR_LINUX_EIO));
         assert(!anon_maps && !patches && !fallback_reads);
     }
     reset(); expected_flags=FILED_FILE_VMO_EXEC; map_error=3;
-    assert(lpr_linux_mmap(0,4096,5,2,3,0)==-LPR_LINUX_ENOMEM);
+    assert(lpr_linux_mmap(0,4096,5,2,3,0, 0)==-LPR_LINUX_ENOMEM);
     assert(exec_snapshots==1 && !anon_maps && !fallback_reads);
     reset(); expected_flags=FILED_FILE_VMO_EXEC;
-    assert(lpr_linux_mmap(0,4096,5,2,3,file_bytes)>=4096);
+    assert(lpr_linux_mmap(0,4096,5,2,3,file_bytes, 0)>=4096);
     assert(exec_snapshots==1 && !anon_maps && !patches);
     reset(); expected_flags=FILED_FILE_VMO_EXEC;
-    base=lpr_linux_mmap(0,file_bytes+4096,5,2,3,0);
+    base=lpr_linux_mmap(0,file_bytes+4096,5,2,3,0, 0);
     assert(base>=4096 && exec_snapshots==1 && !anon_maps && patches==1);
     assert(!lpr_pacha_syscall3(PACHAOS_SYSCALL_MPROTECT,base,file_bytes,5));
     assert(!lpr_pacha_syscall3(PACHAOS_SYSCALL_MPROTECT,base+file_bytes,4096,5));
     reset();
-    base=lpr_linux_mmap(0,4096,1,2,3,file_bytes);
+    base=lpr_linux_mmap(0,4096,1,2,3,file_bytes, 0);
     assert(base>=4096 && !exec_snapshots && !anon_maps);
     assert(lpr_pacha_syscall3(PACHAOS_SYSCALL_MPROTECT,base,4096,5)==1);
     reset(); snapshot_error=-LPR_LINUX_EIO; allow_fallback=1;
-    base=lpr_linux_mmap(0,4096,1,2,3,0);
+    base=lpr_linux_mmap(0,4096,1,2,3,0, 0);
     assert(base>=4096 && !exec_snapshots && !anon_maps && fallback_reads==1);
     assert(!(local_rights & PACHA_FD_RIGHT_MAP_EXEC));
     assert(lpr_pacha_syscall3(PACHAOS_SYSCALL_MPROTECT,base,4096,5)==1);
     reset(); snapshot_error=-LPR_LINUX_EIO; allow_fallback=1; map_error=3;
-    assert(lpr_linux_mmap(0,4096,1,2,3,0)==-LPR_LINUX_ENOMEM);
+    assert(lpr_linux_mmap(0,4096,1,2,3,0, 0)==-LPR_LINUX_ENOMEM);
     assert(!anon_maps && fallback_reads==1);
     reset(); file_bytes=0;
-    assert(lpr_linux_mmap(0,4096,5,2,3,0)==-LPR_LINUX_EINVAL && !snapshots && !anon_maps);
+    assert(lpr_linux_mmap(0,4096,5,2,3,0, 0)==-LPR_LINUX_EINVAL && !snapshots && !anon_maps);
     reset();
-    assert(lpr_linux_mmap(0,4096,5,2,3,UINT64_MAX-4095)==-LPR_LINUX_EOVERFLOW && !snapshots && !anon_maps);
+    assert(lpr_linux_mmap(0,4096,5,2,3,UINT64_MAX-4095, 0)==-LPR_LINUX_EOVERFLOW && !snapshots && !anon_maps);
     reset(); expected_flags=FILED_FILE_VMO_EXEC; log_result=-19;
-    assert(lpr_linux_mmap(0,4096,5,2,3,0)>=4096 && exec_snapshots==1);
+    assert(lpr_linux_mmap(0,4096,5,2,3,0, 0)>=4096 && exec_snapshots==1);
     assert(pins==unpins);
     puts("LPR_PRIVATE_MMAP_AUTHORITY_UNIT_PASS");
+}
+
+/* Request preparation and reply rendering are fixture phases within one
+ * synchronous syscall. Their transaction tags never become caller FDs. */
+int64_t lpr_pacha_syscall2(uint64_t nr, uint64_t a, uint64_t b)
+{
+    assert(nr != PACHAOS_SYSCALL_IPC_CALL);
+    return fixture_prepare_request(nr, a, b);
+}
+int64_t lpr_pacha_syscall4(uint64_t nr, uint64_t a, uint64_t b, uint64_t c, uint64_t d)
+{
+    return fixture_finish_request(nr, a, b, c, d);
+}
+int64_t lpr_ipc_message(uint64_t nr, uint64_t endpoint,
+    uint64_t request, uint64_t reply, uint64_t timeout, uint64_t flags, int *sent)
+{
+    if (nr != PACHA_IPC_SYSCALL_CALL) return test_lpr_ipc_noncall(nr, endpoint, request, reply, timeout, flags, sent);
+
+    assert(nr == PACHAOS_SYSCALL_IPC_CALL && request && reply);
+    assert(timeout == UINT64_MAX && flags == PACHA_WAIT_UNINTERRUPTIBLE);
+    *sent = 0;
+    int64_t transaction = fixture_prepare_request(nr, endpoint, request);
+    if (transaction < 16) return transaction;
+    *sent = 1;
+    int64_t status = fixture_finish_request(PACHAOS_SYSCALL_IPC_RECV_WAIT,
+        (uint64_t)transaction, reply, timeout, flags);
+
+    return status;
 }

@@ -140,7 +140,7 @@ static int validate_elf_header(const char *path, const unsigned char *image, uin
 
 static int stage_load_segment(
     const char *path,
-    int process_fd,
+    pacha_fd_t process_fd,
     uint64_t target_va,
     const unsigned char *image,
     uint32_t image_size,
@@ -177,14 +177,14 @@ static int stage_load_segment(
         PACHA_FD_RIGHT_MAP_READ |
         PACHA_FD_RIGHT_MAP_WRITE |
         PACHA_FD_RIGHT_MAP_EXEC;
-    const int vmo_fd = pacha_vmo_create(map_size, vmo_rights, 0);
+    const pacha_fd_t vmo_fd = pacha_vmo_create(map_size, vmo_rights, 0);
     if (vmo_fd < 16) {
-        fprintf(stderr, "[seed0boot] next-stage: vmo_create failed segment=%u status=%d\n", index, vmo_fd);
+        fprintf(stderr, "[seed0boot] next-stage: vmo_create failed segment=%u status=%ld\n", index, vmo_fd);
         return -3;
     }
     unsigned char *mapped = pacha_mmap(vmo_fd, map_size, PACHA_PROT_READ | PACHA_PROT_WRITE, PACHA_MMAP_SHARED, 0);
     if (mapped == 0) {
-        fprintf(stderr, "[seed0boot] next-stage: mmap staging VMO failed segment=%u fd=%d\n", index, vmo_fd);
+        fprintf(stderr, "[seed0boot] next-stage: mmap staging VMO failed segment=%u fd=%ld\n", index, vmo_fd);
         (void)pacha_fd_close(vmo_fd);
         return -4;
     }
@@ -196,7 +196,7 @@ static int stage_load_segment(
     const long map_status = pacha_process_map(process_fd, vmo_fd, target_va, map_size, prot, 0);
     if (map_status < 4096) {
         fprintf(stderr,
-            "[seed0boot] next-stage: process_map failed segment=%u process_fd=%d vmo_fd=%d status=%ld\n",
+            "[seed0boot] next-stage: process_map failed segment=%u process_fd=%ld vmo_fd=%ld status=%ld\n",
             index,
             process_fd,
             vmo_fd,
@@ -221,7 +221,7 @@ static int stage_load_segment(
 }
 
 int seed0_map_bytes_into_process(
-    int process_fd,
+    pacha_fd_t process_fd,
     uint64_t target_va,
     const void *data,
     uint64_t size,
@@ -242,7 +242,7 @@ int seed0_map_bytes_into_process(
         PACHA_FD_RIGHT_MAP_READ |
         PACHA_FD_RIGHT_MAP_WRITE |
         PACHA_FD_RIGHT_MAP_EXEC;
-    const int vmo_fd = pacha_vmo_create(map_size, vmo_rights, 0);
+    const pacha_fd_t vmo_fd = pacha_vmo_create(map_size, vmo_rights, 0);
     if (vmo_fd < 16) {
         return -3;
     }
@@ -269,22 +269,22 @@ static int push_u64(unsigned char *stack, uint64_t *sp, uint64_t value)
     return 0;
 }
 
-int seed0_start_process(const struct seed0_loaded_process *loaded, const char *argv0, int bootstrap_fd)
+int seed0_start_process(const struct seed0_loaded_process *loaded, const char *argv0, pacha_fd_t bootstrap_fd)
 {
     if (loaded == 0 || loaded->process_fd < 16 || loaded->runtime_entry == 0 ||
         loaded->phdr_va == 0 || loaded->phent == 0 || loaded->phnum == 0 || argv0 == 0) {
         return -1;
     }
-    const int process_fd = loaded->process_fd;
+    const pacha_fd_t process_fd = loaded->process_fd;
     const uint64_t stack_rights =
         PACHA_FD_RIGHT_INSPECT |
         PACHA_FD_RIGHT_TRANSFER |
         PACHA_FD_RIGHT_CLOSE |
         PACHA_FD_RIGHT_MAP_READ |
         PACHA_FD_RIGHT_MAP_WRITE;
-    const int stack_fd = pacha_vmo_create(PACHA_PROCESS_DEFAULT_STACK_SIZE, stack_rights, 0);
+    const pacha_fd_t stack_fd = pacha_vmo_create(PACHA_PROCESS_DEFAULT_STACK_SIZE, stack_rights, 0);
     if (stack_fd < 16) {
-        fprintf(stderr, "[seed0boot] next-stage: stack vmo_create failed status=%d\n", stack_fd);
+        fprintf(stderr, "[seed0boot] next-stage: stack vmo_create failed status=%ld\n", stack_fd);
         return -2;
     }
     unsigned char *stack = pacha_mmap(
@@ -367,15 +367,15 @@ int seed0_start_process(const struct seed0_loaded_process *loaded, const char *a
         PACHA_FD_RIGHT_KILL |
         PACHA_FD_RIGHT_START |
         PACHA_FD_RIGHT_SET_CONTEXT;
-    const int thread_fd = pacha_thread_create(process_fd, loaded->runtime_entry, stack_base + sp, 0, 0, thread_rights);
+    const pacha_fd_t thread_fd = pacha_thread_create(process_fd, loaded->runtime_entry, stack_base + sp, 0, 0, thread_rights);
     if (thread_fd < 16) {
-        fprintf(stderr, "[seed0boot] next-stage: thread_create failed status=%d\n", thread_fd);
+        fprintf(stderr, "[seed0boot] next-stage: thread_create failed status=%ld\n", thread_fd);
         (void)pacha_fd_close(process_fd);
         return -7;
     }
     const int start_status = pacha_thread_start(thread_fd);
     if (start_status != 0) {
-        fprintf(stderr, "[seed0boot] next-stage: thread_start failed thread_fd=%d status=%d\n", thread_fd, start_status);
+        fprintf(stderr, "[seed0boot] next-stage: thread_start failed thread_fd=%ld status=%d\n", thread_fd, start_status);
         (void)pacha_fd_close(thread_fd);
         (void)pacha_fd_close(process_fd);
         return -8;
@@ -420,9 +420,9 @@ int seed0_load_elf_process(
         PACHA_FD_RIGHT_SPAWN |
         PACHA_FD_RIGHT_MAP_INTO |
         PACHA_FD_RIGHT_SET_CONTEXT;
-    const int process_fd = pacha_process_create(process_rights, 0, grants, grant_count);
+    const pacha_fd_t process_fd = pacha_process_create(process_rights, 0, grants, grant_count);
     if (process_fd < 16) {
-        fprintf(stderr, "[seed0boot] next-stage: process_create failed status=%d\n", process_fd);
+        fprintf(stderr, "[seed0boot] next-stage: process_create failed status=%ld\n", process_fd);
         return -7;
     }
 

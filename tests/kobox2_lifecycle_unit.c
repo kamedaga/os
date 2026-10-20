@@ -260,7 +260,7 @@ static int ring_stop(void *context) {
     return ring_mode == 4 ? -EIO : 0;
 }
 
-static int ring_wait(void *context, int control_fd, uint64_t timeout) {
+static int ring_wait(void *context, pacha_fd_t control_fd, uint64_t timeout) {
     assert(context == &lifecycle && pthread_equal(pthread_self(), receiver));
     assert(control_fd == 16 && timeout == PACHA_FD_WAIT_FOREVER);
     if (ring_mode == 9) { ++ring_waits; return -EIO; }

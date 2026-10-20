@@ -1,3 +1,4 @@
+const process_timer = @import("../state/process_timer.zig");
 const std = @import("std");
 const abi_root = @import("kernel_abi_root");
 const interrupts = @import("../interrupts.zig");
@@ -24,6 +25,11 @@ const process_map_batch_entry_size: usize = @intCast(process_abi.process_map_bat
 var fork_failure_count: u64 = 0;
 
 fn reportForkFailure(stage: []const u8, status: u64) u64 {
+    // Host failure injection cannot access the serial I/O ports.
+    if (comptime @import("builtin").is_test) {
+        std.debug.print("fork: failure stage={s} status={}\n", .{ stage, status });
+        return status;
+    }
     const count = @atomicRmw(u64, &fork_failure_count, .Add, 1, .monotonic) +% 1;
     if (count <= 8 or (count & 63) == 0) {
         const store = kernel.vmObjectBackingStoreStats();
@@ -172,8 +178,8 @@ fn writeProtectForkCowVmas(state: *kernel.KernelState, from: kernel.PrincipalId)
     const source_table = state.getVmaTable(from) orelse return sc.syscall_err_invalid;
     var active_index: usize = 0;
     while (active_index < source_table.active_count) : (active_index += 1) {
-        const entry_index: usize = @intCast(source_table.active_indices[active_index]);
-        const source_entry = &source_table.entries[entry_index];
+        const entry_index: usize = @intCast(source_table.active_indices.get(@intCast(active_index)).?.*);
+        const source_entry = (source_table.entries.get(@intCast(entry_index)).?);
         if (!source_entry.active) continue;
         if (!source_entry.flags.fork_cow and !kernel.KernelState.forkCowEligible(source_entry)) continue;
         if (!user_vm.writeProtectPresentUserPagesForForkCow(from, source_entry.start_va, source_entry.size_bytes)) {
@@ -221,9 +227,12 @@ fn writeThreadStatus(h: anytype, proc: kernel.PrincipalId, out_va: u64, thread: 
 }
 
 fn wakeTaskFdWaiters(h: anytype, state: *kernel.KernelState, principal: kernel.PrincipalId) ?kernel.ThreadWakeTarget {
-    var wake_targets: [kernel.max_task_fd_waiters]kernel.ThreadWakeTarget = undefined;
-    const wake_count = state.takeTaskReadableWaitersForPrincipal(principal, wake_targets[0..]);
-    _ = fd_syscall.wakeThreadTargets(h, state, wake_targets[0..wake_count]);
+    var wake_targets: [32]kernel.ThreadWakeTarget = undefined;
+    while (true) {
+        const wake_count = state.takeTaskReadableWaitersForPrincipal(principal, wake_targets[0..]);
+        if (wake_count == 0) break;
+        _ = fd_syscall.wakeThreadTargets(h, state, wake_targets[0..wake_count]);
+    }
     return null;
 }
 
@@ -242,12 +251,16 @@ fn closeCloexecFdsWithWakes(
 fn threadObjectIsLive(thread: kernel.ThreadObject) bool {
     const index: usize = @intCast(thread.thread_index);
     const owner: kernel.PrincipalId = @enumFromInt(thread.owner_principal_raw);
-    const generation = scheduler.generationOfThread(index) orelse return false;
-    return generation == thread.thread_generation and scheduler.threadOwnedBy(index, owner);
+    // One table snapshot binds identity and owner to the same live slot.
+    return scheduler.threadWakeTargetIsLive(index, thread.thread_generation, owner);
 }
 
 fn cleanupProcess(h: anytype, state: *kernel.KernelState, principal: kernel.PrincipalId, exit_state: kernel.TaskObjectState, exit_code: u32) void {
     const process_index = kernel.processIndexFromPrincipal(principal) orelse return;
+    // K excludes delivery while T detaches both bindings. Drain before the
+    // old AS disappears: cancellation must never copy into a replacement AS.
+    scheduler.detachPrincipalIpcBindings(principal);
+    state.drainIpcCancellations(h.free_list);
     state.cancelFdWaitGroupsForOwner(principal);
     _ = scheduler.releasePrincipalThreads(principal);
     fd_syscall.closeProcessFdsWithWakes(h, state, principal, false);
@@ -255,8 +268,8 @@ fn cleanupProcess(h: anytype, state: *kernel.KernelState, principal: kernel.Prin
     user_vm.clearUserAddressSpace(principal);
     state.releasePrincipalNativeMemory(principal, h.free_list);
     state.resetProcessRuntimeTables(process_index);
+    user_vm.retireUserAddressSpace(principal);
     user_vm.unlockVmTransaction(principal);
-    _ = state.unpublishServiceEndpointsForTarget(principal);
     _ = state.markProcessExited(principal);
     state.markThreadObjectsExitedForPrincipal(principal, exit_state, exit_code);
     state.markProcessObjectsExited(principal, exit_state, exit_code);
@@ -272,7 +285,7 @@ fn exitProcessAfterTeardown(
     frame: *TrapFrame,
 ) void {
     beginPrincipalLifecycleForSelfExit(h, principal);
-    if (!quiescePrincipalForLifecycle(h, principal, true)) unreachable;
+    if (!quiescePrincipalForLifecycle(h, state, principal, (state.processDescriptor(principal) orelse unreachable).generation, true)) unreachable;
 
     const PublishContext = ProcessExitPublishContext(@TypeOf(h));
     var publish_context = PublishContext{
@@ -330,9 +343,7 @@ fn createProcess(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalI
         }
         _ = state.removeProcessDescriptor(principal);
     };
-    if (!user_vm.buildEmptyUserAddressSpace(principal)) {
-        return sc.syscall_err_map;
-    }
+    user_vm.buildEmptyUserAddressSpace(principal) catch |err| return addressSpacePreparationStatus(err);
     state.grantFdsForProcessCreate(proc, principal, grants[0..count], h.free_list) catch |err| {
         return switch (err) {
             kernel.KernelError.TableFull, kernel.KernelError.OutOfFreePages => sc.syscall_err_alloc,
@@ -364,15 +375,13 @@ fn createThread(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId
         break :blk @as(kernel.PrincipalId, @enumFromInt(process.principal_raw));
     };
     if (!state.hasActivePrincipal(owner)) return sc.syscall_err_invalid;
-    const thread_index = scheduler.allocateSuspendedThread(owner, h.user_spaces, buildUserTrapFrame(frame.rsi, frame.rdx), h.free_list) orelse return sc.syscall_err_alloc;
-    if (!scheduler.setFsBase(thread_index, frame.r8)) {
-        _ = scheduler.releaseThread(thread_index);
+    const allocated = scheduler.allocateSuspendedThread(owner, h.user_spaces, buildUserTrapFrame(frame.rsi, frame.rdx), h.free_list) orelse return sc.syscall_err_alloc;
+    const thread_index = allocated.index;
+    if (!scheduler.setThreadBasesGeneration(thread_index, allocated.generation, owner, frame.r8, 0)) {
+        _ = scheduler.releaseThreadGeneration(thread_index, allocated.generation, owner);
         return sc.syscall_err_invalid;
     }
-    const generation = scheduler.generationOfThread(thread_index) orelse {
-        _ = scheduler.releaseThread(thread_index);
-        return sc.syscall_err_invalid;
-    };
+    const generation = allocated.generation;
     const rights = kernel.fdRightsFromBits(frame.r9);
     return state.createThreadFd(proc, .{
         .owner_principal_raw = @intFromEnum(owner),
@@ -381,7 +390,7 @@ fn createThread(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId
         .state = .active,
         .exit_code = 0,
     }, rights, .{}, first_dynamic_fd) catch |err| {
-        _ = scheduler.releaseThread(thread_index);
+        _ = scheduler.releaseThreadGeneration(thread_index, allocated.generation, owner);
         return switch (err) {
             kernel.KernelError.TableFull => sc.syscall_err_alloc,
             else => sc.syscall_err_invalid,
@@ -389,7 +398,16 @@ fn createThread(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId
     };
 }
 
-fn cloneCurrentProcessForFork(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, frame: *TrapFrame) u64 {
+// These failures occur before publication. Preserve allocation pressure as
+// ERR_ALLOC so callers can retry without mistaking it for an invalid mapping.
+fn addressSpacePreparationStatus(err: error{ OutOfFreePages, InvalidState }) u64 {
+    return switch (err) {
+        error.OutOfFreePages => sc.syscall_err_alloc,
+        error.InvalidState => sc.syscall_err_map,
+    };
+}
+
+fn cloneCurrentProcessForFork(comptime Scheduler: type, h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, frame: *TrapFrame) u64 {
     const rights = kernel.fdRightsFromBits(frame.rdi);
     if ((frame.rsi & ~process_abi.process_clone_known_flags_mask) != 0) return sc.syscall_err_invalid;
     if ((frame.rsi & process_abi.process_clone_flag_current_thread) == 0) return sc.syscall_err_invalid;
@@ -414,7 +432,7 @@ fn cloneCurrentProcessForFork(h: anytype, state: *kernel.KernelState, proc: kern
         "fd-process-clone",
         h.free_list,
         h.user_spaces,
-        scheduler.principalSlotReusable,
+        Scheduler.principalSlotReusable,
     ) orelse return reportForkFailure("process_descriptor", sc.syscall_err_alloc);
     var child_active = true;
     defer if (child_active) {
@@ -428,38 +446,32 @@ fn cloneCurrentProcessForFork(h: anytype, state: *kernel.KernelState, proc: kern
         _ = state.removeProcessDescriptor(child);
     };
 
-    if (!user_vm.buildEmptyUserAddressSpace(child)) {
-        return reportForkFailure("address_space", sc.syscall_err_map);
-    }
+    user_vm.buildEmptyUserAddressSpace(child) catch |err|
+        return reportForkFailure("address_space", addressSpacePreparationStatus(err));
     const source_table = state.getFdTableConst(proc) orelse return sc.syscall_err_invalid;
-    state.ensureFdTableCapacity(child, source_table.slots().len, h.free_list) catch
+    state.ensureFdTableCapacity(child, source_table.capacity, h.free_list) catch
         return reportForkFailure("fd_table_capacity", sc.syscall_err_alloc);
     state.cloneFdTableForFork(proc, child) catch |err| return switch (err) {
-        kernel.KernelError.TableFull => reportForkFailure("fd_table", sc.syscall_err_alloc),
+        kernel.KernelError.TableFull, kernel.KernelError.OutOfFreePages => reportForkFailure("fd_table", sc.syscall_err_alloc),
         else => sc.syscall_err_invalid,
     };
 
     // Allocate every remaining fallible resource before committing parent
     // VM metadata.  The child remains suspended and its process FD cannot be
     // observed until this syscall returns.
-    const thread_index = scheduler.allocateSuspendedThread(child, h.user_spaces, child_frame, h.free_list) orelse
+    const allocated = Scheduler.allocateSuspendedThread(child, h.user_spaces, child_frame, h.free_list) orelse
         return reportForkFailure("thread", sc.syscall_err_alloc);
+    const thread_index = allocated.index;
     var thread_active = true;
     defer {
         if (thread_active) {
-            _ = scheduler.releaseThread(thread_index);
+            _ = Scheduler.releaseThreadGeneration(thread_index, allocated.generation, child);
         }
     }
-    if (!scheduler.copySignalDeliveryConfig(scheduler.currentThread(), thread_index)) {
+    if (!Scheduler.copyCurrentThreadStateToGeneration(thread_index, allocated.generation, child)) {
         return sc.syscall_err_not_ready;
     }
-    if (!scheduler.copyThreadXState(scheduler.currentThread(), thread_index)) {
-        return sc.syscall_err_not_ready;
-    }
-    if (!scheduler.setFsBase(thread_index, scheduler.currentFsBase())) {
-        return sc.syscall_err_invalid;
-    }
-    if (!scheduler.setThreadGsBase(thread_index, scheduler.currentGsBase())) {
+    if (!Scheduler.setThreadBasesGeneration(thread_index, allocated.generation, child, Scheduler.currentFsBase(), Scheduler.currentGsBase())) {
         return sc.syscall_err_invalid;
     }
     const process_fd = state.createProcessFd(proc, .{
@@ -467,7 +479,7 @@ fn cloneCurrentProcessForFork(h: anytype, state: *kernel.KernelState, proc: kern
         .state = .active,
         .exit_code = 0,
     }, rights, .{}, first_dynamic_fd) catch |err| return switch (err) {
-        kernel.KernelError.TableFull => reportForkFailure("process_fd", sc.syscall_err_alloc),
+        kernel.KernelError.TableFull, kernel.KernelError.OutOfFreePages => reportForkFailure("process_fd", sc.syscall_err_alloc),
         else => sc.syscall_err_invalid,
     };
     var process_fd_active = true;
@@ -483,16 +495,15 @@ fn cloneCurrentProcessForFork(h: anytype, state: *kernel.KernelState, proc: kern
         }
         defer user_vm.unlockVmTransactionPair(proc, child);
         state.cloneVmaTableForFork(proc, child) catch |err| return switch (err) {
-            kernel.KernelError.TableFull => reportForkFailure("vma_table", sc.syscall_err_alloc),
+            kernel.KernelError.TableFull, kernel.KernelError.OutOfFreePages => reportForkFailure("vma_table", sc.syscall_err_alloc),
             else => sc.syscall_err_invalid,
         };
         // Clone all fallible child address-space metadata before committing
         // the parent.  Marking every eligible parent VMA COW before the first
         // write-protect makes even a partially failed PTE pass recoverable:
         // any resulting RO page takes the normal COW write-fault path.
-        if (!user_vm.cloneAddressSpaceMetadataForFork(proc, child)) {
-            return reportForkFailure("page_table_clone", sc.syscall_err_map);
-        }
+        user_vm.cloneAddressSpaceMetadataForFork(proc, child) catch |err|
+            return reportForkFailure("page_table_clone", addressSpacePreparationStatus(err));
         state.markForkCowVmasCommitted(proc);
         const protect_status = writeProtectForkCowVmas(state, proc);
         if (protect_status != sc.syscall_ok) {
@@ -507,7 +518,7 @@ fn cloneCurrentProcessForFork(h: anytype, state: *kernel.KernelState, proc: kern
     // Publish the child to the scheduler only after the parent has a durable
     // process handle.  Before this point every rollback can release a
     // suspended context without racing an AP that already entered the child.
-    if (!scheduler.markThreadReady(thread_index, true)) {
+    if (!Scheduler.markThreadReadyGeneration(thread_index, allocated.generation, child, true)) {
         return sc.syscall_err_not_ready;
     }
     process_fd_active = false;
@@ -517,16 +528,21 @@ fn cloneCurrentProcessForFork(h: anytype, state: *kernel.KernelState, proc: kern
     return process_fd;
 }
 
-fn controlThreadContext(h: anytype, state: *kernel.KernelState,
-    proc: kernel.PrincipalId, frame: *TrapFrame) u64
-{
+// Host tests replace only privileged/lifecycle boundaries. Resource ownership,
+// syscall status and rollback execute the production transaction above.
+pub const ForkPreparationTest = if (@import("builtin").is_test) struct {
+    pub fn run(comptime Scheduler: type, h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, frame: *TrapFrame) u64 {
+        return cloneCurrentProcessForFork(Scheduler, h, state, proc, frame);
+    }
+} else struct {};
+
+fn controlThreadContext(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, frame: *TrapFrame) u64 {
     if (frame.rdi > std.math.maxInt(kernel.Fd) or frame.rdx == 0 or
         frame.r10 != process_abi.thread_user_context_size or
         (frame.rsi != process_abi.thread_context_get and frame.rsi != process_abi.thread_context_set))
         return sc.syscall_err_invalid;
     const writing = frame.rsi == process_abi.thread_context_set;
-    const thread = state.threadObjectForFd(proc, @intCast(frame.rdi),
-        if (writing) .{ .set_context = true } else .{ .inspect = true }) orelse return sc.syscall_err_invalid;
+    const thread = state.threadObjectForFd(proc, @intCast(frame.rdi), if (writing) .{ .set_context = true } else .{ .inspect = true }) orelse return sc.syscall_err_invalid;
     if (!processAddressSpaceAvailable(thread.state) or !threadObjectIsLive(thread)) return sc.syscall_err_invalid;
     const owner: kernel.PrincipalId = @enumFromInt(thread.owner_principal_raw);
     const index: usize = @intCast(thread.thread_index);
@@ -535,7 +551,9 @@ fn controlThreadContext(h: anytype, state: *kernel.KernelState,
         if (!scheduler.getControlledThreadContext(index, thread.thread_generation, owner, &context))
             return sc.syscall_err_not_ready;
         return if (h.copy_bytes_to_user_va(proc, frame.rdx, std.mem.asBytes(&context)))
-            sc.syscall_ok else sc.syscall_err_invalid;
+            sc.syscall_ok
+        else
+            sc.syscall_err_invalid;
     }
     // Copy and validate the entire caller image before touching the target.
     if (!h.copy_user_bytes_from_va(proc, frame.rdx, std.mem.asBytes(&context)) or
@@ -543,7 +561,9 @@ fn controlThreadContext(h: anytype, state: *kernel.KernelState,
         context.xstate_features != process_abi.signal_xstate_feature_mask or
         context.reserved[0] != 0 or context.reserved[1] != 0 or context.reserved[2] != 0 or
         context.pkru > std.math.maxInt(u32) or
-        !user_vm.isUserCanonicalVa(context.fs_base) or !user_vm.isUserCanonicalVa(context.gs_base) or
+        // With FSGSBASE a thread may hold any canonical base, so a GET of it
+        // must SET back; a non-canonical one would fault the kernel's write.
+        !x86_platform.isCanonicalBase(context.fs_base) or !x86_platform.isCanonicalBase(context.gs_base) or
         !x86_platform.validateUserXState(&context.xstate)) return sc.syscall_err_invalid;
     var registers: TrapFrame = undefined;
     inline for (std.meta.fields(TrapFrame)) |field|
@@ -553,13 +573,15 @@ fn controlThreadContext(h: anytype, state: *kernel.KernelState,
     // through the externally controlled return frame.
     context.registers.rflags = (context.registers.rflags & 0x0020_0ed5) | 0x202;
     return if (scheduler.setControlledThreadContext(index, thread.thread_generation, owner, &context))
-        sc.syscall_ok else sc.syscall_err_not_ready;
+        sc.syscall_ok
+    else
+        sc.syscall_err_not_ready;
 }
 
 fn startThread(state: *kernel.KernelState, proc: kernel.PrincipalId, fd: kernel.Fd) u64 {
     const thread = state.threadObjectForFd(proc, fd, .{ .start = true }) orelse return sc.syscall_err_invalid;
     if (!processRunnable(thread.state) or !threadObjectIsLive(thread)) return sc.syscall_err_invalid;
-    if (!scheduler.markThreadReady(@intCast(thread.thread_index), true)) return sc.syscall_err_invalid;
+    if (!scheduler.markThreadReadyGeneration(@intCast(thread.thread_index), thread.thread_generation, @enumFromInt(thread.owner_principal_raw), true)) return sc.syscall_err_invalid;
     return sc.syscall_ok;
 }
 
@@ -572,7 +594,7 @@ fn killThread(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, 
         if (thread.thread_index == scheduler.currentThread()) return sc.syscall_err_invalid;
         // In particular, a remote CPU may still be executing this generation.
         // Never release a shared-memory lock based on an uncompleted kill.
-        if (!scheduler.releaseThread(@intCast(thread.thread_index))) return sc.syscall_err_not_ready;
+        if (!scheduler.releaseThreadGeneration(@intCast(thread.thread_index), thread.thread_generation, @enumFromInt(thread.owner_principal_raw))) return sc.syscall_err_not_ready;
     }
     state.markThreadObjectsExitedBySlot(thread.thread_index, thread.thread_generation, .killed, code);
     _ = wakeTaskFdWaiters(h, state, @enumFromInt(thread.owner_principal_raw));
@@ -616,14 +638,11 @@ fn beginPrincipalLifecycleForSelfExit(h: anytype, target: kernel.PrincipalId) vo
 /// Stop every context, let in-flight target syscalls reach the admission
 /// barrier, then scan once more while the kernel-state lock excludes external
 /// thread creation. The current CPU may be ignored only for self-stop.
-fn quiescePrincipalForLifecycle(h: anytype, target: kernel.PrincipalId, ignore_current_cpu: bool) bool {
+fn quiescePrincipalForLifecycle(h: anytype, state: *kernel.KernelState, target: kernel.PrincipalId, generation: u32, ignore_current_cpu: bool) bool {
     const drop_lock = h.before_current_thread_leave orelse return false;
     const reacquire_lock = h.reacquire_kernel_state_lock orelse return false;
     const current_cpu = scheduler.currentCpu();
-    const ignored_mask = if (ignore_current_cpu and current_cpu < 64)
-        @as(u64, 1) << @intCast(current_cpu)
-    else
-        0;
+    const ignored_cpu: ?usize = if (ignore_current_cpu) current_cpu else null;
     while (true) {
         _ = scheduler.stopPrincipalThreads(target);
         drop_lock.run(drop_lock.context);
@@ -633,10 +652,14 @@ fn quiescePrincipalForLifecycle(h: anytype, target: kernel.PrincipalId, ignore_c
             scheduler.waitForPrincipalQuiescence(target);
         }
         reacquire_lock.run(reacquire_lock.context);
+        // Only scalar identity crosses K drop. Reject reuse before rescanning
+        // threads or allowing the caller to clean up the replacement process.
+        const descriptor = state.processDescriptor(target) orelse return false;
+        if (descriptor.generation != generation) return false;
         // An already-entered THREAD_CREATE can finish only while the lock is
         // dropped. Catch its context before deciding teardown is safe.
         _ = scheduler.stopPrincipalThreads(target);
-        if ((scheduler.cpuMaskRunningPrincipal(target) & ~ignored_mask) == 0) return true;
+        if (!scheduler.principalRunningExcept(target, ignored_cpu)) return true;
     }
 }
 
@@ -657,7 +680,7 @@ fn killProcess(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId,
             sc.syscall_err_not_ready;
     }
     defer scheduler.endPrincipalLifecycle();
-    if (!quiescePrincipalForLifecycle(h, target, false)) return sc.syscall_err_not_ready;
+    if (!quiescePrincipalForLifecycle(h, state, target, existing.generation, false)) return sc.syscall_err_not_ready;
     cleanupProcess(h, state, target, .killed, code);
     return sc.syscall_ok;
 }
@@ -680,7 +703,9 @@ fn signalProcess(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalI
     };
     if (!state.hasActivePrincipal(target)) return sc.syscall_err_invalid;
     _ = scheduler.deliverSignal(
+        state,
         target,
+        (state.processDescriptor(target) orelse return sc.syscall_err_invalid).generation,
         signo,
         sc.syscall_err_not_ready,
     ) orelse return sc.syscall_err_not_ready;
@@ -713,9 +738,7 @@ comptime {
 }
 
 fn validReturnedSignalContext(context: *const TrapFrame) bool {
-    const user_cs = @as(u64, boot_static.gdt_user_code_selector) | 0x3;
-    const user_ss = @as(u64, boot_static.gdt_user_data_selector) | 0x3;
-    return context.cs == user_cs and context.ss == user_ss and
+    return @import("../arch/x86_64/platform.zig").validUserSelectors(context.cs, context.ss) and
         isUserEntryVa(context.rip) and isUserEntryVa(context.rsp);
 }
 
@@ -808,7 +831,7 @@ fn writeSignalTimerState(
     h: anytype,
     proc: kernel.PrincipalId,
     out_va: u64,
-    state: scheduler.ProcessSignalTimerState,
+    state: process_timer.State,
 ) u64 {
     if (out_va == 0) return sc.syscall_err_invalid;
     if (!h.write_user_u64(
@@ -830,6 +853,7 @@ fn writeSignalTimerState(
 }
 
 fn signalControl(h: anytype, proc: kernel.PrincipalId, frame: *TrapFrame) u64 {
+    const state = h.state;
     switch (frame.rdi) {
         process_abi.signal_ctl_register => {
             const entry = frame.rsi;
@@ -885,20 +909,22 @@ fn signalControl(h: anytype, proc: kernel.PrincipalId, frame: *TrapFrame) u64 {
                 h,
                 proc,
                 frame.rsi,
-                scheduler.getProcessSignalTimer(proc, scheduler.lapic_tick_count),
+                process_timer.get(state, proc, (state.processDescriptor(proc) orelse return sc.syscall_err_invalid).generation, scheduler.lapic_tick_count),
             );
         },
         process_abi.signal_ctl_set_timer => {
             const signo: u32 = @truncate(frame.rsi);
             if (signo == 0 or signo > process_abi.signal_max)
                 return sc.syscall_err_invalid;
-            const old = scheduler.setProcessSignalTimer(
+            const old = process_timer.set(
+                state,
                 proc,
+                (state.processDescriptor(proc) orelse return sc.syscall_err_invalid).generation,
                 signo,
                 frame.rdx,
                 frame.r10,
                 scheduler.lapic_tick_count,
-            ) catch return sc.syscall_err_alloc;
+            );
             return if (frame.r8 == 0)
                 sc.syscall_ok
             else
@@ -943,7 +969,7 @@ fn stopProcess(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId,
         else
             sc.syscall_err_not_ready;
     }
-    if (!quiescePrincipalForLifecycle(h, target, target == proc)) {
+    if (!quiescePrincipalForLifecycle(h, state, target, existing.generation, target == proc)) {
         scheduler.endPrincipalLifecycle();
         return sc.syscall_err_not_ready;
     }
@@ -1062,7 +1088,7 @@ fn prepareProcessMapRequest(
         kernel_log.write("process.map failed align\n");
         return .{ .status = sc.syscall_err_invalid };
     };
-    if (aligned_size / 4096 > kernel.max_vmo_backing_pages) {
+    if (aligned_size / 4096 > kernel.max_vmo_logical_pages) {
         kernel_log.write("process.map failed too-large\n");
         return .{ .status = sc.syscall_err_alloc };
     }
@@ -1114,16 +1140,16 @@ fn installProcessMapLocked(
         if (state.rangeOverlapsPinnedUserObject(target_owner, target_va, req.aligned_size))
             return .{ .status = sc.syscall_err_invalid };
         const slots = user_vm.unmapPresentRemoteUserRegionSplitSlotsRequired(
-            target_owner, target_va, @intCast(req.aligned_size),
+            target_owner,
+            target_va,
+            @intCast(req.aligned_size),
         ) orelse return .{ .status = sc.syscall_err_map };
-        if (slots > user_vm.freeUserReservationSlotCount(target_owner))
+        if (!user_vm.prepareUserReservationSlots(target_owner, slots))
             return .{ .status = sc.syscall_err_alloc };
         var prepared = (if (req.flags.anonymous)
-            state.prepareFixedAnonymousMmap(target_owner, target_va, req.aligned_size,
-                req.prot, .{ .read = true, .write = true, .exec = true }, req.flags, free_list)
+            state.prepareFixedAnonymousMmap(target_owner, target_va, req.aligned_size, req.prot, .{ .read = true, .write = true, .exec = true }, req.flags, free_list)
         else
-            state.prepareFixedFdMmapIntoProcess(proc, req.vmo_fd, target_owner,
-                target_va, req.aligned_size, req.prot, req.flags, req.vmo_offset, free_list)) catch |err|
+            state.prepareFixedFdMmapIntoProcess(proc, req.vmo_fd, target_owner, target_va, req.aligned_size, req.prot, req.flags, req.vmo_offset, free_list)) catch |err|
             return .{ .status = switch (err) {
                 kernel.KernelError.TableFull, kernel.KernelError.OutOfFreePages => sc.syscall_err_alloc,
                 else => sc.syscall_err_invalid,
@@ -1187,19 +1213,14 @@ fn installProcessMapLocked(
     }
     if (!req.prot.read and !req.prot.write and !req.prot.exec) return .{ .status = sc.syscall_ok, .mapped_va = target_va };
 
-    var paddrs: [kernel.max_vmo_backing_pages]u64 = undefined;
     const page_count: usize = @intCast(req.aligned_size / 4096);
-    var pte_prot: ?kernel.MapProt = null;
-    var i: usize = 0;
-    while (i < page_count) : (i += 1) {
-        const mapping = state.nativeVmaInitialMapping(target_owner, target_va + @as(u64, @intCast(i)) * 4096) orelse {
-            kernel_log.write("process.map failed missing-page\n");
-            state.munmapRangeWithFreeList(target_owner, target_va, req.aligned_size, free_list) catch {};
-            return .{ .status = sc.syscall_err_map };
-        };
-        paddrs[i] = mapping.paddr;
-        if (pte_prot == null) pte_prot = mapping.prot;
-    }
+    const first = state.nativeVmaInitialMapping(target_owner, target_va) orelse {
+        // Host rollback fixtures cannot execute the serial port I/O logger.
+        if (!@import("builtin").is_test) kernel_log.write("process.map failed missing-page\n");
+        state.munmapRangeWithFreeList(target_owner, target_va, req.aligned_size, free_list) catch {};
+        return .{ .status = sc.syscall_err_map };
+    };
+    const pages = user_vm.InitialVmaPages{ .state = state, .principal = target_owner, .base = target_va, .prot = first.prot };
     const low_page_zero_map =
         !anywhere and
         target_va == 0 and
@@ -1208,18 +1229,9 @@ fn installProcessMapLocked(
         req.prot.read and
         !req.prot.write and
         req.prot.exec;
-    const initial_prot = pte_prot orelse kernel.MapProt{};
-    const map_ok = if (low_page_zero_map)
-        user_vm.mapTrustedLowPageZeroPaddrsWithProt(target_owner, target_va, paddrs[0..page_count], .{
-            .read = initial_prot.read,
-            .write = initial_prot.write,
-            .exec = initial_prot.exec,
-            .pkey = initial_prot.pkey,
-        })
-    else
-        user_vm.mapTrustedUserPaddrsWithProt(target_owner, target_va, paddrs[0..page_count], initial_prot);
+    const map_ok = user_vm.mapTrustedUserPageSequence(target_owner, target_va, page_count, pages, user_vm.InitialVmaPages.at, first.prot, low_page_zero_map);
     if (!map_ok) {
-        kernel_log.write("process.map failed map-paddrs\n");
+        if (!@import("builtin").is_test) kernel_log.write("process.map failed map-paddrs\n");
         state.munmapRangeWithFreeList(target_owner, target_va, req.aligned_size, free_list) catch {};
         return .{ .status = sc.syscall_err_map };
     }
@@ -1276,9 +1288,11 @@ fn unmapFromProcess(
     defer user_vm.unlockVmTransactionPair(proc, target);
     if (state.rangeOverlapsPinnedUserObject(target, frame.rsi, size)) return sc.syscall_err_invalid;
     const slots = user_vm.unmapPresentRemoteUserRegionSplitSlotsRequired(
-        target, frame.rsi, @intCast(size),
+        target,
+        frame.rsi,
+        @intCast(size),
     ) orelse return sc.syscall_err_map;
-    if (slots > user_vm.freeUserReservationSlotCount(target)) return sc.syscall_err_alloc;
+    if (!user_vm.prepareUserReservationSlots(target, slots)) return sc.syscall_err_alloc;
     var prepared = state.prepareMunmapRangeWithFreeList(target, frame.rsi, size, free_list) catch |err| return switch (err) {
         kernel.KernelError.TableFull, kernel.KernelError.OutOfFreePages => sc.syscall_err_alloc,
         else => sc.syscall_err_invalid,
@@ -1406,12 +1420,12 @@ fn execFromStagedProcess(
     {
         if (!user_vm.lockVmTransactionPair(staged_owner, proc)) return sc.syscall_err_map;
         defer user_vm.unlockVmTransactionPair(staged_owner, proc);
-        if (!user_vm.cloneAddressSpaceMetadataForFork(staged_owner, proc)) return sc.syscall_err_map;
+        user_vm.cloneAddressSpaceMetadataForFork(staged_owner, proc) catch |err| return addressSpacePreparationStatus(err);
         // The destination page tables were replaced in place while retaining
         // the process PCID.  Flush that context on every CPU before returning
         // any old VMA backing page to the allocator.
         if (!user_copy.synchronizeUserMemoryForPrincipal(proc)) unreachable;
-        state.replaceVmaTableForExec(proc, staged_owner, h.free_list) catch unreachable;
+        transferStagedVmasForExec(state, h.free_list, proc, staged_owner);
     }
 
     cleanupProcess(h, state, staged_owner, .exited, 0);
@@ -1420,6 +1434,18 @@ fn execFromStagedProcess(
     frame.* = image.frame;
     return sc.syscall_ok;
 }
+
+// Caller holds the VM transaction pair and has already retired the destination
+// context. Move the staged clear from cleanup to BEFORE the ownership handoff:
+// a blocked thread is not proof that its old translations have been retired.
+fn transferStagedVmasForExec(state: *kernel.KernelState, free_list: *kernel.FreePageList, proc: kernel.PrincipalId, staged_owner: kernel.PrincipalId) void {
+    user_vm.clearUserAddressSpace(staged_owner);
+    state.replaceVmaTableForExec(proc, staged_owner, free_list) catch unreachable;
+}
+
+pub const ExecTransferTest = if (@import("builtin").is_test) struct {
+    pub const run = transferStagedVmasForExec;
+} else struct {};
 
 fn synchronizeProcessMemory(proc: kernel.PrincipalId, flags: u64) u64 {
     if ((flags & ~process_abi.process_memory_barrier_known_flags_mask) != 0) {
@@ -1436,7 +1462,7 @@ fn exitCurrentThread(h: anytype, state: *kernel.KernelState, proc: kernel.Princi
     if ((exit_flags & ~process_abi.thread_exit_known_flags_mask) != 0) return sc.syscall_err_invalid;
     const clear_tid = (exit_flags & process_abi.thread_exit_flag_clear_tid) != 0;
     const current = scheduler.currentThread();
-    const generation = scheduler.generationOfThread(current) orelse {
+    const generation = scheduler.currentThreadGeneration() orelse {
         if (clear_tid) runtime.clearTidAndWake(h, proc, frame.rsi);
         exitProcessAfterTeardown(h, state, proc, .exited, code, frame);
         return frame.rax;
@@ -1493,7 +1519,7 @@ pub fn dispatch(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId
         sc.syscall_thread_set_fs_base => blk: {
             const fs_base = frame.rdi;
             if (fs_base != 0 and !user_vm.isUserCanonicalVa(fs_base)) break :blk sc.syscall_err_invalid;
-            if (!scheduler.setFsBase(scheduler.currentThread(), fs_base)) break :blk sc.syscall_err_not_ready;
+            if (!scheduler.setCurrentFsBase(fs_base)) break :blk sc.syscall_err_not_ready;
             break :blk sc.syscall_ok;
         },
         sc.syscall_thread_set_gs_base => blk: {
@@ -1502,7 +1528,7 @@ pub fn dispatch(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId
             if (!scheduler.setCurrentGsBase(gs_base)) break :blk sc.syscall_err_not_ready;
             break :blk sc.syscall_ok;
         },
-        sc.syscall_process_clone => cloneCurrentProcessForFork(h, state, proc, frame),
+        sc.syscall_process_clone => cloneCurrentProcessForFork(scheduler, h, state, proc, frame),
         sc.syscall_process_map => mapIntoProcess(state, proc, h.free_list, frame),
         sc.syscall_process_map_batch => mapBatchIntoProcess(h, state, proc, h.free_list, frame),
         sc.syscall_process_unmap => unmapFromProcess(state, proc, h.free_list, frame),
@@ -1510,4 +1536,51 @@ pub fn dispatch(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId
         sc.syscall_process_memory_barrier => synchronizeProcessMemory(proc, frame.rdi),
         else => null,
     };
+}
+
+test "lifecycle admission rechecks process generation before resumed scan" {
+    const Fixture = struct {
+        var storage: [kernel.runtimeStorageBytes()]u8 align(4096) = undefined;
+        state: *kernel.KernelState,
+        owner: kernel.PrincipalId,
+        replace: bool,
+        reacquired: bool = false,
+        fn drop(_: *anyopaque) void {}
+        fn reacquire(pointer: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(pointer));
+            self.reacquired = true;
+            if (self.replace) {
+                std.debug.assert(self.state.removeProcessDescriptor(self.owner));
+                std.debug.assert(self.state.createProcessDescriptor("replacement lifecycle").? == self.owner);
+            }
+            const ctx = scheduler.threadContextMutable(9).?;
+            ctx.* = .{ .id = 9, .generation = 9, .allocated = true, .ready = true, .owner_process = self.owner };
+        }
+    };
+    scheduler.initializeStaticStorage();
+    defer scheduler.initializeStaticStorage();
+    try std.testing.expect(kernel.initRuntimeStorage(&Fixture.storage));
+    const state = try std.testing.allocator.create(kernel.KernelState);
+    defer std.testing.allocator.destroy(state);
+    try state.initFromDetectedRegionsInPlace(1);
+    const owner = state.createProcessDescriptor("lifecycle").?;
+    const old_generation = state.processDescriptor(owner).?.generation;
+    const ctx = scheduler.threadContextMutable(9).?;
+    const saved = ctx.*;
+    defer ctx.* = saved;
+    var fixture = Fixture{ .state = state, .owner = owner, .replace = true };
+    const callback = scheduler.BeforeCurrentThreadLeaveCallback;
+    const hooks = .{
+        .before_current_thread_leave = @as(?callback, .{ .context = &fixture, .run = Fixture.drop }),
+        .reacquire_kernel_state_lock = @as(?callback, .{ .context = &fixture, .run = Fixture.reacquire }),
+    };
+    try std.testing.expect(!quiescePrincipalForLifecycle(hooks, state, owner, old_generation, false));
+    try std.testing.expect(fixture.reacquired);
+    try std.testing.expect(ctx.ready and !ctx.stopped);
+    fixture.replace = false;
+    fixture.reacquired = false;
+    const generation = state.processDescriptor(owner).?.generation;
+    try std.testing.expect(quiescePrincipalForLifecycle(hooks, state, owner, generation, false));
+    try std.testing.expect(fixture.reacquired);
+    try std.testing.expect(!ctx.ready and ctx.stopped);
 }

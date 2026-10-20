@@ -12,7 +12,7 @@
 
 static char diagnostic[256];
 static unsigned int observed_phases;
-int pacha_log_emit(int endpoint_fd, unsigned source, const char *message, size_t length)
+int pacha_log_emit(pacha_fd_t endpoint_fd, unsigned source, const char *message, size_t length)
 {
     assert(endpoint_fd == 29 && source == PACHA_LOG_SOURCE_GPUD);
     assert(length < sizeof(diagnostic));
@@ -76,7 +76,7 @@ static void prime_profile_admission(void)
     for (size_t i = 0; i < 2; ++i) {
         service.profile_kind = profiles[i];
         service.files.generation = 1;
-        service.received.fd_count = 2;
+        service.received.fd_count = 1;
         gpud_drm_prime_export_request_t export = {0};
         pacha_service_envelope_t header = {.op = GPUD_DRM_OP_PRIME_EXPORT,
             .payload_size = sizeof(export)};
@@ -93,13 +93,13 @@ static void prime_profile_admission(void)
         service.received.fd_count = 1;
         assert(dispatch_request(&service, &header, &import, &result,
             &transfer, 0) == -EINVAL);
-        service.received.fd_count = 2;
+        service.received.fd_count = 1;
         gpud_drm_prime_token_request_t token = {.token = 1};
         header = (pacha_service_envelope_t){.op = GPUD_DRM_OP_PRIME_RELEASE,
             .payload_size = sizeof(token)};
         assert(dispatch_request(&service, &header, &token, &result,
             &transfer, 0) == -ENOENT);
-        service.received.fd_count = 3;
+        service.received.fd_count = 2;
         header.op = GPUD_DRM_OP_PRIME_ACQUIRE;
         assert(dispatch_request(&service, &header, &token, &result,
             &transfer, 0) == -EINVAL);
@@ -199,12 +199,14 @@ static void kms_session_lifetime(void)
     assert(!service.kms_session_mode);
 }
 
-long pacha_syscall2(uint64_t nr, uint64_t a, uint64_t b)
+static long protocol_oracle2(uint64_t, uint64_t, uint64_t);
+static long protocol_oracle2(uint64_t nr, uint64_t a, uint64_t b)
 {
     if (nr == PACHA_FD_SYSCALL_GET_INFO) {
+        assert(a == 20 || a == 21 || a == 23 || a == 24 || a == 25);
         struct pacha_fd_info *info = (void *)(uintptr_t)b;
         *info = (struct pacha_fd_info){.kind = a == 20 || a == 23 ? PACHA_FD_KIND_VMO :
-            a == 21 || a == 24 || a == 25 ? PACHA_FD_KIND_CHANNEL : PACHA_FD_KIND_REPLY,
+            PACHA_FD_KIND_CHANNEL,
             .size = a == 20 ? GPUD_DRM_PAGE_BYTES : a == 23 ? auxiliary_size : 0,
             .rights = a == 23 ? auxiliary_rights : UINT64_MAX};
         return 0;
@@ -235,9 +237,9 @@ long pacha_syscall6(uint64_t nr, uint64_t fd, uint64_t address, uint64_t bytes,
     return (map_failure || (fd == 23 && auxiliary_map_failure)) ? PACHA_SYSCALL_ERR_ALLOC :
         (long)(uintptr_t)(fd == 20 ? page : auxiliary);
 }
-int pacha_fd_close(int fd) { assert(fd >= 16); ++closes; return close_failure; }
-int pacha_ipc_reply(int fd, const struct pacha_ipc_msg *reply)
-{ assert(fd == 22); ++replies; last_reply = *reply; return 0; }
+int pacha_fd_close(pacha_fd_t fd) { assert(fd >= 16); ++closes; return close_failure; }
+int pacha_ipc_reply(pacha_fd_t fd, const struct pacha_ipc_msg *reply)
+{ assert(fd == PACHA_IPC_REPLY_IMPLICIT); ++replies; last_reply = *reply; return 0; }
 int ph_ipc_packet_release(struct ph_ipc_packet *packet)
 {
     for (size_t i = 0; i < packet->fd_count; ++i)
@@ -297,12 +299,12 @@ int gpud_gpu_rpc_next_event(struct gpud_gpu_rpc *r, unsigned char *m, size_t cap
 { (void)r;(void)m;(void)cap; *s = 0; return 0; }
 int pacha_ipc_channel_create(struct pacha_ipc_channel_pair *p, uint64_t r, uint32_t f)
 { (void)p;(void)r;(void)f; assert(0); return -EIO; }
-int pacha_fd_get_info(int f, struct pacha_fd_info *i)
+int pacha_fd_get_info(pacha_fd_t f, struct pacha_fd_info *i)
 { return (int)pacha_syscall2(PACHA_FD_SYSCALL_GET_INFO, f, (uintptr_t)i); }
-int pacha_vmo_revoke(int f) { (void)f; assert(0); return -EIO; }
-int pacha_ipc_send(int f, const struct pacha_ipc_msg *m)
+int pacha_vmo_revoke(pacha_fd_t f) { (void)f; assert(0); return -EIO; }
+int pacha_ipc_send(pacha_fd_t f, const struct pacha_ipc_msg *m)
 { (void)f;(void)m; assert(0); return -EIO; }
-long pacha_syscall4(uint64_t nr, uint64_t a, uint64_t b, uint64_t c, uint64_t d)
+static long protocol_oracle4(uint64_t nr, uint64_t a, uint64_t b, uint64_t c, uint64_t d)
 {
     assert(nr == PACHA_FD_SYSCALL_WAIT_MANY && b == 2 && c == UINT64_MAX && !d);
     struct pacha_pollfd *fds = (void *)(uintptr_t)a;
@@ -315,8 +317,8 @@ long pacha_fd_wait_many_batched(struct pacha_pollfd *fds, uint64_t count, uint64
     assert(!ticks);
     long ready = 0;
     for (uint64_t i = 0; i < count; ++i) {
-        fds[i].revents = (fds[i].fd == ready_fd ? PACHA_FD_EVENT_READABLE : 0) |
-            (fds[i].fd == hungup_fd ? PACHA_FD_EVENT_HANGUP : 0);
+        fds[i].revents = (fds[i].fd == (uint64_t)ready_fd ? PACHA_FD_EVENT_READABLE : 0) |
+            (fds[i].fd == (uint64_t)hungup_fd ? PACHA_FD_EVENT_HANGUP : 0);
         ready += !!fds[i].revents;
     }
     return ready;
@@ -327,7 +329,7 @@ long pacha_fd_poll(struct pacha_pollfd *fds, uint64_t count)
 static void binding(struct gpud_drm_service *service, int aux)
 {
     queued = (struct pacha_ipc_msg){.word0 = GPUD_DRM_BIND_PAGE_REQUEST_MAGIC,
-        .word1 = aux ? sizeof(auxiliary) : 0, .fd_count = 3u + aux};
+        .word1 = aux ? sizeof(auxiliary) : 0, .fd_count = 2u + aux};
     queued_fds[0] = (struct pacha_ipc_fd){.fd = 20};
     queued_fds[1] = (struct pacha_ipc_fd){.fd = 21};
     queued_fds[2] = (struct pacha_ipc_fd){.fd = 23, .rights = auxiliary_rights};
@@ -363,7 +365,7 @@ static void auxiliary_call(struct gpud_drm_service *service, uint64_t handle, in
     memset(auxiliary, 0xa5, 12);
     queued = (struct pacha_ipc_msg){.word0 = PACHA_SERVICE_REQUEST_MAGIC,
         .word1 = bound ? GPUD_DRM_REQUEST_BOUND_AUX : 0,
-        .word3 = header->request_id, .fd_count = bound ? 1 : 2};
+        .word3 = header->request_id, .fd_count = bound ? 0 : 1};
     queued_fds[0] = (struct pacha_ipc_fd){.fd = 23, .rights = auxiliary_rights};
     size_t index = bound ? 0 : 1;
     if (fence_request) {
@@ -394,7 +396,7 @@ static void resources_call(struct gpud_drm_service *service)
         .arg_size = sizeof(gpud_drm_mode_card_res_t),
         .data_size = sizeof(gpud_drm_kms_resources_wire_t)};
     queued = (struct pacha_ipc_msg){.word0 = PACHA_SERVICE_REQUEST_MAGIC,
-        .word3 = 99, .fd_count = 1};
+        .word3 = 99, .fd_count = 0};
     queued_fds[0] = (struct pacha_ipc_fd){.fd = 22};
     service->connections->ready = 1;
     ready_fd = 21;
@@ -474,7 +476,7 @@ int main(void)
     /* The optional physical GPU endpoint is published before manual probe.
      * Both the cached-page handshake and uncached request must fail promptly. */
     queued = (struct pacha_ipc_msg){.word0 = GPUD_DRM_BIND_PAGE_REQUEST_MAGIC,
-        .fd_count = 3};
+        .fd_count = 2};
     queued_fds[0] = (struct pacha_ipc_fd){.fd = 20};
     queued_fds[1] = (struct pacha_ipc_fd){.fd = 21};
     queued_fds[2] = (struct pacha_ipc_fd){.fd = 22};
@@ -487,7 +489,7 @@ int main(void)
         .header_size = sizeof(pacha_service_envelope_t), .service_id = GPUD_DRM_SERVICE_ID,
         .op = GPUD_DRM_OP_OPEN_NODE, .request_id = 17};
     queued = (struct pacha_ipc_msg){.word0 = PACHA_SERVICE_REQUEST_MAGIC,
-        .word3 = 17, .fd_count = 2};
+        .word3 = 17, .fd_count = 1};
     queued_fds[0] = (struct pacha_ipc_fd){.fd = 20};
     queued_fds[1] = (struct pacha_ipc_fd){.fd = 22};
     ready_fd = 16;
@@ -496,7 +498,7 @@ int main(void)
         offline_header->status == -ENODEV && last_reply.word3 == 17);
     assert(maps == 1 && unmaps == 1);
     queued = (struct pacha_ipc_msg){.word0 = GPUD_DRM_INLINE_IOCTL_REQUEST_MAGIC,
-        .word2 = UINT64_C(0xc010640c), .fd_count = 1};
+        .word2 = UINT64_C(0xc010640c), .fd_count = 0};
     queued_fds[0] = (struct pacha_ipc_fd){.fd = 22};
     ready_fd = 16;
     assert(!gpud_drm_service_reject_unavailable(16));
@@ -513,13 +515,13 @@ int main(void)
     assert(!valid_aux_fd(&auxiliary_fd, sizeof(auxiliary)));
     binding(&service, 0);
     assert(service.connections && service.connections->page == page && service.connections->fd == 21);
-    assert(maps == 1 && !unmaps && closes == 2 && last_reply.word0 == GPUD_DRM_BIND_PAGE_REPLY_MAGIC);
+    assert(maps == 1 && !unmaps && closes == 1 && last_reply.word0 == GPUD_DRM_BIND_PAGE_REPLY_MAGIC);
     for (unsigned i = 1; i <= 8; ++i) {
         pacha_service_envelope_t *header = (void *)page;
         *header = (pacha_service_envelope_t){.magic = PACHA_SERVICE_REQUEST_MAGIC,
             .header_size = sizeof(pacha_service_envelope_t), .service_id = GPUD_DRM_SERVICE_ID,
             .op = GPUD_DRM_OP_HELLO, .request_id = i};
-        queued = (struct pacha_ipc_msg){.word0 = PACHA_SERVICE_REQUEST_MAGIC, .word3 = i, .fd_count = 1};
+        queued = (struct pacha_ipc_msg){.word0 = PACHA_SERVICE_REQUEST_MAGIC, .word3 = i, .fd_count = 0};
         queued_fds[0] = (struct pacha_ipc_fd){.fd = 22};
         ready_fd = 21;
         assert(!gpud_drm_service_reap_hangups(&service) && service.connections->ready);
@@ -534,7 +536,7 @@ int main(void)
     *header = (pacha_service_envelope_t){.magic = PACHA_SERVICE_REQUEST_MAGIC,
         .header_size = sizeof(pacha_service_envelope_t), .service_id = GPUD_DRM_SERVICE_ID,
         .op = GPUD_DRM_OP_HELLO, .request_id = 9};
-    queued = (struct pacha_ipc_msg){.word0 = PACHA_SERVICE_REQUEST_MAGIC, .word3 = 9, .fd_count = 2};
+    queued = (struct pacha_ipc_msg){.word0 = PACHA_SERVICE_REQUEST_MAGIC, .word3 = 9, .fd_count = 1};
     queued_fds[0] = (struct pacha_ipc_fd){.fd = 20};
     queued_fds[1] = (struct pacha_ipc_fd){.fd = 22};
     ready_fd = 21;
@@ -609,4 +611,34 @@ int main(void)
     puts("GPUD page connection: bind, actual HELLO reuse/correlation, cleanup failures PASS");
     puts("GPUD auxiliary connection: real execbuffer/caps codecs, copy/zero, fallback, lifetime PASS");
 #endif
+}
+
+long pacha_syscall2(uint64_t nr, uint64_t a, uint64_t b) {
+    assert(nr != PACHA_IPC_SYSCALL_SEND && nr != PACHA_IPC_SYSCALL_RECV);
+    return protocol_oracle2(nr, a, b);
+}
+long pacha_syscall4(uint64_t nr, uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    assert(nr != PACHA_IPC_SYSCALL_RECV_WAIT);
+    return protocol_oracle4(nr, a, b, c, d);
+}
+long pacha_ipc_registers(uint64_t nr, uint64_t fd, uint64_t flags, uint64_t timeout,
+    uint64_t words[4], struct pacha_ipc_extension *extension, int *committed) {
+    const int sending = nr == PACHA_IPC_SYSCALL_SEND;
+    struct pacha_ipc_msg message = {
+        .word0=words[0], .word1=words[1], .word2=words[2], .word3=words[3],
+        .fds=extension ? (void *)(uintptr_t)(sending ? extension->send_array : extension->receive_array) : 0,
+        .fd_count=extension && sending ? extension->send_count : 0,
+        .fd_capacity=extension ? extension->receive_capacity : 0,
+    };
+    long status = nr == PACHA_IPC_SYSCALL_RECV_WAIT ?
+        protocol_oracle4(nr, fd, (uintptr_t)&message, timeout, flags) :
+        protocol_oracle2(nr, fd, (uintptr_t)&message);
+    words[0]=words[1]=words[2]=words[3]=0;
+    if (!sending && !status) {
+        words[0]=message.word0; words[1]=message.word1;
+        words[2]=message.word2; words[3]=message.word3;
+    }
+    if (extension) extension->received_count = message.fd_count;
+    if (committed) *committed=0;
+    return status;
 }

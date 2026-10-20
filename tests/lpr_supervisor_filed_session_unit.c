@@ -29,7 +29,7 @@ int pacha_fd_table(uint64_t minimum, struct pacha_fd_table_info *info)
     return 0;
 }
 
-int pacha_vmo_create(uint64_t bytes, uint64_t rights, uint32_t flags)
+pacha_fd_t pacha_vmo_create(uint64_t bytes, uint64_t rights, uint32_t flags)
 {
     assert(bytes >= KB2_FILESYSTEM_REQUEST_SIZE + KB2_FILESYSTEM_CREDENTIALS_SIZE + 8);
     assert(!(bytes & 4095) && !flags && !wire);
@@ -42,7 +42,7 @@ int pacha_vmo_create(uint64_t bytes, uint64_t rights, uint32_t flags)
     return 80;
 }
 
-void *pacha_mmap(int fd, uint64_t bytes, uint64_t prot, uint64_t flags, uint64_t offset)
+void *pacha_mmap(pacha_fd_t fd, uint64_t bytes, uint64_t prot, uint64_t flags, uint64_t offset)
 {
     assert(fd == 80 && bytes == wire_size && !offset);
     assert(prot == (PACHA_PROT_READ | PACHA_PROT_WRITE) && flags == PACHA_MMAP_SHARED);
@@ -58,7 +58,7 @@ int pacha_munmap(void *mapping, uint64_t bytes)
     return 0;
 }
 
-int pacha_fd_close(int fd)
+int pacha_fd_close(pacha_fd_t fd)
 {
     assert(fd >= 16 && fd < 128 && descriptors[fd].kind);
     descriptors[fd] = (struct pacha_fd_info){0};
@@ -66,7 +66,7 @@ int pacha_fd_close(int fd)
     return 0;
 }
 
-int pacha_fd_get_info(int fd, struct pacha_fd_info *info)
+int pacha_fd_get_info(pacha_fd_t fd, struct pacha_fd_info *info)
 {
     assert(fd == 72 && descriptors[fd].kind);
     if (inspect_error) return -EIO;
@@ -74,7 +74,7 @@ int pacha_fd_get_info(int fd, struct pacha_fd_info *info)
     return 0;
 }
 
-int pacha_ipc_call(int endpoint, const struct pacha_ipc_msg *message)
+int pacha_ipc_call(pacha_fd_t endpoint, const struct pacha_ipc_msg *message, struct pacha_ipc_msg *reply, uint64_t timeout, int *sent)
 {
     assert(endpoint == 33 && message->fd_count == 1 && message->fds[0].fd == 80);
     assert(message->fds[0].transfer_flags == PACHA_IPC_TRANSFER_CLOEXEC);
@@ -96,13 +96,8 @@ int pacha_ipc_call(int endpoint, const struct pacha_ipc_msg *message)
     const unsigned char groups[] = {42, 0, 0, 0, 43, 0, 0, 0};
     assert(!memcmp(wire + request.groups.offset, groups, sizeof(groups)));
     ++calls;
-    create_fd(90, PACHA_FD_KIND_REPLY, PACHA_FD_RIGHT_CLOSE);
-    return 90;
-}
-
-int pacha_ipc_recv_wait(int fd, struct pacha_ipc_msg *reply, uint64_t timeout)
-{
-    assert(fd == 90 && timeout == PACHA_FD_WAIT_FOREVER);
+    if (sent) *sent = 1;
+    assert(timeout == PACHA_FD_WAIT_FOREVER);
     kb2_fs_response_t response = {.opcode = request.opcode, .generation = request.generation,
         .sequence = request.sequence, .result = response_error,
         .handle = response_error ? 0 : issued_handle};
@@ -150,14 +145,14 @@ static void check_session(uint64_t rights, unsigned count, uint64_t kind,
         assert(reply.transfer_flags == (PACHA_IPC_TRANSFER_PRIVATE | PACHA_IPC_TRANSFER_CLOEXEC));
         assert(!(reply.rights & (PACHA_FD_RIGHT_DUP | PACHA_FD_RIGHT_TRANSFER |
             PACHA_FD_RIGHT_SET_FLAGS | PACHA_FD_RIGHT_RECV | PACHA_FD_RIGHT_SEND)));
-        assert(closes == 2 && descriptors[72].rights == FILED_CLIENT_REGISTER_RIGHTS);
+        assert(closes == 1 && descriptors[72].rights == FILED_CLIENT_REGISTER_RIGHTS);
         assert(!lprs_filed_session(&process, &reply, &session) && calls == 1);
         lprs_unix_release(&process);
         assert(process.filed_fd == -1 && !process.filed_session);
     } else {
         assert(process.filed_fd == -1 && !process.filed_session && !session && reply.fd == -1);
     }
-    assert(closes == count + 2);
+    assert(closes == count + 1);
     for (unsigned i = 16; i < 128; ++i) assert(!descriptors[i].kind);
 }
 

@@ -22,7 +22,7 @@ enum {
 };
 
 struct live_client {
-    int endpoint, page_fd;
+    pacha_fd_t endpoint, page_fd;
     void *page;
     uint32_t service;
     uint64_t request_id;
@@ -30,7 +30,7 @@ struct live_client {
 
 struct live_input_slot {
     uint64_t handle;
-    int notify_fd;
+    pacha_fd_t notify_fd;
     uint16_t bus, vendor, product;
     char name[64];
 };
@@ -39,7 +39,7 @@ struct live_console {
     struct live_client termd, inputd;
     struct live_input_slot *slots;
     size_t slot_count;
-    int mmio_fd, master_notify_fd;
+    pacha_fd_t mmio_fd, master_notify_fd;
     void *framebuffer_reservation;
     size_t framebuffer_reservation_size;
     volatile uint32_t *pixels;
@@ -62,7 +62,7 @@ struct live_console {
     int redraw;
 };
 
-static int client_init(struct live_client *client, int endpoint, uint32_t service)
+static int client_init(struct live_client *client, pacha_fd_t endpoint, uint32_t service)
 {
     memset(client, 0, sizeof(*client));
     client->endpoint = endpoint;
@@ -77,7 +77,7 @@ static int client_init(struct live_client *client, int endpoint, uint32_t servic
 }
 
 static int client_call(struct live_client *client, uint32_t op,
-    uint32_t payload_size, int notify_fd, uint64_t *out_result)
+    uint32_t payload_size, pacha_fd_t notify_fd, uint64_t *out_result)
 {
     if (payload_size > PACHA_SERVICE_PAGE_BYTES - PACHA_SERVICE_HEADER_BYTES)
         return -22;
@@ -113,11 +113,8 @@ static int client_call(struct live_client *client, uint32_t op,
         .word0 = PACHA_SERVICE_REQUEST_MAGIC, .word3 = id,
         .fds = fds, .fd_count = count,
     };
-    const int reply_fd = pacha_ipc_call(client->endpoint, &request);
-    if (reply_fd < 16) return reply_fd < 0 ? reply_fd : -5;
     struct pacha_ipc_msg reply = {0};
-    const int received = pacha_ipc_recv_wait(reply_fd, &reply, PACHA_FD_WAIT_FOREVER);
-    (void)pacha_fd_close(reply_fd);
+    int received = pacha_ipc_call(client->endpoint, &request, &reply, PACHA_FD_WAIT_FOREVER, NULL);
     if (received != 0) return received;
     if (reply.word0 != PACHA_SERVICE_REPLY_MAGIC || reply.word3 != id ||
         header->magic != PACHA_SERVICE_REPLY_MAGIC ||
@@ -187,7 +184,7 @@ static int open_master(struct live_console *console)
 
 static int map_framebuffer(struct live_console *console,
     const pacha_live_root_bootstrap_t *boot,
-    const struct pacha_root_device_record *devices, const int *device_fds,
+    const struct pacha_root_device_record *devices, const pacha_fd_t *device_fds,
     uint64_t device_count)
 {
     if (!boot->framebuffer_paddr || !boot->framebuffer_size ||
@@ -227,7 +224,7 @@ static int map_framebuffer(struct live_console *console,
                     PACHA_MMAP_NORESERVE, 0);
             if (reserved < 4096) return reserved < 0 ? (int)reserved : -5;
             void *reservation = (void *)(uintptr_t)reserved;
-            const int fd = pacha_capsule_derive_mmio_range(device_fds[i], bar,
+            const pacha_fd_t fd = pacha_capsule_derive_mmio_range(device_fds[i], bar,
                 reservation, (size_t)map_size,
                 PACHA_CAPSULE_MMIO_REPLACE_EXISTING |
                     PACHA_CAPSULE_MMIO_CACHE_UC, page_offset);
@@ -638,8 +635,8 @@ static int scan_inputs(struct live_console *console)
 }
 
 int live_console_prepare(const pacha_live_root_bootstrap_t *boot,
-    const struct pacha_root_device_record *devices, const int *device_fds,
-    uint64_t device_count, int termd_fd, int inputd_fd,
+    const struct pacha_root_device_record *devices, const pacha_fd_t *device_fds,
+    uint64_t device_count, pacha_fd_t termd_fd, pacha_fd_t inputd_fd,
     struct live_console **out)
 {
     if (out == NULL) return -22;
@@ -823,12 +820,12 @@ const char *live_console_ctty(const struct live_console *console)
 }
 
 void live_console_report_usb_boot(struct live_console *console,
-    const int *ready_fds, size_t ready_count)
+    const pacha_fd_t *ready_fds, size_t ready_count)
 {
     if (console == NULL) return;
     char line[192];
     for (size_t i = 0; i < ready_count; i++) {
-        const int state = ready_fds[i];
+        const pacha_fd_t state = ready_fds[i];
         if (state == -1) {
             (void)snprintf(line, sizeof(line),
                 "usbd%zu: ready; Kobox2 xHCI sandbox and inputd bridge synced\r\n", i);
@@ -990,7 +987,7 @@ int live_console_run(struct live_console *console,
     void (*on_tick)(void *context), void *tick_context)
 {
     if (console == NULL) return -22;
-    const int timer_fd = pacha_timerfd_create(UINT64_C(20000000),
+    const pacha_fd_t timer_fd = pacha_timerfd_create(UINT64_C(20000000),
         UINT64_C(20000000), PACHA_FD_RIGHT_READ | PACHA_FD_RIGHT_WAIT |
         PACHA_FD_RIGHT_POLL | PACHA_FD_RIGHT_CLOSE, 0);
     if (timer_fd < 16) return -5;

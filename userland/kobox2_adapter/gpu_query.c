@@ -320,11 +320,11 @@ int ph_gpu_query_publish_attachment(struct ph_gpu_query *query,
         for (uint64_t index = 0; index < query->result.mapping_page_count; ++index)
             if (pages[index] >= ph_core.ram_size / PH_PAGE_SIZE) return -EPROTO;
         native_fd = pacha_syscall5(PACHA_FD_SYSCALL_VMO_CREATE_PAGE_VIEW,
-            (uint64_t)(uint32_t)ph_core.ram_fd, (uintptr_t)pages,
+            (uint64_t)ph_core.ram_fd, (uintptr_t)pages,
             query->result.mapping_page_count, rights, PACHA_FD_FLAG_CLOEXEC);
         if (native_fd < 16)
             ph_boot_log_gpu_page_view_failure(native_fd,
-                (uint32_t)ph_core.ram_fd, rights, cache,
+                (uint64_t)ph_core.ram_fd, rights, cache,
                 query->result.mapping_page_count, pages[0],
                 pages[query->result.mapping_page_count / 2],
                 pages[query->result.mapping_page_count - 1]);
@@ -332,7 +332,7 @@ int ph_gpu_query_publish_attachment(struct ph_gpu_query *query,
         return -EPROTO;
     }
     if (native_fd < 16) {
-        ph_boot_log_gpu_map_failure(5, (int)native_fd,
+        ph_boot_log_gpu_map_failure(5, (pacha_fd_t)native_fd,
             query->plan.mapping_handle, query->result.mapping_length);
         switch (native_fd) {
         case PACHA_SYSCALL_ERR_NOT_READY:
@@ -348,7 +348,7 @@ int ph_gpu_query_publish_attachment(struct ph_gpu_query *query,
             return -EINVAL;
         }
     }
-    int fd = (int)native_fd;
+    pacha_fd_t fd = (pacha_fd_t)native_fd;
     struct ph_ipc_packet packet = {
         .operation = query->result.attachment_class == KB2_GPU_ATTACHMENT_MEMORY ?
             PH_GPU_MAPPING_ATTACHMENT : PH_GPU_DMA_BUF_ATTACHMENT,
@@ -361,7 +361,7 @@ int ph_gpu_query_publish_attachment(struct ph_gpu_query *query,
     };
     int result = ph_ipc_send(ipc, &packet);
     int closed = pacha_syscall1(PACHA_FD_SYSCALL_CLOSE,
-        (uint64_t)(uint32_t)fd) ? -EIO : 0;
+        (uint64_t)fd) ? -EIO : 0;
     return result ? result : closed;
 }
 

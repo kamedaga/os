@@ -154,7 +154,7 @@ int installer_disk_port_pump(struct installer_disk_port *port) {
         if (request.fd_count != 1 || request.fds[0].fd < 16)
             status = -EPROTO;
         else {
-            const int fd = (int)request.fds[0].fd;
+            const pacha_fd_t fd = (pacha_fd_t)request.fds[0].fd;
             struct pacha_fd_info info = {0};
             if (pacha_fd_get_info(fd, &info) ||
                 info.kind != PACHA_FD_KIND_VMO ||
@@ -191,7 +191,7 @@ int installer_disk_port_pump(struct installer_disk_port *port) {
     else status = installer_disk_port_dispatch(port, port->page);
     if (request.fd_count &&
         (operation != INSTALLER_DISK_PORT_ATTACH || status))
-        (void)pacha_fd_close((int)request.fds[0].fd);
+        (void)pacha_fd_close((pacha_fd_t)request.fds[0].fd);
     if (operation != INSTALLER_DISK_PORT_ATTACH && port->page) {
         port->completed_status = status;
         port->completed_operation = operation;

@@ -1,3 +1,4 @@
+#include "lpr_ipc_mock.h"
 /* LPR adapter + shared wire implementation + real broker, with a loopback
  * syscall fixture. This is not native IPC or Linux socket FD integration. */
 #include "../userland/personality/linux/runtime/lpr_unix/client.c"
@@ -36,11 +37,11 @@ void lpr_trace_error_record(uint64_t domain, uint64_t op, uint64_t stage,
     (void)request; (void)count; (void)subject; (void)child; (void)text;
 }
 
-int lpr_create_standalone_wire_page(void **out)
+pacha_fd_t lpr_create_standalone_wire_page(void **out)
 {
     assert(!live[70]); live[70] = 1; *out = process_page; return 70;
 }
-void lpr_destroy_standalone_wire_page(int fd, void *page)
+void lpr_destroy_standalone_wire_page(pacha_fd_t fd, void *page)
 {
     assert(fd == 70 && live[70] && page == process_page); live[70] = 0;
 }
@@ -52,7 +53,7 @@ int64_t lpr_pacha_syscall1(uint64_t nr, uint64_t fd)
     return 0;
 }
 
-int64_t lpr_pacha_syscall2(uint64_t nr, uint64_t a0, uint64_t a1)
+static int64_t fixture_prepare_request(uint64_t nr, uint64_t a0, uint64_t a1)
 {
     if (nr == PACHAOS_SYSCALL_LOG) {
         assert(a0 && a1 && a1 <= 256);
@@ -164,11 +165,11 @@ int64_t lpr_pacha_syscall6(uint64_t nr, uint64_t fd, uint64_t address,
     assert(!maps); maps++; return (int64_t)(uintptr_t)unix_page;
 }
 
-int64_t lpr_pacha_syscall4(uint64_t nr, uint64_t fd, uint64_t address, uint64_t timeout, uint64_t flags)
+static int64_t fixture_finish_request(uint64_t nr, uint64_t fd, uint64_t address, uint64_t timeout, uint64_t flags)
 {
     if (nr == PACHA_FD_SYSCALL_WAIT_MANY) {
         struct pacha_pollfd *pollfd = (void *)(uintptr_t)fd;
-        assert(address == 1 && timeout == PACHA_FD_WAIT_FOREVER && !flags);
+        assert(address == 1 && timeout == PACHA_FD_WAIT_FOREVER && flags == PACHA_WAIT_UNINTERRUPTIBLE);
         assert(pollfd->fd == 80 && pollfd->events == PACHA_FD_EVENT_WRITABLE);
         writable_waits++;
         pollfd->revents = PACHA_FD_EVENT_WRITABLE;
@@ -181,7 +182,7 @@ int64_t lpr_pacha_syscall4(uint64_t nr, uint64_t fd, uint64_t address, uint64_t 
         assert(flags == (PACHA_FD_FLAG_PRIVATE | PACHA_FD_FLAG_CLOEXEC));
         live[50] = 1; return 50;
     }
-    assert(nr == PACHAOS_SYSCALL_IPC_RECV_WAIT && timeout == UINT64_MAX && !flags && live[fd]);
+    assert(nr == PACHAOS_SYSCALL_IPC_RECV_WAIT && timeout == UINT64_MAX && flags == PACHA_WAIT_UNINTERRUPTIBLE && live[fd]);
     struct pacha_ipc_msg *reply = (struct pacha_ipc_msg *)(uintptr_t)address;
     if (fd == 71) {
         assert(reply->fd_capacity == 1 && !live[80]);
@@ -237,7 +238,7 @@ int main(void)
     assert(lpr_unix_client_open(&client) == 0 && client.fd == 80 && client.process_token == 101);
     unsigned received = 0;
     struct unix_control request = { .operation = UNIX_OP_SOCKETPAIR, .request = 1, .argument = UNIX_TRANSPORT_STREAM };
-    interruptions = 1;
+    interruptions = 0;
     assert(lpr_unix_client_call(&client, &request, NULL, 0, NULL, 0, &received) == 0);
     assert(calls == 1 && !interruptions && unix_broker_socket_count(broker) == 2);
     uint64_t owner = 0;
@@ -319,5 +320,33 @@ int main(void)
     lpr_unix_client_close(&client); native_close(81);
     unix_broker_destroy(broker);
     for (unsigned i = 16; i < 256; i++) assert(!live[i]);
-    puts("lpr unix client: session-to-socketpair loopback, attach caps, interrupted reply, errors, fork identity passed");
+    puts("lpr unix client: session-to-socketpair loopback, attach caps, synchronous reply, errors, fork identity passed");
+}
+
+/* Request preparation and reply rendering are fixture phases within one
+ * synchronous syscall. Their transaction tags never become caller FDs. */
+int64_t lpr_pacha_syscall2(uint64_t nr, uint64_t a, uint64_t b)
+{
+    assert(nr != PACHAOS_SYSCALL_IPC_CALL);
+    return fixture_prepare_request(nr, a, b);
+}
+int64_t lpr_pacha_syscall4(uint64_t nr, uint64_t a, uint64_t b, uint64_t c, uint64_t d)
+{
+    return fixture_finish_request(nr, a, b, c, d);
+}
+int64_t lpr_ipc_message(uint64_t nr, uint64_t endpoint,
+    uint64_t request, uint64_t reply, uint64_t timeout, uint64_t flags, int *sent)
+{
+    if (nr != PACHA_IPC_SYSCALL_CALL) return test_lpr_ipc_noncall(nr, endpoint, request, reply, timeout, flags, sent);
+
+    assert(nr == PACHAOS_SYSCALL_IPC_CALL && request && reply);
+    assert(timeout == UINT64_MAX && flags == PACHA_WAIT_UNINTERRUPTIBLE);
+    *sent = 0;
+    int64_t transaction = fixture_prepare_request(nr, endpoint, request);
+    if (transaction < 16) return transaction;
+    *sent = 1;
+    int64_t status = fixture_finish_request(PACHAOS_SYSCALL_IPC_RECV_WAIT,
+        (uint64_t)transaction, reply, timeout, flags);
+    live[transaction] = 0;
+    return status;
 }

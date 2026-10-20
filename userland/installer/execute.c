@@ -67,7 +67,7 @@ static int wait_for_restart(struct installer_block_target *target,
     uint64_t old_generation) {
     const uint64_t rights = PACHA_FD_RIGHT_READ | PACHA_FD_RIGHT_WAIT |
         PACHA_FD_RIGHT_POLL | PACHA_FD_RIGHT_CLOSE;
-    int timer = pacha_timerfd_create(UINT64_C(100000000),
+    pacha_fd_t timer = pacha_timerfd_create(UINT64_C(100000000),
         UINT64_C(100000000), rights, 0);
     if (timer < 16) return timer < 0 ? timer : -EIO;
     int status = -ETIMEDOUT;

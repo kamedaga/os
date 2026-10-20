@@ -43,7 +43,7 @@ int64_t lpr_pacha_syscall1(uint64_t nr, uint64_t fd)
 { (void)nr; (void)fd; assert(0); return -1; }
 int64_t lpr_pacha_syscall2(uint64_t nr, uint64_t a, uint64_t b)
 { (void)nr; (void)a; (void)b; assert(0); return -1; }
-int64_t lpr_supervisor_call_token(uint32_t op, uint64_t token, int fd, uint64_t *result)
+int64_t lpr_supervisor_call_token(uint32_t op, uint64_t token, pacha_fd_t fd, uint64_t *result)
 { (void)op; (void)token; (void)fd; (void)result; assert(0); return -1; }
 
 int main(void)
@@ -69,4 +69,14 @@ int main(void)
         assert(lease_closed == failed && source_dropped == 1 && retired == 1);
     }
     puts("LPR_EXEC_RETIREMENT_ORDER_UNIT_PASS");
+}
+
+#include "lpr_ipc_mock.h"
+int64_t lpr_ipc_message(uint64_t nr, uint64_t fd, uint64_t send, uint64_t receive,
+    uint64_t timeout, uint64_t flags, int *committed) {
+    return test_lpr_ipc_noncall(nr, fd, send, receive, timeout, flags, committed);
+}
+
+int64_t lpr_pacha_syscall4(uint64_t nr,uint64_t a,uint64_t b,uint64_t c,uint64_t d) {
+    (void)nr;(void)a;(void)b;(void)c;(void)d;abort();
 }

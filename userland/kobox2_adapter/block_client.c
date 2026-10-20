@@ -17,7 +17,7 @@ static int status_errno(uint32_t status) {
     }
 }
 
-static int wait_reply(struct ph_ipc *ipc, int process_fd,
+static int wait_reply(struct ph_ipc *ipc, pacha_fd_t process_fd,
     uint64_t operation, uint64_t sequence, uint64_t *status) {
     for (;;) {
         struct ph_ipc_packet reply = {0};
@@ -43,7 +43,7 @@ static int wait_reply(struct ph_ipc *ipc, int process_fd,
 }
 
 static int issue(struct ph_block_client *client, struct ph_ipc *ipc,
-    int process_fd, kb2_block_header_t *header, int attach_fd) {
+    pacha_fd_t process_fd, kb2_block_header_t *header, pacha_fd_t attach_fd) {
     if (!client || !client->shared || !ipc ||
         client->generation != ipc->generation || process_fd < 16)
         return -EINVAL;
@@ -97,12 +97,12 @@ static int issue(struct ph_block_client *client, struct ph_ipc *ipc,
 }
 
 int ph_block_client_open(struct ph_block_client *client, struct ph_ipc *ipc,
-    int process_fd, uint64_t generation) {
+    pacha_fd_t process_fd, uint64_t generation) {
     if (!client || client->shared || !ipc || !generation ||
         generation != ipc->generation) return -EINVAL;
     const uint64_t rights = PACHA_FD_RIGHT_INSPECT | PACHA_FD_RIGHT_CLOSE |
         PACHA_FD_RIGHT_TRANSFER | PACHA_FD_RIGHT_MAP_READ | PACHA_FD_RIGHT_MAP_WRITE;
-    int fd = pacha_vmo_create(PH_BLOCK_SHARED_BYTES, rights, 0);
+    pacha_fd_t fd = pacha_vmo_create(PH_BLOCK_SHARED_BYTES, rights, 0);
     if (fd < 16) return fd < 0 ? fd : -ENOMEM;
     void *mapped = pacha_mmap(fd, PH_BLOCK_SHARED_BYTES,
         PACHA_PROT_READ | PACHA_PROT_WRITE, PACHA_MMAP_SHARED, 0);
@@ -119,7 +119,7 @@ int ph_block_client_open(struct ph_block_client *client, struct ph_ipc *ipc,
 }
 
 int ph_block_client_snapshot(struct ph_block_client *client, struct ph_ipc *ipc,
-    int process_fd, uint64_t start, kb2_block_disk_t *disks,
+    pacha_fd_t process_fd, uint64_t start, kb2_block_disk_t *disks,
     size_t capacity, size_t *count, uint64_t *next) {
     if (!disks || !count || !next || !capacity ||
         capacity > KB2_BLOCK_DEVICE_MAX_DISKS) return -EINVAL;
@@ -141,7 +141,7 @@ int ph_block_client_snapshot(struct ph_block_client *client, struct ph_ipc *ipc,
 }
 
 static int transfer(struct ph_block_client *client, struct ph_ipc *ipc,
-    int process_fd, const kb2_block_disk_t *disk, uint64_t offset,
+    pacha_fd_t process_fd, const kb2_block_disk_t *disk, uint64_t offset,
     void *buffer, size_t length, uint32_t opcode) {
     if (!client || !client->shared || !disk || !buffer || !length ||
         length > KB2_BLOCK_DEVICE_MAX_TRANSFER ||
@@ -159,21 +159,21 @@ static int transfer(struct ph_block_client *client, struct ph_ipc *ipc,
 }
 
 int ph_block_client_read(struct ph_block_client *client, struct ph_ipc *ipc,
-    int process_fd, const kb2_block_disk_t *disk, uint64_t offset,
+    pacha_fd_t process_fd, const kb2_block_disk_t *disk, uint64_t offset,
     void *buffer, size_t length) {
     return transfer(client, ipc, process_fd, disk, offset, buffer, length,
         KB2_BLOCK_DEVICE_OP_READ);
 }
 
 int ph_block_client_write(struct ph_block_client *client, struct ph_ipc *ipc,
-    int process_fd, const kb2_block_disk_t *disk, uint64_t offset,
+    pacha_fd_t process_fd, const kb2_block_disk_t *disk, uint64_t offset,
     const void *buffer, size_t length) {
     return transfer(client, ipc, process_fd, disk, offset, (void *)buffer, length,
         KB2_BLOCK_DEVICE_OP_WRITE);
 }
 
 int ph_block_client_flush(struct ph_block_client *client, struct ph_ipc *ipc,
-    int process_fd, const kb2_block_disk_t *disk) {
+    pacha_fd_t process_fd, const kb2_block_disk_t *disk) {
     if (!disk) return -EINVAL;
     kb2_block_header_t header = {.opcode = KB2_BLOCK_DEVICE_OP_FLUSH,
         .diskseq = disk->diskseq, .major = disk->major, .minor = disk->minor};

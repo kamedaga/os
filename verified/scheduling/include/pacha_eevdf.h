@@ -33,6 +33,7 @@ typedef struct pacha_eevdf_entity {
   int64_t thread_id;
   int64_t generation;
   int64_t weight;
+  uint64_t inv_weight; /* ceil(2^64/weight); zero encodes weight=1 */
   int64_t slice_ns;
   int64_t service_ns;
   int64_t vruntime;

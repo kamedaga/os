@@ -67,7 +67,7 @@ int ph_module_access(void *address, enum kobox_linux_module_access operation) {
 
     if (process >= 16) {
         struct pacha_pollfd completion = {
-            .fd = (int)process, .events = PACHA_FD_EVENT_READABLE,
+            .fd = (pacha_fd_t)process, .events = PACHA_FD_EVENT_READABLE,
         };
         uint64_t status[4];
 

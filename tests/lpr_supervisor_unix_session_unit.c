@@ -24,19 +24,19 @@ static int allocate_filed_fd(uint64_t rights)
     native_rights[fd] = rights;
     return fd;
 }
-int pacha_vmo_create(uint64_t bytes, uint64_t rights, uint32_t flags)
+pacha_fd_t pacha_vmo_create(uint64_t bytes, uint64_t rights, uint32_t flags)
 {
     assert(bytes == sizeof(filed_page) && !flags);
     memset(filed_page, 0, sizeof(filed_page));
     return allocate_filed_fd(rights);
 }
-void *pacha_mmap(int fd, uint64_t bytes, uint64_t prot, uint64_t flags, uint64_t offset)
+void *pacha_mmap(pacha_fd_t fd, uint64_t bytes, uint64_t prot, uint64_t flags, uint64_t offset)
 {
     assert(fd >= 200 && native_rights[fd] && bytes == sizeof(filed_page) && !offset);
     assert(prot == (PACHA_PROT_READ | PACHA_PROT_WRITE) && flags == PACHA_MMAP_SHARED);
     return filed_page;
 }
-int pacha_ipc_call(int fd, const struct pacha_ipc_msg *message)
+int pacha_ipc_call(pacha_fd_t fd, const struct pacha_ipc_msg *message, struct pacha_ipc_msg *response, uint64_t timeout, int *sent)
 {
     assert(fd == 33 && message->fd_count == 1);
     assert(!kb2_fs_request_decode(filed_page, message->word1, message->word1, &filed_request));
@@ -51,11 +51,8 @@ int pacha_ipc_call(int fd, const struct pacha_ipc_msg *message)
         assert(filed_request.client == 1 && filed_request.capabilities == 1023);
         filed_updates++;
     }
-    return allocate_filed_fd(PACHA_FD_RIGHT_CLOSE);
-}
-int pacha_ipc_recv_wait(int fd, struct pacha_ipc_msg *response, uint64_t timeout)
-{
-    assert(fd >= 200 && timeout == PACHA_FD_WAIT_FOREVER);
+    if (sent) *sent = 1;
+    assert(timeout == PACHA_FD_WAIT_FOREVER);
     kb2_fs_response_t result = {.opcode = filed_request.opcode,
         .generation = filed_request.generation, .sequence = filed_request.sequence,
         .handle = filed_registrations};
@@ -80,14 +77,14 @@ int pacha_fd_table(uint64_t minimum, struct pacha_fd_table_info *info)
 
 int64_t pacha_kernel_status_to_errno(int64_t status) { return status; }
 
-int pacha_fd_get_info(int fd, struct pacha_fd_info *info)
+int pacha_fd_get_info(pacha_fd_t fd, struct pacha_fd_info *info)
 {
     if (fd < 16 || fd >= 256 || !native_rights[fd]) return -1;
     *info = (struct pacha_fd_info){ .kind = PACHA_FD_KIND_CHANNEL, .rights = native_rights[fd] };
     return 0;
 }
 
-int pacha_fd_close(int fd)
+int pacha_fd_close(pacha_fd_t fd)
 {
     assert(fd >= 16 && fd < 256 && native_rights[fd]);
     native_rights[fd] = 0;
@@ -107,7 +104,7 @@ int pacha_munmap(void *address, uint64_t bytes)
     return 0;
 }
 
-int unix_client_call(int endpoint, struct unix_control *request,
+int unix_client_call(pacha_fd_t endpoint, struct unix_control *request,
     const struct pacha_ipc_fd *send, unsigned send_count,
     struct pacha_ipc_fd *receive, unsigned capacity, unsigned *received)
 {

@@ -6,7 +6,7 @@
 static void close_caps(const struct pacha_ipc_fd *caps, unsigned count)
 {
     for (unsigned i = 0; i < count; i++) {
-        if (caps[i].fd < 16 || caps[i].fd >= PACHAOS_FD_TABLE_LIMIT) continue;
+        if (caps[i].fd < 16 || caps[i].fd >= PACHAOS_THREAD_SELF_FD) continue;
         unsigned j;
         for (j = 0; j < i && caps[j].fd != caps[i].fd; j++) {}
         if (j == i) (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, caps[i].fd);
@@ -65,7 +65,7 @@ int lpr_unix_route_import(const struct pacha_ipc_fd *caps, unsigned count,
         struct pacha_fd_info info;
         uint64_t rights = common | ((i == 0) == !!writing ? PACHA_FD_RIGHT_MAP_WRITE : 0);
         uint64_t size = i ? sizeof(struct unix_rx) : sizeof(struct unix_tx);
-        if (caps[i].fd < 16 || caps[i].fd >= PACHAOS_FD_TABLE_LIMIT || caps[0].fd == caps[1].fd ||
+        if (caps[i].fd < 16 || caps[i].fd >= PACHAOS_THREAD_SELF_FD || caps[0].fd == caps[1].fd ||
             lpr_pacha_syscall2(PACHAOS_SYSCALL_FD_GET_INFO, caps[i].fd, (uint64_t)(uintptr_t)&info) != 0 ||
             info.kind != PACHA_FD_KIND_VMO || info.rights != rights || info.size != size ||
             info.flags != (PACHA_FD_FLAG_PRIVATE | PACHA_FD_FLAG_CLOEXEC)) {
@@ -130,7 +130,7 @@ int lpr_unix_mapping_import(const struct unix_attachment *attachment,
         unsigned j;
         for (j = 0; j < i && caps[j].fd != caps[i].fd; j++) {}
         const uint64_t expected = common | (i == 0 ? PACHA_FD_RIGHT_MAP_WRITE : 0);
-        if (j != i || caps[i].fd < 16 || caps[i].fd >= PACHAOS_FD_TABLE_LIMIT ||
+        if (j != i || caps[i].fd < 16 || caps[i].fd >= PACHAOS_THREAD_SELF_FD ||
             lpr_pacha_syscall2(PACHAOS_SYSCALL_FD_GET_INFO, caps[i].fd, (uint64_t)(uintptr_t)&info) != 0 ||
             info.kind != PACHA_FD_KIND_VMO || info.rights != expected || info.size != sizeof(struct unix_endpoint) || info.flags != 0) {
             close_caps(caps, count);
@@ -140,7 +140,7 @@ int lpr_unix_mapping_import(const struct unix_attachment *attachment,
     struct lpr_unix_mapping local = { .socket = attachment->socket, .generation = attachment->generation,
         .peer = attachment->peer, .type = attachment->type, .flags = attachment->flags,
         .peer_credentials = attachment->peer_credentials };
-    for (unsigned i = 0; i < 2; i++) local.fds[i] = (int)caps[i].fd;
+    for (unsigned i = 0; i < 2; i++) local.fds[i] = (pacha_fd_t)caps[i].fd;
     struct unix_endpoint *pages[2] = {0};
     for (unsigned i = 0; i < 2; i++) {
         const uint64_t prot = PACHA_PROT_READ | (i == 0 ? PACHA_PROT_WRITE : 0);

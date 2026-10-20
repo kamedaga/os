@@ -1,3 +1,4 @@
+#include <pacha/abi.h>
 /* SPDX-License-Identifier: MIT */
 #ifndef PACHA_GPUD_PACKAGE_H
 #define PACHA_GPUD_PACKAGE_H
@@ -30,16 +31,16 @@ struct gpud_package {
     struct ph_bootstrap_item items[GPUD_PACKAGE_ITEMS];
     struct ph_package_identity identity;
     struct ph_device_authority device;
-    int device_fd;
+    pacha_fd_t device_fd;
 };
 
 /* Loads the fixed verified VirGL closure through filed and converts immutable
  * bytes to read-only transferable VMOs. device_fd remains caller-owned. */
-int gpud_package_open(struct gpud_package *package, int filed_fd, int device_fd);
+int gpud_package_open(struct gpud_package *package, pacha_fd_t filed_fd, pacha_fd_t device_fd);
 /* Manifest-driven PCI package. The owner supplies an absolute, fixed package
  * root; no driver or PCI ID list is interpreted here. */
-int gpud_package_open_at(struct gpud_package *package, int filed_fd,
-    int device_fd, const char *package_root, const uint8_t firmware_sha256[32],
+int gpud_package_open_at(struct gpud_package *package, pacha_fd_t filed_fd,
+    pacha_fd_t device_fd, const char *package_root, const uint8_t firmware_sha256[32],
     const uint8_t manifest_sha256[32], const uint8_t sandbox_sha256[32]);
 /* Creates the per-generation resource grant after controller generation is
  * known. The logical IDs are private owner policy, never native FD numbers. */

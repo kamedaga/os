@@ -13,6 +13,15 @@ static _Alignas(pacha_service_envelope_t) unsigned char activation_page[PACHA_SE
 static struct pacha_ipc_fd activated_cap;
 static unsigned activated;
 
+static int fail_extract;
+pacha_fd_t pacha_ipc_reply_extract(void)
+{
+    if (fail_extract) return PACHA_ERR_ALLOC;
+    assert(!native_rights[72]);
+    native_rights[72] = PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_SEND;
+    return 72;
+}
+
 int pacha_fd_table(uint64_t minimum, struct pacha_fd_table_info *info)
 {
     assert(minimum <= 256);
@@ -28,7 +37,7 @@ long pacha_syscall2(uint64_t number, uint64_t a0, uint64_t a1)
     return 0;
 }
 
-void *pacha_mmap(int fd, uint64_t size, uint64_t prot, uint64_t flags, uint64_t offset)
+void *pacha_mmap(pacha_fd_t fd, uint64_t size, uint64_t prot, uint64_t flags, uint64_t offset)
 {
     assert(fd == 70 && size == sizeof(activation_page) && !offset);
     assert(prot == (PACHA_PROT_READ | PACHA_PROT_WRITE) && flags == PACHA_MMAP_SHARED);
@@ -41,7 +50,7 @@ int pacha_munmap(void *page, uint64_t size)
     return 0;
 }
 
-int pacha_ipc_reply(int fd, const struct pacha_ipc_msg *reply)
+int pacha_ipc_reply(pacha_fd_t fd, const struct pacha_ipc_msg *reply)
 {
     assert(fd == 71 && reply->word0 == PACHA_SERVICE_REPLY_MAGIC && !reply->word1);
     assert(reply->word3 == 55 && reply->fd_count == 1);
@@ -50,14 +59,14 @@ int pacha_ipc_reply(int fd, const struct pacha_ipc_msg *reply)
     return 0;
 }
 
-int pacha_fd_get_info(int fd, struct pacha_fd_info *info)
+int pacha_fd_get_info(pacha_fd_t fd, struct pacha_fd_info *info)
 {
     if (fd < 16 || fd >= 256 || !native_rights[fd]) return -1;
     *info = (struct pacha_fd_info){ .kind = PACHA_FD_KIND_CHANNEL, .rights = native_rights[fd] };
     return 0;
 }
 
-int pacha_fd_close(int fd)
+int pacha_fd_close(pacha_fd_t fd)
 {
     assert(fd >= 16 && fd < 256 && native_rights[fd]);
     native_rights[fd] = 0;
@@ -199,5 +208,18 @@ int main(void)
     assert(lprs_prepare_control(&processes[2], &bootstrap) == -PACHA_LINUX_EMFILE);
     assert(processes[2].bootstrap_server_fd < 16);
     memset(native_rights, 0, sizeof(native_rights));
+    lprs_waiter_t deferred[1] = {0};
+    g_waiters = deferred; g_waiter_count = 1; g_waiter_capacity = 1;
+    pacha_service_envelope_t header = {.request_id = 123};
+    lprs_wait4_t wait = {0};
+    fail_extract = 1;
+    assert(lprs_queue_waiter(70, PACHA_IPC_REPLY_IMPLICIT, &header, &wait) == PACHA_STATUS_EAGAIN);
+    assert(!deferred[0].active && !native_rights[72]);
+    fail_extract = 0;
+    assert(!lprs_queue_waiter(70, PACHA_IPC_REPLY_IMPLICIT, &header, &wait));
+    assert(deferred[0].active && deferred[0].reply_fd == 72 && deferred[0].page_fd == 70);
+    assert(deferred[0].header.request_id == 123);
+    pacha_fd_close(deferred[0].reply_fd);
+    g_waiters = NULL; g_waiter_count = g_waiter_capacity = 0;
     puts("lprs control: one-shot bootstrap, private rights, actor/subject isolation, fork relation, exec revocation, admission passed");
 }

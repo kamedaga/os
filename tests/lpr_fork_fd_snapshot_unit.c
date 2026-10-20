@@ -5,9 +5,11 @@
 
 lpr_state_t lpr_state;
 static unsigned closed[64], freed, device_unmapped;
+static uint64_t high_closed;
 void *lpr_memset(void *p, int c, size_t n) { return memset(p, c, n); }
 int64_t lpr_close_native_fd_if_open(uint64_t fd)
 {
+    if (fd >= 0x80000000ull) { high_closed = fd; return 0; }
     assert(fd >= 16 && fd < 64);
     closed[fd]++;
     return 0;
@@ -42,6 +44,14 @@ int main(void)
     assert(lpr_exec_manifest_capability_count(LPR_FD_OPS_DMABUF, &prime) == 1);
     prime.token = 19;
     assert(lpr_exec_manifest_capability_count(LPR_FD_OPS_DMABUF, &prime) == 2);
+    lpr_dmabuf_backend_t high = {.native.raw = 0x80000000ll, .lease_fd.raw = 0xfffffffdll};
+    pacha_fd_t native[2];
+    assert(lpr_exec_backend_native_fds(LPR_FD_OPS_DMABUF, &high, native) == 2);
+    assert(native[0] == 0x80000000ll && native[1] == 0xfffffffdll);
+    lpr_dmabuf_backend_t replaced = high;
+    replaced.lease_fd.raw = 31;
+    lpr_fork_close_displaced_capabilities(LPR_FD_OPS_DMABUF, &high, &replaced);
+    assert(high_closed == 0xfffffffdull);
     lpr_fd_entry_t entries[16] = {0};
     lpr_ofd_t ofds[3] = {0};
     lpr_backend_record_t backends[3] = {0};

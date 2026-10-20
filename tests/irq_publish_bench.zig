@@ -1,5 +1,8 @@
 //! Host-only benchmark of the actual kernel IRQ publication path. This is not
 //! a page-load benchmark and its times must not be presented as browser gains.
+// Historical pool sizes used only to exercise growth beyond the removed limits.
+const former_max_fd_objects: usize = 8192;
+
 const std = @import("std");
 const kernel = @import("kernel");
 
@@ -19,7 +22,7 @@ pub fn main() !void {
     var owners: [16]kernel.PrincipalId = undefined;
     for ([_]usize{ 1, 16, 128 }) |occupied| {
         for (0..occupied) |i| {
-            const index = (kernel.max_fd_objects - 1) * (i + 1) / occupied;
+            const index = (former_max_fd_objects - 1) * (i + 1) / occupied;
             state.publishIrqObject(.{ .kind = .irq, .index = @intCast(index), .generation = 1 }, .{
                 .owner_principal_raw = @intFromEnum(owner),
                 .device = if (i == occupied - 1) 0x1001 else 0x1002,
@@ -38,7 +41,7 @@ pub fn main() !void {
             });
         }
         for (0..occupied) |i| {
-            const index = (kernel.max_fd_objects - 1) * (i + 1) / occupied;
+            const index = (former_max_fd_objects - 1) * (i + 1) / occupied;
             state.unpublishIrqObject(.{ .kind = .irq, .index = @intCast(index), .generation = 1 });
         }
     }

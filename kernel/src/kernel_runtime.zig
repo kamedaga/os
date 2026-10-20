@@ -49,8 +49,8 @@ pub fn threadLabel(thread_index: usize) []const u8 {
 
 pub fn principalLabel(principal: kernel.PrincipalId) []const u8 {
     if (kernel_state_ready) {
-        if (kernel_state_global.processDescriptor(principal)) |desc| {
-            return desc.label;
+        if (kernel_state_global.tryProcessLabel(principal)) |label| {
+            return label;
         }
     }
     return kernel.principalLabel(principal);

@@ -11,7 +11,7 @@
 #include <termios.h>
 
 static int termd_call(struct installer_tty *tty, uint32_t op,
-    size_t payload_size, int passed_fd, uint64_t *result) {
+    size_t payload_size, pacha_fd_t passed_fd, uint64_t *result) {
     if (!tty || !tty->page || payload_size >
         PACHA_SERVICE_PAGE_BYTES - PACHA_SERVICE_HEADER_BYTES) return -EINVAL;
     const uint64_t id = ++tty->request_id;
@@ -39,12 +39,8 @@ static int termd_call(struct installer_tty *tty, uint32_t op,
     const struct pacha_ipc_msg request = {
         .word0 = PACHA_SERVICE_REQUEST_MAGIC, .word3 = id,
         .fds = fds, .fd_count = count};
-    const int reply_fd = pacha_ipc_call(tty->endpoint_fd, &request);
-    if (reply_fd < 16) return reply_fd < 0 ? reply_fd : -EIO;
     struct pacha_ipc_msg reply = {0};
-    int status = pacha_ipc_recv_wait(reply_fd, &reply,
-        PACHA_FD_WAIT_FOREVER);
-    (void)pacha_fd_close(reply_fd);
+    int status = pacha_ipc_call(tty->endpoint_fd, &request, &reply, PACHA_FD_WAIT_FOREVER, NULL);
     if (status) return status;
     if (reply.fd_count || reply.word0 != PACHA_SERVICE_REPLY_MAGIC ||
         reply.word3 != id || header->magic != PACHA_SERVICE_REPLY_MAGIC ||
@@ -196,7 +192,7 @@ int installer_tty_read_key(void *context, uint64_t timeout_ns) {
     }
 }
 
-int installer_tty_open(struct installer_tty *tty, int termd_fd,
+int installer_tty_open(struct installer_tty *tty, pacha_fd_t termd_fd,
     unsigned pts_index, FILE **output) {
     if (!tty || termd_fd < 16 || !output) return -EINVAL;
     *tty = (struct installer_tty){.endpoint_fd = termd_fd,

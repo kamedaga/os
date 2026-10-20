@@ -15,7 +15,13 @@ static unsigned int calls, sends, closed;
 static struct gpud_process_exit exit_status;
 static uint64_t ready_operation, ready_generation, ready_correlation, ready_value, ready_fd;
 
-long pacha_syscall4(uint64_t nr, uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+long pacha_syscall3(uint64_t nr, uint64_t a, uint64_t b, uint64_t c) {
+    (void)nr; (void)a; (void)b; (void)c;
+    abort(); /* These scenarios never consume native notifications. */
+}
+
+static long protocol_oracle2(uint64_t, uint64_t, uint64_t);
+static long protocol_oracle4(uint64_t nr, uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
     (void)nr; (void)a; (void)b; (void)c; (void)d;
     abort(); /* Lifecycle step tests only use nonblocking receive. */
 }
@@ -28,7 +34,7 @@ long pacha_syscall1(uint64_t nr, uint64_t fd) {
     return 0;
 }
 
-long pacha_syscall2(uint64_t nr, uint64_t fd, uint64_t address) {
+static long protocol_oracle2(uint64_t nr, uint64_t fd, uint64_t address) {
     ++calls;
     if (nr == PACHA_PROCESS_SYSCALL_WAIT) {
         assert(fd == 17);
@@ -188,4 +194,34 @@ int main(void) {
     for (unsigned int mode = 0; mode < 3; ++mode) quiesce_round(mode);
     puts("gpud module lifecycle binding: PASS (not DRM service readiness)");
     return 0;
+}
+
+long pacha_syscall2(uint64_t nr, uint64_t a, uint64_t b) {
+    assert(nr != PACHA_IPC_SYSCALL_SEND && nr != PACHA_IPC_SYSCALL_RECV);
+    return protocol_oracle2(nr, a, b);
+}
+long pacha_syscall4(uint64_t nr, uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    assert(nr != PACHA_IPC_SYSCALL_RECV_WAIT);
+    return protocol_oracle4(nr, a, b, c, d);
+}
+long pacha_ipc_registers(uint64_t nr, uint64_t fd, uint64_t flags, uint64_t timeout,
+    uint64_t words[4], struct pacha_ipc_extension *extension, int *committed) {
+    const int sending = nr == PACHA_IPC_SYSCALL_SEND;
+    struct pacha_ipc_msg message = {
+        .word0=words[0], .word1=words[1], .word2=words[2], .word3=words[3],
+        .fds=extension ? (void *)(uintptr_t)(sending ? extension->send_array : extension->receive_array) : 0,
+        .fd_count=extension && sending ? extension->send_count : 0,
+        .fd_capacity=extension ? extension->receive_capacity : 0,
+    };
+    long status = nr == PACHA_IPC_SYSCALL_RECV_WAIT ?
+        protocol_oracle4(nr, fd, (uintptr_t)&message, timeout, flags) :
+        protocol_oracle2(nr, fd, (uintptr_t)&message);
+    words[0]=words[1]=words[2]=words[3]=0;
+    if (!sending && !status) {
+        words[0]=message.word0; words[1]=message.word1;
+        words[2]=message.word2; words[3]=message.word3;
+    }
+    if (extension) extension->received_count = message.fd_count;
+    if (committed) *committed=0;
+    return status;
 }

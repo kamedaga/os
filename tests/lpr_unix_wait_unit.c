@@ -89,7 +89,7 @@ int lpr_unix_client_call(const struct lpr_unix_client *client, struct unix_contr
     return 0;
 }
 
-int64_t lpr_wait_graph_block(lpr_wait_graph_t *graph, const lpr_wait_deadline_t *until)
+int64_t lpr_wait_graph_block(lpr_wait_graph_t *graph, const lpr_wait_deadline_t *until, unsigned *wait_not_ready __attribute__((unused)))
 {
     assert(until == &deadline && until->expires_ns == 123456);
     assert(graph->leaf_count == 2 && graph->leaves[0].fd == 40 && graph->leaves[1].fd == 80);
@@ -116,7 +116,7 @@ static int ready(void *context)
 static int64_t attempt(struct lpr_unix_waiter *waiter)
 {
     ready_calls = 0;
-    return lpr_unix_waiter_wait(waiter, &bank, &changes[0], &changes[1], ready, &bank, &deadline);
+    return lpr_unix_waiter_wait(waiter, &bank, &changes[0], &changes[1], ready, &bank, &deadline, 0);
 }
 
 static void disarmed(void)
@@ -249,4 +249,14 @@ int main(void)
     lpr_unix_waiter_destroy(&waiter);
     assert(!live && closes == old_closes + 1);
     puts("lpr unix wait: cap validation, own drain, bounded flood, arm/recheck, real graph leaves, signal cleanup, broker HUP, fork cleanup passed");
+}
+
+#include "lpr_ipc_mock.h"
+int64_t lpr_ipc_message(uint64_t nr, uint64_t fd, uint64_t send, uint64_t receive,
+    uint64_t timeout, uint64_t flags, int *committed) {
+    return test_lpr_ipc_noncall(nr, fd, send, receive, timeout, flags, committed);
+}
+
+int64_t lpr_pacha_syscall4(uint64_t nr,uint64_t a,uint64_t b,uint64_t c,uint64_t d) {
+    (void)nr;(void)a;(void)b;(void)c;(void)d;abort();
 }

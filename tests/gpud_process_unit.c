@@ -14,6 +14,11 @@ static struct gpud_process_exit observed;
 static long info_error, wait_error, kill_error, close_error;
 static unsigned int calls, kills, closes, waits, exit_on_kill;
 
+long pacha_syscall3(uint64_t nr, uint64_t a, uint64_t b, uint64_t c) {
+    (void)nr; (void)a; (void)b; (void)c;
+    abort(); /* These scenarios never consume native notifications. */
+}
+
 long pacha_syscall4(uint64_t nr, uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
     (void)nr; (void)a; (void)b; (void)c; (void)d;
     abort(); /* Process ownership tests do not use blocking IPC receive. */
@@ -270,4 +275,10 @@ int main(void) {
     for (unsigned int mode = 0; mode < 3; ++mode) test_controller_exit(mode);
     puts("gpud process ownership/controller exit unit: PASS (not a service recovery Gate)");
     return 0;
+}
+
+long pacha_ipc_registers(uint64_t nr, uint64_t fd, uint64_t flags, uint64_t timeout,
+    uint64_t words[4], struct pacha_ipc_extension *extension, int *committed) {
+    (void)nr; (void)fd; (void)flags; (void)timeout; (void)words; (void)extension; (void)committed;
+    abort(); /* This fixture exercises process ownership, never IPC. */
 }

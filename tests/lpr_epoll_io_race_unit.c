@@ -27,7 +27,7 @@ int64_t lpr_pacha_syscall2(uint64_t nr, uint64_t fd, uint64_t message)
     notifications++;
     return 0;
 }
-int64_t lpr_linux_poll_current(uint64_t raw, uint64_t count)
+int64_t lpr_linux_poll_current(uint64_t raw, uint64_t count, unsigned *wait_not_ready __attribute__((unused)))
 {
     lpr_linux_pollfd_t *fds = (void *)(uintptr_t)raw;
     assert(!locked);
@@ -38,9 +38,9 @@ int64_t lpr_linux_poll_current(uint64_t raw, uint64_t count)
     }
     return ready;
 }
-int64_t lpr_linux_poll_cached(uint64_t raw, uint64_t count)
+int64_t lpr_linux_poll_cached(uint64_t raw, uint64_t count, unsigned *wait_not_ready __attribute__((unused)))
 {
-    return lpr_linux_poll_current(raw, count);
+    return lpr_linux_poll_current(raw, count, 0);
 }
 
 int64_t lpr_unix_socket_poll_sequence(uint64_t fd, uint32_t events,
@@ -97,14 +97,14 @@ static uint32_t take_event(void)
     lpr_linux_epoll_event_t event = {0};
     uint32_t count;
     assert(lpr_epoll_snapshot(4, snapshot, &count) == 0);
-    const int64_t result = lpr_epoll_scan(4, snapshot, count, &event, 1, 1, 1);
+    const int64_t result = lpr_epoll_scan(4, snapshot, count, &event, 1, 1, 1, 0);
     assert(result == 0 || result == 1);
     assert(!result || event.data == 1234);
     return result ? event.events : 0;
 }
 static void note_io(uint64_t fd, uint32_t direction, int64_t result)
 {
-    lpr_epoll_note_fd_state(fd, direction, result);
+    lpr_epoll_note_fd_state(fd, direction, result, 0);
 }
 int main(void)
 {
@@ -163,4 +163,14 @@ int main(void)
     if (failures) return 1;
     puts("LPR_EPOLL_IO_RACE_UNIT=OK");
     return 0;
+}
+
+#include "lpr_ipc_mock.h"
+int64_t lpr_ipc_message(uint64_t nr, uint64_t fd, uint64_t send, uint64_t receive,
+    uint64_t timeout, uint64_t flags, int *committed) {
+    return test_lpr_ipc_noncall(nr, fd, send, receive, timeout, flags, committed);
+}
+
+int64_t lpr_pacha_syscall4(uint64_t nr,uint64_t a,uint64_t b,uint64_t c,uint64_t d) {
+    (void)nr;(void)a;(void)b;(void)c;(void)d;abort();
 }

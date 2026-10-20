@@ -1,0 +1,210 @@
+{
+  "_start": {
+    "sha256": "c46aee93d89f79e83200d8b2e92ff8a4b1c302b8a9eccb97aeebbbdb644ca46e",
+    "switches": {
+      "8": {
+        "initial_bytes": 0,
+        "reason": "platform.ring0StackTop: BSP stack base, no relation to old RSP"
+      }
+    },
+    "variants": [
+      {
+        "sha256": "4d9b9a36df236376a600aecc33db9a7e9c762e5058b3529598f8dc7042c47f3d",
+        "switches": {
+          "57": {
+            "initial_bytes": 0,
+            "reason": "stack-high-water: unused BSP painting completes on Limine stack before ring0StackTop RSP switch"
+          }
+        }
+      },
+      {
+        "sha256": "15a8a4a30936c3ed066300536ad345223c8e6430480b969c05ae3c47a04cf03a",
+        "switches": {
+          "57": {
+            "initial_bytes": 0,
+            "reason": "stack-high-water: unused BSP painting completes on Limine stack before ring0StackTop RSP switch (lock checks on; reviewed absolute table relocation)"
+          }
+        }
+      }
+    ]
+  },
+  "boot.entry.enterUserModeIretq": {
+    "sha256": "0489e5851610a02df0c2a5758630e3101cdbf8ca8d88cbfe21c05bfb8c775aa0",
+    "switches": {
+      "25": {
+        "initial_bytes": 0,
+        "reason": "platform.ring0StackTop: BSP stack base, no relation to old RSP"
+      },
+      "26": {
+        "initial_bytes": 0,
+        "reason": "per-CPU saved IRET frame: no pushes/calls before IRET, consumes no new stack"
+      }
+    }
+  },
+  "deviceInterruptHandlerStub": {
+    "sha256": "46d58603030ec3c1eabb938914381baca80953fb1360b1f09d4a17d0fad15513",
+    "switches": {
+      "60": {
+        "initial_bytes": 0,
+        "reason": "validated CPU index into kernel_syscall_stack_tops: new kernel stack segment"
+      }
+    }
+  },
+  "timerInterruptHandlerStub": {
+    "sha256": "c2cbf130f1b9685414b5e50e6a74c6b3c90a9541ce4f0191493426104528216c",
+    "switches": {
+      "60": {
+        "initial_bytes": 0,
+        "reason": "validated CPU index into kernel_syscall_stack_tops: new kernel stack segment"
+      }
+    }
+  },
+  "schedulerWakeIpiHandlerStub": {
+    "sha256": "acbf9d696253039a1baf4b59080ccad3fc301f0ca919d693a193e25490dd7d65",
+    "switches": {
+      "60": {
+        "initial_bytes": 0,
+        "reason": "validated CPU index into kernel_syscall_stack_tops: new kernel stack segment"
+      }
+    }
+  },
+  "syscallEntryCommon": {
+    "sha256": "01e8511489d2ee71fa7d8bdcbe9840e08c0156c08c3d0925d5211f16e9ab55c7",
+    "switches": {
+      "9": {
+        "initial_bytes": 0,
+        "reason": "validated CPU index into kernel_syscall_stack_tops: new kernel stack segment"
+      },
+      "52": {
+        "initial_bytes": 0,
+        "reason": "per-CPU saved IRET frame: no pushes/calls before IRET, consumes no new stack"
+      }
+    },
+    "variants": [
+      {
+        "sha256": "08e7439f45a3b8e8e1618b84ed5b4f9ee8a75e96ed43986a2691fcc155b418bc",
+        "switches": {
+          "28": {
+            "initial_bytes": 0,
+            "reason": "B3-only diagnostic: unchanged per-CPU kernel stack selection; scalar timestamp instructions do not use stack"
+          },
+          "114": {
+            "initial_bytes": 0,
+            "reason": "B3-only diagnostic: saved IRET frame, only GPR loads before IRET"
+          }
+        }
+      },
+      {
+        "sha256": "6b86a1ed7b7ec464f450c6134bb839ab303fab1e9396f5e21bff950b64a073e9",
+        "switches": {
+          "9": {
+            "initial_bytes": 0,
+            "reason": "B3 scalar admission uses same per-CPU kernel stack, aligned calls preserve R15 anchor"
+          },
+          "66": {
+            "initial_bytes": 0,
+            "reason": "B3 scalar or saved return joins before original GPR-only IRET frame handoff; both CR3 loads retained"
+          }
+        }
+      },
+      {
+        "sha256": "38e2413cb8e3bbc7d1285134b8b012f062d1803abff03f7ec36c0314f82a57e0",
+        "switches": {
+          "28": {
+            "initial_bytes": 0,
+            "reason": "B3 scalar profile: same per-CPU kernel stack; stamps use GPRs only"
+          },
+          "140": {
+            "initial_bytes": 0,
+            "reason": "B3 scalar profile: joined GPR-only IRET exit after two CR3 loads"
+          }
+        }
+      },
+      {
+        "sha256": "ec37fa2102ee171f3db3f5db3206604d20ded10b9efdd0a12e248f157c97355c",
+        "switches": {
+          "9": {
+            "initial_bytes": 0,
+            "reason": "B7 notify: validated per-CPU kernel stack before aligned calls"
+          }
+        }
+      },
+      {
+        "sha256": "772e1a150d5203b2f0d2cb6ed62fcd9e58cda3a014a8e3bf117a01793e57ac96",
+        "switches": {}
+      }
+    ]
+  },
+  "userReturnToSavedFrame": {
+    "sha256": "5e668afcdf2debc91ea838ec657abc282eb57b5060609cfaefa3994a8df2f432",
+    "switches": {
+      "38": {
+        "initial_bytes": 0,
+        "reason": "per-CPU saved IRET frame: no pushes/calls before IRET, consumes no new stack"
+      }
+    }
+  },
+  "syscallDirectIpcEntry": {
+    "sha256": "6a7445d3609b26ce4c9f097373ea666a525cce32bca8a1b32f27301566a647e4",
+    "switches": {
+      "4": {
+        "initial_bytes": 0,
+        "reason": "Boot-generated CPU slot selects kernel_syscall_stack_tops before any call; partial frame has already saved user RSP."
+      },
+      "53": {
+        "initial_bytes": 0,
+        "reason": "Validated low-user RSP from admitted IPC syscall frame; only GPR loads precede SYSRET, no stack accesses."
+      }
+    },
+    "variants": [
+      {
+        "sha256": "4583f37bd51dbef7e85178fe60e3e83f0021c2db3397700cb1c0b2f38294df60",
+        "switches": {
+          "4": {
+            "initial_bytes": 0,
+            "reason": "B7 notify: validated per-CPU kernel stack before aligned calls"
+          },
+          "56": {
+            "initial_bytes": 0,
+            "reason": "B7 notify: validated saved user frame; only GPR loads before SYSRET/IRET, no further stack allocation"
+          }
+        }
+      },
+      {
+        "sha256": "3d268df557fab0b167be2da51a6ced93b9bc511bb65c9d0487dfdd0435eb6e17",
+        "switches": {
+          "4": {
+            "initial_bytes": 0,
+            "reason": "Validated boot-generated CPU slot selects its kernel stack before preflight; full user GPR frame precedes fallback."
+          },
+          "56": {
+            "initial_bytes": 0,
+            "reason": "Validated native user RSP; only GPR restores precede SYSRET. Miss jumps to the shared entry under the already installed kernel CR3."
+          }
+        }
+      }
+    ]
+  },
+  "syscallIpcCommittedReturn": {
+    "sha256": "0e4e2a1a6a6dbf15c4d1532869d2d8cda0cf54cac2f38cc75258fc665cdbf272",
+    "switches": {
+      "23": {
+        "initial_bytes": 0,
+        "reason": "B7 notify: validated saved user frame; only GPR loads before SYSRET/IRET, no further stack allocation"
+      }
+    }
+  },
+  "syscallEntryCommonFromKernel": {
+    "sha256": "37ca61ff8392fba4ce8795ac04b1e4fb6953fcddb33b5acee2db3f936cf65477",
+    "switches": {}
+  },
+  "syscallEntryCommonKernelReady": {
+    "sha256": "eaf85c7b3fc2cf20f056edfc76d38525f639c636085f70f65cb9234a8d29acdb",
+    "switches": {
+      "1": {
+        "initial_bytes": 0,
+        "reason": "Both reviewed preambles form R14=validated CPU slot*8 and R12=supervisor work frame with kernel CR3 installed; select the boot-owned kernel stack before any call."
+      }
+    }
+  }
+}

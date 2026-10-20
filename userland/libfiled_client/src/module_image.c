@@ -11,14 +11,14 @@ static uint64_t rd64(const unsigned char *p)
     for(unsigned i=0;i<8;++i) value|=(uint64_t)p[i]<<(8*i);
     return value;
 }
-static int close_handle(int endpoint,uint64_t handle)
+static int close_handle(pacha_fd_t endpoint,uint64_t handle)
 {
     kb2_fs_request_t r={.opcode=KB2_FILESYSTEM_OP_CLOSE,.handle=handle};
     kb2_fs_response_t response;
     int status=filedfs_call(endpoint,&r,NULL,NULL,NULL,0,NULL,0,&response,NULL,0,NULL,NULL);
     return status ? status : response.result<0 ? (int)response.result : 0;
 }
-int filed_client_load_module_image_limited(int endpoint,const char *path,
+int filed_client_load_module_image_limited(pacha_fd_t endpoint,const char *path,
     const char *name,size_t max_bytes,struct filed_client_module_image *out)
 {
     if(endpoint<16 || !path || !name || !out || !max_bytes) return -22;
@@ -58,7 +58,7 @@ int filed_client_load_module_image_limited(int endpoint,const char *path,
     *out=(struct filed_client_module_image){.data=copy,.size=(size_t)size,.name=name};
     return 0;
 }
-int filed_client_load_module_image(int endpoint,const char *path,const char *name,
+int filed_client_load_module_image(pacha_fd_t endpoint,const char *path,const char *name,
     struct filed_client_module_image *out)
 {
     return filed_client_load_module_image_limited(endpoint,path,name,

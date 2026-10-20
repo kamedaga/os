@@ -19,6 +19,10 @@
 #include "../tests/internal_microbench_clock.h"
 #endif
 
+/* Service admission budgets for queue inventory and its share of sandbox
+ * RAM. These do not describe the kernel FD table or Linux RLIMIT_NOFILE. */
+enum { owner_client_admission = 1024, owner_queue_admission = 4096 };
+
 static const uint8_t device_schema[32] = KB2_PCI_FUNCTION_SCHEMA_SHA256_BYTES;
 
 struct owner_queue {
@@ -26,7 +30,7 @@ struct owner_queue {
     struct ph_fs_channel channel;
     kb2_vq_chain_t **slots;
     uint16_t *owners;
-    int vmo_fd;
+    pacha_fd_t vmo_fd;
     void *mapping;
     size_t mapping_size;
     uint64_t bind_operation, notify_operation;
@@ -75,7 +79,7 @@ static int make_blob(const void *bytes, size_t size, struct ph_bootstrap_item *i
     size_t mapped_size = (size + 4095) & ~(size_t)4095;
     const uint64_t rights = PACHA_FD_RIGHT_INSPECT | PACHA_FD_RIGHT_CLOSE |
         PACHA_FD_RIGHT_TRANSFER | PACHA_FD_RIGHT_MAP_READ | PACHA_FD_RIGHT_MAP_WRITE;
-    int fd = pacha_vmo_create(mapped_size, rights, 0);
+    pacha_fd_t fd = pacha_vmo_create(mapped_size, rights, 0);
     if (fd < 16) return fd < 0 ? fd : -ENOMEM;
     void *mapping = pacha_mmap(fd, mapped_size, PACHA_PROT_READ | PACHA_PROT_WRITE,
         PACHA_MMAP_SHARED, 0);
@@ -195,13 +199,11 @@ static int configure_controller(struct filed_storage_owner *owner)
     kb2_sha256(device_schema, 32, capability_digest);
     kb2_sha256(channel_contract, sizeof(channel_contract) - 1, channel_digest);
     const uint8_t *const digests[] = {owner->identity.manifest_digest, capability_digest, channel_digest};
-    /* Dedicated client queues make the old fixed three-lane topology false.
-     * Bound controller resource accounting by the native FD table, not an
-     * invented filesystem client/file ceiling. Each queue's negotiated depth
-     * remains the descriptor budget; actual allocation/FD pressure can fail
-     * earlier without changing Linux filesystem semantics. */
-    uint64_t limits[] = {owner->config.sandbox_ram_bytes, PACHA_FD_TABLE_LIMIT,
-        PACHA_FD_TABLE_LIMIT, PACHA_FD_TABLE_LIMIT * owner->config.queue_size};
+    /* Queue depth bounds outstanding requests; the service RAM budget can
+     * reject admission earlier. Kernel capabilities grow independently. */
+    if (owner->config.queue_size > UINT64_MAX / owner_queue_admission) return -EOVERFLOW;
+    uint64_t limits[] = {owner->config.sandbox_ram_bytes, owner_queue_admission,
+        owner_queue_admission, owner_queue_admission * owner->config.queue_size};
     for (unsigned kind = KB2_DIGEST_PROFILE; kind <= KB2_DIGEST_CHANNEL_SET; ++kind)
         if (kb2_controller_set_digest(owner->controller, kind,
                 digests[kind - KB2_DIGEST_PROFILE], 32) != KB2_STATUS_OK) return -EINVAL;
@@ -301,9 +303,9 @@ int filed_storage_owner_client_config(struct filed_storage_owner *owner, uint64_
     if (owner->next_exchange == UINT64_MAX) return -EOVERFLOW;
     uint64_t budget = owner->config.sandbox_ram_bytes / 4;
     /* The owner's large control arena is not a per-process reservation.
-     * Derive idle client capacity from RAM and the native lease count budget;
+     * Derive idle client capacity from RAM and the service client admission budget;
      * larger operations request their own exact authenticated lease below. */
-    uint64_t base_arena = (budget / (2 * (PACHA_FD_TABLE_LIMIT / 4))) & ~4095ull;
+    uint64_t base_arena = (budget / (2 * owner_client_admission)) & ~4095ull;
     if (base_arena < 4096) base_arena = 4096;
     if (base_arena > owner->config.queue_arena_bytes) base_arena = owner->config.queue_arena_bytes;
     *config = (struct ph_fs_channel_config){.generation = owner->identity.generation,
@@ -325,7 +327,7 @@ int filed_storage_owner_client_config(struct filed_storage_owner *owner, uint64_
         inventory > UINT64_MAX - bytes - config->arena_bytes) return -EOVERFLOW;
     uint64_t charge = bytes + config->arena_bytes + inventory;
     if (charge > budget) return -ENOMEM;
-    if (owner->client_bytes > budget - charge || owner->client_count >= PACHA_FD_TABLE_LIMIT / 4)
+    if (owner->client_bytes > budget - charge || owner->client_count >= owner_client_admission)
         return -EAGAIN;
     struct owner_client_queue *reserved = calloc(1, sizeof(*reserved));
     if (!reserved) return -ENOMEM;
@@ -370,7 +372,7 @@ static int client_ack(struct filed_storage_owner *owner, uint64_t id, uint64_t o
 }
 
 int filed_storage_owner_client_bind(struct filed_storage_owner *owner,
-    const struct ph_fs_channel_config *config, int vmo_fd, int doorbell_fd)
+    const struct ph_fs_channel_config *config, pacha_fd_t vmo_fd, pacha_fd_t doorbell_fd)
 {
     if (!owner || !owner->started || owner->failed) return -EPIPE;
     if (!config || config->generation != owner->identity.generation ||
@@ -528,7 +530,7 @@ static int queue_wait(void *context, uint32_t notification)
     }
 }
 
-int filed_storage_owner_create(int bootfs_fd, uint64_t bootfs_size,
+int filed_storage_owner_create(pacha_fd_t bootfs_fd, uint64_t bootfs_size,
     const storage_filed_bootstrap_t *bootstrap, struct filed_storage_owner **out)
 {
     if (!out || !bootstrap || bootfs_fd < 16 || bootstrap->device_fd < 16 ||
@@ -541,7 +543,7 @@ int filed_storage_owner_create(int bootfs_fd, uint64_t bootfs_size,
     owner->next_exchange = 2;
     owner->management = (struct pacha_ipc_channel_pair){.a = -1, .b = -1};
     struct pacha_capsule_info info = {0};
-    int error = pacha_capsule_query((int)bootstrap->device_fd, &info);
+    int error = pacha_capsule_query((pacha_fd_t)bootstrap->device_fd, &info);
     uint64_t required = PH_DEVICE_FUNCTION_RIGHTS | PACHA_FD_RIGHT_TRANSFER;
     if (!error && (info.kind != PACHA_CAPSULE_KIND_DEVICE || !info.device ||
             (info.rights & required) != required || !(info.flags & PACHA_CAPSULE_DMA_TRANSLATED) ||
@@ -818,7 +820,7 @@ static int retire_owner(struct filed_storage_owner *owner)
             continue;
         }
         if (type == KB2_ACTION_REVOKE_RESOURCES) {
-            int error = pacha_capsule_dma_set_enabled((int)owner->config.device_fd, 0);
+            int error = pacha_capsule_dma_set_enabled((pacha_fd_t)owner->config.device_fd, 0);
             if (error) return error;
             if (owner->data.channel.identity.generation)
                 kb2_vq_channel_fault(&owner->data.channel.channel);
@@ -828,7 +830,7 @@ static int retire_owner(struct filed_storage_owner *owner)
                 kb2_vq_channel_fault(&owner->temporary->channel.channel);
         } else if (type == KB2_ACTION_RELEASE_RESOURCES) {
             if (owner->items[1].capability.fd >= 16) {
-                int error = pacha_fd_close((int)owner->items[1].capability.fd);
+                int error = pacha_fd_close((pacha_fd_t)owner->items[1].capability.fd);
                 if (error) return error;
                 owner->items[1] = (struct ph_bootstrap_item){0};
             }
@@ -855,7 +857,7 @@ int filed_storage_owner_destroy(struct filed_storage_owner *owner)
     for (size_t i = 0; owner->items && i < owner->artifact_count + 2; ++i) {
         uint64_t fd = owner->items[i].capability.fd;
         if (fd >= 16) {
-            error = pacha_fd_close((int)fd);
+            error = pacha_fd_close((pacha_fd_t)fd);
             if (error) return error;
             owner->items[i].capability.fd = 0;
         }

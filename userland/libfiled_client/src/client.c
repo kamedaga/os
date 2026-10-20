@@ -5,10 +5,10 @@
 #include <stdlib.h>
 #include <string.h>
 
-int filed_client_call_published(int endpoint, const kb2_fs_request_t *r,
+int filed_client_call_published(pacha_fd_t endpoint, const kb2_fs_request_t *r,
     const void *tail, size_t tail_size, void *out, size_t capacity,
-    kb2_fs_response_t *response, const int *sources, size_t source_count,
-    int *reply_fds, size_t *reply_count, int *published)
+    kb2_fs_response_t *response, const pacha_fd_t *sources, size_t source_count,
+    pacha_fd_t *reply_fds, size_t *reply_count, int *published)
 {
     if (published) *published=0;
     if (endpoint < 16 || !r || !response || (tail_size && !tail) ||
@@ -21,7 +21,7 @@ int filed_client_call_published(int endpoint, const kb2_fs_request_t *r,
     size_t size = request_size > response_size ? request_size : response_size;
     if (size > SIZE_MAX-4095) return -75;
     size = (size+4095)&~(size_t)4095;
-    int vmo = pacha_vmo_create(size, PACHA_FD_RIGHT_INSPECT |
+    pacha_fd_t vmo = pacha_vmo_create(size, PACHA_FD_RIGHT_INSPECT |
         PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_TRANSFER |
         PACHA_FD_RIGHT_MAP_READ | PACHA_FD_RIGHT_MAP_WRITE, 0);
     if (vmo < 16) return vmo < 0 ? vmo : -5;
@@ -46,13 +46,7 @@ int filed_client_call_published(int endpoint, const kb2_fs_request_t *r,
     struct pacha_ipc_fd received[PACHA_IPC_MAX_TRANSFER_FDS] = {{0}};
     struct pacha_ipc_msg reply = { .fds=received,.fd_capacity=PACHA_IPC_MAX_TRANSFER_FDS };
     if (!status) {
-        int reply_fd=pacha_ipc_call(endpoint,&message);
-        if (reply_fd < 16) status=reply_fd < 0 ? reply_fd : -5;
-        else {
-            if (published) *published=1;
-            status=pacha_ipc_recv_wait(reply_fd,&reply,PACHA_FD_WAIT_FOREVER);
-            (void)pacha_fd_close(reply_fd);
-        }
+        status=pacha_ipc_call(endpoint,&message,&reply,PACHA_FD_WAIT_FOREVER,published);
     }
     if (!status && (reply.word0 != r->opcode || reply.word2 > response_size ||
         reply.word2 < KB2_FILESYSTEM_RESPONSE_SIZE || reply.word3 != r->sequence ||
@@ -66,26 +60,26 @@ int filed_client_call_published(int endpoint, const kb2_fs_request_t *r,
     if (!status && reply.fd_count>accepted) { status=-71; accepted=0; }
     if (accepted > reply.fd_count) accepted=reply.fd_count;
     for (size_t i=0; i<reply.fd_count; ++i) {
-        if (i<accepted) reply_fds[i]=(int)received[i].fd;
-        else (void)pacha_fd_close((int)received[i].fd);
+        if (i<accepted) reply_fds[i]=(pacha_fd_t)received[i].fd;
+        else (void)pacha_fd_close((pacha_fd_t)received[i].fd);
     }
     if (reply_count) *reply_count=accepted;
     (void)pacha_munmap(page,size);
     (void)pacha_fd_close(vmo);
     return status;
 }
-int filed_client_call(int endpoint,const kb2_fs_request_t *r,
+int filed_client_call(pacha_fd_t endpoint,const kb2_fs_request_t *r,
     const void *tail,size_t tail_size,void *out,size_t capacity,
-    kb2_fs_response_t *response,const int *sources,size_t source_count,
-    int *reply_fds,size_t *reply_count)
+    kb2_fs_response_t *response,const pacha_fd_t *sources,size_t source_count,
+    pacha_fd_t *reply_fds,size_t *reply_count)
 {
     return filed_client_call_published(endpoint,r,tail,tail_size,out,capacity,
         response,sources,source_count,reply_fds,reply_count,NULL);
 }
-int filedfs_call(int endpoint,kb2_fs_request_t *r,const char *path,
+int filedfs_call(pacha_fd_t endpoint,kb2_fs_request_t *r,const char *path,
     const char *second,const void *data,size_t data_size,
     void *out,size_t capacity,kb2_fs_response_t *response,
-    const int *sources,size_t source_count,int *received,size_t *received_count)
+    const pacha_fd_t *sources,size_t source_count,pacha_fd_t *received,size_t *received_count)
 {
     static uint64_t sequence;
     if (!r || (data_size && !data)) return -22;

@@ -9,10 +9,10 @@ void *lpr_termd_payload(void *page)
 
 static int64_t lpr_termd_call_with_fd(
     uint32_t op,
-    int page_fd,
+    pacha_fd_t page_fd,
     void *page,
     uint32_t payload_size,
-    int transfer_fd,
+    pacha_fd_t transfer_fd,
     uint64_t *out_result)
 {
     if (LPR_TERMD_TTY_ENDPOINT_FD < 16) {
@@ -52,7 +52,7 @@ static int64_t lpr_termd_call_with_fd(
         PACHA_FD_RIGHT_MAP_WRITE;
     fd_count++;
     if (transfer_fd >= 16) {
-        fds[fd_count].fd = (uint64_t)(uint32_t)transfer_fd;
+        fds[fd_count].fd = (uint64_t)transfer_fd;
         fds[fd_count].rights =
             PACHA_FD_RIGHT_INSPECT |
             PACHA_FD_RIGHT_TRANSFER |
@@ -75,52 +75,12 @@ static int64_t lpr_termd_call_with_fd(
     if (lpr_boot_diagnostic_tty_active())
         lpr_boot_diagnostic_emit("tty.call.enter", op, LPR_TERMD_TTY_ENDPOINT_FD,
             request_id, 0, 0);
-    const int64_t reply_fd = lpr_pacha_syscall2(
-        PACHAOS_SYSCALL_IPC_CALL,
-        LPR_TERMD_TTY_ENDPOINT_FD,
-        (uint64_t)(uintptr_t)request);
+    const int64_t recv_status = lpr_native_ipc_call_wait(
+        LPR_TERMD_TTY_ENDPOINT_FD, request, reply, NULL);
     if (lpr_boot_diagnostic_tty_active())
-        lpr_boot_diagnostic_emit("tty.call.return", op, request_id, fd_count,
-            reply_fd < 16 ? lpr_pacha_status_to_errno(reply_fd) : 0, reply_fd);
-    if (reply_fd < 16) {
-        const int64_t err = lpr_pacha_status_to_errno(reply_fd);
-        lpr_trace_error_record(
-            LPR_ERROR_DOMAIN_KERNEL,
-            op,
-            LPR_ERROR_STAGE_CHILD_RPC_CALL,
-            err,
-            reply_fd,
-            request->word3,
-            fd_count,
-            LPR_TERMD_TTY_ENDPOINT_FD,
-            0,
-            "termd ipc_call failed");
-        return lpr_pacha_status_to_errno(reply_fd);
-    }
-    if (lpr_boot_diagnostic_tty_active())
-        lpr_boot_diagnostic_emit("tty.recv.enter", op, request_id, reply_fd, 0, 0);
-    const int64_t recv_status = lpr_native_ipc_recv_wait(
-        (uint64_t)(uint32_t)reply_fd,
-        reply);
-    if (lpr_boot_diagnostic_tty_active())
-        lpr_boot_diagnostic_emit("tty.recv.return", op, request_id, reply->word0,
+        lpr_boot_diagnostic_emit("tty.call.return", op, request_id, reply->word0,
             recv_status ? lpr_pacha_status_to_errno(recv_status) : 0, recv_status);
-    (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, (uint64_t)(uint32_t)reply_fd);
-    if (recv_status != 0) {
-        const int64_t err = lpr_pacha_status_to_errno(recv_status);
-        lpr_trace_error_record(
-            LPR_ERROR_DOMAIN_KERNEL,
-            op,
-            LPR_ERROR_STAGE_CHILD_RPC_RECV,
-            err,
-            recv_status,
-            request->word3,
-            fd_count,
-            (uint64_t)(uint32_t)reply_fd,
-            0,
-            "termd reply recv failed");
-        return err;
-    }
+    if (recv_status != 0) return lpr_pacha_status_to_errno(recv_status);
     const pacha_service_envelope_t *reply_header =
         (const pacha_service_envelope_t *)page;
     if (lpr_boot_diagnostic_tty_active())
@@ -168,7 +128,7 @@ static int64_t lpr_termd_call_with_fd(
 
 int64_t lpr_termd_call(
     uint32_t op,
-    int page_fd,
+    pacha_fd_t page_fd,
     void *page,
     uint32_t payload_size,
     uint64_t *out_result)
@@ -180,7 +140,7 @@ int64_t lpr_termd_call(
 int64_t lpr_termd_call_handle(uint32_t op, uint64_t handle, uint64_t *out_result)
 {
     void *page = 0;
-    const int page_fd = lpr_create_tty_wire_page(&page);
+    const pacha_fd_t page_fd = lpr_create_tty_wire_page(&page);
     if (page_fd < 0) {
         return page_fd;
     }
@@ -197,7 +157,7 @@ int64_t lpr_termd_call_handle(uint32_t op, uint64_t handle, uint64_t *out_result
 
 int64_t lpr_termd_transfer_dup_handle(
     uint64_t handle,
-    int lease_fd,
+    pacha_fd_t lease_fd,
     uint64_t *out_handle)
 {
     if (out_handle == 0 || lease_fd < 16) {
@@ -205,7 +165,7 @@ int64_t lpr_termd_transfer_dup_handle(
     }
     *out_handle = 0;
     void *page = 0;
-    const int page_fd = lpr_create_tty_wire_page(&page);
+    const pacha_fd_t page_fd = lpr_create_tty_wire_page(&page);
     if (page_fd < 0) {
         return page_fd;
     }
@@ -232,7 +192,7 @@ int64_t lpr_termd_transfer_dup_handle(
         (status != 0 ? status : -LPR_LINUX_EIO);
 }
 
-int lpr_tty_fd_alloc(uint64_t handle, uint64_t flags, int native_wait_fd)
+int lpr_tty_fd_alloc(uint64_t handle, uint64_t flags, pacha_fd_t native_wait_fd)
 {
     const lpr_tty_backend_t record = {
         .active = 1, .flags = (uint32_t)flags, .handle = handle,
@@ -252,7 +212,7 @@ int64_t lpr_tty_open_peer(uint64_t master_fd, uint64_t flags)
     }
 
     void *page = 0;
-    const int page_fd = lpr_create_tty_wire_page(&page);
+    const pacha_fd_t page_fd = lpr_create_tty_wire_page(&page);
     if (page_fd < 0) {
         return page_fd;
     }
@@ -271,8 +231,8 @@ int64_t lpr_tty_open_peer(uint64_t master_fd, uint64_t flags)
         &request->tty.signal_ignored);
 
     uint64_t handle = 0;
-    int native_wait_fd = -1;
-    int remote_wait_fd = -1;
+    pacha_fd_t native_wait_fd = -1;
+    pacha_fd_t remote_wait_fd = -1;
     const int wait_status =
         lpr_native_wait_pair(&native_wait_fd, &remote_wait_fd);
     if (wait_status != 0) {
@@ -288,15 +248,15 @@ int64_t lpr_tty_open_peer(uint64_t master_fd, uint64_t flags)
         &handle);
     lpr_destroy_tty_wire_page(page_fd, page);
     if (status != 0) {
-        (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)native_wait_fd);
-        (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)remote_wait_fd);
+        (void)lpr_close_native_fd_if_open((uint64_t)native_wait_fd);
+        (void)lpr_close_native_fd_if_open((uint64_t)remote_wait_fd);
         return status;
     }
 
     const int peer_fd = lpr_tty_fd_alloc(handle, flags, native_wait_fd);
     if (peer_fd < 0) {
         (void)lpr_termd_call_handle(TERMD_OP_HANDLE_CLOSE, handle, 0);
-        (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)native_wait_fd);
+        (void)lpr_close_native_fd_if_open((uint64_t)native_wait_fd);
         return peer_fd;
     }
     lpr_tty_backend_t *peer = lpr_tty_backend((uint64_t)(uint32_t)peer_fd);
@@ -575,7 +535,7 @@ int64_t lpr_tty_open_path(const char *path, uint64_t flags)
     }
 
     void *page = 0;
-    const int page_fd = lpr_create_tty_wire_page(&page);
+    const pacha_fd_t page_fd = lpr_create_tty_wire_page(&page);
     if (page_fd < 0) {
         return page_fd;
     }
@@ -591,8 +551,8 @@ int64_t lpr_tty_open_path(const char *path, uint64_t flags)
         &open_req->tty.signal_mask,
         &open_req->tty.signal_ignored);
     uint64_t handle = 0;
-    int native_wait_fd = -1;
-    int remote_wait_fd = -1;
+    pacha_fd_t native_wait_fd = -1;
+    pacha_fd_t remote_wait_fd = -1;
     const int wait_status = lpr_native_wait_pair(&native_wait_fd, &remote_wait_fd);
     if (wait_status != 0) {
         lpr_destroy_tty_wire_page(page_fd, page);
@@ -602,14 +562,14 @@ int64_t lpr_tty_open_path(const char *path, uint64_t flags)
         op, page_fd, page, sizeof(*open_req), remote_wait_fd, &handle);
     lpr_destroy_tty_wire_page(page_fd, page);
     if (status != 0) {
-        (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)native_wait_fd);
-        (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)remote_wait_fd);
+        (void)lpr_close_native_fd_if_open((uint64_t)native_wait_fd);
+        (void)lpr_close_native_fd_if_open((uint64_t)remote_wait_fd);
         return status;
     }
     const int fd = lpr_tty_fd_alloc(handle, flags, native_wait_fd);
     if (fd < 0) {
         (void)lpr_termd_call_handle(TERMD_OP_HANDLE_CLOSE, handle, 0);
-        (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)native_wait_fd);
+        (void)lpr_close_native_fd_if_open((uint64_t)native_wait_fd);
         return fd;
     }
     lpr_tty_backend_t *tty = lpr_tty_backend((uint64_t)fd);

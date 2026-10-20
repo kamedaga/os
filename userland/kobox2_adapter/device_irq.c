@@ -104,11 +104,11 @@ static int allocate_routes(void *context, enum kobox_linux_irq_mode mode,
         long fd = pacha_syscall4(PACHA_CAPSULE_SYSCALL_DERIVE_IRQ,
             irq->config.device_fd, kind, index + i, 0);
         raw = fd;
-        if (fd < 16 || fd >= PACHA_FD_TABLE_LIMIT) {
+        if (fd < 16 || fd >= PACHA_THREAD_SELF_FD) {
             result = fd ? irq_status(fd) : -EPROTO;
             goto rollback;
         }
-        irq->native[index + i].fd = (int)fd;
+        irq->native[index + i].fd = (pacha_fd_t)fd;
         step = 3;
         raw = pacha_syscall1(PACHA_CAPSULE_SYSCALL_IRQ_QUIESCE, fd);
         result = irq_status(raw);
@@ -298,7 +298,7 @@ int ph_irq_init(struct ph_irq *irq, const struct ph_irq_config *config) {
         PACHA_FD_RIGHT_WAIT | PACHA_FD_RIGHT_POLL | PACHA_FD_RIGHT_CLOSE;
     struct pacha_capsule_info info = {0};
     if (!irq || !config || irq->config.generation || config->device_fd < 0 ||
-        config->device_fd >= PACHA_FD_TABLE_LIMIT || !config->native_device ||
+        config->device_fd >= PACHA_THREAD_SELF_FD || !config->native_device ||
         !config->generation || !config->cpu_count || config->cpu_count > PH_CPU_COUNT ||
         !config->cookie_sequence) return -EINVAL;
     long words = pacha_syscall3(PACHA_CAPSULE_SYSCALL_QUERY, config->device_fd,
@@ -308,10 +308,10 @@ int ph_irq_init(struct ph_irq *irq, const struct ph_irq_config *config) {
         return -ENODEV;
     if ((info.rights & required) != required) return -EACCES;
     long control = pacha_syscall3(PACHA_FD_SYSCALL_EVENTFD_CREATE, 0, event_rights, 0);
-    if (control < 16 || control >= PACHA_FD_TABLE_LIMIT)
+    if (control < 16 || control >= PACHA_THREAD_SELF_FD)
         return control ? irq_status(control) : -EPROTO;
     irq->config = *config;
-    irq->control_fd = (int)control;
+    irq->control_fd = (pacha_fd_t)control;
     PH_OK(ph_irq_queue_init(&irq->queue, irq->slots, PH_IRQ_ROUTES,
         config->cpu_count, config->cookie_sequence));
     irq->host = (struct kobox_linux_irq_host){

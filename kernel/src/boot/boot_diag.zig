@@ -1,41 +1,37 @@
 //! One-boot GOP diagnostics for the separate DIAG ELF. This is not a console:
 //! the normal image has this entire path compiled out and userland owns TTY.
+const lock_diagnostics = @import("../sync/lock_diagnostics.zig");
 const std = @import("std");
 const root = @import("root");
 const x86 = @import("../arch/x86_64/platform.zig");
-const layout = @import("../arch/x86_64/physical_layout.zig");
 const mtrr = @import("../arch/x86_64/mtrr.zig");
 const kernel_log = @import("../kernel_log.zig");
 const FramebufferInfo = @import("boot_resources.zig").FramebufferInfo;
 
 pub const enabled = if (@hasDecl(root, "boot_diagnostic_enabled")) root.boot_diagnostic_enabled else false;
 const font = if (enabled) @import("boot_diag_font").bytes else "";
-// user_copy owns 0..max_cpus-1. The diagnostic ELF exclusively borrows the
-// final PTE in the existing physical-copy window, one GOP page at a time.
+// Runtime per-CPU copy windows live in a separate dynamically allocated
+// island. The diagnostic ELF retains the final legacy scratch PTE so early
+// GOP output remains usable before MADT storage is allocated.
 const slot: usize = x86.page_entries - 1;
 const slot_va: u64 = x86.phys_copy_window_va + slot * 4096;
-const high_identity_start: u64 = x86.phys_copy_window_va + (1 << 21);
-const high_identity_end: u64 = x86.phys_copy_window_va +
-    (@as(u64, x86.high_mmio_pdp_table_count) << 30);
 
 var fb: FramebufferInfo = undefined;
 var mapped_page: u64 = 0;
 var armed: bool = false;
 var active: bool = false;
 var drawing: u8 = 0;
+var drawing_record: lock_diagnostics.Record = .{};
 var next_row: usize = 0;
 var snapshot: mtrr.CacheSnapshot = .{};
 var trace_lock: u8 = 0;
+var trace_record: lock_diagnostics.Record = .{};
 var trace_line: [96]u8 = undefined;
 var trace_len: usize = 0;
 var trace_row: usize = 0;
 var trace_first_row: usize = 0;
 var trace_max_row: usize = 0;
 var trace_wrapped: bool = false;
-
-comptime {
-    if (slot < x86.max_cpus) @compileError("diagnostic GOP slot overlaps user_copy");
-}
 
 /// Called while Limine still owns CR3. Validate the complete physical span
 /// before enabling any post-switch write. The seventh early marker reports
@@ -55,12 +51,6 @@ pub fn arm(info: FramebufferInfo) bool {
     if (end < end_raw or end <= first) return false;
     if (!mtrr.captureCacheSnapshot(&snapshot) or
         !snapshot.rangeSupportsUncachedMapping(first, end - first)) return false;
-    // The high MMIO identity map uses WB PTEs. It may alias the GOP only if
-    // the MTRR makes that overlapping portion effectively uncached already.
-    const overlap_first = @max(first, high_identity_start);
-    const overlap_end = @min(end, high_identity_end);
-    if (overlap_first < overlap_end and
-        !snapshot.rangeIsUncached(overlap_first, overlap_end - overlap_first)) return false;
     fb = info;
     armed = true;
     return true;
@@ -72,25 +62,28 @@ pub fn arm(info: FramebufferInfo) bool {
 pub fn afterCr3() void {
     if (comptime !enabled) return;
     if (!armed) return;
-    const first = fb.paddr & ~@as(u64, 4095);
-    const end_raw = fb.paddr + fb.size_bytes;
-    const end = std.mem.alignForward(u64, end_raw, 4096);
-    const low_end = @min(end, layout.identity_limit);
-    if (first < low_end and
-        !x86.mapBootMmioIdentityRange(first, low_end - first)) return;
     active = true;
     mark('C');
 }
 
 fn begin() bool {
+    const diagnostic_if = lock_diagnostics.maskInterrupts();
+    defer lock_diagnostics.restoreInterrupts(diagnostic_if);
     if (!active or @atomicRmw(u8, &drawing, .Xchg, 1, .acq_rel) != 0) return false;
+    lock_diagnostics.acquiredTry(&drawing_record, .{ .class = .boot_drawing });
     return true;
 }
 
 fn finish() void {
-    x86.phys_copy_window_pt[slot] = 0;
-    x86.invlpg(slot_va);
+    const diagnostic_if = lock_diagnostics.maskInterrupts();
+    defer lock_diagnostics.restoreInterrupts(diagnostic_if);
+    lock_diagnostics.assertOwned(&drawing_record);
+    if (!@import("builtin").is_test) {
+        x86.phys_copy_window_pt[slot] = 0;
+        x86.invlpg(slot_va);
+    }
     mapped_page = 0;
+    lock_diagnostics.releasing(&drawing_record);
     @atomicStore(u8, &drawing, 0, .release);
 }
 
@@ -183,15 +176,33 @@ fn traceText(text: []const u8) void {
     // User logging can be interrupted by another logger, including an IRQ on
     // this CPU. Drop that fragment instead of spinning with interrupts off or
     // recursively using the single temporary GOP PTE.
-    if (@atomicRmw(u8, &trace_lock, .Xchg, 1, .acq_rel) != 0) return;
-    defer @atomicStore(u8, &trace_lock, 0, .release);
+    // Keep the unchecked early-return and deferred-store control flow intact:
+    // even empty diagnostic calls in those blocks can change LLVM block layout.
+    const diagnostic_if = lock_diagnostics.maskInterrupts();
+    if (comptime lock_diagnostics.enabled) {
+        if (@atomicRmw(u8, &trace_lock, .Xchg, 1, .acq_rel) != 0) {
+            lock_diagnostics.restoreInterrupts(diagnostic_if);
+            return;
+        }
+    } else {
+        if (@atomicRmw(u8, &trace_lock, .Xchg, 1, .acq_rel) != 0) return;
+    }
+    lock_diagnostics.acquiredTry(&trace_record, .{ .class = .boot_trace });
+    lock_diagnostics.restoreInterrupts(diagnostic_if);
+    defer {
+        if (comptime lock_diagnostics.enabled) {
+            const release_if = lock_diagnostics.maskInterrupts();
+            lock_diagnostics.releasing(&trace_record);
+            @atomicStore(u8, &trace_lock, 0, .release);
+            lock_diagnostics.restoreInterrupts(release_if);
+        } else @atomicStore(u8, &trace_lock, 0, .release);
+    }
     for (text) |char| {
         if (char == '\r') continue;
         if (char == '\n') {
             if (trace_len != 0) {
                 const line = trace_line[0..trace_len];
-                const console_ready = std.mem.startsWith(u8, line,
-                    "[live_console] framebuffer ");
+                const console_ready = std.mem.startsWith(u8, line, "[live_console] framebuffer ");
                 showTraceLine(line);
                 trace_len = 0;
                 // The userland framebuffer console now owns the GOP. Do not
@@ -256,6 +267,23 @@ pub fn showPanic(message: []const u8) void {
 }
 
 test "diagnostic slot cannot collide with per-CPU copy slots" {
-    try std.testing.expect(slot >= x86.max_cpus);
+    try std.testing.expect(slot_va < @import("../arch/x86_64/cpu_runtime.zig").base or slot_va >= @import("../boot/image_range.zig").virtual_base);
     try std.testing.expectEqual(x86.phys_copy_window_va + slot * 4096, slot_va);
+}
+
+test "lock admission boot trace and drawing actual single exchange paths" {
+    if (!lock_diagnostics.enabled) return;
+    active = true;
+    defer active = false;
+    try std.testing.expect(begin());
+    try std.testing.expect(!begin());
+    try std.testing.expectEqual(lock_diagnostics.order.Mode.try_once, drawing_record.mode);
+    finish();
+    trace_len = 0;
+    traceText("abc");
+    try std.testing.expectEqual(@as(usize, 3), trace_len);
+    try std.testing.expectEqual(lock_diagnostics.order.Mode.try_once, trace_record.mode);
+    try std.testing.expect(!trace_record.linked);
+    trace_len = 0;
+    lock_diagnostics.assertRootEmpty();
 }

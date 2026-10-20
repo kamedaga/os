@@ -242,23 +242,38 @@ fn readRsdp(access: *const Access, paddr: u64) !Rsdp {
     const revision = legacy[15];
     const rsdt = read32(legacy, 16);
     if (revision < 2) return .{
-        .revision = revision, .rsdt = rsdt, .xsdt = 0, .extended_status = "legacy RSDT only",
+        .revision = revision,
+        .rsdt = rsdt,
+        .xsdt = 0,
+        .extended_status = "legacy RSDT only",
     };
 
     // Match the production ACPI walker: a valid legacy RSDP may still use
     // its RSDT if the optional extended portion is malformed or inaccessible.
     const header = access.bytes(paddr, 36) orelse return .{
-        .revision = revision, .rsdt = rsdt, .xsdt = 0, .extended_status = "unmapped; RSDT fallback",
+        .revision = revision,
+        .rsdt = rsdt,
+        .xsdt = 0,
+        .extended_status = "unmapped; RSDT fallback",
     };
     const length = read32(header, 20);
     if (length < 36 or length > 4096) return .{
-        .revision = revision, .rsdt = rsdt, .xsdt = 0, .extended_status = "bad length; RSDT fallback",
+        .revision = revision,
+        .rsdt = rsdt,
+        .xsdt = 0,
+        .extended_status = "bad length; RSDT fallback",
     };
     const extended = access.bytes(paddr, length) orelse return .{
-        .revision = revision, .rsdt = rsdt, .xsdt = 0, .extended_status = "unmapped span; RSDT fallback",
+        .revision = revision,
+        .rsdt = rsdt,
+        .xsdt = 0,
+        .extended_status = "unmapped span; RSDT fallback",
     };
     if (!checksumOk(extended)) return .{
-        .revision = revision, .rsdt = rsdt, .xsdt = 0, .extended_status = "bad checksum; RSDT fallback",
+        .revision = revision,
+        .rsdt = rsdt,
+        .xsdt = 0,
+        .extended_status = "bad checksum; RSDT fallback",
     };
     return .{ .revision = revision, .rsdt = rsdt, .xsdt = read64(extended, 24), .extended_status = "valid" };
 }
@@ -389,11 +404,14 @@ fn noteSource(result: *PciInventory, decision: PciDecision, packed_bdf: u16) voi
 /// IVHD `device_id` is a packed BDF, not the PCI vendor/product ID.
 fn pciDecision(info: *const ivrs.Info, packed_bdf: u16, class: u8) PciDecision {
     if (class == 0x06) return .{ .status = .platform };
-    for (info.units[0..info.unit_count]) |unit| {
+    var units = info.units();
+    while (units.next()) |unit| {
         if (unit.segment == 0 and unit.device_id == packed_bdf) return .{ .status = .platform };
     }
     var found: ?PciDecision = null;
-    for (info.units[0..info.unit_count], 0..) |*unit, index| {
+    units = info.units();
+    var index: usize = 0;
+    while (units.next()) |unit| : (index += 1) {
         if (unit.segment != 0) continue;
         const rule = unit.ruleFor(packed_bdf) orelse continue;
         if (found != null) return .{ .status = .ambiguous };
@@ -529,12 +547,12 @@ fn pciStatusName(status: PciStatus) []const u8 {
 fn pciLine(screen: *Screen, row: *usize, prefix: []const u8, entry: PciFunction) void {
     if (entry.decision.status == .matched) {
         line(screen, row, "{s} {x:0>2}:{x:0>2}.{d} {x:0>4}:{x:0>4} cls={x:0>2}/{x:0>2} src={x:0>4} U{d}", .{
-            prefix, entry.bus, entry.device, entry.function, entry.vendor, entry.product,
+            prefix,      entry.bus,      entry.device,          entry.function,            entry.vendor, entry.product,
             entry.class, entry.subclass, entry.decision.source, entry.decision.unit_index,
         });
     } else {
         line(screen, row, "{s} {x:0>2}:{x:0>2}.{d} {x:0>4}:{x:0>4} cls={x:0>2}/{x:0>2} {s}", .{
-            prefix, entry.bus, entry.device, entry.function, entry.vendor, entry.product,
+            prefix,      entry.bus,      entry.device,                         entry.function, entry.vendor, entry.product,
             entry.class, entry.subclass, pciStatusName(entry.decision.status),
         });
     }
@@ -630,9 +648,7 @@ fn summarizeBlocks(screen: *Screen, row: *usize, bytes: []const u8) ?usize {
                     other_count += 1;
                     if (first_other == null) first_other = .{ .offset = entry_offset, .kind = entry_kind };
                 }
-                const step: usize = if (entry_kind < 0x40) 4 else if (entry_kind < 0x80) 8 else if (
-                    entry_kind == 0xf0 and kind == 0x40 and end - entry_offset >= 22
-                ) 22 + @as(usize, bytes[entry_offset + 21]) else 0;
+                const step: usize = if (entry_kind < 0x40) 4 else if (entry_kind < 0x80) 8 else if (entry_kind == 0xf0 and kind == 0x40 and end - entry_offset >= 22) 22 + @as(usize, bytes[entry_offset + 21]) else 0;
                 if (step == 0 or step > end - entry_offset) {
                     scan_stop = entry_offset;
                     break;
@@ -787,20 +803,22 @@ test "covered ACPI spans reject gaps and type-1 reserved areas" {
 test "PCI preflight mirrors platform skip unique rules and CF8 restoration" {
     const info = try std.testing.allocator.create(ivrs.Info);
     defer std.testing.allocator.destroy(info);
-    info.* = .{};
-    info.unit_count = 3;
-    info.units[0].segment = 0;
-    info.units[0].device_id = 0x0002;
-    info.units[0].rule_count = 3;
-    info.units[0].rules[0] = .{ .first = 0x0008, .last = 0x0008, .alias = true, .source = 0x0040 };
-    info.units[0].rules[1] = .{ .first = 0x0018, .last = 0x0018 };
-    info.units[0].rules[2] = .{ .first = 0x0020, .last = 0x0020, .alias = true, .source = 0x0040 };
-    info.units[1].segment = 0;
-    info.units[1].rule_count = 1;
-    info.units[1].rules[0] = .{ .first = 0x0018, .last = 0x0018 };
-    info.units[2].segment = 1;
-    info.units[2].rule_count = 1;
-    info.units[2].rules[0] = .{ .first = 0x0010, .last = 0x0010 };
+    var first = ivrs.TestEntries{};
+    defer first.deinit();
+    first.unit.device_id = 2;
+    try first.appendRule(.{ .first = 8, .last = 8, .alias = true, .source = 0x40 });
+    try first.appendRule(.{ .first = 0x18, .last = 0x18 });
+    try first.appendRule(.{ .first = 0x20, .last = 0x20, .alias = true, .source = 0x40 });
+    var second = ivrs.TestEntries{};
+    defer second.deinit();
+    try second.appendRule(.{ .first = 0x18, .last = 0x18 });
+    var third = ivrs.TestEntries{};
+    defer third.deinit();
+    third.unit.segment = 1;
+    try third.appendRule(.{ .first = 0x10, .last = 0x10 });
+    const bytes = try ivrs.testTable(std.testing.allocator, &.{ first.unit, second.unit, third.unit });
+    defer std.testing.allocator.free(bytes);
+    try ivrs.parse(bytes, info);
 
     const FakeIo = struct {
         selector: u32 = 0x1234_5678,
@@ -862,6 +880,5 @@ test "PCI preflight mirrors platform skip unique rules and CF8 restoration" {
     try std.testing.expectEqual(@as(usize, 2), result.root_count);
     try std.testing.expect(result.root_multifunction);
     try std.testing.expectEqual(@as(u8, 2), result.root[1].function);
-    try std.testing.expectEqual(@as(u16, 0x0010),
-        (@as(u16, result.first_unmatched.?.bus) << 8) | (@as(u16, result.first_unmatched.?.device) << 3));
+    try std.testing.expectEqual(@as(u16, 0x0010), (@as(u16, result.first_unmatched.?.bus) << 8) | (@as(u16, result.first_unmatched.?.device) << 3));
 }

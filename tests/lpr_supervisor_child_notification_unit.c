@@ -25,7 +25,7 @@ long pacha_syscall2(uint64_t nr, uint64_t a0, uint64_t a1)
     return g_syscall_result;
 }
 
-int pacha_fd_close(int fd)
+int pacha_fd_close(pacha_fd_t fd)
 {
     if (g_closed_fd_count < 2) {
         g_closed_fds[g_closed_fd_count++] = fd;
@@ -33,7 +33,7 @@ int pacha_fd_close(int fd)
     return 0;
 }
 
-void *pacha_mmap(int fd, uint64_t size, uint64_t prot, uint64_t flags, uint64_t offset)
+void *pacha_mmap(pacha_fd_t fd, uint64_t size, uint64_t prot, uint64_t flags, uint64_t offset)
 {
     (void)fd;
     (void)size;
@@ -50,7 +50,7 @@ int pacha_munmap(void *addr, uint64_t size)
     return 0;
 }
 
-int pacha_ipc_reply(int reply_fd, const struct pacha_ipc_msg *reply)
+int pacha_ipc_reply(pacha_fd_t reply_fd, const struct pacha_ipc_msg *reply)
 {
     g_reply_fd = reply_fd;
     g_reply = *reply;

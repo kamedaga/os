@@ -74,3 +74,13 @@ int main(void)
     assert(lpr_device_description_flags(&device) == LPR_OFD_NONBLOCK);
     puts("device description: kind/capability validation, shared flags and untrusted bits: PASS");
 }
+
+#include "lpr_ipc_mock.h"
+int64_t lpr_ipc_message(uint64_t nr, uint64_t fd, uint64_t send, uint64_t receive,
+    uint64_t timeout, uint64_t flags, int *committed) {
+    return test_lpr_ipc_noncall(nr, fd, send, receive, timeout, flags, committed);
+}
+
+int64_t lpr_pacha_syscall4(uint64_t nr,uint64_t a,uint64_t b,uint64_t c,uint64_t d) {
+    (void)nr;(void)a;(void)b;(void)c;(void)d;abort();
+}

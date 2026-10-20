@@ -168,18 +168,18 @@ int lpr_user_range_plausible(uint64_t ptr, uint64_t bytes);
 
 typedef struct lpr_prepared_lease {
     uint32_t pin_index;
-    int32_t fd;
+    pacha_fd_t fd;
 } lpr_prepared_lease_t;
 
 typedef struct lpr_exec_transaction {
-    int manifest_fd;
-    int supervisor_bootstrap_fd;
+    pacha_fd_t manifest_fd;
+    pacha_fd_t supervisor_bootstrap_fd;
     uint64_t map_bytes;
     lpr_manifest_t *manifest;
     lpr_fd_pin_t *pins;
     uint64_t pin_count;
     uint64_t cwd_handle;
-    int cwd_lease_fd;
+    pacha_fd_t cwd_lease_fd;
     lpr_prepared_lease_t *prepared_leases;
     uint64_t prepared_lease_count;
     uint64_t prepared_lease_capacity;
@@ -279,7 +279,7 @@ typedef struct lpr_linux_process_entry {
     int32_t linux_ppid;
     int32_t linux_sid;
     int32_t linux_pgrp;
-    int32_t process_fd;
+    pacha_fd_t process_fd;
     uint32_t reserved1;
 } lpr_linux_process_entry_t;
 
@@ -344,7 +344,7 @@ typedef struct lpr_thread_record {
     volatile uint32_t started;
     uint32_t tid;
     volatile uint32_t parent_ready;
-    int32_t signal_fd;
+    pacha_fd_t signal_fd;
     uint64_t signal_mask;
     struct lpr_unix_context unix_context;
 } lpr_thread_record_t;
@@ -441,7 +441,7 @@ typedef struct lpr_cwd_state {
     int checked;
     uint64_t handle;
     uint64_t lease_handle;
-    int32_t lease_fd;
+    pacha_fd_t lease_fd;
 } lpr_cwd_state_t;
 
 typedef struct lpr_rlimit_state {
@@ -455,14 +455,14 @@ typedef struct lpr_filed_rpc_state {
     volatile uint32_t readv_lock_word;
     uint64_t request_id;
     int endpoint_checked;
-    int client_fd;
+    pacha_fd_t client_fd;
     uint64_t client_id;
 } lpr_filed_rpc_state_t;
 
 typedef struct lpr_termd_rpc_state {
     volatile uint32_t lock_word;
     uint64_t request_id;
-    int wire_page_fd;
+    pacha_fd_t wire_page_fd;
     void *wire_page;
     int wire_page_busy;
 } lpr_termd_rpc_state_t;
@@ -471,8 +471,8 @@ enum { LPR_NETD_PAGE_POOL_SLOTS = 8 };
 
 typedef struct lpr_netd_page_slot {
     uint64_t attachment_id;
-    int page_fd;
-    int lease_fd;
+    pacha_fd_t page_fd;
+    pacha_fd_t lease_fd;
     void *page;
     uint8_t busy;
 } lpr_netd_page_slot_t;
@@ -536,8 +536,8 @@ void lpr_signal_thread_state_after_fork_child(void);
 #define lpr_filed_endpoint_checked (lpr_state.filed_rpc.endpoint_checked)
 #define lpr_filed_client_fd (lpr_state.filed_rpc.client_fd)
 #define lpr_filed_client_id (lpr_state.filed_rpc.client_id)
-int lpr_filed_lease_pair(int *local, int *remote);
-int lpr_filed_adopt(uint64_t *handle, int lease_fd);
+int lpr_filed_lease_pair(pacha_fd_t *local, pacha_fd_t *remote);
+int lpr_filed_adopt(uint64_t *handle, pacha_fd_t lease_fd);
 #define lpr_termd_request_id (lpr_state.termd_rpc.request_id)
 #define lpr_tty_wire_page_fd (lpr_state.termd_rpc.wire_page_fd)
 #define lpr_tty_wire_page (lpr_state.termd_rpc.wire_page)
@@ -605,8 +605,8 @@ void lpr_state_checkpoint_log(const char *source, int64_t status);
 int lpr_pipe_fd_is_active(uint64_t fd);
 int lpr_fd_slot_available(uint64_t fd);
 int lpr_fd_slot_alloc_from(uint64_t min_fd);
-int lpr_create_tty_wire_page(void **out_page);
-void lpr_destroy_tty_wire_page(int page_fd, void *page);
+pacha_fd_t lpr_create_tty_wire_page(void **out_page);
+void lpr_destroy_tty_wire_page(pacha_fd_t page_fd, void *page);
 void lpr_netd_page_pool_after_fork_child(void);
 void lpr_reset_fork_child_rpc_state(void);
 void lpr_linux_process_state_init(void);
@@ -620,19 +620,19 @@ void *lpr_supervisor_payload(void *page);
 lpr_linux_process_entry_t *lpr_linux_process_find(int32_t linux_pid);
 int64_t lpr_supervisor_call(
     uint32_t op,
-    int page_fd,
+    pacha_fd_t page_fd,
     void *page,
     uint32_t payload_size,
-    int transfer_fd,
+    pacha_fd_t transfer_fd,
     uint64_t *out_result);
 int64_t lpr_supervisor_call_token(
     uint32_t op,
     uint64_t token,
-    int transfer_fd,
+    pacha_fd_t transfer_fd,
     uint64_t *out_result);
 int64_t lpr_supervisor_kill_pid(int32_t pid, uint32_t sig, uint64_t *out_delivered);
 int lpr_supervisor_get_state(lprs_process_state_t *out_state);
-int lpr_supervisor_get_owner(lprs_process_state_t *out_state, int *out_process_fd);
+int lpr_supervisor_get_owner(lprs_process_state_t *out_state, pacha_fd_t *out_process_fd);
 int lpr_supervisor_list_processes(
     uint64_t offset,
     uint64_t *pids,
@@ -641,17 +641,17 @@ int lpr_supervisor_list_processes(
 int lpr_supervisor_set_comm(const char *path);
 int lpr_supervisor_query_process(uint64_t pid, lprs_process_query_t *out);
 int lpr_supervisor_diag_attach(void);
-int64_t lpr_tty_wait(uint64_t fd, uint32_t events);
+int64_t lpr_tty_wait(uint64_t fd, uint32_t events, unsigned *wait_not_ready __attribute__((unused)));
 void lpr_fd_after_fork_child(void);
 void lpr_cwd_init(void);
 int64_t lpr_filed_close_handle(uint64_t handle);
 int64_t lpr_filed_dup_handle(uint64_t handle, uint64_t fd_flags, uint64_t *out_handle);
 int64_t lpr_filed_transfer_dup_handle(
-    uint64_t handle, uint64_t fd_flags, int lease_fd, uint64_t *out_handle);
+    uint64_t handle, uint64_t fd_flags, pacha_fd_t lease_fd, uint64_t *out_handle);
 int64_t lpr_netd_dup_handle(uint64_t handle);
 int64_t lpr_netd_close_handle(uint64_t handle);
-int lpr_create_standalone_wire_page(void **out_page);
-void lpr_destroy_standalone_wire_page(int fd, void *page);
+pacha_fd_t lpr_create_standalone_wire_page(void **out_page);
+void lpr_destroy_standalone_wire_page(pacha_fd_t fd, void *page);
 int lpr_exec_local_fd_preserve(uint64_t fd, int *out_preserve);
 int lpr_count_exec_local_fds(uint64_t *out_count);
 int lpr_prepare_exec_manifest(filed_exec_path_t *exec, lpr_exec_transaction_t *transaction);
@@ -683,8 +683,8 @@ int lpr_control_set_fd_flags(uint64_t fd, uint64_t flags);
 int lpr_control_set_status_flags(uint64_t fd, uint64_t flags);
 int lpr_control_set_effective_rights(uint32_t fd, uint32_t rights);
 int lpr_count_exec_local_fds(uint64_t *out_count);
-int lpr_create_standalone_wire_page(void **out_page);
-int lpr_create_tty_wire_page(void **out_page);
+pacha_fd_t lpr_create_standalone_wire_page(void **out_page);
+pacha_fd_t lpr_create_tty_wire_page(void **out_page);
 int lpr_exec_values_prepare(filed_exec_path_t *, const char *, uint64_t, uint64_t);
 void lpr_exec_values_destroy(filed_exec_path_t *);
 int lpr_exec_local_fd_active(uint64_t fd);
@@ -729,22 +729,22 @@ int64_t lpr_fd_prepare_dup(uint64_t fd);
 int lpr_fd_transfer_prepare(
     const lpr_fd_pin_t *pin,
     struct unix_transfer_item *item,
-    int *capability_fds,
+    pacha_fd_t *capability_fds,
     uint32_t capability_capacity,
     uint32_t *out_capability_count);
-int64_t lpr_netd_transfer_dup_handle(uint64_t handle, int lease_fd);
+int64_t lpr_netd_transfer_dup_handle(uint64_t handle, pacha_fd_t lease_fd);
 int lpr_fd_transfer_stage_batch(
     const struct unix_transfer_item *items,
     uint32_t item_count,
-    const int *capability_fds,
+    const pacha_fd_t *capability_fds,
     uint32_t capability_count,
     uint32_t receive_flags,
     int *out_fds);
-int64_t lpr_backend_read(const lpr_fd_pin_t *pin, uint64_t buffer, uint64_t count);
-int64_t lpr_backend_write(uint64_t fd, uint64_t buffer, uint64_t count);
-int64_t lpr_backend_readv(const lpr_fd_pin_t *pin, uint64_t iov, uint64_t count);
-int64_t lpr_backend_writev(uint64_t fd, uint64_t iov, uint64_t count);
-int64_t lpr_backend_ioctl(uint64_t fd, uint64_t request, uint64_t arg);
+int64_t lpr_backend_read(const lpr_fd_pin_t *pin, uint64_t buffer, uint64_t count, unsigned *wait_not_ready __attribute__((unused)));
+int64_t lpr_backend_write(uint64_t fd, uint64_t buffer, uint64_t count, unsigned *wait_not_ready __attribute__((unused)));
+int64_t lpr_backend_readv(const lpr_fd_pin_t *pin, uint64_t iov, uint64_t count, unsigned *wait_not_ready __attribute__((unused)));
+int64_t lpr_backend_writev(uint64_t fd, uint64_t iov, uint64_t count, unsigned *wait_not_ready __attribute__((unused)));
+int64_t lpr_backend_ioctl(uint64_t fd, uint64_t request, uint64_t arg, unsigned *wait_not_ready __attribute__((unused)));
 int64_t lpr_backend_fstat(uint64_t fd, uint64_t statbuf);
 int64_t lpr_backend_mmap(
     uint64_t addr,
@@ -752,22 +752,22 @@ int64_t lpr_backend_mmap(
     uint64_t prot,
     uint64_t flags,
     uint64_t fd,
-    uint64_t offset);
+    uint64_t offset, unsigned *wait_not_ready __attribute__((unused)));
 int64_t lpr_fd_dispatch_mmap(
     uint64_t addr,
     uint64_t len,
     uint64_t prot,
     uint64_t flags,
     uint64_t fd,
-    uint64_t offset);
+    uint64_t offset, unsigned *wait_not_ready __attribute__((unused)));
 int64_t lpr_socket_close_backend(void *state);
-int lpr_install_exec_bootstrap_fd(int bootstrap_fd);
+int lpr_install_exec_bootstrap_fd(pacha_fd_t bootstrap_fd);
 int lpr_linux_default_signal_ignored(uint32_t sig);
 int lpr_linux_default_signal_stops(uint32_t sig);
 int lpr_linux_eventfd_active(uint64_t fd);
 int lpr_linux_inotify_active(uint64_t fd);
 int lpr_linux_signalfd_active(uint64_t fd);
-int lpr_eventfd_native_wait_fd(uint64_t fd);
+pacha_fd_t lpr_eventfd_native_wait_fd(uint64_t fd);
 void lpr_eventfd_drain_wait(uint64_t fd);
 void lpr_event_backend_notify(lpr_event_backend_t *event);
 int lpr_linux_timerfd_active(uint64_t fd);
@@ -778,9 +778,9 @@ int lpr_linux_dmabuf_fd_active(uint64_t fd);
 int lpr_linux_sync_file_fd_active(uint64_t fd);
 int lpr_linux_filed_fd_active(uint64_t fd);
 int lpr_linux_pipe_fd_active(uint64_t fd);
-int lpr_linux_process_register( int32_t linux_pid, int32_t linux_ppid, int32_t linux_sid, int32_t linux_pgrp, int process_fd);
+int lpr_linux_process_register( int32_t linux_pid, int32_t linux_ppid, int32_t linux_sid, int32_t linux_pgrp, pacha_fd_t process_fd);
 int lpr_linux_signal_pgrp(int32_t pgrp, uint32_t signo);
-int lpr_linux_signal_process_fd(int process_fd, uint32_t signo);
+int lpr_linux_signal_process_fd(pacha_fd_t process_fd, uint32_t signo);
 int lpr_linux_tty_fd_active(uint64_t fd);
 int lpr_load_manifest(void);
 int lpr_native_fd_info(uint64_t fd, struct pacha_fd_info *out);
@@ -795,18 +795,18 @@ int lpr_resolve_final_symlink_path(const char *path, const char *target, char *o
 int lpr_runtime_reserved_fd(uint64_t fd);
 int lpr_supervisor_get_state(lprs_process_state_t *out_state);
 int lpr_timespec_less_equal( const struct pachaos_timespec *lhs, const struct pachaos_timespec *rhs);
-int lpr_tty_fd_alloc(uint64_t handle, uint64_t flags, int native_wait_fd);
+int lpr_tty_fd_alloc(uint64_t handle, uint64_t flags, pacha_fd_t native_wait_fd);
 int64_t lpr_tty_open_peer(uint64_t fd, uint64_t flags);
 int64_t lpr_drm_open_path(const char *path, uint64_t flags);
 int64_t lpr_filed_device_open_route(uint32_t service, const uint8_t *statx, uint64_t flags);
 int64_t lpr_drm_stat_path(const char *path, uint64_t statbuf);
-int64_t lpr_drm_ioctl(uint64_t fd, uint64_t request, uint64_t arg);
+int64_t lpr_drm_ioctl(uint64_t fd, uint64_t request, uint64_t arg, unsigned *wait_not_ready __attribute__((unused)));
 int64_t lpr_drm_close_handle(uint64_t handle);
 int64_t lpr_drm_dup_handle(uint64_t handle);
 int64_t lpr_drm_transfer_dup_handle(
-    uint64_t handle, int lease_fd, uint64_t *out_handle);
+    uint64_t handle, pacha_fd_t lease_fd, uint64_t *out_handle);
 int64_t lpr_drm_prime_ref(uint32_t op, uint64_t token);
-int64_t lpr_drm_prime_transfer_acquire(uint64_t token, int lease_fd);
+int64_t lpr_drm_prime_transfer_acquire(uint64_t token, pacha_fd_t lease_fd);
 int64_t lpr_dmabuf_mmap(uint64_t fd, uint64_t address, uint64_t length,
     uint64_t prot, uint64_t flags, uint64_t offset);
 void lpr_drm_after_fork_child(void);
@@ -824,9 +824,9 @@ void lpr_drm_mapping_remapped(
     uint64_t new_address, uint64_t new_length);
 int64_t lpr_dmabuf_ioctl(uint64_t fd, uint64_t request, uint64_t arg);
 int64_t lpr_sync_file_create_signaled(void);
-int64_t lpr_sync_file_install_wait(int wait_fd);
-int lpr_sync_file_duplicate_wait(uint64_t fd);
-int lpr_sync_file_native_wait_fd(uint64_t fd);
+int64_t lpr_sync_file_install_wait(pacha_fd_t wait_fd);
+pacha_fd_t lpr_sync_file_duplicate_wait(uint64_t fd);
+pacha_fd_t lpr_sync_file_native_wait_fd(uint64_t fd);
 uint32_t lpr_sync_file_poll_events(uint64_t fd, uint32_t events);
 int64_t lpr_drm_mmap(uint64_t fd, uint64_t address, uint64_t length, uint64_t pacha_prot, uint64_t pacha_flags, uint64_t offset);
 int32_t lpr_linux_alloc_child_pid(void);
@@ -841,15 +841,15 @@ int64_t lpr_filed_close_handle(uint64_t handle);
 int64_t lpr_filed_dup_handle(uint64_t handle, uint64_t fd_flags, uint64_t *out_handle);
 int64_t lpr_filed_endpoint_ready(void);
 int64_t lpr_filed_fd_binding(uint64_t fd);
-int64_t lpr_filed_exec_self( filed_exec_path_t *exec, const lpr_exec_transaction_t *transaction, int *out_process_fd, int *out_thread_fd, int *out_manifest_fd);
+int64_t lpr_filed_exec_self( filed_exec_path_t *exec, const lpr_exec_transaction_t *transaction, pacha_fd_t *out_process_fd, pacha_fd_t *out_thread_fd, pacha_fd_t *out_manifest_fd);
 int64_t lpr_filed_io(uint32_t op, uint64_t fd, uint64_t buf, uint64_t count, uint64_t offset);
 int64_t lpr_filed_open_handle_at( uint64_t dirfd, const char *path, uint64_t flags, uint64_t mode, uint64_t *out_handle, uint64_t *out_kind);
 int64_t lpr_filed_utimens_handle(uint64_t handle, uint64_t times_raw);
 int64_t lpr_install_stdio_fd_from_tty(uint64_t tty_fd, uint64_t target_fd);
-int64_t lpr_iov_scalar_io(uint64_t fd, uint64_t iov_raw, uint64_t iov_count, int write);
+int64_t lpr_iov_scalar_io(uint64_t fd, uint64_t iov_raw, uint64_t iov_count, int write, unsigned *wait_not_ready __attribute__((unused)));
 int64_t lpr_linux_access(uint64_t path, uint64_t mode);
 int64_t lpr_linux_chdir(uint64_t path_raw);
-int64_t lpr_linux_clock_nanosleep(uint64_t clock_id, uint64_t flags, uint64_t req_raw, uint64_t rem_raw);
+int64_t lpr_linux_clock_nanosleep(uint64_t clock_id, uint64_t flags, uint64_t req_raw, uint64_t rem_raw, unsigned *wait_not_ready __attribute__((unused)));
 int64_t lpr_linux_clone(uint64_t flags, uint64_t child_stack, uint64_t parent_tid, uint64_t child_tid, uint64_t tls);
 int64_t lpr_linux_clone_frame(const struct lpr_linux_user_frame *user_frame, uint64_t flags, uint64_t child_stack, uint64_t parent_tid, uint64_t child_tid, uint64_t tls);
 int64_t lpr_linux_prctl(uint64_t option, uint64_t arg2, uint64_t arg3, uint64_t arg4, uint64_t arg5);
@@ -867,14 +867,14 @@ int64_t lpr_linux_signalfd4(
 int64_t lpr_linux_timerfd_create(uint64_t clock_id, uint64_t flags);
 int64_t lpr_linux_timerfd_settime(uint64_t fd, uint64_t flags, uint64_t new_value, uint64_t old_value);
 int64_t lpr_linux_timerfd_gettime(uint64_t fd, uint64_t current_value);
-int64_t lpr_linux_timerfd_read(uint64_t fd, uint64_t buf, uint64_t count);
+int64_t lpr_linux_timerfd_read(uint64_t fd, uint64_t buf, uint64_t count, unsigned *wait_not_ready __attribute__((unused)));
 int64_t lpr_linux_inotify_init1(uint64_t flags);
-int64_t lpr_linux_inotify_add_watch(uint64_t fd, uint64_t path, uint64_t mask);
+int64_t lpr_linux_inotify_add_watch(uint64_t fd, uint64_t path, uint64_t mask, unsigned *wait_not_ready __attribute__((unused)));
 int64_t lpr_linux_inotify_rm_watch(uint64_t fd, uint64_t wd);
-int64_t lpr_linux_inotify_read(uint64_t fd, uint64_t buf, uint64_t count);
+int64_t lpr_linux_inotify_read(uint64_t fd, uint64_t buf, uint64_t count, unsigned *wait_not_ready __attribute__((unused)));
 int64_t lpr_linux_execve(uint64_t path_raw, uint64_t argv_raw, uint64_t envp_raw);
 int64_t lpr_linux_faccessat(uint64_t dirfd, uint64_t path, uint64_t mode, uint64_t flags);
-int64_t lpr_linux_fchdir(uint64_t fd);
+int64_t lpr_linux_fchdir(uint64_t fd, unsigned *wait_not_ready __attribute__((unused)));
 int64_t lpr_linux_fchmod(uint64_t fd, uint64_t mode);
 int64_t lpr_linux_fchmodat(uint64_t dirfd, uint64_t path_raw, uint64_t mode, uint64_t flags);
 int64_t lpr_linux_fchownat(uint64_t dirfd, uint64_t path, uint64_t owner, uint64_t group, uint64_t flags);
@@ -883,7 +883,7 @@ int64_t lpr_linux_file_vmo(uint64_t fd, uint64_t file_offset, uint64_t length, i
 int64_t lpr_linux_shared_file_vmo(uint64_t fd, uint64_t file_offset, uint64_t length, int writable, int executable, uint64_t *out_file_size);
 int64_t lpr_linux_flock(uint64_t fd, uint64_t operation);
 int64_t lpr_linux_fork(void);
-int64_t lpr_linux_fstat(uint64_t fd, uint64_t statbuf);
+int64_t lpr_linux_fstat(uint64_t fd, uint64_t statbuf, unsigned *wait_not_ready __attribute__((unused)));
 int64_t lpr_linux_statfs(uint64_t path, uint64_t statfsbuf);
 int64_t lpr_linux_fstatfs(uint64_t fd, uint64_t statfsbuf);
 int64_t lpr_linux_fsync(uint64_t fd);
@@ -898,7 +898,7 @@ int64_t lpr_linux_gettid(void);
 int lpr_linux_thread_exists(uint64_t tid);
 int64_t lpr_linux_getppid(void);
 int64_t lpr_linux_getsid(uint64_t pid_raw);
-int64_t lpr_linux_ioctl(uint64_t fd, uint64_t request, uint64_t arg);
+int64_t lpr_linux_ioctl(uint64_t fd, uint64_t request, uint64_t arg, unsigned *wait_not_ready __attribute__((unused)));
 int64_t lpr_linux_kill(uint64_t pid_raw, uint64_t sig_raw);
 int64_t lpr_linux_tkill(uint64_t tid_raw, uint64_t sig_raw);
 int64_t lpr_linux_tgkill(uint64_t tgid_raw, uint64_t tid_raw, uint64_t sig_raw);
@@ -907,24 +907,24 @@ int64_t lpr_linux_lseek(uint64_t fd, uint64_t offset, uint64_t whence);
 int64_t lpr_linux_mkdirat(uint64_t dirfd, uint64_t path_raw, uint64_t mode);
 int64_t lpr_linux_memfd_create(uint64_t name_raw, uint64_t flags);
 int64_t lpr_linux_mknodat(uint64_t dirfd, uint64_t path, uint64_t mode, uint64_t dev);
-int64_t lpr_linux_nanosleep(uint64_t req_raw, uint64_t rem_raw);
-int64_t lpr_linux_newfstatat(uint64_t dirfd, uint64_t path_raw, uint64_t statbuf, uint64_t flags);
+int64_t lpr_linux_nanosleep(uint64_t req_raw, uint64_t rem_raw, unsigned *wait_not_ready __attribute__((unused)));
+int64_t lpr_linux_newfstatat(uint64_t dirfd, uint64_t path_raw, uint64_t statbuf, uint64_t flags, unsigned *wait_not_ready __attribute__((unused)));
 int64_t lpr_linux_now(lpr_linux_timespec_t *out);
-int64_t lpr_linux_open_metadata(uint64_t dirfd, uint64_t path_raw, uint64_t flags);
-int64_t lpr_linux_openat(uint64_t dirfd, uint64_t path_raw, uint64_t flags, uint64_t mode);
-int64_t lpr_linux_proc_snapshot_open(const char *path, uint64_t flags);
+int64_t lpr_linux_open_metadata(uint64_t dirfd, uint64_t path_raw, uint64_t flags, unsigned *wait_not_ready __attribute__((unused)));
+int64_t lpr_linux_openat(uint64_t dirfd, uint64_t path_raw, uint64_t flags, uint64_t mode, unsigned *wait_not_ready __attribute__((unused)));
+int64_t lpr_linux_proc_snapshot_open(const char *path, uint64_t flags, unsigned *wait_not_ready __attribute__((unused)));
 int lpr_linux_proc_readlink(const char *path, char *target, uint64_t capacity, int64_t *out_status);
-int64_t lpr_linux_openat_once(uint64_t dirfd, uint64_t path_raw, uint64_t flags, uint64_t mode, uint64_t *out_kind);
+int64_t lpr_linux_openat_once(uint64_t dirfd, uint64_t path_raw, uint64_t flags, uint64_t mode, uint64_t *out_kind, unsigned *wait_not_ready __attribute__((unused)));
 int64_t lpr_linux_pipe2(uint64_t fds_raw, uint64_t flags);
 int64_t lpr_linux_pread64(uint64_t fd, uint64_t buf, uint64_t count, uint64_t offset);
 int64_t lpr_linux_pread_to_vmo( uint64_t fd, uint64_t vmo_fd, uint64_t vmo_offset, uint64_t count, uint64_t file_offset);
-int64_t lpr_linux_read(uint64_t fd, uint64_t buf, uint64_t count);
-int64_t lpr_drm_read_events(uint64_t fd, uint64_t buf, uint64_t count);
+int64_t lpr_linux_read(uint64_t fd, uint64_t buf, uint64_t count, unsigned *wait_not_ready __attribute__((unused)));
+int64_t lpr_drm_read_events(uint64_t fd, uint64_t buf, uint64_t count, unsigned *wait_not_ready __attribute__((unused)));
 int64_t lpr_drm_poll_events(uint64_t fd, uint32_t events);
-int lpr_drm_native_wait_fd(uint64_t fd);
+pacha_fd_t lpr_drm_native_wait_fd(uint64_t fd);
 int64_t lpr_linux_readlink(uint64_t path, uint64_t buf, uint64_t bufsiz);
 int64_t lpr_linux_readlinkat_to_buffer(uint64_t dirfd, uint64_t path_raw, char *target, uint64_t capacity);
-int64_t lpr_linux_readv(uint64_t fd, uint64_t iov_raw, uint64_t iov_count);
+int64_t lpr_linux_readv(uint64_t fd, uint64_t iov_raw, uint64_t iov_count, unsigned *wait_not_ready __attribute__((unused)));
 int64_t lpr_linux_renameat(uint64_t old_dirfd, uint64_t old_path_raw, uint64_t new_dirfd, uint64_t new_path_raw);
 int lpr_linux_utimens_both_omit(const lpr_linux_timespec_t *times);
 int64_t lpr_linux_rt_sigaction(uint64_t sig_raw, uint64_t act_raw, uint64_t oldact_raw, uint64_t sigsetsize);
@@ -934,11 +934,15 @@ int64_t lpr_linux_rt_sigtimedwait(
     uint64_t set_raw,
     uint64_t info_raw,
     uint64_t timeout_raw,
-    uint64_t sigsetsize);
+    uint64_t sigsetsize, unsigned *wait_not_ready __attribute__((unused)));
 int64_t lpr_linux_sigaltstack(uint64_t ss_raw, uint64_t old_ss_raw);
 void lpr_linux_signal_runtime_init(void);
 void lpr_linux_signal_after_fork_child(void);
 void lpr_linux_deliver_native_pending_frame(int64_t interrupted_result);
+/* The output is owned by this call chain, consumed only after pins/RPCs unwind.
+ * NOT_READY is authoritative even before the sender copies out its hint. */
+void lpr_linux_deliver_native_pending_frame_after_wait(
+    int64_t interrupted_result, unsigned *wait_not_ready);
 void *lpr_linux_async_signal_prepare(void *native_frame);
 _Noreturn void lpr_linux_rt_sigreturn_frame(const struct lpr_linux_user_frame *frame);
 _Noreturn void lpr_linux_rt_sigreturn_body(void *body);
@@ -953,27 +957,27 @@ int64_t lpr_linux_unlinkat(uint64_t dirfd, uint64_t path_raw, uint64_t flags);
 int64_t lpr_linux_utimensat(uint64_t dirfd, uint64_t path_raw, uint64_t times, uint64_t flags);
 int64_t lpr_linux_validate_timespec(const struct pachaos_timespec *ts);
 int64_t lpr_linux_vfork(void);
-int64_t lpr_linux_wait4(uint64_t pid, uint64_t status_raw, uint64_t options, uint64_t rusage);
-int64_t lpr_linux_wait_process_fd(uint64_t process_fd, uint64_t *out_exit_code);
-int64_t lpr_linux_write(uint64_t fd, uint64_t buf, uint64_t count);
-int64_t lpr_linux_writev(uint64_t fd, uint64_t iov_raw, uint64_t iov_count);
+int64_t lpr_linux_wait4(uint64_t pid, uint64_t status_raw, uint64_t options, uint64_t rusage, unsigned *wait_not_ready __attribute__((unused)));
+int64_t lpr_linux_wait_process_fd(uint64_t process_fd, uint64_t *out_exit_code, unsigned *wait_not_ready __attribute__((unused)));
+int64_t lpr_linux_write(uint64_t fd, uint64_t buf, uint64_t count, unsigned *wait_not_ready __attribute__((unused)));
+int64_t lpr_linux_writev(uint64_t fd, uint64_t iov_raw, uint64_t iov_count, unsigned *wait_not_ready __attribute__((unused)));
 int64_t lpr_pacha_clock_gettime(uint64_t clock_id, struct pachaos_timespec *out);
 int64_t lpr_pacha_nanosleep(const struct pachaos_timespec *req);
 int64_t lpr_pacha_status_to_errno(int64_t status);
-int64_t lpr_pipe_wait(uint64_t fd, uint32_t events, uint64_t min_write_bytes);
-int64_t lpr_process_client_call( uint64_t *request_counter, int64_t (*status_to_errno)(int64_t status), uint32_t op, int page_fd, void *page, uint32_t payload_size, int transfer_fd, uint64_t *out_result);
-int64_t lpr_process_client_call_token( uint64_t *request_counter, int64_t (*status_to_errno)(int64_t status), int (*create_page)(void **out_page), void (*destroy_page)(int fd, void *page), uint32_t op, uint64_t token, int transfer_fd, uint64_t *out_result);
-int64_t lpr_supervisor_call( uint32_t op, int page_fd, void *page, uint32_t payload_size, int transfer_fd, uint64_t *out_result);
-int64_t lpr_supervisor_call_token( uint32_t op, uint64_t token, int transfer_fd, uint64_t *out_result);
+int64_t lpr_pipe_wait(uint64_t fd, uint32_t events, uint64_t min_write_bytes, unsigned *wait_not_ready __attribute__((unused)));
+int64_t lpr_process_client_call( uint64_t *request_counter, int64_t (*status_to_errno)(int64_t status), uint32_t op, pacha_fd_t page_fd, void *page, uint32_t payload_size, pacha_fd_t transfer_fd, uint64_t *out_result);
+int64_t lpr_process_client_call_token( uint64_t *request_counter, int64_t (*status_to_errno)(int64_t status), pacha_fd_t (*create_page)(void **out_page), void (*destroy_page)(pacha_fd_t fd, void *page), uint32_t op, uint64_t token, pacha_fd_t transfer_fd, uint64_t *out_result);
+int64_t lpr_supervisor_call( uint32_t op, pacha_fd_t page_fd, void *page, uint32_t payload_size, pacha_fd_t transfer_fd, uint64_t *out_result);
+int64_t lpr_supervisor_call_token( uint32_t op, uint64_t token, pacha_fd_t transfer_fd, uint64_t *out_result);
 int64_t lpr_supervisor_cwd_set(uint64_t handle, const char *path);
 int64_t lpr_supervisor_kill_pid(int32_t pid, uint32_t sig, uint64_t *out_delivered);
-int64_t lpr_termd_call( uint32_t op, int page_fd, void *page, uint32_t payload_size, uint64_t *out_result);
+int64_t lpr_termd_call( uint32_t op, pacha_fd_t page_fd, void *page, uint32_t payload_size, uint64_t *out_result);
 int64_t lpr_termd_call_handle(uint32_t op, uint64_t handle, uint64_t *out_result);
-int64_t lpr_termd_transfer_dup_handle(uint64_t handle, int lease_fd, uint64_t *out_handle);
-int64_t lpr_tty_io(uint64_t op, uint64_t fd, uint64_t buf, uint64_t count);
+int64_t lpr_termd_transfer_dup_handle(uint64_t handle, pacha_fd_t lease_fd, uint64_t *out_handle);
+int64_t lpr_tty_io(uint64_t op, uint64_t fd, uint64_t buf, uint64_t count, unsigned *wait_not_ready __attribute__((unused)));
 int64_t lpr_tty_ioctl(uint64_t fd, uint64_t request, uint64_t arg);
 int64_t lpr_tty_open_path(const char *path, uint64_t flags);
-int64_t lpr_tty_wait(uint64_t fd, uint32_t events);
+int64_t lpr_tty_wait(uint64_t fd, uint32_t events, unsigned *wait_not_ready __attribute__((unused)));
 uint16_t lpr_control_fd_flags_from_fcntl(uint64_t flags);
 uint16_t lpr_control_fd_flags_from_linux(uint64_t flags);
 uint16_t lpr_dirent_reclen(uint64_t name_len);
@@ -982,16 +986,16 @@ uint32_t lpr_control_status_flags_from_linux(uint64_t flags);
 uint32_t lpr_control_status_flags_to_linux(uint32_t status);
 uint32_t lpr_fd_table_live_ofd_count(const lpr_fd_table_t *table);
 uint32_t lpr_fd_table_open_count(const lpr_fd_table_t *table);
-uint32_t lpr_linux_eventfd_poll_events(uint64_t fd, uint32_t events);
+uint32_t lpr_linux_eventfd_poll_events(uint64_t fd, uint32_t events, unsigned *wait_not_ready __attribute__((unused)));
 uint32_t lpr_linux_signalfd_poll_events(uint64_t fd, uint32_t events);
 uint32_t lpr_linux_timerfd_poll_events(uint64_t fd, uint32_t events);
-uint32_t lpr_linux_inotify_poll_events(uint64_t fd, uint32_t events);
+uint32_t lpr_linux_inotify_poll_events(uint64_t fd, uint32_t events, unsigned *wait_not_ready __attribute__((unused)));
 int64_t lpr_timerfd_remaining_ns(uint64_t fd, uint64_t *out_remaining_ns);
 uint32_t lpr_linux_first_pending_signal(uint64_t mask);
 uint64_t lpr_signalfd_union_mask(void);
 void lpr_signalfd_refresh_mask(void);
 int lpr_signalfd_enqueue(uint32_t sig);
-int64_t lpr_linux_signalfd_read(uint64_t fd, uint64_t buf, uint64_t count);
+int64_t lpr_linux_signalfd_read(uint64_t fd, uint64_t buf, uint64_t count, unsigned *wait_not_ready __attribute__((unused)));
 uint32_t lpr_linux_pipe_poll_events(uint64_t fd, uint32_t events);
 uint32_t lpr_linux_tty_poll_events(uint64_t fd, uint32_t events);
 uint32_t lpr_pipe_flags_from_info(const struct pacha_fd_info *info);
@@ -1026,8 +1030,8 @@ void lpr_control_sync_backend_flags(uint64_t fd);
 void lpr_cwd_init(void);
 void lpr_cwd_set_root(void);
 void lpr_destroy_exec_transaction(lpr_exec_transaction_t *transaction);
-void lpr_destroy_standalone_wire_page(int fd, void *page);
-void lpr_destroy_tty_wire_page(int fd, void *page);
+void lpr_destroy_standalone_wire_page(pacha_fd_t fd, void *page);
+void lpr_destroy_tty_wire_page(pacha_fd_t fd, void *page);
 void lpr_fd_arrays_init(void);
 void lpr_state_lock(volatile uint32_t *word);
 void lpr_state_unlock(volatile uint32_t *word);
@@ -1045,7 +1049,7 @@ void lpr_fill_termd_caller(uint64_t *session_id, uint64_t *process_id, uint64_t 
 void lpr_fill_termd_signal_state(uint64_t *signal_mask, uint64_t *signal_ignored);
 void lpr_linux_apply_pending_fork_child(void);
 void lpr_thread_after_fork_child(void);
-void lpr_linux_ensure_default_stdio(void);
+void lpr_linux_ensure_default_stdio(unsigned *wait_not_ready __attribute__((unused)));
 void lpr_linux_exit_for_signal(uint32_t sig);
 void lpr_signal_source_diag(
     const char *source, uint32_t sig, uint64_t arg0, uint64_t arg1);
@@ -1063,7 +1067,7 @@ void lpr_trace_process_event(const char *event, uint64_t a, uint64_t b, int64_t 
 void lpr_trace_readv_size(uint64_t fd, uint64_t iov_count, uint64_t requested, uint64_t coalesced, uint64_t offset);
 void lpr_trace_readv_to_vmo_status(uint64_t fd, uint64_t requested, int64_t status);
 void lpr_write_linux_stat(void *statbuf, const uint8_t *wire);
-int64_t lpr_linux_statx(uint64_t dirfd, uint64_t path, uint64_t flags, uint64_t mask, uint64_t statxbuf);
+int64_t lpr_linux_statx(uint64_t dirfd, uint64_t path, uint64_t flags, uint64_t mask, uint64_t statxbuf, unsigned *wait_not_ready __attribute__((unused)));
 void lpr_zero_bytes(void *ptr, uint64_t len);
 
 #if defined(LPR_GLYCIN_DIAG) && LPR_GLYCIN_DIAG

@@ -22,8 +22,8 @@ pub fn invlpg(addr: u64) void {
     x86_platform.invlpg(addr);
 }
 
-pub fn installIdentityPageTables0To1GiB() bool {
-    return x86_platform.installIdentityPageTables0To1GiB();
+pub fn installKernelPageTables() bool {
+    return x86_platform.installKernelPageTables();
 }
 
 pub fn hardenKernelMappingsSupervisorOnly() void {

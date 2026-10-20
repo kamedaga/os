@@ -65,12 +65,8 @@ static int publish_device(
         .word2 = device,
         .word3 = ++request_id,
     };
-    const int reply_fd = pacha_ipc_call((int)service->cfg->netd_endpoint_fd, &request);
-    if (reply_fd < 16) return reply_fd;
-    struct pacha_ipc_msg reply;
-    memset(&reply, 0, sizeof(reply));
-    const int recv_status = pacha_ipc_recv_wait(reply_fd, &reply, PACHA_FD_WAIT_FOREVER);
-    (void)pacha_fd_close(reply_fd);
+    struct pacha_ipc_msg reply = {0};
+    const int recv_status = pacha_ipc_call((pacha_fd_t)service->cfg->netd_endpoint_fd, &request, &reply, PACHA_FD_WAIT_FOREVER, NULL);
     if (recv_status != 0) return recv_status;
     if (reply.word0 != PACHA_SERVICE_REPLY_MAGIC || reply.word3 != request.word3) return -5;
     return (int)(int64_t)reply.word1;
@@ -178,22 +174,29 @@ static int dispatch_source_page(inputd_service_t *service,
     return -95;
 }
 
+/* Finish malformed calls too: a new receive cannot overwrite an implicit reply. */
+static int reject_call(int status)
+{
+    const struct pacha_ipc_msg reply = {.word1 = (uint64_t)(int64_t)status};
+    (void)pacha_ipc_reply(PACHA_IPC_REPLY_IMPLICIT, &reply);
+    return status;
+}
+
 int inputd_service_source_dispatch(inputd_service_t *service,
     const struct pacha_ipc_msg *request, const struct pacha_ipc_fd *fds)
 {
     if (!service || !request || !fds)
-        return -22;
-    if (request->fd_count != 2) {
+        return reject_call(-22);
+    if (request->fd_count != 1) {
         for (uint64_t i = 0; i < request->fd_count; i++)
-            if (fds[i].fd >= 16) (void)pacha_fd_close((int)fds[i].fd);
-        return -22;
+            if (fds[i].fd >= 16) (void)pacha_fd_close((pacha_fd_t)fds[i].fd);
+        return reject_call(-22);
     }
-    const int page_fd = (int)(uint32_t)fds[0].fd;
-    const int reply_fd = (int)(uint32_t)fds[1].fd;
-    if (page_fd < 16 || reply_fd < 16 || page_fd == reply_fd) {
+    const pacha_fd_t page_fd = (pacha_fd_t)fds[0].fd;
+    const pacha_fd_t reply_fd = PACHA_IPC_REPLY_IMPLICIT;
+    if (page_fd < 16) {
         if (page_fd >= 16) (void)pacha_fd_close(page_fd);
-        if (reply_fd >= 16) (void)pacha_fd_close(reply_fd);
-        return -22;
+        return reject_call(-22);
     }
     const struct inputd_source_page *page = pacha_mmap(page_fd,
         INPUTD_SOURCE_PAGE_BYTES, PACHA_PROT_READ, PACHA_MMAP_SHARED, 0);
@@ -207,24 +210,27 @@ int inputd_service_source_dispatch(inputd_service_t *service,
     const struct pacha_ipc_msg reply = {.word0 = INPUTD_SOURCE_MAGIC,
         .word1 = (uint64_t)(int64_t)status, .word3 = request->word3};
     int sent = pacha_ipc_reply(reply_fd, &reply);
-    (void)pacha_fd_close(reply_fd);
+    if (sent) {
+        const struct pacha_ipc_msg failed = {0};
+        (void)pacha_ipc_reply(reply_fd, &failed);
+    }
     return sent ? sent : status;
 }
 
 static void close_received(
     const struct pacha_ipc_msg *request,
     const struct pacha_ipc_fd *fds,
-    int reply_fd,
-    int keep_fd)
+    pacha_fd_t reply_fd,
+    pacha_fd_t keep_fd)
 {
     for (uint64_t i = 0; i < request->fd_count; i++) {
-        const int fd = (int)(uint32_t)fds[i].fd;
+        const pacha_fd_t fd = (pacha_fd_t)fds[i].fd;
         if (fd >= 16 && fd != reply_fd && fd != keep_fd) (void)pacha_fd_close(fd);
     }
 }
 
 static int send_reply(
-    int reply_fd,
+    pacha_fd_t reply_fd,
     void *page,
     const pacha_service_envelope_t *request_header,
     int64_t status,
@@ -244,7 +250,10 @@ static int send_reply(
         .word3 = request_header->request_id,
     };
     const int reply_status = pacha_ipc_reply(reply_fd, &reply);
-    (void)pacha_fd_close(reply_fd);
+    if (reply_status) {
+        const struct pacha_ipc_msg failed = {0};
+        (void)pacha_ipc_reply(reply_fd, &failed);
+    }
     return reply_status;
 }
 
@@ -257,7 +266,7 @@ int inputd_service_send_boot_ready(inputd_service_t *service, int64_t status, ui
         .word1 = (uint64_t)status,
         .word2 = status == 0 ? result : 0,
     };
-    return pacha_ipc_send((int)service->cfg->ready_channel_fd, &ready);
+    return pacha_ipc_send((pacha_fd_t)service->cfg->ready_channel_fd, &ready);
 }
 
 int inputd_service_dispatch(
@@ -265,25 +274,25 @@ int inputd_service_dispatch(
     const struct pacha_ipc_msg *request,
     const struct pacha_ipc_fd *fds)
 {
-    if (service == NULL || request == NULL || fds == NULL || request->fd_count < 2)
-        return -22;
-    const int reply_fd = (int)(uint32_t)fds[request->fd_count - 1u].fd;
-    const int page_fd = (int)(uint32_t)fds[0].fd;
-    if (reply_fd < 16 || page_fd < 16 || page_fd == reply_fd) {
+    if (service == NULL || request == NULL || fds == NULL || request->fd_count < 1)
+        return reject_call(-22);
+    const pacha_fd_t reply_fd = PACHA_IPC_REPLY_IMPLICIT;
+    const pacha_fd_t page_fd = (pacha_fd_t)fds[0].fd;
+    if (page_fd < 16 || page_fd == reply_fd) {
         close_received(request, fds, reply_fd, -1);
-        return -22;
+        return reject_call(-22);
     }
     void *page = pacha_mmap(page_fd, PACHA_SERVICE_PAGE_BYTES,
         PACHA_PROT_READ | PACHA_PROT_WRITE, PACHA_MMAP_SHARED, 0);
     if (page == NULL) {
         close_received(request, fds, reply_fd, -1);
-        return -5;
+        return reject_call(-5);
     }
     pacha_service_envelope_t header;
     memcpy(&header, page, sizeof(header));
     int64_t status = -22;
     uint64_t result = 0;
-    int keep_fd = -1;
+    pacha_fd_t keep_fd = -1;
     if (request->word0 == PACHA_SERVICE_REQUEST_MAGIC &&
         request->word3 == header.request_id &&
         pacha_service_request_is_valid(&header, INPUTD_SERVICE_ID)) {
@@ -292,7 +301,7 @@ int inputd_service_dispatch(
         case INPUTD_OP_OPEN:
             if (header.payload_size >= sizeof(inputd_open_request_t)) {
                 const inputd_open_request_t *open = payload;
-                const int notify_fd = request->fd_count >= 3 ? (int)(uint32_t)fds[1].fd : -1;
+                const pacha_fd_t notify_fd = request->fd_count >= 2 ? (pacha_fd_t)fds[1].fd : -1;
                 status = inputd_input_open(open->event_index, open->flags, notify_fd, &result);
                 if (status == 0) keep_fd = notify_fd;
             } else {
@@ -305,8 +314,8 @@ int inputd_service_dispatch(
             break;
         case INPUTD_OP_DUP:
             if (header.payload_size >= sizeof(inputd_handle_request_t)) {
-                const int notify_fd = request->fd_count >= 3 ?
-                    (int)(uint32_t)fds[1].fd : -1;
+                const pacha_fd_t notify_fd = request->fd_count >= 2 ?
+                    (pacha_fd_t)fds[1].fd : -1;
                 status = notify_fd >= 16 ? inputd_input_transfer_dup(
                     ((inputd_handle_request_t *)payload)->handle, notify_fd, &result) :
                     inputd_input_dup(

@@ -58,7 +58,7 @@ typedef struct inputd_handle {
     int clock_id;
     uint64_t id;
     uint64_t cursor;
-    int notify_fd;
+    pacha_fd_t notify_fd;
     int notify_pending;
     int readable;
     int resyncing;
@@ -74,7 +74,7 @@ typedef struct inputd_handle {
 
 typedef struct inputd_transfer_lease {
     int active;
-    int notify_fd;
+    pacha_fd_t notify_fd;
     uint64_t handle;
     uint32_t generation;
 } inputd_transfer_lease_t;
@@ -807,7 +807,7 @@ int inputd_input_public_device(
     return 0;
 }
 
-int inputd_input_open(uint32_t event_index, uint32_t flags, int notify_fd, uint64_t *out_handle)
+int inputd_input_open(uint32_t event_index, uint32_t flags, pacha_fd_t notify_fd, uint64_t *out_handle)
 {
     if (out_handle == NULL || notify_fd < 16) return -22;
     inputd_registry_entry_t *entry = lookup_registry_by_event(event_index);
@@ -859,7 +859,7 @@ int inputd_input_dup(uint64_t id, uint64_t *out_handle)
     return 0;
 }
 
-int inputd_input_transfer_dup(uint64_t id, int notify_fd, uint64_t *out_handle)
+int inputd_input_transfer_dup(uint64_t id, pacha_fd_t notify_fd, uint64_t *out_handle)
 {
     inputd_handle_t *handle = find_handle(id);
     if (handle == NULL || out_handle == NULL || notify_fd < 16 ||
@@ -1268,7 +1268,7 @@ void inputd_input_handle_wait_event(
             handle->notify_fd != source->fd) return;
         const uint64_t orphan_id = handle->id;
         const uint32_t orphan_refs = handle->refs;
-        const int notify_fd = handle->notify_fd;
+        const pacha_fd_t notify_fd = handle->notify_fd;
         handle->notify_fd = -1;
         if (notify_fd >= 16) (void)pacha_fd_close(notify_fd);
         handle->refs = inputd_transfer_lease_count(handle->id) + 1u;

@@ -14,6 +14,7 @@ for diagnostics in 0 1; do
     -ffunction-sections -fdata-sections -Wl,--gc-sections \
     -fsanitize=address,undefined -fno-omit-frame-pointer \
     "${includes[@]}" -Imusl/pachaos/include \
-    tests/lpr_bootstrap_diagnostic_unit.c -o "$out/unit-$diagnostics"
+    tests/lpr_bootstrap_diagnostic_unit.c \
+    userland/personality/linux/runtime/lpr_fd/table.c -o "$out/unit-$diagnostics"
   "$out/unit-$diagnostics"
 done

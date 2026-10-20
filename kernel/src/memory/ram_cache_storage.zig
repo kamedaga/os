@@ -2,11 +2,18 @@ const std = @import("std");
 const policy = @import("ram_cache_policy.zig");
 const kernel = @import("../kernel.zig");
 const paging = @import("ram_cache_paging.zig");
+const physical_layout = @import("../arch/x86_64/physical_layout.zig");
+const PhysicalAddress = physical_layout.PhysicalAddress;
+
+// A mapped allocation carries its original grant: a CPU pointer is never a
+// physical return token, even when the current mapping happens to be identity.
+const Allocation = struct { physical: PhysicalAddress, bytes: []u8 };
 
 pub const Block = struct {
     owner: *Store,
     next: ?*Block = null,
     pages: usize,
+    physical: PhysicalAddress,
     available: bool = false,
     published: bool = false,
     snapshot: policy.Snapshot = .{},
@@ -18,7 +25,7 @@ pub const Block = struct {
     }
 
     pub fn overlapsTargets(self: *const Block, pages: []const u64) bool {
-        return paging.pagesIntersect(pages, @intFromPtr(self), self.pages * 4096);
+        return paging.pagesIntersect(pages, self.physical.toInt(), self.pages * 4096);
     }
 
     pub fn items(self: *Block, comptime T: type, count: usize) ![]T {
@@ -233,9 +240,9 @@ pub const Store = struct {
             }
             link = &block.next;
         }
-        const address = try backend.take(pages);
-        const block: *Block = @ptrFromInt(address);
-        block.* = .{ .owner = self, .pages = pages };
+        const allocation = try backend.take(pages);
+        const block: *Block = @ptrCast(@alignCast(allocation.bytes.ptr));
+        block.* = .{ .owner = self, .pages = pages, .physical = allocation.physical };
         return block;
     }
 
@@ -252,7 +259,7 @@ pub const Store = struct {
         if (block.owner != self or block.available or block.published) return error.InvalidState;
         // Save everything before give(): another PMM consumer may overwrite
         // this memory immediately after successful insertion.
-        const address = @intFromPtr(block);
+        const address = block.physical;
         const pages = block.pages;
         if (backend.give(address, pages)) return;
         block.snapshot = .{};
@@ -264,11 +271,18 @@ pub const Store = struct {
 
 const Native = struct {
     free_list: *kernel.FreePageList,
-    fn take(self: *@This(), pages: usize) !u64 {
-        return self.free_list.popContiguousBelow(pages, @import("../arch/x86_64/physical_layout.zig").identity_limit);
+    fn take(self: *@This(), pages: usize) !Allocation {
+        const bytes = try std.math.mul(usize, pages, 4096);
+        const physical = PhysicalAddress.fromInt(try self.free_list.popContiguousBelow(pages, physical_layout.allocation_limit));
+        // PMM grants aligned, nonzero complete extents below the same limit.
+        const mapped = physical_layout.identitySlice(u8, physical, bytes) orelse unreachable;
+        return .{ .physical = physical, .bytes = mapped };
     }
-    fn give(self: *@This(), address: u64, pages: usize) bool {
-        self.free_list.appendContiguousRange(0, address, pages) catch return false;
+    fn give(self: *@This(), address: PhysicalAddress, pages: usize) bool {
+        self.free_list.appendContiguousRange(address.toInt(), pages) catch |err| switch (err) {
+            error.PageQuarantined => return false,
+            else => @panic("invalid PMM return"),
+        };
         return true;
     }
 };
@@ -283,21 +297,22 @@ test "MMIO overlay snapshot owner reclaims only after final reader barrier" {
         barrier: bool = false,
         publication_started: bool = false,
         released: usize = 0,
-        fn take(self: *@This(), pages: usize) !u64 {
+        fn take(self: *@This(), pages: usize) !Allocation {
             if (pages != 1) return error.OutOfMemory;
             for (&self.used, 0..) |*used, i| {
                 if (used.*) continue;
                 used.* = true;
-                return @intFromPtr(&self.memory[i]);
+                return .{ .physical = .fromInt(0x100000 + i * 4096), .bytes = &self.memory[i] };
             }
             return error.OutOfMemory;
         }
-        fn give(self: *@This(), address: u64, _: usize) bool {
-            const block: *Block = @ptrFromInt(address);
+        fn give(self: *@This(), address: PhysicalAddress, _: usize) bool {
+            const index = (address.toInt() - 0x100000) / 4096;
+            const block: *Block = @ptrCast(@alignCast(&self.memory[index]));
             std.debug.assert(!copy.ramCacheSnapshotIsCurrent(&block.snapshot));
             std.debug.assert(!self.publication_started or self.barrier);
             for (&self.used, 0..) |*used, i| {
-                if (address != @intFromPtr(&self.memory[i])) continue;
+                if (address.toInt() != 0x100000 + i * 4096) continue;
                 std.debug.assert(used.*);
                 used.* = false;
                 self.released += 1;
@@ -373,14 +388,14 @@ test "MMIO overlay RAM snapshot storage retains failed returns and protects publ
         fail_return: bool = false,
         takes: usize = 0,
         gives: usize = 0,
-        fn take(self: *@This(), pages: usize) !u64 {
+        fn take(self: *@This(), pages: usize) !Allocation {
             self.takes += 1;
             if (self.used or self.fail_take or pages > 4) return error.OutOfMemory;
             self.used = true;
-            return @intFromPtr(&self.memory);
+            return .{ .physical = .fromInt(0x100000), .bytes = self.memory[0 .. pages * 4096] };
         }
-        fn give(self: *@This(), address: u64, _: usize) bool {
-            std.debug.assert(address == @intFromPtr(&self.memory) and self.used);
+        fn give(self: *@This(), address: PhysicalAddress, _: usize) bool {
+            std.debug.assert(address.toInt() == 0x100000 and self.used);
             self.gives += 1;
             if (self.fail_return) return false;
             self.used = false;
@@ -395,7 +410,10 @@ test "MMIO overlay RAM snapshot storage retains failed returns and protects publ
     try std.testing.expect(@intFromPtr(split_items.ptr) % @alignOf(@import("ram_cache_vm_plan.zig").Split) == 0);
     try std.testing.expectError(error.NoSpace, first.items(u64, 10000));
     try std.testing.expectError(error.Overflow, first.items(u64, std.math.maxInt(usize)));
-    try std.testing.expect(first.overlapsTargets(&.{@intFromPtr(first)}));
+    try std.testing.expect(first.physical.toInt() != @intFromPtr(first));
+    try std.testing.expect(first.overlapsTargets(&.{0x100000}));
+    try std.testing.expect(!first.overlapsTargets(&.{@intFromPtr(first)}));
+    try std.testing.expect(!first.overlapsTargets(&.{0x100000 + first.pages * 4096}));
     first.published = true;
     try std.testing.expectError(error.InvalidState, store.releaseWith(&backend, first));
     try std.testing.expectEqual(@as(usize, 0), backend.gives);

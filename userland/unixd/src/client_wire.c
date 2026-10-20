@@ -10,7 +10,7 @@ static void copy_bytes(void *destination, const void *source, size_t count)
     for (size_t i = 0; i < count; i++) out[i] = in[i];
 }
 
-static int exchange_page_once(const struct unix_client_io *io, int endpoint,
+static int exchange_page_once(const struct unix_client_io *io, pacha_fd_t endpoint,
     struct unix_control *request, const struct pacha_ipc_fd *send, unsigned send_count,
     struct pacha_ipc_fd *receive, unsigned capacity, unsigned *received,
     struct unix_client_buffer *buffer, int *miss)
@@ -18,15 +18,15 @@ static int exchange_page_once(const struct unix_client_io *io, int endpoint,
     *miss = 0;
     /* 256 is the initial table capacity, not the native descriptor limit.
      * LPR can grow its table before creating per-thread UNIX sessions. */
-    if (!io || !io->page_create || !io->page_destroy || !io->call || !io->receive || !io->close ||
-        !request || !request->request || !received || endpoint < 16 || endpoint >= PACHA_FD_TABLE_LIMIT ||
+    if (!io || !io->page_create || !io->page_destroy || !io->call || !io->close ||
+        !request || !request->request || !received || endpoint < 16 || endpoint >= PACHA_THREAD_SELF_FD ||
         (send_count && !send) || (capacity && !receive) ||
         send_count > PACHA_IPC_MAX_TRANSFER_FDS - 2 || capacity > PACHA_IPC_MAX_TRANSFER_FDS)
         return -EINVAL;
     *received = 0;
     if (!buffer || buffer->fd < 16 || !buffer->page) return -EINVAL;
     struct unix_control *page = buffer->page;
-    const int page_fd = buffer->fd;
+    const pacha_fd_t page_fd = buffer->fd;
     UP_BEGIN(serialize, UP_RPC, request->operation, UP_SERIALIZE);
     copy_bytes(page, request, sizeof(*request));
     page->magic = UNIX_SERVICE_MAGIC;
@@ -49,16 +49,12 @@ static int exchange_page_once(const struct unix_client_io *io, int endpoint,
         .word2 = token, .word3 = request->request, .fds = outgoing, .fd_count = send_count + page_caps };
     int status;
     UP_END(serialize);
+    struct pacha_ipc_fd incoming[PACHA_IPC_MAX_TRANSFER_FDS] = {{0}};
+    struct pacha_ipc_msg reply = { .fds = incoming, .fd_capacity = PACHA_IPC_MAX_TRANSFER_FDS };
     UP_BEGIN(call, UP_RPC, request->operation, UP_CALL);
-    const int reply_fd = io->call(endpoint, &message);
+    status = io->call(endpoint, &message, &reply);
     UP_END(call);
-    if (reply_fd < 16) status = reply_fd < 0 ? reply_fd : -EIO;
-    else {
-        struct pacha_ipc_fd incoming[PACHA_IPC_MAX_TRANSFER_FDS] = {{0}};
-        struct pacha_ipc_msg reply = { .fds = incoming, .fd_capacity = PACHA_IPC_MAX_TRANSFER_FDS };
-        UP_BEGIN(receive_time, UP_RPC, request->operation, UP_RECEIVE);
-        status = io->receive(reply_fd, &reply);
-        UP_END(receive_time);
+    {
         UP_BEGIN(validate, UP_RPC, request->operation, UP_VALIDATE);
         if (status == 0 && reply.word0 == UNIX_BUFFER_MISS_MAGIC) {
             if (token >= 2 && reply.word1 == 0 && reply.word2 == token &&
@@ -87,15 +83,13 @@ static int exchange_page_once(const struct unix_client_io *io, int endpoint,
         }
         if (status != 0)
             for (unsigned i = 0; i < reply.fd_count && i < PACHA_IPC_MAX_TRANSFER_FDS; i++)
-                if (incoming[i].fd >= 16) io->close((int)incoming[i].fd);
+                if (incoming[i].fd >= 16) io->close((pacha_fd_t)incoming[i].fd);
         UP_END(validate);
-        UP_BEGIN(close_time, UP_RPC, request->operation, UP_CLOSE);
-        io->close(reply_fd);
     }
     return status;
 }
 
-int unix_client_exchange_page(const struct unix_client_io *io, int endpoint,
+int unix_client_exchange_page(const struct unix_client_io *io, pacha_fd_t endpoint,
     struct unix_control *request, const struct pacha_ipc_fd *send, unsigned send_count,
     struct pacha_ipc_fd *receive, unsigned capacity, unsigned *received,
     struct unix_client_buffer *buffer)
@@ -111,7 +105,7 @@ int unix_client_exchange_page(const struct unix_client_io *io, int endpoint,
         receive, capacity, received, buffer, &miss);
 }
 
-int unix_client_exchange(const struct unix_client_io *io, int endpoint,
+int unix_client_exchange(const struct unix_client_io *io, pacha_fd_t endpoint,
     struct unix_control *request, const struct pacha_ipc_fd *send, unsigned send_count,
     struct pacha_ipc_fd *receive, unsigned capacity, unsigned *received)
 {

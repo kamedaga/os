@@ -70,7 +70,7 @@ static void *controller_allocate(void *context, size_t size)
 static void controller_deallocate(void *context, void *pointer, size_t size)
 { (void)context; (void)size; free(pointer); }
 
-static int wait_readable(int fd, int process_fd)
+static int wait_readable(pacha_fd_t fd, pacha_fd_t process_fd)
 {
     struct pacha_pollfd events[2] = {
         {.fd = fd, .events = PACHA_FD_EVENT_READABLE | PACHA_FD_EVENT_HANGUP},
@@ -84,7 +84,7 @@ static int wait_readable(int fd, int process_fd)
     return -EIO;
 }
 
-static int wait_process(int process_fd)
+static int wait_process(pacha_fd_t process_fd)
 {
     struct pacha_pollfd event = {.fd = process_fd,
         .events = PACHA_FD_EVENT_READABLE | PACHA_FD_EVENT_HANGUP};
@@ -376,7 +376,7 @@ static int restart_generation(void)
     }
 }
 
-static int sandbox_exited(int process_fd)
+static int sandbox_exited(pacha_fd_t process_fd)
 {
     struct pacha_pollfd event = {.fd = process_fd,
         .events = PACHA_FD_EVENT_READABLE | PACHA_FD_EVENT_HANGUP};
@@ -432,7 +432,7 @@ int netd_kobox2_nic_start(struct netd_runtime *runtime)
     diagnostic = (struct netd_nic_diagnostic){0};
     nic_progress(NETD_NIC_STEP_PACKAGE, "validate PCI capsule and load Kobox2 package");
     int error = netd_kobox2_package_open(&nic.package,
-        (int)runtime->cfg->filed_endpoint_fd, (int)runtime->cfg->device_fd);
+        (pacha_fd_t)runtime->cfg->filed_endpoint_fd, (pacha_fd_t)runtime->cfg->device_fd);
     if (error) return nic_failure(NETD_NIC_STEP_PACKAGE, error, error, 0, 0);
     nic_progress(NETD_NIC_STEP_CONTROLLER, "create and configure Kobox2 controller");
     kb2_status_t status = kb2_controller_create(controller_allocate,

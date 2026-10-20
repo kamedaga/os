@@ -1,3 +1,4 @@
+#include <pacha/abi.h>
 #pragma once
 
 #include <stdint.h>
@@ -11,8 +12,8 @@ int filed_exec_native_handle(
     struct filed_runtime *runtime,
     filed_handle_id_t handle_id,
     const filed_exec_path_t *request,
-    const int *inherit_fds,
+    const pacha_fd_t *inherit_fds,
     uint64_t inherit_fd_count,
-    int bootstrap_fd,
-    int *out_process_fd,
-    int *out_thread_fd);
+    pacha_fd_t bootstrap_fd,
+    pacha_fd_t *out_process_fd,
+    pacha_fd_t *out_thread_fd);

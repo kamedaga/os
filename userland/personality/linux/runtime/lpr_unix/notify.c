@@ -10,13 +10,13 @@ static int next_request(struct lpr_unix_notifier *notifier, uint64_t *out)
     return 0;
 }
 
-static void close_notification(void *context, int fd)
+static void close_notification(void *context, pacha_fd_t fd)
 {
     (void)context;
     (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, (uint64_t)(uint32_t)fd);
 }
 
-static int resolve_notification(void *context, uint64_t socket, uint32_t notification, int *out)
+static int resolve_notification(void *context, uint64_t socket, uint32_t notification, pacha_fd_t *out)
 {
     struct lpr_unix_notifier *notifier = context;
     *out = -1;
@@ -32,26 +32,25 @@ static int resolve_notification(void *context, uint64_t socket, uint32_t notific
     }
     struct pacha_fd_info info = {0};
     const uint64_t rights = PACHA_FD_RIGHT_INSPECT | PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_SEND;
-    if (count != 1 || request.result != notification || cap.fd < 16 || cap.fd >= PACHAOS_FD_TABLE_LIMIT ||
+    if (count != 1 || request.result != notification || cap.fd < 16 || cap.fd >= PACHAOS_THREAD_SELF_FD ||
         lpr_pacha_syscall2(PACHAOS_SYSCALL_FD_GET_INFO, cap.fd, (uint64_t)(uintptr_t)&info) != 0 ||
         info.kind != PACHA_FD_KIND_CHANNEL || info.rights != rights ||
         info.flags != (PACHA_FD_FLAG_PRIVATE | PACHA_FD_FLAG_CLOEXEC)) {
         lpr_unix_diag('E', socket, -EPROTO, 110, count);
         lpr_unix_diag('E', cap.fd, info.kind, info.rights, info.flags);
-        if (count && cap.fd >= 16) close_notification(context, (int)cap.fd);
+        if (count && cap.fd >= 16) close_notification(context, (pacha_fd_t)cap.fd);
         return -EPROTO;
     }
-    *out = (int)cap.fd;
+    *out = (pacha_fd_t)cap.fd;
     return 0;
 }
 
-static int send_notification(void *context, int fd, uint64_t token)
+static int send_notification(void *context, pacha_fd_t fd, uint64_t token)
 {
     (void)context;
     const struct pacha_ipc_msg message = { .word0 = UNIX_NOTIFY_MAGIC,
         .word1 = (uint32_t)token, .word2 = (uint32_t)(token >> 32) };
-    const int64_t status = lpr_pacha_syscall2(PACHAOS_SYSCALL_IPC_SEND,
-        (uint64_t)(uint32_t)fd, (uint64_t)(uintptr_t)&message);
+    const int64_t status = lpr_ipc_message(PACHAOS_SYSCALL_IPC_SEND, (uint64_t)(uint32_t)fd, (uint64_t)(uintptr_t)((uint64_t)(uintptr_t)&message), 0, 0, 0, 0);
     /* Native SEND maps MailboxFull to NOT_READY. A full notification queue
      * already guarantees a pending wake; do not turn that backpressure into
      * a sticky socket error. Allocation/validation errors still need relay. */

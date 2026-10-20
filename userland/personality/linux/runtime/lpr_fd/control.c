@@ -110,11 +110,11 @@ static void lpr_backend_slab_acquire(void)
     while (__atomic_exchange_n(
             &lpr_backend_slab_lock, 2u, __ATOMIC_ACQUIRE) != 0u)
     {
-        (void)lpr_pacha_syscall3(
+        (void)lpr_pacha_syscall4(
             PACHA_RUNTIME_SYSCALL_FUTEX_WAIT,
             (uint64_t)(uintptr_t)&lpr_backend_slab_lock,
             2u,
-            0);
+            0, PACHA_WAIT_UNINTERRUPTIBLE);
     }
 }
 
@@ -461,7 +461,7 @@ int lpr_runtime_reserved_fd(uint64_t fd)
 
 int lpr_native_fd_info(uint64_t fd, struct pacha_fd_info *out)
 {
-    if (fd > LPR_LINUX_FD_MAX || out == 0) {
+    if (fd < 16 || fd >= PACHAOS_THREAD_SELF_FD || out == 0) {
         return 0;
     }
     lpr_memset(out, 0, sizeof(*out));
@@ -474,7 +474,7 @@ int lpr_native_fd_info(uint64_t fd, struct pacha_fd_info *out)
 int64_t lpr_close_native_fd_if_open(uint64_t fd)
 {
     struct pacha_fd_info info;
-    if (fd > LPR_LINUX_FD_MAX || lpr_runtime_reserved_fd(fd)) {
+    if (fd < 16 || fd >= PACHAOS_THREAD_SELF_FD || lpr_runtime_reserved_fd(fd)) {
         return 0;
     }
     if (!lpr_native_fd_info(fd, &info)) {
@@ -671,7 +671,7 @@ int lpr_control_install_fd(
         lpr_pipe_backend_t *backend = (lpr_pipe_backend_t *)state;
         backend->active = 1;
         backend->flags = (uint32_t)linux_flags;
-        backend->native.raw = (int32_t)backend_id;
+        backend->native.raw = (pacha_fd_t)backend_id;
         break;
     }
     case LPR_FD_OPS_EVENT: {
@@ -997,7 +997,7 @@ int lpr_pipe_track_native_fd(
     pipe->readable = (info->rights & PACHA_FD_RIGHT_READ) != 0 ? 1u : 0u;
     pipe->writable = (info->rights & PACHA_FD_RIGHT_WRITE) != 0 ? 1u : 0u;
     pipe->flags = flags;
-    pipe->native.raw = (int32_t)native_fd;
+    pipe->native.raw = (pacha_fd_t)native_fd;
     return 0;
 }
 
@@ -1035,7 +1035,8 @@ int lpr_fd_slot_alloc(void)
 int lpr_fd_slot_available(uint64_t fd)
 {
     lpr_fd_arrays_init();
-    return fd < lpr_fd_table_capacity &&
+    return fd < lpr_fd_table_soft_limit(&lpr_control_fd_table) &&
+        fd < lpr_fd_table_capacity &&
         !lpr_runtime_reserved_fd(fd) &&
         !lpr_control_fd_active(fd);
 }
@@ -1045,8 +1046,11 @@ int lpr_fd_slot_alloc_from(uint64_t min_fd)
     if (min_fd > LPR_LINUX_FD_MAX) {
         return -LPR_LINUX_EINVAL;
     }
+    lpr_fd_arrays_init();
     uint64_t fd = min_fd;
     for (;;) {
+        if (fd >= lpr_fd_table_soft_limit(&lpr_control_fd_table))
+            return -LPR_LINUX_EMFILE;
         if (fd >= lpr_fd_table_capacity) {
             const int status = lpr_fd_table_ensure_fd(fd);
             if (status != 0) {
@@ -1059,7 +1063,7 @@ int lpr_fd_slot_alloc_from(uint64_t min_fd)
             }
             fd++;
         }
-        if (lpr_fd_table_capacity >= LPR_FD_TABLE_MAX_SIZE) {
+        if (lpr_fd_table_capacity >= lpr_fd_table_soft_limit(&lpr_control_fd_table)) {
             lpr_browser_diag("linux-fd-full", min_fd, fd, lpr_fd_table_capacity);
             return -LPR_LINUX_EMFILE;
         }
@@ -1141,7 +1145,8 @@ int lpr_install_manifest_fds(const lpr_manifest_t *manifest)
     for (uint64_t i = 0; i < manifest->capability_count; ++i) {
         struct pacha_fd_info info;
         if (capabilities[i].ordinal != i ||
-            capabilities[i].native_fd > INT32_MAX ||
+            capabilities[i].native_fd < 16 ||
+            capabilities[i].native_fd >= PACHAOS_THREAD_SELF_FD ||
             !lpr_native_fd_info(capabilities[i].native_fd, &info) ||
             (info.rights & capabilities[i].rights) != capabilities[i].rights)
         {

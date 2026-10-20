@@ -37,7 +37,7 @@ static unsigned lpr_gui_stat_count;
  * interval except for the single start anchor. */
 static void lpr_gui_emit(const char *line, uint64_t length)
 {
-    (void)lpr_linux_write(2, (uint64_t)(uintptr_t)line, length);
+    (void)lpr_linux_write(2, (uint64_t)(uintptr_t)line, length, 0);
 }
 
 static void lpr_gui_log(const char *tag, const uint64_t *values, unsigned count)

@@ -1,3 +1,4 @@
+#include <pacha/abi.h>
 #pragma once
 
 #include <stddef.h>
@@ -7,7 +8,7 @@
 
 struct pacha_service_wait_set;
 
-int netd_netlink_socket_open(uint64_t type, uint64_t protocol, int notify_fd, uint64_t *out_handle);
+int netd_netlink_socket_open(uint64_t type, uint64_t protocol, pacha_fd_t notify_fd, uint64_t *out_handle);
 int netd_netlink_socket_dup(uint64_t handle);
 int netd_netlink_socket_bind(const netd_netlink_bind_t *request);
 int netd_netlink_socket_recv(netd_io_t *request, size_t capacity, size_t *out_received);

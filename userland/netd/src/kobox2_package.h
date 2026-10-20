@@ -1,3 +1,4 @@
+#include <pacha/abi.h>
 /* SPDX-License-Identifier: MIT */
 #ifndef PACHA_NETD_KOBOX2_PACKAGE_H
 #define PACHA_NETD_KOBOX2_PACKAGE_H
@@ -21,11 +22,11 @@ struct netd_kobox2_package {
     struct ph_bootstrap_item items[NETD_PACKAGE_ITEMS];
     struct ph_package_identity identity;
     struct ph_device_authority device;
-    int device_fd;
+    pacha_fd_t device_fd;
 };
 
 int netd_kobox2_package_open(struct netd_kobox2_package *package,
-    int filed_fd, int device_fd);
+    pacha_fd_t filed_fd, pacha_fd_t device_fd);
 int netd_kobox2_package_bind(struct netd_kobox2_package *package,
     uint64_t generation);
 int netd_kobox2_package_unbind(struct netd_kobox2_package *package,

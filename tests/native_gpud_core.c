@@ -65,7 +65,7 @@ static void select_device(struct core_package *package) {
         IPC_CHECK(!package->device_fd);
         package->device_fd = (int)pacha_syscall1(PACHA_CAPSULE_SYSCALL_PCI_CLAIM, i);
         IPC_CHECK(package->device_fd >= 16 &&
-            package->device_fd < PACHA_FD_TABLE_LIMIT);
+            package->device_fd < PACHA_THREAD_SELF_FD);
     }
     IPC_CHECK(package->device_fd);
     struct pacha_capsule_info info = {0};
@@ -312,7 +312,7 @@ static void publish_package(struct core_package *package, uint64_t generation) {
     for (size_t i = 0; i < GPUD_CORE_TEST_BLOBS; ++i) {
         size_t size = (package->sizes[i] + IPC_TEST_PAGE - 1) & ~(IPC_TEST_PAGE - 1);
         long fd = pacha_syscall3(PACHA_FD_SYSCALL_VMO_CREATE, size, IPC_TEST_VMO_RIGHTS, 0);
-        IPC_CHECK(fd >= 16 && fd < PACHA_FD_TABLE_LIMIT);
+        IPC_CHECK(fd >= 16 && fd < PACHA_THREAD_SELF_FD);
         void *mapping = ipc_test_map(fd, size, IPC_TEST_RW);
         memcpy(mapping, package->bytes[i], package->sizes[i]);
         ipc_test_unmap(mapping, size);
@@ -631,7 +631,7 @@ static void boot_round(kb2_controller_t *controller,
                                    GPUD_GPU_CHANNEL_SIZE,
                                    PH_GPU_QUERY_RIGHTS | PACHA_FD_RIGHT_TRANSFER,
                                    0);
-    IPC_CHECK(query_fd >= 16 && query_fd < PACHA_FD_TABLE_LIMIT);
+    IPC_CHECK(query_fd >= 16 && query_fd < PACHA_THREAD_SELF_FD);
     unsigned char *query_mapping = ipc_test_map(query_fd, GPUD_GPU_CHANNEL_SIZE, IPC_TEST_RW);
     struct gpud_gpu_channel query_channel = {0};
     IPC_CHECK(!ph_gpu_channel_bind(&query_channel,

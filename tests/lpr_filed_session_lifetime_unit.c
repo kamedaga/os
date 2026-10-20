@@ -45,7 +45,7 @@ static unsigned hold_first, stop_server, malformed, attach_error, detach_error, 
 static unsigned third_waiting;
 static unsigned lease_limit = UINT_MAX, budget_rejections;
 static unsigned initialize_failure, cleanup_failure;
-static unsigned send_pressure, wait_interruptions, interrupted_waits;
+static unsigned wait_interruptions, interrupted_waits, kicks;
 static unsigned wake_close_failure, control_close_failure, malformed_config;
 static _Thread_local unsigned caller_handle;
 static int fork_cleanup;
@@ -71,7 +71,7 @@ static struct peer *fd_peer(int fd)
 }
 int64_t lpr_fs_call(kb2_fs_request_t *r, const char *path, const char *second,
     const void *input, uint64_t input_bytes, void *output, uint64_t output_bytes,
-    kb2_fs_response_t *reply, int transfer, int *returned)
+    kb2_fs_response_t *reply, pacha_fd_t transfer, pacha_fd_t *returned)
 {
     assert(!path && !second && !input && !input_bytes && transfer == -1 && !returned);
     assert(!lpr_state.filed_rpc.connection_lock);
@@ -115,7 +115,7 @@ int64_t lpr_fs_call(kb2_fs_request_t *r, const char *path, const char *second,
     }
     pthread_mutex_unlock(&peer_lock); return 0;
 }
-int64_t lpr_fs_call_attach(kb2_fs_request_t *r, int vmo, int remote, kb2_fs_response_t *reply)
+int64_t lpr_fs_call_attach(kb2_fs_request_t *r, pacha_fd_t vmo, pacha_fd_t remote, kb2_fs_response_t *reply)
 {
     pthread_mutex_lock(&peer_lock);
     struct peer *p = fd_peer(vmo);
@@ -130,15 +130,14 @@ int64_t lpr_fs_call_attach(kb2_fs_request_t *r, int vmo, int remote, kb2_fs_resp
 }
 int64_t lpr_pacha_syscall3(uint64_t nr, uint64_t a, uint64_t b, uint64_t c)
 {
-    if (nr == PACHA_RUNTIME_SYSCALL_FUTEX_WAIT) {
-        assert(!c);
-        if (caller_handle == 6) {
-            pthread_mutex_lock(&peer_lock);
-            third_waiting = 1; pthread_cond_broadcast(&peer_event);
-            pthread_mutex_unlock(&peer_lock);
-        }
-        (void)syscall(SYS_futex, (void *)(uintptr_t)a, FUTEX_WAIT_PRIVATE, (uint32_t)b, NULL);
-        return 0;
+    if (nr == PACHAOS_SYSCALL_IPC_NOTIFY_WAIT) {
+        /* Eight caller threads take the WAIT_MANY path, which only consumes. */
+        assert(!b && c == PACHA_WAIT_UNINTERRUPTIBLE);
+        pthread_mutex_lock(&peer_lock);
+        struct peer *p = fd_peer(a); assert(a == (uint64_t)p->local);
+        int latched = p->messages != 0; p->messages = 0;
+        pthread_mutex_unlock(&peer_lock);
+        return latched ? 0 : PACHA_SYSCALL_ERR_EMPTY;
     }
     assert(c == (PACHA_FD_FLAG_PRIVATE | PACHA_FD_FLAG_CLOEXEC));
     struct peer *p = &peers[peer_count - 1];
@@ -174,6 +173,12 @@ int64_t lpr_pacha_syscall6(uint64_t nr, uint64_t fd, uint64_t at, uint64_t bytes
 }
 int64_t lpr_pacha_syscall1(uint64_t nr, uint64_t fd)
 {
+    if (nr == PACHAOS_SYSCALL_IPC_NOTIFY) {
+        pthread_mutex_lock(&peer_lock);
+        struct peer *p = fd_peer(fd); assert(fd == (uint64_t)p->local);
+        ++kicks; pthread_cond_broadcast(&peer_event);
+        pthread_mutex_unlock(&peer_lock); return 0;
+    }
     assert(nr == PACHAOS_SYSCALL_FD_CLOSE && fd >= 16);
     pthread_mutex_lock(&peer_lock);
     if (fd == 50 && control_close_failure) {
@@ -206,19 +211,12 @@ int64_t lpr_pacha_syscall2(uint64_t nr, uint64_t a, uint64_t b)
             assert(m->word0 == 1); p->wake_hint = 1;
             pthread_cond_broadcast(&peer_event); pthread_mutex_unlock(&peer_lock); return 0;
         }
-        assert(m->word0 == PH_FS_QUEUE_NOTIFY && m->word1 == 7 &&
-            m->word2 == p->config.channel_id && m->word3 == 1);
-        if (send_pressure) {
-            --send_pressure; pthread_mutex_unlock(&peer_lock);
-            return PACHA_SYSCALL_ERR_NOT_READY;
-        }
-        pthread_cond_broadcast(&peer_event);
+        (void)m; assert(!"doorbells are notify latches, never packets");
     } else if (nr == PACHAOS_SYSCALL_IPC_RECV) {
+        /* Only reached when WAIT_MANY saw a doorbell readable with no latch,
+         * i.e. a forged packet; this peer never queues one. */
         struct peer *p = fd_peer(a); assert(a == (uint64_t)p->local);
-        if (!p->messages) { pthread_mutex_unlock(&peer_lock); return PACHA_SYSCALL_ERR_EMPTY; }
-        --p->messages;
-        *(struct pacha_ipc_msg *)(uintptr_t)b = (struct pacha_ipc_msg){
-            .word0 = PH_FS_QUEUE_NOTIFY, .word1 = 7, .word2 = p->config.channel_id, .word3 = 2};
+        pthread_mutex_unlock(&peer_lock); return PACHA_SYSCALL_ERR_EMPTY;
     } else {
         assert(nr == PACHAOS_SYSCALL_MUNMAP);
         void *memory = (void *)(uintptr_t)a; int found = 0;
@@ -240,11 +238,22 @@ int64_t lpr_pacha_syscall2(uint64_t nr, uint64_t a, uint64_t b)
 }
 int64_t lpr_pacha_syscall4(uint64_t nr, uint64_t fd, uint64_t raw, uint64_t timeout, uint64_t flags)
 {
-    assert(nr == PACHA_FD_SYSCALL_WAIT_MANY && raw == 2 && timeout == UINT64_MAX && !flags);
+    if (nr == PACHA_RUNTIME_SYSCALL_FUTEX_WAIT) {
+        assert(!timeout && flags == PACHA_WAIT_UNINTERRUPTIBLE);
+        if (caller_handle == 6) {
+            pthread_mutex_lock(&peer_lock);
+            third_waiting = 1; pthread_cond_broadcast(&peer_event);
+            pthread_mutex_unlock(&peer_lock);
+        }
+        (void)syscall(SYS_futex, (void *)(uintptr_t)fd, FUTEX_WAIT_PRIVATE, (uint32_t)raw, NULL);
+        return 0;
+    }
+
+    assert(nr == PACHA_FD_SYSCALL_WAIT_MANY && raw == 2 && timeout == UINT64_MAX && flags == PACHA_WAIT_UNINTERRUPTIBLE);
     pthread_mutex_lock(&peer_lock);
     struct pacha_pollfd *fds = (void *)(uintptr_t)fd;
     struct peer *p = fd_peer(fds[0].fd);
-    assert(fds[1].fd == p->wake_read);
+    assert(fds[1].fd == (uint64_t)p->wake_read);
     if (wait_interruptions) {
         --wait_interruptions; ++interrupted_waits;
         pthread_mutex_unlock(&peer_lock); return PACHA_SYSCALL_ERR_NOT_READY;
@@ -310,7 +319,7 @@ static void *server(void *unused)
                 int notify;
                 r->chain.written = KB2_FILESYSTEM_RESPONSE_SIZE + response.data_length;
                 assert(!kb2_vq_complete(&p->device.lane, 7, &r->chain, &notify));
-                if (notify) ++p->messages;
+                if (notify) p->messages = 1; /* binary kernel latch */
                 ++finished[r->decoded.handle];
                 r->active = 0; progress = 1;
             }
@@ -489,12 +498,12 @@ int main(void)
     }
     puts("LPR_FS_PREATTACH_RESERVATION_CANCELLATION_AND_LOCAL_CLEANUP_INVENTORY_PASS");
     pthread_mutex_lock(&peer_lock);
-    send_pressure = 1; wait_interruptions = 2;
+    wait_interruptions = 2;
     pthread_mutex_unlock(&peer_lock);
     struct caller interrupted = {.handle = 28, .bytes = 16, .writing = 1}; call(&interrupted);
     assert(!interrupted.status && seen[28] == 1 && interrupted_waits == 2 && writes[28] == 16 && finished[28] == 1);
     assert(!lpr_filed_session_drop()); fork_reset();
-    puts("LPR_FS_INTERRUPTED_WAIT_AND_SEND_PRESSURE_NO_REPLAY_PASS");
+    puts("LPR_FS_INTERRUPTED_WAIT_NO_REPLAY_PASS");
     puts("LPR_FS_INTERRUPTED_PWRITE_SINGLE_EFFECT_PASS");
     pthread_mutex_lock(&peer_lock); malformed = 1; pthread_mutex_unlock(&peer_lock);
     struct caller ambiguous_write = {.handle = 29, .bytes = 16, .writing = 1};
@@ -550,4 +559,10 @@ int main(void)
     assert(!pthread_join(host, NULL));
     puts("LPR_FS_SESSION_LIFETIME_UNIT_PASS");
     return 0;
+}
+
+#include "lpr_ipc_mock.h"
+int64_t lpr_ipc_message(uint64_t nr, uint64_t fd, uint64_t send, uint64_t receive,
+    uint64_t timeout, uint64_t flags, int *committed) {
+    return test_lpr_ipc_noncall(nr, fd, send, receive, timeout, flags, committed);
 }

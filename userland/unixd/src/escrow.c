@@ -26,7 +26,7 @@ static struct unix_escrow_entry *find(struct unix_escrow *escrow, uint64_t id)
 static void dispose(struct unix_escrow_entry *entry)
 {
     for (unsigned i = 0; i < entry->item.capability_count; i++)
-        (void)pacha_fd_close((int)entry->caps[i].fd);
+        (void)pacha_fd_close((pacha_fd_t)entry->caps[i].fd);
     free(entry);
 }
 
@@ -53,7 +53,7 @@ int unix_escrow_capture(struct unix_escrow *escrow, const struct unix_transfer_i
     for (unsigned i = 0; i < item->capability_count; i++) {
         const uint64_t fd = incoming[item->capability_first + i].fd;
         struct pacha_fd_info info;
-        if (fd < 16 || fd >= PACHA_FD_TABLE_LIMIT || pacha_fd_get_info((int)fd, &info) != 0 ||
+        if (fd < 16 || fd >= PACHA_THREAD_SELF_FD || pacha_fd_get_info((pacha_fd_t)fd, &info) != 0 ||
             !(info.rights & PACHA_FD_RIGHT_TRANSFER)) { free(entry); return -EBADF; }
         for (unsigned j = 0; j < i; j++)
             if (entry->caps[j].fd == fd) { free(entry); return -EINVAL; }

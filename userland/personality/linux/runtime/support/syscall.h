@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 
+int64_t lpr_ipc_message(uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, int *committed);
 int64_t lpr_pacha_syscall0(uint64_t nr);
 int64_t lpr_pacha_syscall1(uint64_t nr, uint64_t a0);
 int64_t lpr_pacha_syscall2(uint64_t nr, uint64_t a0, uint64_t a1);

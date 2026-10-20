@@ -94,7 +94,7 @@ static int64_t create(uint64_t type_flags, uint64_t protocol, int pair, uint64_t
     lpr_fd_arrays_init();
     while (lpr_fd_table_alloc_batch(&lpr_control_fd_table, 0, installs, count, NULL, 0, fds) != 0) {
         const uint64_t capacity = lpr_fd_table_capacity;
-        if (capacity >= LPR_FD_TABLE_MAX_SIZE || lpr_fd_table_ensure_capacity(capacity + count) != 0) {
+        if (capacity >= lpr_fd_table_soft_limit(&lpr_control_fd_table) || lpr_fd_table_ensure_capacity(capacity + count) != 0) {
             status = -EMFILE; goto fail;
         }
     }
@@ -162,7 +162,7 @@ void lpr_unix_copy_iov(const lpr_linux_iovec_t *vectors, unsigned count,
 
 static int64_t io(const lpr_fd_pin_t *pin, const lpr_linux_iovec_t *vectors,
     unsigned count, uint64_t length, int writing, uint64_t flags, uint32_t *message_flags,
-    struct lpr_unix_ancillary *ancillary)
+    struct lpr_unix_ancillary *ancillary, unsigned *wait_not_ready __attribute__((unused)))
 {
     if (!pin || pin->ops_id != LPR_FD_OPS_UNIX || !pin->state) return -EBADF;
     if (!(pin->effective_rights & (writing ? LPR_FD_RIGHT_WRITE : LPR_FD_RIGHT_READ))) return -EBADF;
@@ -170,7 +170,7 @@ static int64_t io(const lpr_fd_pin_t *pin, const lpr_linux_iovec_t *vectors,
         return -EOPNOTSUPP;
     struct lpr_unix_socket *socket = pin->state;
     if (socket->type == UNIX_TRANSPORT_DGRAM)
-        return lpr_unix_dgram_io(pin, vectors, count, length, writing, flags, message_flags, ancillary);
+        return lpr_unix_dgram_io(pin, vectors, count, length, writing, flags, message_flags, ancillary, wait_not_ready);
     UP_BEGIN(total, UP_IO, socket->type * 2 + writing, UP_TOTAL);
     UP_BEGIN(setup, UP_IO, socket->type * 2 + writing, UP_SETUP);
     int mapped_status = lpr_unix_socket_map(socket);
@@ -280,7 +280,7 @@ static int64_t io(const lpr_fd_pin_t *pin, const lpr_linux_iovec_t *vectors,
             writing ? &map->outgoing_tx->waiters : &map->incoming_rx->waiters,
             writing ? &map->outgoing_tx->changes : &map->incoming_tx->changes,
             writing ? &map->outgoing_rx->changes : &map->incoming_rx->changes,
-            ready, &state, &deadline);
+            ready, &state, &deadline, wait_not_ready);
         if (result != 0) break;
     }
     UP_BEGIN(cleanup, UP_IO, socket->type * 2 + writing, UP_CLEANUP);
@@ -293,21 +293,21 @@ static int64_t io(const lpr_fd_pin_t *pin, const lpr_linux_iovec_t *vectors,
 }
 
 int64_t lpr_unix_socket_io(const lpr_fd_pin_t *pin, uint64_t buffer, uint64_t length,
-    int writing, uint64_t flags)
+    int writing, uint64_t flags, unsigned *wait_not_ready __attribute__((unused)))
 {
     if (length > INT64_MAX || (length && !lpr_user_range_plausible(buffer, length))) return -EFAULT;
     const lpr_linux_iovec_t vector = { .base = buffer, .len = length };
-    return io(pin, &vector, 1, length, writing, flags, NULL, NULL);
+    return io(pin, &vector, 1, length, writing, flags, NULL, NULL, wait_not_ready);
 }
 
 int64_t lpr_unix_socket_iov(const lpr_fd_pin_t *pin, uint64_t raw, uint64_t count,
-    int writing, uint64_t flags, uint32_t *message_flags)
+    int writing, uint64_t flags, uint32_t *message_flags, unsigned *wait_not_ready __attribute__((unused)))
 {
-    return lpr_unix_socket_message_iov(pin, raw, count, writing, flags, message_flags, NULL);
+    return lpr_unix_socket_message_iov(pin, raw, count, writing, flags, message_flags, NULL, wait_not_ready);
 }
 
 int64_t lpr_unix_socket_message_iov(const lpr_fd_pin_t *pin, uint64_t raw, uint64_t count,
-    int writing, uint64_t flags, uint32_t *message_flags, struct lpr_unix_ancillary *ancillary)
+    int writing, uint64_t flags, uint32_t *message_flags, struct lpr_unix_ancillary *ancillary, unsigned *wait_not_ready __attribute__((unused)))
 {
     if (count > 1024) return -EMSGSIZE;
     if (count && !lpr_user_range_plausible(raw, count * sizeof(lpr_linux_iovec_t))) return -EFAULT;
@@ -319,16 +319,16 @@ int64_t lpr_unix_socket_message_iov(const lpr_fd_pin_t *pin, uint64_t raw, uint6
         if (vectors[i].len && !lpr_user_range_plausible(vectors[i].base, vectors[i].len)) return -EFAULT;
         length += vectors[i].len;
     }
-    return io(pin, vectors, (unsigned)count, length, writing, flags, message_flags, ancillary);
+    return io(pin, vectors, (unsigned)count, length, writing, flags, message_flags, ancillary, wait_not_ready);
 }
 
 int64_t lpr_unix_socket_sendrecv(uint64_t fd, uint64_t buffer, uint64_t length,
-    int writing, uint64_t flags)
+    int writing, uint64_t flags, unsigned *wait_not_ready __attribute__((unused)))
 {
     if (fd > LPR_LINUX_FD_MAX) return -EBADF;
     lpr_fd_pin_t pin;
     if (lpr_fd_table_pin(&lpr_control_fd_table, (uint32_t)fd, &pin) != 0) return -EBADF;
-    int64_t result = lpr_unix_socket_io(&pin, buffer, length, writing, flags);
+    int64_t result = lpr_unix_socket_io(&pin, buffer, length, writing, flags, wait_not_ready);
     lpr_fd_unpin(&pin);
     return result;
 }

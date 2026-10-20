@@ -8,11 +8,11 @@ static void *lpr_inputd_payload(void *page)
 
 static int64_t lpr_inputd_call_transfer(
     uint32_t op,
-    int page_fd,
+    pacha_fd_t page_fd,
     void *page,
     uint32_t payload_size,
     uint64_t *out_result,
-    int transfer_fd)
+    pacha_fd_t transfer_fd)
 {
     if (page_fd < 16 || page == 0) return -LPR_LINUX_EINVAL;
     pacha_service_envelope_t *header = page;
@@ -36,9 +36,9 @@ static int64_t lpr_inputd_call_transfer(
     uint64_t fd_count = 1;
     if (transfer_fd >= 16) {
         struct pacha_fd_info info;
-        if (!lpr_native_fd_info((uint64_t)(uint32_t)transfer_fd, &info) ||
+        if (!lpr_native_fd_info((uint64_t)transfer_fd, &info) ||
             info.kind != PACHA_FD_KIND_CHANNEL) return -LPR_LINUX_EBADF;
-        fds[1].fd = (uint64_t)(uint32_t)transfer_fd;
+        fds[1].fd = (uint64_t)transfer_fd;
         fds[1].rights = PACHA_FD_RIGHT_INSPECT | PACHA_FD_RIGHT_TRANSFER |
             PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_SEND | PACHA_FD_RIGHT_RECV |
             PACHA_FD_RIGHT_WAIT | PACHA_FD_RIGHT_POLL;
@@ -51,17 +51,9 @@ static int64_t lpr_inputd_call_transfer(
         .fds = fds,
         .fd_count = fd_count,
     };
-    const int reply_fd = (int)lpr_pacha_syscall2(
-        PACHAOS_SYSCALL_IPC_CALL,
-        LPR_INPUTD_INPUT_ENDPOINT_FD,
-        (uint64_t)(uintptr_t)&request);
-    if (reply_fd < 16) return lpr_pacha_status_to_errno(reply_fd);
-    struct pacha_ipc_msg reply;
-    lpr_memset(&reply, 0, sizeof(reply));
-    const int64_t recv_status = lpr_native_ipc_recv_wait(
-        (uint64_t)(uint32_t)reply_fd,
-        &reply);
-    (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, (uint64_t)(uint32_t)reply_fd);
+    struct pacha_ipc_msg reply = {0};
+    const int64_t recv_status = lpr_native_ipc_call_wait(
+        LPR_INPUTD_INPUT_ENDPOINT_FD, &request, &reply, NULL);
     if (recv_status != 0) return lpr_pacha_status_to_errno(recv_status);
     if (reply.word0 != PACHA_SERVICE_REPLY_MAGIC || reply.word3 != request_id ||
         header->magic != PACHA_SERVICE_REPLY_MAGIC ||
@@ -76,7 +68,7 @@ static int64_t lpr_inputd_call_transfer(
 
 static int64_t lpr_inputd_call(
     uint32_t op,
-    int page_fd,
+    pacha_fd_t page_fd,
     void *page,
     uint32_t payload_size,
     uint64_t *out_result)
@@ -103,7 +95,7 @@ static int lpr_input_parse_event_index(const char *suffix, uint32_t *out_event_i
     return 1;
 }
 
-static int lpr_input_fd_alloc(uint64_t handle, uint64_t flags, uint32_t event_index, int native_wait_fd)
+static int lpr_input_fd_alloc(uint64_t handle, uint64_t flags, uint32_t event_index, pacha_fd_t native_wait_fd)
 {
     const lpr_input_backend_t record = {
         .active = 1, .event_index = (uint8_t)event_index,
@@ -123,14 +115,14 @@ int64_t lpr_input_open_path(const char *path, uint64_t flags)
     if (!lpr_input_parse_event_index(suffix, &event_index))
         return -LPR_LINUX_ENOENT;
     void *page = 0;
-    const int page_fd = lpr_create_tty_wire_page(&page);
+    const pacha_fd_t page_fd = lpr_create_tty_wire_page(&page);
     if (page_fd < 0) return page_fd;
     inputd_open_request_t *open = lpr_inputd_payload(page);
     lpr_memset(open, 0, sizeof(*open));
     open->event_index = event_index;
     open->flags = (uint32_t)flags;
-    int native_wait_fd = -1;
-    int remote_wait_fd = -1;
+    pacha_fd_t native_wait_fd = -1;
+    pacha_fd_t remote_wait_fd = -1;
     const int pair_status = lpr_native_wait_pair(&native_wait_fd, &remote_wait_fd);
     if (pair_status != 0) {
         lpr_destroy_tty_wire_page(page_fd, page);
@@ -141,14 +133,14 @@ int64_t lpr_input_open_path(const char *path, uint64_t flags)
         INPUTD_OP_OPEN, page_fd, page, sizeof(*open), &handle, remote_wait_fd);
     lpr_destroy_tty_wire_page(page_fd, page);
     if (status != 0) {
-        (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)native_wait_fd);
-        (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)remote_wait_fd);
+        (void)lpr_close_native_fd_if_open((uint64_t)native_wait_fd);
+        (void)lpr_close_native_fd_if_open((uint64_t)remote_wait_fd);
         return status;
     }
     const int fd = lpr_input_fd_alloc(handle, flags, event_index, native_wait_fd);
     if (fd < 0) {
         (void)lpr_input_close_handle(handle);
-        (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)native_wait_fd);
+        (void)lpr_close_native_fd_if_open((uint64_t)native_wait_fd);
     }
     return fd;
 }
@@ -156,7 +148,7 @@ int64_t lpr_input_open_path(const char *path, uint64_t flags)
 static int64_t lpr_input_handle_call(uint32_t op, uint64_t handle, uint64_t *out_result)
 {
     void *page = 0;
-    const int page_fd = lpr_create_tty_wire_page(&page);
+    const pacha_fd_t page_fd = lpr_create_tty_wire_page(&page);
     if (page_fd < 0) return page_fd;
     inputd_handle_request_t *request = lpr_inputd_payload(page);
     lpr_memset(request, 0, sizeof(*request));
@@ -180,13 +172,13 @@ int64_t lpr_input_dup_handle(uint64_t handle)
 
 int64_t lpr_input_transfer_dup_handle(
     uint64_t handle,
-    int lease_fd,
+    pacha_fd_t lease_fd,
     uint64_t *out_handle)
 {
     if (out_handle == 0 || lease_fd < 16) return -LPR_LINUX_EINVAL;
     *out_handle = 0;
     void *page = 0;
-    const int page_fd = lpr_create_tty_wire_page(&page);
+    const pacha_fd_t page_fd = lpr_create_tty_wire_page(&page);
     if (page_fd < 0) return page_fd;
     inputd_handle_request_t *request = lpr_inputd_payload(page);
     lpr_memset(request, 0, sizeof(*request));
@@ -203,7 +195,7 @@ int64_t lpr_input_transfer_dup_handle(
         (status != 0 ? status : -LPR_LINUX_EIO);
 }
 
-int64_t lpr_input_read_events(uint64_t fd, uint64_t buf, uint64_t count)
+int64_t lpr_input_read_events(uint64_t fd, uint64_t buf, uint64_t count, unsigned *wait_not_ready __attribute__((unused)))
 {
     lpr_input_backend_t *input = lpr_input_backend(fd);
     if (input == 0) return -LPR_LINUX_EBADF;
@@ -213,7 +205,7 @@ int64_t lpr_input_read_events(uint64_t fd, uint64_t buf, uint64_t count)
     for (;;) {
         if (input->wait_fd.raw >= 16) lpr_native_wait_drain(input->wait_fd.raw);
         void *page = 0;
-        const int page_fd = lpr_create_tty_wire_page(&page);
+        const pacha_fd_t page_fd = lpr_create_tty_wire_page(&page);
         if (page_fd < 0) return page_fd;
         inputd_read_request_t *read = lpr_inputd_payload(page);
         lpr_memset(read, 0, sizeof(*read));
@@ -247,7 +239,7 @@ int64_t lpr_input_read_events(uint64_t fd, uint64_t buf, uint64_t count)
         if (wait_status != 0) return wait_status;
         wait_status = lpr_wait_deadline_init(&deadline, -1);
         if (wait_status != 0) return wait_status;
-        wait_status = lpr_wait_graph_block(&graph, &deadline);
+        wait_status = lpr_wait_graph_block(&graph, &deadline, wait_not_ready);
         if (wait_status != 0) return wait_status;
     }
 }
@@ -261,7 +253,7 @@ int64_t lpr_input_ioctl(uint64_t fd, uint64_t command, uint64_t arg)
     if (size > INPUTD_IOCTL_DATA_BYTES) return -LPR_LINUX_EINVAL;
     if (size != 0 && arg == 0) return -LPR_LINUX_EFAULT;
     void *page = 0;
-    const int page_fd = lpr_create_tty_wire_page(&page);
+    const pacha_fd_t page_fd = lpr_create_tty_wire_page(&page);
     if (page_fd < 0) return page_fd;
     inputd_ioctl_request_t *request = lpr_inputd_payload(page);
     lpr_memset(request, 0, sizeof(*request));
@@ -298,7 +290,7 @@ int64_t lpr_input_poll_events(uint64_t fd, uint32_t events)
         return (pollfd.revents & PACHA_FD_EVENT_READABLE) != 0 ? events & INPUTD_POLLIN : 0;
     }
     void *page = 0;
-    const int page_fd = lpr_create_tty_wire_page(&page);
+    const pacha_fd_t page_fd = lpr_create_tty_wire_page(&page);
     if (page_fd < 0) return page_fd;
     inputd_poll_request_t *request = lpr_inputd_payload(page);
     lpr_memset(request, 0, sizeof(*request));
@@ -311,7 +303,7 @@ int64_t lpr_input_poll_events(uint64_t fd, uint32_t events)
     return status == 0 ? (int64_t)result : status;
 }
 
-int lpr_input_native_wait_fd(uint64_t fd)
+pacha_fd_t lpr_input_native_wait_fd(uint64_t fd)
 {
     lpr_input_backend_t *input = lpr_input_backend(fd);
     return input != 0 ? input->wait_fd.raw : -1;

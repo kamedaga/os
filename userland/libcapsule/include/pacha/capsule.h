@@ -91,20 +91,20 @@ struct pacha_capsule_pci_function {
 };
 
 struct pacha_capsule_mmio {
-    int fd;
+    pacha_fd_t fd;
     void *addr;
     size_t len;
 };
 
 struct pacha_capsule_dma {
-    int fd;
+    pacha_fd_t fd;
     void *addr;
     size_t len;
     uint64_t iova;
 };
 
 struct pacha_capsule_irq {
-    int fd;
+    pacha_fd_t fd;
     uint64_t count;
 };
 
@@ -114,48 +114,48 @@ struct pacha_capsule_irq_route {
     uint64_t hwirq;
 };
 
-int pacha_capsule_is_fd(int fd);
+pacha_fd_t pacha_capsule_is_fd(pacha_fd_t fd);
 int pacha_capsule_has_rights(const struct pacha_capsule_info *info, uint64_t rights);
 
-int pacha_capsule_query(int fd, struct pacha_capsule_info *out);
-int pacha_capsule_expect_kind(int fd, uint64_t kind, struct pacha_capsule_info *out);
-int pacha_capsule_close(int fd);
+int pacha_capsule_query(pacha_fd_t fd, struct pacha_capsule_info *out);
+int pacha_capsule_expect_kind(pacha_fd_t fd, uint64_t kind, struct pacha_capsule_info *out);
+int pacha_capsule_close(pacha_fd_t fd);
 
 /* Enumeration and claiming are restricted to the bootstrap owner. The
  * catalog includes all non-bridge functions captured before user drivers.
  * Each entry may be claimed once and transferred to its driver. */
 long pacha_capsule_pci_function_count(void);
 int pacha_capsule_pci_function_at(uint64_t index, struct pacha_capsule_pci_function *out);
-int pacha_capsule_pci_claim(uint64_t index);
+pacha_fd_t pacha_capsule_pci_claim(uint64_t index);
 
-int pacha_capsule_pci_config_read(int device_fd, uint16_t offset, unsigned width, uint32_t *out);
-int pacha_capsule_pci_config_write(int device_fd, uint16_t offset, unsigned width, uint32_t value);
-int pacha_capsule_pci_bar_info(int device_fd, unsigned bar, struct pacha_capsule_bar_info *out);
+int pacha_capsule_pci_config_read(pacha_fd_t device_fd, uint16_t offset, unsigned width, uint32_t *out);
+int pacha_capsule_pci_config_write(pacha_fd_t device_fd, uint16_t offset, unsigned width, uint32_t value);
+int pacha_capsule_pci_bar_info(pacha_fd_t device_fd, unsigned bar, struct pacha_capsule_bar_info *out);
 
-int pacha_capsule_derive_mmio(int device_fd, unsigned bar, void *addr, size_t len, uint64_t flags);
+pacha_fd_t pacha_capsule_derive_mmio(pacha_fd_t device_fd, unsigned bar, void *addr, size_t len, uint64_t flags);
 /* page_offset is relative to the page containing BAR start, not a physical
  * address. Unsupported cache types fail; they are never silently substituted. */
-int pacha_capsule_derive_mmio_range(int device_fd, unsigned bar, void *addr, size_t len, uint64_t flags, uint64_t page_offset);
-int pacha_capsule_derive_dma_buffer(int device_fd, void *addr, uint64_t iova, size_t len, uint64_t flags);
-int pacha_capsule_derive_dma_mapping(int device_fd, void *addr, uint64_t iova, size_t len, unsigned direction, uint64_t flags);
+pacha_fd_t pacha_capsule_derive_mmio_range(pacha_fd_t device_fd, unsigned bar, void *addr, size_t len, uint64_t flags, uint64_t page_offset);
+pacha_fd_t pacha_capsule_derive_dma_buffer(pacha_fd_t device_fd, void *addr, uint64_t iova, size_t len, uint64_t flags);
+pacha_fd_t pacha_capsule_derive_dma_mapping(pacha_fd_t device_fd, void *addr, uint64_t iova, size_t len, unsigned direction, uint64_t flags);
 /* Returns one DMA-mapping fd. out_page_dma[0] addresses user_va exactly;
  * later entries address the base of each following page. Keep the userspace
  * range mapped and unchanged until the returned fd is closed. */
-int pacha_capsule_derive_dma_mapping_pages(int device_fd, void *user_va, size_t size, unsigned direction, uint64_t *out_page_dma, size_t out_capacity_entries);
-int pacha_capsule_derive_dma_mapping_from_buffer(int dma_buffer_fd, uint64_t iova, size_t len, unsigned direction, uint64_t flags);
+pacha_fd_t pacha_capsule_derive_dma_mapping_pages(pacha_fd_t device_fd, void *user_va, size_t size, unsigned direction, uint64_t *out_page_dma, size_t out_capacity_entries);
+pacha_fd_t pacha_capsule_derive_dma_mapping_from_buffer(pacha_fd_t dma_buffer_fd, uint64_t iova, size_t len, unsigned direction, uint64_t flags);
 /* Requires DERIVE_DMA and BUS_MASTER. Controls the shared device domain,
  * including mappings created through other aliases. Disable retains mapping
  * FDs/IOVAs and synchronously drains DMA; failure is not a completed stop.
  * Only isolated legacy VT-d domains with read/write drain are supported. */
-int pacha_capsule_dma_set_enabled(int device_fd, unsigned enabled);
-int pacha_capsule_derive_irq(int device_fd, unsigned kind, unsigned vector, uint64_t flags);
+int pacha_capsule_dma_set_enabled(pacha_fd_t device_fd, unsigned enabled);
+pacha_fd_t pacha_capsule_derive_irq(pacha_fd_t device_fd, unsigned kind, unsigned vector, uint64_t flags);
 
-int pacha_capsule_mmio_from_fd(int mmio_fd, struct pacha_capsule_mmio *out);
-int pacha_capsule_mmio_mapping(int mmio_fd, void **addr, size_t *len);
-int pacha_capsule_dma_from_fd(int dma_fd, struct pacha_capsule_dma *out);
-int pacha_capsule_dma_mapping(int dma_fd, void **addr, size_t *len, uint64_t *iova);
-int pacha_capsule_irq_from_fd(int irq_fd, struct pacha_capsule_irq *out);
-int pacha_capsule_irq_route(int irq_fd, struct pacha_capsule_irq_route *out);
+int pacha_capsule_mmio_from_fd(pacha_fd_t mmio_fd, struct pacha_capsule_mmio *out);
+int pacha_capsule_mmio_mapping(pacha_fd_t mmio_fd, void **addr, size_t *len);
+int pacha_capsule_dma_from_fd(pacha_fd_t dma_fd, struct pacha_capsule_dma *out);
+int pacha_capsule_dma_mapping(pacha_fd_t dma_fd, void **addr, size_t *len, uint64_t *iova);
+int pacha_capsule_irq_from_fd(pacha_fd_t irq_fd, struct pacha_capsule_irq *out);
+int pacha_capsule_irq_route(pacha_fd_t irq_fd, struct pacha_capsule_irq_route *out);
 /* Explicit MSI/MSI-X routes only. Both operations require IRQ_ACK and keep
  * the source physically masked. Failure retains the lease/FD; it may still
  * have masked the source. Quiesce drains without dropping the route.
@@ -163,15 +163,15 @@ int pacha_capsule_irq_route(int irq_fd, struct pacha_capsule_irq_route *out);
  * reports HANGUP and route/poll/control operations report CLOSED. Closing an
  * old alias never touches a replacement route. Caller must stop the device's
  * interrupt source and synchronize its userspace collector/handlers first. */
-int pacha_capsule_irq_quiesce(int irq_fd);
-int pacha_capsule_irq_retire(int irq_fd);
-int pacha_capsule_irq_poll(int irq_fd, uint64_t last_count, uint64_t *out_count);
-int pacha_capsule_irq_wait(int irq_fd, uint64_t last_count, uint64_t *out_count);
+int pacha_capsule_irq_quiesce(pacha_fd_t irq_fd);
+int pacha_capsule_irq_retire(pacha_fd_t irq_fd);
+int pacha_capsule_irq_poll(pacha_fd_t irq_fd, uint64_t last_count, uint64_t *out_count);
+int pacha_capsule_irq_wait(pacha_fd_t irq_fd, uint64_t last_count, uint64_t *out_count);
 
-int pacha_capsule_device_derive_mmio(int device_fd, unsigned bar, void *addr, size_t len, uint64_t flags, struct pacha_capsule_mmio *out);
-int pacha_capsule_device_derive_dma_buffer(int device_fd, void *addr, uint64_t iova, size_t len, uint64_t flags, struct pacha_capsule_dma *out);
+int pacha_capsule_device_derive_mmio(pacha_fd_t device_fd, unsigned bar, void *addr, size_t len, uint64_t flags, struct pacha_capsule_mmio *out);
+int pacha_capsule_device_derive_dma_buffer(pacha_fd_t device_fd, void *addr, uint64_t iova, size_t len, uint64_t flags, struct pacha_capsule_dma *out);
 int pacha_capsule_dma_derive_mapping(const struct pacha_capsule_dma *buffer, uint64_t iova, size_t len, unsigned direction, uint64_t flags, struct pacha_capsule_dma *out);
-int pacha_capsule_device_derive_irq(int device_fd, unsigned kind, unsigned vector, uint64_t flags, struct pacha_capsule_irq *out);
+int pacha_capsule_device_derive_irq(pacha_fd_t device_fd, unsigned kind, unsigned vector, uint64_t flags, struct pacha_capsule_irq *out);
 int pacha_capsule_irq_next(struct pacha_capsule_irq *irq);
 
 #ifdef __cplusplus

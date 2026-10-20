@@ -148,7 +148,7 @@ static int memory_map_pages(void *opaque, size_t offset, void *backing,
     long view_fd = pacha_syscall5(PACHA_FD_SYSCALL_VMO_CREATE_PAGE_VIEW,
         image->ram_fd, (uintptr_t)page_indices, page_count, rights,
         PACHA_FD_FLAG_CLOEXEC);
-    if (view_fd < 16 || view_fd >= PACHA_FD_TABLE_LIMIT) {
+    if (view_fd < 16 || view_fd >= PACHA_THREAD_SELF_FD) {
         ph_boot_log_scatter_failure((uintptr_t)window->base, offset,
             page_indices[0], page_count, protection, 1, (uintptr_t)view_fd);
         ph_fail(__FILE__, __LINE__, view_fd);
@@ -398,7 +398,7 @@ static void allocate_image_memory(struct ph_image *image) {
         PACHA_FD_RIGHT_REVOKE | PACHA_FD_RIGHT_SHARE | PACHA_FD_RIGHT_INSPECT |
         PACHA_FD_RIGHT_CACHE_POLICY;
 
-    image->ram_fd = (int)pacha_syscall3(PACHA_FD_SYSCALL_VMO_CREATE, image->ram_size, rights, 0);
+    image->ram_fd = (pacha_fd_t)pacha_syscall3(PACHA_FD_SYSCALL_VMO_CREATE, image->ram_size, rights, 0);
     PH_CHECK(image->ram_fd >= 16);
     image->ram_cache_modes = ph_alloc(image->ram_size / PH_PAGE_SIZE);
     PH_CHECK(image->ram_cache_modes != NULL);

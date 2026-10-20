@@ -43,7 +43,7 @@ int ph_pci_destroy(struct ph_pci *pci) {
 int ph_dma_init(struct ph_dma *dma, const struct ph_dma_config *config) {
     ++calls;
     assert(config->native_device == 42 && config->mapping_capacity == PH_DEVICE_DMA_MAPPINGS);
-    assert(config->mapping_capacity >= PACHA_FD_TABLE_LIMIT);
+    assert(config->mapping_capacity == 4096u); /* adapter admission policy */
     if (dma_error) return dma_error;
     dma->config = *config;
     dma->admitted = dma->drained = 1;

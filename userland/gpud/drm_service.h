@@ -1,3 +1,4 @@
+#include <pacha/abi.h>
 /* SPDX-License-Identifier: MIT */
 #ifndef PACHA_GPUD_DRM_SERVICE_H
 #define PACHA_GPUD_DRM_SERVICE_H
@@ -9,7 +10,7 @@
 
 struct gpud_drm_watch {
     uint64_t handle, device_minor;
-    int fd;
+    pacha_fd_t fd;
     unsigned int transferred, submit_reported, modeset_reported;
     unsigned int dirty_probe_reported, dirty_update_reported;
 };
@@ -29,19 +30,19 @@ enum {
 struct gpud_drm_mapping {
     uint64_t id, exchange, handle, length;
     uint32_t rights, cache_policy, gem_handle;
-    int view_fd;
+    pacha_fd_t view_fd;
     unsigned int owner_closed;
 };
 
 struct gpud_drm_prime {
     uint64_t token, length;
-    int view_fd;
+    pacha_fd_t view_fd;
     unsigned int owner_closed;
 };
 
 struct gpud_drm_object_lease {
     uint64_t object_id;
-    int fd;
+    pacha_fd_t fd;
     unsigned int prime_owner;
 };
 
@@ -54,7 +55,7 @@ struct gpud_drm_event_buffer {
 struct gpud_drm_connection {
     struct gpud_drm_connection *next;
     void *page;
-    int fd;
+    pacha_fd_t fd;
     unsigned ready;
     void *aux;
 };
@@ -67,7 +68,7 @@ struct gpud_drm_service {
     struct gpud_drm_files files;
     struct gpud_gpu_rpc gpu;
     uint32_t profile_kind;
-    int log_endpoint_fd;
+    pacha_fd_t log_endpoint_fd;
     uint64_t backend_client, correlation, event_sequence;
     /* Linux DRM grants the first primary open master implicitly. Track the
      * owning frontend file so DROP/SET and last-close follow that lifetime. */
@@ -104,19 +105,20 @@ struct gpud_drm_service {
     struct ph_ipc_packet received;
     void *page;
     void *request_aux;
-    int endpoint_fd, error;
+    pacha_fd_t endpoint_fd;
+    int error;
 };
 
 /* Binds this generation to filed's process-lifetime DRM endpoint. The
  * endpoint is borrowed so a replacement generation can bind it again. */
-int gpud_drm_service_bind(struct gpud_drm_service *service, int endpoint_fd);
+int gpud_drm_service_bind(struct gpud_drm_service *service, pacha_fd_t endpoint_fd);
 /* Receives and replies to one existing LPR native IPC_CALL. -EAGAIN means no
  * request; other errors stop the service. A Linux operation error is sent in
  * the reply, not returned here. CLOSE waits for the real backend completion. */
 int gpud_drm_service_receive(struct gpud_drm_service *service);
 /* While an optional physical GPU is armed but not probed, the public node
  * must answer clients instead of leaving an IPC_CALL waiting indefinitely. */
-int gpud_drm_service_reject_unavailable(int endpoint_fd);
+int gpud_drm_service_reject_unavailable(pacha_fd_t endpoint_fd);
 /* Drain completed sandbox event-lane messages into the handle-local backlog
  * and signal the original LPR notification channel on empty->nonempty. */
 int gpud_drm_service_pump_events(struct gpud_drm_service *service);

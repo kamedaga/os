@@ -76,6 +76,9 @@ int lpr_manifest_begin(
     manifest->record_offset = layout->record_offset;
     manifest->record_bytes = record_bytes;
     manifest->cwd_capability_index = UINT64_MAX;
+    /* Initial launches (including seed0root) use Linux int FD policy.
+     * Exec replaces these with the parent's snapshot before sealing. */
+    manifest->nofile_soft = manifest->nofile_hard = (uint64_t)INT32_MAX + 1u;
     return 0;
 }
 
@@ -122,6 +125,9 @@ int lpr_manifest_validate(const void *memory, uint64_t capacity)
     const lpr_manifest_t *manifest = memory;
     if (manifest == NULL || capacity < sizeof(*manifest) ||
         manifest->magic != LPR_MANIFEST_MAGIC ||
+        manifest->entry_offset != sizeof(*manifest) ||
+        manifest->nofile_soft > manifest->nofile_hard ||
+        manifest->nofile_hard > (uint64_t)INT32_MAX + 1u ||
         manifest->byte_size < sizeof(*manifest) || manifest->byte_size > capacity ||
         !lpr_manifest_range(manifest->entry_offset, manifest->entry_count,
             sizeof(lpr_manifest_entry_t), manifest->byte_size) ||

@@ -36,13 +36,13 @@ static int transfer(struct installer_block_source *source,
 }
 
 int installer_block_source_open(struct installer_block_source *source,
-    int channel_fd, uint64_t resource_id) {
+    pacha_fd_t channel_fd, uint64_t resource_id) {
     if (!source || channel_fd < 16 || !resource_id) return -EINVAL;
     *source = (struct installer_block_source){.channel_fd = channel_fd,
         .shared_fd = -1, .resource_id = resource_id};
     const uint64_t rights = PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_TRANSFER |
         PACHA_FD_RIGHT_MAP_READ | PACHA_FD_RIGHT_MAP_WRITE;
-    const int fd = pacha_vmo_create(INSTALLER_BLOCK_PAGE_BYTES, rights, 0);
+    const pacha_fd_t fd = pacha_vmo_create(INSTALLER_BLOCK_PAGE_BYTES, rights, 0);
     if (fd < 16) return fd < 0 ? fd : -EIO;
     source->shared_fd = fd;
     source->page = pacha_mmap(fd, INSTALLER_BLOCK_PAGE_BYTES,

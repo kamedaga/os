@@ -483,11 +483,11 @@ static int exercise_runtime(void)
     }
 
     volatile uint32_t futex_word = 1;
-    const long wait_status = pacha_syscall3(
+    const long wait_status = pacha_syscall4(
         PACHA_RUNTIME_SYSCALL_FUTEX_WAIT,
         (uint64_t)(uintptr_t)&futex_word,
         0,
-        0);
+        0, 0);
     if (wait_status != PACHA_SYSCALL_ERR_NOT_READY && wait_status != -PACHA_SYSCALL_ERR_NOT_READY) {
         return -41;
     }

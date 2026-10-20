@@ -11,6 +11,7 @@ const boot_resources = @import("boot_resources.zig");
 const user_vm = @import("../memory/user_vm.zig");
 const user_copy = @import("../user_copy.zig");
 const halt = @import("../halt.zig");
+const resource_pages = @import("resource_pages.zig");
 
 const init_bootstrap_abi = boot_abi.init_bootstrap_abi;
 const service_registry_abi = boot_abi.service_registry_abi;
@@ -68,7 +69,7 @@ pub fn mapBootFsImageIntoProcessOrHalt(
     principal: kernel.PrincipalId,
     role_label: []const u8,
     base_va: u64,
-    staged_pages: []const u64,
+    staged_pages: []resource_pages.StagedPage,
     image_size: usize,
     free_list: *kernel.FreePageList,
 ) BootFsImageSetup {
@@ -100,10 +101,17 @@ pub fn mapBootFsImageIntoProcessOrHalt(
         // allocPhysicalPage already zeroed the whole page through the window.
         const remaining = image_size - copied;
         const chunk_len: usize = if (remaining > 4096) 4096 else remaining;
-        const source: [*]const u8 = @ptrFromInt(staged_pages[page_index]);
+        // Borrow the original metadata slot, not a copied record. The VMO
+        // receives independent bytes; no staging view crosses loan.end().
+        var source_loan: resource_pages.Loan = .{};
+        staged_pages[page_index].borrowInto(&source_loan) catch
+            haltInitBootstrapDescriptor("bootfs source borrow rejected");
+        const source = source_loan.identityBytes() catch
+            haltInitBootstrapDescriptor("bootfs source identity view rejected");
         if (!user_copy.writePhysicalBytes(page.paddr, source[0..chunk_len])) {
             halt.haltWithRolePageMessage(role_label, "bootfs image page", "physical write failed");
         }
+        source_loan.end() catch haltInitBootstrapDescriptor("bootfs source borrow end rejected");
         if (!user_vm.mapUserLinearRegion(
             principal,
             base_va + @as(u64, @intCast(page_index)) * 4096,
@@ -321,7 +329,7 @@ pub fn publishInitBootstrapDescriptorPage(
 pub fn setupInitBootstrapResources(
     state: *kernel.KernelState,
     init_process_principal: kernel.PrincipalId,
-    bootfs_stage_pages: []const u64,
+    bootfs_stage_pages: []resource_pages.StagedPage,
     bootfs_size: usize,
     framebuffer_info: ?boot_resources.FramebufferInfo,
     free_list: *kernel.FreePageList,

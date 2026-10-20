@@ -16,7 +16,7 @@
 #define NETD_DBUS_DIAG 0
 #endif
 
-static int g_netd_socket_endpoint_fd = -1;
+static pacha_fd_t g_netd_socket_endpoint_fd = -1;
 static uint64_t g_netd_socket_requests;
 static uint64_t g_netd_socket_errors;
 static int g_netd_socket_trace;
@@ -25,7 +25,7 @@ static uint64_t g_netd_socket_recv_bytes;
 struct netd_socket_transfer_lease {
     struct netd_socket_transfer_lease *next;
     uint64_t handle;
-    int lease_fd;
+    pacha_fd_t lease_fd;
 };
 
 static struct netd_socket_transfer_lease *g_netd_socket_transfer_leases;
@@ -41,7 +41,7 @@ struct netd_page_attachment {
     struct netd_page_attachment *next;
     uint64_t id;
     uint64_t wait_index;
-    int lease_fd;
+    pacha_fd_t lease_fd;
     void *page;
 };
 
@@ -61,7 +61,7 @@ static int netd_socket_admit_fds(uint64_t received, uint64_t retained)
     if (retained == 0) return 0;
     if (retained > received) return -22;
     uint64_t available = received - retained;
-    for (int fd = 16; fd < 256 && available < PACHA_IPC_MAX_TRANSFER_FDS; ++fd) {
+    for (pacha_fd_t fd = 16; fd < 256 && available < PACHA_IPC_MAX_TRANSFER_FDS; ++fd) {
         struct pacha_fd_info info;
         if (pacha_fd_get_info(fd, &info) != 0) ++available;
     }
@@ -93,7 +93,7 @@ static void netd_socket_transfer_lease_destroy(
     free(lease);
 }
 
-static int netd_socket_transfer_lease_add(uint64_t handle, int lease_fd)
+static int netd_socket_transfer_lease_add(uint64_t handle, pacha_fd_t lease_fd)
 {
     if (handle == 0 || lease_fd < 16) return -22;
     struct netd_socket_transfer_lease *lease =
@@ -131,35 +131,35 @@ static void netd_socket_trace_data_op(uint64_t op, int status, uint64_t result)
 
 static int netd_socket_send_reply(
     uint64_t op,
-    int reply_fd,
+    pacha_fd_t reply_fd,
     uint64_t request_id,
     int64_t status,
     uint64_t result,
-    const int *transfer_fds,
+    const pacha_fd_t *transfer_fds,
     uint32_t transfer_count)
 {
     struct pacha_ipc_fd transferred[NETD_TRANSFER_MAX_CAPABILITIES];
     if (transfer_count > NETD_TRANSFER_MAX_CAPABILITIES) {
-        (void)pacha_fd_close(reply_fd);
-        return -22;
+
+        return netd_socket_send_reply(op, reply_fd, request_id, -22, 0, NULL, 0);
     }
     memset(transferred, 0, sizeof(transferred));
     for (uint32_t i = 0; i < transfer_count; ++i) {
         if (transfer_fds == NULL || transfer_fds[i] < 16) {
-            (void)pacha_fd_close(reply_fd);
+    
             for (uint32_t j = 0; transfer_fds != NULL && j < transfer_count; ++j)
                 if (transfer_fds[j] >= 16) (void)pacha_fd_close(transfer_fds[j]);
-            return -22;
+            return netd_socket_send_reply(op, reply_fd, request_id, -22, 0, NULL, 0);
         }
         struct pacha_fd_info info;
         memset(&info, 0, sizeof(info));
         if (pacha_fd_get_info(transfer_fds[i], &info) != 0 ||
             (info.rights & PACHA_FD_RIGHT_TRANSFER) == 0)
         {
-            (void)pacha_fd_close(reply_fd);
+    
             for (uint32_t j = 0; j < transfer_count; ++j)
                 if (transfer_fds[j] >= 16) (void)pacha_fd_close(transfer_fds[j]);
-            return -9;
+            return netd_socket_send_reply(op, reply_fd, request_id, -9, 0, NULL, 0);
         }
         transferred[i].fd = (uint64_t)(uint32_t)transfer_fds[i];
         transferred[i].rights = info.rights;
@@ -177,10 +177,14 @@ static int netd_socket_send_reply(
         pacha_trace4(PACHA_TRACE_COMPONENT_NETD, PACHA_TRACE_EVENT_NETD_SOCKET, PACHA_TRACE_CLASS_DEBUG, op, (uint64_t)status, result, (uint64_t)(uint32_t)reply_fd);
     }
     const int reply_status = pacha_ipc_reply(reply_fd, &reply);
+    if (reply_status) {
+        const struct pacha_ipc_msg failed = {0};
+        (void)pacha_ipc_reply(reply_fd, &failed);
+    }
     if (g_netd_socket_trace && (op == NETD_OP_CONNECT || op == NETD_OP_POLL)) {
         pacha_trace4(PACHA_TRACE_COMPONENT_NETD, PACHA_TRACE_EVENT_NETD_SOCKET, reply_status != 0 ? PACHA_TRACE_CLASS_ERROR : PACHA_TRACE_CLASS_DEBUG, op, (uint64_t)reply_status, result, (uint64_t)(uint32_t)reply_fd);
     }
-    (void)pacha_fd_close(reply_fd);
+
     for (uint32_t i = 0; i < transfer_count; ++i)
         (void)pacha_fd_close(transfer_fds[i]);
     return reply_status;
@@ -191,15 +195,15 @@ static int netd_socket_reject_request(
     const struct pacha_ipc_fd *fds,
     int status)
 {
-    for (uint64_t i = 0; i + 1 < request->fd_count; ++i)
-        if (fds[i].fd >= 16) (void)pacha_fd_close((int)fds[i].fd);
+    for (uint64_t i = 0; i < request->fd_count; ++i)
+        if (fds[i].fd >= 16) (void)pacha_fd_close((pacha_fd_t)fds[i].fd);
     g_netd_socket_errors++;
     return netd_socket_send_reply(request->word1,
-        (int)fds[request->fd_count - 1].fd, request->word3,
+        PACHA_IPC_REPLY_IMPLICIT, request->word3,
         status, 0, NULL, 0);
 }
 
-static void *netd_socket_map_page(int page_fd)
+static void *netd_socket_map_page(pacha_fd_t page_fd)
 {
     if (page_fd < 16) {
         return NULL;
@@ -237,8 +241,8 @@ static void netd_page_attachment_destroy(
 }
 
 static int netd_page_attachment_add(
-    int page_fd,
-    int lease_fd,
+    pacha_fd_t page_fd,
+    pacha_fd_t lease_fd,
     uint64_t *out_id)
 {
     if (page_fd < 16 || lease_fd < 16 || out_id == NULL) return -22;
@@ -295,12 +299,14 @@ static int netd_page_attachment_add(
 static int netd_socket_dispatch(
     uint64_t op,
     void *page,
-    const int *transferred_fds,
+    const pacha_fd_t *transferred_fds,
     uint32_t transferred_count,
     uint64_t *out_result,
-    int *out_reply_fds,
+    pacha_fd_t *out_reply_fds,
     uint32_t *out_reply_count)
 {
+    (void)out_reply_fds;
+    (void)out_reply_count;
     if (out_result == NULL) {
         return -22;
     }
@@ -446,26 +452,21 @@ static int netd_socket_dispatch_request(
     if (request == NULL) {
         return -22;
     }
-    if (request->fd_count < 1 || fds == NULL || fds[request->fd_count - 1].fd < 16) {
-        for (uint64_t i = 0; fds != NULL && i < request->fd_count; ++i)
-            if (fds[i].fd >= 16) (void)pacha_fd_close((int)fds[i].fd);
-        return -22;
-    }
 
-    const int reply_fd = (int)fds[request->fd_count - 1].fd;
+    const pacha_fd_t reply_fd = PACHA_IPC_REPLY_IMPLICIT;
     if (request->word0 != PACHA_SERVICE_REQUEST_MAGIC || request->word3 == 0) {
         return netd_socket_reject_request(request, fds, -22);
     }
 
     if (request->word1 == NETD_OP_PAGE_ATTACH) {
-        if (request->fd_count != 3 || fds[0].fd < 16 || fds[1].fd < 16) {
+        if (request->fd_count != 2 || fds[0].fd < 16 || fds[1].fd < 16) {
             return netd_socket_reject_request(request, fds, -22);
         }
         const int admission = netd_socket_admit_fds(request->fd_count, 1);
         if (admission != 0)
             return netd_socket_reject_request(request, fds, admission);
-        const int page_fd = (int)fds[0].fd;
-        const int lease_fd = (int)fds[1].fd;
+        const pacha_fd_t page_fd = (pacha_fd_t)fds[0].fd;
+        const pacha_fd_t lease_fd = (pacha_fd_t)fds[1].fd;
         uint64_t attachment_id = 0;
         const int status = netd_page_attachment_add(
             page_fd, lease_fd, &attachment_id);
@@ -497,8 +498,8 @@ static int netd_socket_dispatch_request(
     struct netd_page_attachment *attachment = op_uses_page ?
         netd_page_attachment_find(request->word2) : NULL;
     if (op_uses_page && attachment == NULL) {
-        for (uint64_t i = 0; i + 1 < request->fd_count; ++i)
-            if (fds[i].fd >= 16) (void)pacha_fd_close((int)fds[i].fd);
+        for (uint64_t i = 0; i < request->fd_count; ++i)
+            if (fds[i].fd >= 16) (void)pacha_fd_close((pacha_fd_t)fds[i].fd);
         g_netd_socket_errors++;
         return netd_socket_send_reply(
             request->word1,
@@ -510,15 +511,15 @@ static int netd_socket_dispatch_request(
             0);
     }
 
-    int transferred_fds[NETD_TRANSFER_MAX_CAPABILITIES];
+    pacha_fd_t transferred_fds[NETD_TRANSFER_MAX_CAPABILITIES];
     memset(transferred_fds, 0xff, sizeof(transferred_fds));
-    const uint64_t transferred_count64 = request->fd_count - 1u;
+    const uint64_t transferred_count64 = request->fd_count;
     if (transferred_count64 > NETD_TRANSFER_MAX_CAPABILITIES) {
         return netd_socket_reject_request(request, fds, -22);
     }
     const uint32_t transferred_count = (uint32_t)transferred_count64;
     for (uint32_t i = 0; i < transferred_count; ++i)
-        transferred_fds[i] = (int)(uint32_t)fds[i].fd;
+        transferred_fds[i] = (pacha_fd_t)fds[i].fd;
 
     void *const page = attachment != NULL ? attachment->page : NULL;
     if (page != NULL) __atomic_thread_fence(__ATOMIC_ACQUIRE);
@@ -531,7 +532,7 @@ static int netd_socket_dispatch_request(
     if (admission != 0)
         return netd_socket_reject_request(request, fds, admission);
     uint64_t result = op_uses_page ? 0 : request->word2;
-    int reply_transfer_fds[NETD_TRANSFER_MAX_CAPABILITIES];
+    pacha_fd_t reply_transfer_fds[NETD_TRANSFER_MAX_CAPABILITIES];
     uint32_t reply_transfer_count = 0;
     memset(reply_transfer_fds, 0xff, sizeof(reply_transfer_fds));
     const int status = netd_socket_dispatch(
@@ -573,7 +574,7 @@ int netd_socket_service_start(struct netd_runtime *runtime)
     if (runtime == NULL || runtime->cfg == NULL) {
         return 8;
     }
-    g_netd_socket_endpoint_fd = (int)runtime->cfg->socket_endpoint_fd;
+    g_netd_socket_endpoint_fd = (pacha_fd_t)runtime->cfg->socket_endpoint_fd;
     g_netd_socket_requests = 0;
     g_netd_socket_errors = 0;
     g_netd_socket_trace = (runtime->cfg->flags & NETD_BOOT_FLAG_TRACE) != 0;

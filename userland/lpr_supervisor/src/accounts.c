@@ -8,7 +8,7 @@
 #include <stdio.h>
 #include <string.h>
 
-static int read_file(int endpoint, const char *path, char **text, size_t *length)
+static int read_file(pacha_fd_t endpoint, const char *path, char **text, size_t *length)
 {
     kb2_fs_request_t request = {.opcode = KB2_FILESYSTEM_OP_OPENAT2};
     kb2_fs_response_t response = {0};
@@ -46,7 +46,7 @@ static int read_file(int endpoint, const char *path, char **text, size_t *length
     return status ? status : closed;
 }
 
-int lprs_accounts_load(int endpoint, struct pacha_accounts *db)
+int lprs_accounts_load(pacha_fd_t endpoint, struct pacha_accounts *db)
 {
     char *passwd = NULL, *group = NULL;
     size_t plen = 0, glen = 0;

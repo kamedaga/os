@@ -1,3 +1,4 @@
+#include "lpr_ipc_mock.h"
 /* SPDX-License-Identifier: MIT */
 #include <assert.h>
 #include <stdio.h>
@@ -59,8 +60,34 @@ static struct allocation *find_fd(uint64_t fd)
 static void put64(unsigned char *p, uint64_t value)
 { for (unsigned i = 0; i < 8; ++i) p[i] = (unsigned char)(value >> (8 * i)); }
 
+static int64_t serve_doorbell(void)
+{
+    /* This synchronous mock services even unnotified requests so both
+     * diagnostic boundaries complete. Lost-wakeup semantics have their own
+     * real relay regression; this test measures observer noninterference. */
+    kb2_vq_segment_t segments[8];
+    kb2_vq_chain_t chain = {.segments = segments, .capacity = 8};
+    assert(!kb2_vq_take_available(&device.lane, 7, &chain));
+    unsigned char wire[KB2_FILESYSTEM_REQUEST_SIZE];
+    assert(!kb2_vq_copy_request(&device.lane, 7, &chain, 0, wire, sizeof(wire)));
+    kb2_fs_request_t request;
+    assert(!kb2_fs_request_decode(wire, sizeof(wire), chain.readable, &request));
+    kb2_fs_response_t response = {.opcode = request.opcode, .generation = 7,
+        .sequence = request.sequence};
+    unsigned char output[KB2_FILESYSTEM_RESPONSE_SIZE];
+    assert(!kb2_fs_response_encode(output, sizeof(output), &response));
+    assert(!kb2_vq_write_response(&device.lane, 7, &chain, output, sizeof(output)));
+    int notify;
+    assert(!kb2_vq_complete(&device.lane, 7, &chain, &notify));
+    ++reads; return 0;
+}
+
 int64_t lpr_pacha_syscall3(uint64_t nr, uint64_t a, uint64_t b, uint64_t flags)
 {
+    if (nr == PACHAOS_SYSCALL_IPC_NOTIFY_WAIT) {
+        assert(a == 80 && b == UINT64_MAX && flags == PACHA_WAIT_UNINTERRUPTIBLE);
+        return serve_doorbell();
+    }
     assert(flags == (PACHA_FD_FLAG_PRIVATE | PACHA_FD_FLAG_CLOEXEC));
     if (nr == PACHAOS_SYSCALL_IPC_CHANNEL_CREATE) {
         uint64_t *pair = (void *)(uintptr_t)a; pair[0] = 80; pair[1] = 81; return 0;
@@ -93,9 +120,12 @@ int64_t lpr_pacha_syscall6(uint64_t nr, uint64_t fd, uint64_t address,
 }
 
 int64_t lpr_pacha_syscall1(uint64_t nr, uint64_t fd)
-{ assert(nr == PACHAOS_SYSCALL_FD_CLOSE && fd >= 16); return 0; }
+{
+    if (nr == PACHAOS_SYSCALL_IPC_NOTIFY) { assert(fd == 80); ++sends; return 0; }
+    assert(nr == PACHAOS_SYSCALL_FD_CLOSE && fd >= 16); return 0;
+}
 
-int64_t lpr_pacha_syscall2(uint64_t nr, uint64_t a, uint64_t b)
+static int64_t fixture_prepare_request(uint64_t nr, uint64_t a, uint64_t b)
 {
     if (nr == PACHAOS_SYSCALL_LOG) {
         const char *line = (void *)(uintptr_t)a;
@@ -118,9 +148,6 @@ int64_t lpr_pacha_syscall2(uint64_t nr, uint64_t a, uint64_t b)
                 free(allocations[i].memory); allocations[i].memory = NULL; return 0;
             }
         assert(0);
-    }
-    if (nr == PACHAOS_SYSCALL_IPC_SEND) {
-        assert(a == 80); ++sends; return 0;
     }
     assert(nr == PACHAOS_SYSCALL_IPC_CALL && a == 50);
     const struct pacha_ipc_msg *message = (void *)(uintptr_t)b;
@@ -156,10 +183,11 @@ int64_t lpr_pacha_syscall2(uint64_t nr, uint64_t a, uint64_t b)
     ++controls; return 90;
 }
 
-int64_t lpr_pacha_syscall4(uint64_t nr, uint64_t fd, uint64_t raw,
+static int64_t fixture_finish_request(uint64_t nr, uint64_t fd, uint64_t raw,
     uint64_t timeout, uint64_t flags)
 {
-    assert(timeout == UINT64_MAX && !flags);
+    assert(timeout == UINT64_MAX && flags ==
+        (nr == PACHAOS_SYSCALL_IPC_RECV_WAIT ? PACHA_WAIT_UNINTERRUPTIBLE : 0));
     if (nr == PACHA_FD_SYSCALL_WAIT_MANY) {
         struct pacha_pollfd *item = (void *)(uintptr_t)fd;
         assert(raw == 1 && item->fd == 80 && item->events == PACHA_FD_EVENT_HANGUP);
@@ -168,27 +196,8 @@ int64_t lpr_pacha_syscall4(uint64_t nr, uint64_t fd, uint64_t raw,
     assert(nr == PACHAOS_SYSCALL_IPC_RECV_WAIT);
     struct pacha_ipc_msg *reply = (void *)(uintptr_t)raw;
     if (fd == 90) { *reply = completion; return 0; }
-    assert(fd == 80);
-    /* This synchronous mock services even unnotified requests so both
-     * diagnostic boundaries complete. Lost-wakeup semantics have their own
-     * real relay regression; this test measures observer noninterference. */
-    kb2_vq_segment_t segments[8];
-    kb2_vq_chain_t chain = {.segments = segments, .capacity = 8};
-    assert(!kb2_vq_take_available(&device.lane, 7, &chain));
-    unsigned char wire[KB2_FILESYSTEM_REQUEST_SIZE];
-    assert(!kb2_vq_copy_request(&device.lane, 7, &chain, 0, wire, sizeof(wire)));
-    kb2_fs_request_t request;
-    assert(!kb2_fs_request_decode(wire, sizeof(wire), chain.readable, &request));
-    kb2_fs_response_t response = {.opcode = request.opcode, .generation = 7,
-        .sequence = request.sequence};
-    unsigned char output[KB2_FILESYSTEM_RESPONSE_SIZE];
-    assert(!kb2_fs_response_encode(output, sizeof(output), &response));
-    assert(!kb2_vq_write_response(&device.lane, 7, &chain, output, sizeof(output)));
-    int notify;
-    assert(!kb2_vq_complete(&device.lane, 7, &chain, &notify));
-    *reply = (struct pacha_ipc_msg){.word0 = PH_FS_QUEUE_NOTIFY,
-        .word1 = 7, .word2 = 99, .word3 = 2};
-    ++reads; return 0;
+    assert(0);
+    return PACHA_SYSCALL_ERR_INVALID;
 }
 
 static void exercise(int64_t rejected_log)
@@ -214,9 +223,12 @@ static void exercise(int64_t rejected_log)
         lpr_boot_diagnostic_read_enter(0, 3, LPR_FD_OPS_PIPE, UINT64_MAX);
 #if defined(LPR_BOOT_DIAGNOSTICS) && LPR_BOOT_DIAGNOSTICS
     if (!rejected_log) {
-        assert(publishes == 2 && logs < LPR_BOOT_DIAGNOSTIC_RECORDS);
+        /* The asynchronous session uses ph_fs_channel_publish/take rather
+         * than ph_fs_channel_call: FS_DIAG(26) belongs to the latter.
+         * Actual EVENT_IDX coalescing is checked above via sends == 1. */
+        assert(publishes == 0 && logs < LPR_BOOT_DIAGNOSTIC_RECORDS);
         assert(lpr_boot_diagnostic_state.fs_completed == 2 && !lpr_boot_diagnostic_fs_active());
-        assert(lpr_boot_diagnostic_state.fd3_reads == 3 && logs == 62);
+        assert(lpr_boot_diagnostic_state.fd3_reads == 3 && logs == 48);
         printf("LPR FS boot observer: stdio15 + endpoint10 + real session/two VQ calls + fd3read3 = %u/64 records\n", logs);
     } else {
         assert(logs == 1 && lpr_boot_diagnostic_state.last_log_status == rejected_log);
@@ -235,4 +247,32 @@ int main(void)
 {
     exercise(0); exercise(19); exercise(-19);
     puts("LPR_FS_BOOT_DIAGNOSTIC_UNIT_PASS");
+}
+
+/* Request preparation and reply rendering are fixture phases within one
+ * synchronous syscall. Their transaction tags never become caller FDs. */
+int64_t lpr_pacha_syscall2(uint64_t nr, uint64_t a, uint64_t b)
+{
+    assert(nr != PACHAOS_SYSCALL_IPC_CALL);
+    return fixture_prepare_request(nr, a, b);
+}
+int64_t lpr_pacha_syscall4(uint64_t nr, uint64_t a, uint64_t b, uint64_t c, uint64_t d)
+{
+    return fixture_finish_request(nr, a, b, c, d);
+}
+int64_t lpr_ipc_message(uint64_t nr, uint64_t endpoint,
+    uint64_t request, uint64_t reply, uint64_t timeout, uint64_t flags, int *sent)
+{
+    if (nr != PACHA_IPC_SYSCALL_CALL) return test_lpr_ipc_noncall(nr, endpoint, request, reply, timeout, flags, sent);
+
+    assert(nr == PACHAOS_SYSCALL_IPC_CALL && request && reply);
+    assert(timeout == UINT64_MAX && flags == PACHA_WAIT_UNINTERRUPTIBLE);
+    *sent = 0;
+    int64_t transaction = fixture_prepare_request(nr, endpoint, request);
+    if (transaction < 16) return transaction;
+    *sent = 1;
+    int64_t status = fixture_finish_request(PACHAOS_SYSCALL_IPC_RECV_WAIT,
+        (uint64_t)transaction, reply, timeout, flags);
+
+    return status;
 }

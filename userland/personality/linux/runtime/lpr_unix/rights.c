@@ -60,7 +60,7 @@ static int call(struct lpr_unix_context *context, struct unix_control *request)
     return lpr_unix_context_call(context, request, NULL, 0, NULL, 0, &received);
 }
 
-static void close_caps(const int *fds, unsigned count)
+static void close_caps(const pacha_fd_t *fds, unsigned count)
 {
     for (unsigned i = 0; i < count; i++)
         if (fds[i] >= 16) (void)lpr_close_native_fd_if_open((uint32_t)fds[i]);
@@ -111,7 +111,7 @@ int lpr_unix_rights_prepare(struct lpr_unix_context *context, uint64_t socket,
         request = (struct unix_control){ .operation = UNIX_OP_RIGHTS_APPEND,
             .io.owner = context->waiter.owner,
             .rights = { .ticket = state->ticket, .offset = offset } };
-        int fds[PACHA_IPC_MAX_TRANSFER_FDS];
+        pacha_fd_t fds[PACHA_IPC_MAX_TRANSFER_FDS];
         struct pacha_ipc_fd caps[PACHA_IPC_MAX_TRANSFER_FDS];
         unsigned cap_count = 0;
         lpr_fd_pin_t pins[4];
@@ -176,8 +176,8 @@ static int stage_socket(const struct unix_control *claim,
     const struct pacha_ipc_fd *caps, unsigned count, uint64_t flags, lpr_linux_fd_t *fd)
 {
     const struct unix_attachment *attachment = &claim->attachment;
-    int native[PACHA_IPC_MAX_TRANSFER_FDS];
-    for (unsigned i = 0; i < count; i++) native[i] = (int)caps[i].fd;
+    pacha_fd_t native[PACHA_IPC_MAX_TRANSFER_FDS];
+    for (unsigned i = 0; i < count; i++) native[i] = (pacha_fd_t)caps[i].fd;
     if (claim->rights.count != 1 || attachment->socket != claim->rights.items[0].object ||
         !attachment->socket || attachment->reserved || attachment->listening > 1 ||
         (attachment->flags & ~UINT32_C(0x800)) ||
@@ -210,7 +210,7 @@ static int stage_socket(const struct unix_control *claim,
             .backend_state = socket, .backend_state_bytes = sizeof(*socket) };
         while (lpr_fd_table_stage_batch(&lpr_control_fd_table, &install, 1, fd) != 0) {
             const uint64_t capacity = lpr_fd_table_capacity;
-            if (capacity >= LPR_FD_TABLE_MAX_SIZE || lpr_fd_table_ensure_capacity(capacity + 1) != 0) {
+            if (capacity >= lpr_fd_table_soft_limit(&lpr_control_fd_table) || lpr_fd_table_ensure_capacity(capacity + 1) != 0) {
                 status = -EMFILE; break;
             }
         }
@@ -264,8 +264,8 @@ int lpr_unix_rights_receive(struct lpr_unix_context *context, uint64_t socket,
         status = lpr_unix_context_call(context, &request, NULL, 0, caps, PACHA_IPC_MAX_TRANSFER_FDS, &received);
         if (status) break;
         if (request.rights.flags & UNIX_RIGHTS_CREDENTIALS) credentials = request.credentials;
-        int native[PACHA_IPC_MAX_TRANSFER_FDS];
-        for (unsigned i = 0; i < received; i++) native[i] = (int)caps[i].fd;
+        pacha_fd_t native[PACHA_IPC_MAX_TRANSFER_FDS];
+        for (unsigned i = 0; i < received; i++) native[i] = (pacha_fd_t)caps[i].fd;
         total = request.rights.total;
         if (total > UNIX_RIGHTS_MAX || total < taken || request.rights.count > UNIX_TRANSFER_BATCH ||
             (capacity > taken && request.rights.count > capacity - taken) ||

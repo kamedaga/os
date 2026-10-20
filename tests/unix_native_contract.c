@@ -14,14 +14,15 @@
 #define EVENT (OBSERVE | PACHA_FD_RIGHT_READ | PACHA_FD_RIGHT_WRITE)
 
 static unsigned char worker_stack[65536] __attribute__((aligned(16)));
-static int worker_control, ready_event, release_event;
-static int worker_observer, worker_error;
+static pacha_fd_t worker_control, ready_event, release_event;
+static pacha_fd_t worker_observer;
+static int worker_error;
 
-static int observe_self(void)
+static pacha_fd_t observe_self(void)
 {
     const long fd = pacha_syscall4(PACHA_FD_SYSCALL_DUP,
         PACHA_THREAD_SELF_FD, 16, OBSERVE, 0);
-    return fd >= 16 ? (int)fd : -1;
+    return fd >= 16 ? (pacha_fd_t)fd : -1;
 }
 
 static int wait_events(struct pacha_pollfd *polls, unsigned count)
@@ -38,13 +39,13 @@ static int wait_events(struct pacha_pollfd *polls, unsigned count)
     }
 }
 
-static int wait_ready(int fd)
+static int wait_ready(pacha_fd_t fd)
 {
     struct pacha_pollfd poll = { .fd = fd, .events = PACHA_FD_EVENT_READABLE };
     return wait_events(&poll, 1) == 1 && poll.revents == PACHA_FD_EVENT_READABLE ? 0 : -1;
 }
 
-static int receive_message(int fd, struct pacha_ipc_msg *message)
+static int receive_message(pacha_fd_t fd, struct pacha_ipc_msg *message)
 {
     /* Native finite waits may return NOT_READY on a scheduler wake. That
      * is a retry, not proof that the peer died or the timeout elapsed. */
@@ -59,7 +60,7 @@ static int receive_message(int fd, struct pacha_ipc_msg *message)
     }
 }
 
-static int signal_event(int fd)
+static int signal_event(pacha_fd_t fd)
 {
     uint64_t value = 1;
     return pacha_fd_write(fd, &value, sizeof(value)) == sizeof(value) ? 0 : -1;
@@ -73,7 +74,7 @@ static _Noreturn void exit_process(unsigned code)
 
 static _Noreturn void worker(void)
 {
-    const int fd = observe_self();
+    const pacha_fd_t fd = observe_self();
     /* A successful self-kill would return into a supposedly dead generation.
      * The ordinary control FD, not the restricted observation FD, tests it. */
     const long self_kill = pacha_syscall2(PACHA_THREAD_SYSCALL_KILL,
@@ -92,7 +93,7 @@ static _Noreturn void worker(void)
 
 static int check_self_rights(void)
 {
-    const int fd = observe_self();
+    const pacha_fd_t fd = observe_self();
     struct pacha_fd_info info;
     if (fd < 16 || pacha_fd_get_info(fd, &info) != 0 ||
         info.kind != PACHA_FD_KIND_THREAD || info.rights != OBSERVE) return -1;
@@ -102,15 +103,15 @@ static int check_self_rights(void)
         if ((extra & OBSERVE) != 0) continue;
         const long result = pacha_syscall4(PACHA_FD_SYSCALL_DUP,
             PACHA_THREAD_SELF_FD, 16, OBSERVE | extra, 0);
-        if (result >= 16) (void)pacha_fd_close((int)result);
+        if (result >= 16) (void)pacha_fd_close((pacha_fd_t)result);
         if (result != 1) return -1;
     }
     return pacha_syscall4(PACHA_FD_SYSCALL_DUP, PACHA_THREAD_SELF_FD,
         16, OBSERVE, UINT64_C(1) << 32) == 1 ? 0 : -1;
 }
 
-static _Noreturn void child_observer(int channel, int private_fd,
-    int main_observer, int inherited_observer, unsigned expected_state,
+static _Noreturn void child_observer(pacha_fd_t channel, pacha_fd_t private_fd,
+    pacha_fd_t main_observer, pacha_fd_t inherited_observer, unsigned expected_state,
     unsigned expected_code)
 {
     struct pacha_fd_info info;
@@ -123,7 +124,7 @@ static _Noreturn void child_observer(int channel, int private_fd,
     struct pacha_ipc_msg message = { .fds = &capability, .fd_capacity = 1 };
     if (receive_message(channel, &message) != 0 ||
         message.fd_count != 1) exit_process(12);
-    const int observed = (int)capability.fd;
+    const pacha_fd_t observed = (pacha_fd_t)capability.fd;
     if (pacha_fd_get_info(observed, &info) != 0 ||
         info.kind != PACHA_FD_KIND_THREAD || info.rights != OBSERVE) exit_process(13);
     struct pacha_ipc_msg ack = { .word0 = 1 };
@@ -142,22 +143,22 @@ static _Noreturn void child_observer(int channel, int private_fd,
     exit_process(0);
 }
 
-static int run_death_case(int kill, int main_observer, int previous_observer,
-    int *retained_observer)
+static int run_death_case(int kill, pacha_fd_t main_observer, pacha_fd_t previous_observer,
+    pacha_fd_t *retained_observer)
 {
     ready_event = pacha_eventfd_create(0, EVENT, 0);
     release_event = pacha_eventfd_create(0, EVENT, 0);
-    const int private_fd = pacha_eventfd_create(0, EVENT, PACHA_FD_FLAG_PRIVATE);
+    const pacha_fd_t private_fd = pacha_eventfd_create(0, EVENT, PACHA_FD_FLAG_PRIVATE);
     struct pacha_ipc_channel_pair channel;
     if (ready_event < 16 || release_event < 16 || private_fd < 16 ||
         pacha_ipc_channel_create(&channel, CHANNEL, 0) != 0) return 1;
-    worker_control = pacha_thread_create((int)PACHA_PROCESS_SELF_FD,
+    worker_control = pacha_thread_create((pacha_fd_t)PACHA_PROCESS_SELF_FD,
         (uint64_t)(uintptr_t)worker,
         (uint64_t)(uintptr_t)(worker_stack + sizeof(worker_stack) - 8),
         0, 0, CONTROL);
     if (worker_control < 16 || pacha_thread_start(worker_control) != 0 ||
         wait_ready(ready_event) != 0) return 2;
-    const int observed = __atomic_load_n(&worker_observer, __ATOMIC_ACQUIRE);
+    const pacha_fd_t observed = __atomic_load_n(&worker_observer, __ATOMIC_ACQUIRE);
     if (__atomic_load_n(&worker_error, __ATOMIC_ACQUIRE) != 0) return 3;
     if (previous_observer >= 16) {
         /* Reusing a scheduler slot must not reactivate the previous FD. */
@@ -167,7 +168,7 @@ static int run_death_case(int kill, int main_observer, int previous_observer,
         if (pacha_fd_poll(&poll, 1) != 1 || poll.revents != PACHA_FD_EVENT_READABLE)
             return 4;
     }
-    const int child = pacha_process_clone(OBSERVE, PACHA_PROCESS_CLONE_CURRENT_THREAD);
+    const pacha_fd_t child = pacha_process_clone(OBSERVE, PACHA_PROCESS_CLONE_CURRENT_THREAD);
     if (child < 0) return 5;
     if (child == 0) {
         (void)pacha_fd_close(channel.a);
@@ -227,10 +228,10 @@ int main(void)
         puts("UNIX_NATIVE_FAIL rights");
         return 1;
     }
-    const int main_observer = observe_self();
-    int previous = -1;
+    const pacha_fd_t main_observer = observe_self();
+    pacha_fd_t previous = -1;
     for (unsigned iteration = 0; iteration < 16; iteration++) {
-        int retained = -1;
+        pacha_fd_t retained = -1;
         const int status = run_death_case(iteration & 1, main_observer, previous, &retained);
         if (status != 0) {
             printf("UNIX_NATIVE_FAIL iteration=%u stage=%d\n", iteration, status);

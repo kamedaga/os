@@ -8,18 +8,18 @@
 int lpr_linux_epoll_fd_active(uint64_t fd);
 int64_t lpr_linux_epoll_create1(uint64_t flags);
 int64_t lpr_linux_epoll_ctl(uint64_t epfd, uint64_t op, uint64_t fd, uint64_t event);
-int64_t lpr_linux_epoll_wait(uint64_t epfd, uint64_t events, uint64_t maxevents, uint64_t timeout);
+int64_t lpr_linux_epoll_wait(uint64_t epfd, uint64_t events, uint64_t maxevents, uint64_t timeout, unsigned *wait_not_ready __attribute__((unused)));
 int64_t lpr_linux_epoll_pwait(
     uint64_t epfd,
     uint64_t events,
     uint64_t maxevents,
     uint64_t timeout,
     uint64_t sigmask,
-    uint64_t sigsetsize);
-int64_t lpr_epoll_poll_events(uint64_t fd, uint32_t events);
+    uint64_t sigsetsize, unsigned *wait_not_ready __attribute__((unused)));
+int64_t lpr_epoll_poll_events(uint64_t fd, uint32_t events, unsigned *wait_not_ready __attribute__((unused)));
 int64_t lpr_epoll_add_wait_graph(uint64_t fd, lpr_wait_graph_t *graph);
 enum { LPR_EPOLL_IO_READ = 0x0001u, LPR_EPOLL_IO_WRITE = 0x0004u };
-void lpr_epoll_note_fd_state(uint64_t fd, uint32_t io_events, int64_t result);
+void lpr_epoll_note_fd_state(uint64_t fd, uint32_t io_events, int64_t result, unsigned *wait_not_ready __attribute__((unused)));
 void lpr_epoll_before_close(uint64_t fd);
 
 #endif

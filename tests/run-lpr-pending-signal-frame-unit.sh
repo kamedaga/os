@@ -22,6 +22,9 @@ mkdir -p "$(dirname "$out")"
   -Iuserland/termd/include \
   -Iuserland/gpud/include \
   -Iuserland/inputd/include \
+  -Ikobox2/include \
+  -Ikobox2/protocol/include \
+  -Ikobox2/protocol/generated/include \
   tests/lpr_pending_signal_frame_unit.c \
   -Wl,--gc-sections \
   -o "$out"

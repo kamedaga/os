@@ -1,3 +1,4 @@
+#include <pacha/abi.h>
 /* SPDX-License-Identifier: MIT */
 #ifndef PACHA_KOBOX2_OWNER_BOOT_H
 #define PACHA_KOBOX2_OWNER_BOOT_H
@@ -36,7 +37,7 @@ struct ph_owner_boot_config {
     size_t artifact_count, resource_count;
     const struct gpud_launch_blob *extra_blobs;
     size_t extra_blob_count;
-    int log_endpoint_fd;
+    pacha_fd_t log_endpoint_fd;
 };
 
 struct ph_owner_boot {

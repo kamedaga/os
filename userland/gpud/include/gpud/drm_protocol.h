@@ -63,7 +63,7 @@ typedef struct gpud_drm_ioctl_request {
 } gpud_drm_ioctl_request_t;
 
 /* Small, pointer-free ioctl payloads fit in native IPC words; no VMO or client
- * capability is transferred. The kernel supplies the one-shot reply capability.
+ * capability is transferred. The kernel binds one-shot reply authority to the receiving thread.
  * Request: magic, DRM handle, ioctl number, up to eight argument bytes.
  * Reply: magic, signed status, echoed ioctl number, up to eight output bytes.
  * The reply capability correlates calls (including concurrent calls).

@@ -111,6 +111,7 @@ static int lane_allocate(struct ph_fs_queue *queue, struct ph_fs_queue_lane *lan
     const struct ph_fs_channel_config *config) {
     if (lane->slots) return -EBUSY;
     atomic_init(&lane->ring_lock, 0);
+    lane->armed = 0;
     size_t count = config->queue_size, requests = count / 2;
     size_t bytes = count * (sizeof(*lane->slots) + sizeof(*lane->owners) +
         sizeof(*lane->segments)) + requests * sizeof(*lane->requests);
@@ -232,7 +233,7 @@ static int client_prepare(struct ph_fs_queue *queue, struct ph_ipc_packet *packe
     error = ph_fs_channel_bind(&lane->channel, lane->mapping, lane->mapping_bytes,
         &client->config, KB2_VQ_DEVICE, &queue->atomics, lane->slots, lane->owners);
     if (error) return error;
-    error = ph_ipc_init(&client->ipc, (int)doorbell->fd, client->config.generation);
+    error = ph_ipc_init(&client->ipc, (pacha_fd_t)doorbell->fd, client->config.generation);
     if (error) return error;
     packet->fds[1].fd = PH_IPC_NO_FD;
     lane->bound = 1;
@@ -467,13 +468,36 @@ static int accept_lane(struct ph_fs_queue *queue, struct ph_fs_queue_lane *lane,
         (index == 2 && !client && queue->exchange_consumed) || (control && queue->control_active) ||
         (client && (client->client == queue->barrier_client || client->client == queue->barrier_target)))
         return 0;
+    /* An armed, unchanged ring is idle until its driver publishes; checking
+     * that needs one shared-index load, not the lock (a notification mask,
+     * two atomic RMWs and an exchange). Only the owner moves consumed and the
+     * armed state, so both are stable here; take_available stays the
+     * authority once something is pending. */
+    if (lane->armed && lane->armed_consumed == lane->channel.lane.consumed) {
+        int pending;
+        kb2_vq_status_t peek = kb2_vq_peek_available(&lane->channel.lane, config->generation, &pending);
+        if (peek == KB2_VQ_OK && !pending) return 0;
+    }
     uint64_t mask = lane_lock(lane);
     kb2_vq_status_t status = kb2_vq_take_available(&lane->channel.lane, config->generation, &lane->probe);
     if (status == KB2_VQ_EMPTY) {
+        /* Every pass checks every client ring, nearly all of them idle. An
+         * arm stores consumed as the event index; while consumed is unchanged
+         * that index still makes the client notify on its next publish, so
+         * re-arming only repeated a store and full fence per idle client. */
+        if (lane->armed && lane->armed_consumed == lane->channel.lane.consumed) {
+            lane_unlock(lane, mask);
+            return 0;
+        }
         int ready;
         status = kb2_vq_arm(&lane->channel.lane, config->generation, &ready);
         if (!status && ready) status = kb2_vq_take_available(&lane->channel.lane, config->generation, &lane->probe);
-        else if (!status) { lane_unlock(lane, mask); return 0; }
+        else if (!status) {
+            lane->armed = 1;
+            lane->armed_consumed = lane->channel.lane.consumed;
+            lane_unlock(lane, mask);
+            return 0;
+        }
     }
     lane_unlock(lane, mask);
     if (status == KB2_VQ_EMPTY) return 0;
@@ -521,9 +545,7 @@ static int accept_lane(struct ph_fs_queue *queue, struct ph_fs_queue_lane *lane,
     memset(request, 0, sizeof(*request));
     request->lane = lane; request->queue = queue;
     request->client = client; request->lane_index = index; request->control = control;
-    if (client) request->notice = (struct ph_ipc_notice){.fd = client->ipc.fd,
-        .operation = PH_FS_QUEUE_NOTIFY, .generation = config->generation,
-        .correlation = config->channel_id, .value = lane->channel.queue.used_notification_id};
+    if (client) request->notice = (struct ph_ipc_notice){.fd = client->ipc.fd};
     request->chain = (kb2_vq_chain_t){.segments = request->segments, .capacity = 2};
     if (lane->probe.count > 2) {
         request->extra_bytes = lane->probe.count * sizeof(*request->chain.segments);
@@ -614,16 +636,15 @@ static int accept_client(struct ph_fs_queue *queue, struct ph_ipc *ipc) {
     struct ph_fs_client_queue *client = first;
     do {
         queue->client_cursor = client->next ? client->next : queue->clients;
+        /* The ring itself says whether work is available; the doorbell only
+         * wakes the native helper, which consumes it. Receiving it here cost
+         * every pass a syscall, and the one that found the doorbell waited on
+         * the kernel lock behind the client's own SEND and the helper's wake. */
         if (client->lane.bound && !client->lane.retiring) {
-            struct ph_ipc_packet packet = {0};
-            int error = ph_ipc_receive(&client->ipc, client->config.generation, &packet);
-            if (!error && (packet.operation != PH_FS_QUEUE_NOTIFY || packet.correlation != client->config.channel_id ||
-                packet.fd_count || packet.value != client->lane.channel.queue.available_notification_id)) error = -EPROTO;
-            int closed = ph_ipc_packet_release(&packet);
-            if (closed) { client->ipc.rejected = packet; error = closed; }
-            if (error && error != -EAGAIN) client_fault(queue, client);
-            if (!client->lane.retiring) {
-                error = accept_lane(queue, &client->lane, &client->config, client, 0, ipc);
+            if (atomic_load_explicit(&client->doorbell_fault, memory_order_acquire))
+                client_fault(queue, client);
+            else {
+                int error = accept_lane(queue, &client->lane, &client->config, client, 0, ipc);
                 if (error) return error;
             }
         }
@@ -657,8 +678,12 @@ static int advance(void *context, void *linux_service, struct ph_ipc *ipc, bool 
         int error = queue->close(queue->workers);
         if (error) return error;
     }
-    int progressed = collect_one(queue, ipc);
-    if (progressed < 0) return progressed;
+    /* Collect every completion now. Collecting alone is not progress: the
+     * accepts below already see what it released, and another pass would
+     * only repeat this advance's syscalls. Closing still waits on it. */
+    int progressed = 0, collected;
+    while ((collected = collect_one(queue, ipc)) > 0) progressed = 1;
+    if (collected < 0) return collected;
     int retired = queue->closing ? 0 : retire_one(queue, ipc);
     if (retired < 0) return retired;
     if (queue->closing) return queue->inflight ? (progressed || retired ? 2 : 0) : 1;
@@ -673,7 +698,7 @@ static int advance(void *context, void *linux_service, struct ph_ipc *ipc, bool 
         if (result) { queue->prefer_client = 1; return result; }
     }
     int result = accept_client(queue, ipc);
-    return result ? result : progressed || retired ? PH_LIFECYCLE_SERVICE_PROGRESS : 0;
+    return result ? result : retired ? PH_LIFECYCLE_SERVICE_PROGRESS : 0;
 }
 
 static int finish(void *context, void *linux_service) {
@@ -728,7 +753,7 @@ static void drain_wake(struct ph_fs_queue *queue) {
     PH_CHECK(result == -EAGAIN);
 }
 
-static uint64_t wait_snapshot(struct ph_fs_queue *queue, int control_fd, uint64_t after,
+static uint64_t wait_snapshot(struct ph_fs_queue *queue, pacha_fd_t control_fd, uint64_t after,
     struct pacha_pollfd *events, size_t *count, uint64_t *epoch, int *whole) {
     events[0] = (struct pacha_pollfd){.fd = control_fd,
         .events = PACHA_FD_EVENT_READABLE | PACHA_FD_EVENT_HANGUP};
@@ -739,7 +764,9 @@ static uint64_t wait_snapshot(struct ph_fs_queue *queue, int control_fd, uint64_
     watch_lock(queue);
     *epoch = queue->watch_epoch;
     for (struct ph_fs_client_queue *client = queue->clients; client; client = client->next) {
-        if (!client->watch_fd || client->config.channel_id <= after) continue;
+        /* A faulted doorbell stays readable until the owner closes it. */
+        if (!client->watch_fd || client->config.channel_id <= after ||
+            atomic_load_explicit(&client->doorbell_fault, memory_order_relaxed)) continue;
         if (*count == 256) { following = last; break; }
         events[(*count)++] = (struct pacha_pollfd){.fd = client->watch_fd,
             .events = PACHA_FD_EVENT_READABLE | PACHA_FD_EVENT_HANGUP};
@@ -750,7 +777,43 @@ static uint64_t wait_snapshot(struct ph_fs_queue *queue, int control_fd, uint64_
     return following;
 }
 
-static int wait_clients(void *context, int control_fd, uint64_t timeout) {
+/* Consume the doorbells that ended this wait, so the next wait sleeps.
+ * The owner never acts on them: it reads the ring, and arms it before
+ * sleeping, so a consumed doorbell cannot hide work. Holding watch_lock
+ * across the consume is what keeps the endpoint alive: client_fault clears watch_fd
+ * under this lock before it destroys the endpoint. The owner takes the lock
+ * only to add, fault or retire a client. */
+static void drain_doorbells(struct ph_fs_queue *queue, const struct pacha_pollfd *events,
+    size_t count, uint64_t epoch) {
+    watch_lock(queue);
+    if (epoch != queue->watch_epoch) { watch_unlock(queue); return; }
+    for (size_t i = 2; i < count; ++i) {
+        if (!events[i].revents) continue;
+        struct ph_fs_client_queue *client = queue->clients;
+        while (client && (uint64_t)client->watch_fd != events[i].fd) client = client->next;
+        if (!client || !client->watch_fd ||
+            atomic_load_explicit(&client->doorbell_fault, memory_order_relaxed)) continue;
+        /* Client doorbells are kernel latches: consuming one carries no
+         * payload or capability, so there is nothing to validate or retain. */
+        int error = ph_ipc_notify_consume(client->ipc.fd);
+        if (error == -EAGAIN) {
+            /* Readable with no latch means a queued message. The client keeps
+             * SEND on its doorbell, and an unread message would hold WAIT_MANY
+             * ready forever; a doorbell never carries packets, so any packet
+             * is a forgery. An empty receive is only a benign race. */
+            struct ph_ipc_packet packet = {0};
+            error = ph_ipc_receive(&client->ipc, client->config.generation, &packet);
+            if (!error) error = -EPROTO;
+            int closed = ph_ipc_packet_release(&packet);
+            if (closed) { client->ipc.rejected = packet; error = closed; }
+        }
+        if (error && error != -EAGAIN)
+            atomic_store_explicit(&client->doorbell_fault, 1, memory_order_release);
+    }
+    watch_unlock(queue);
+}
+
+static int wait_clients(void *context, pacha_fd_t control_fd, uint64_t timeout) {
     struct ph_fs_queue *queue = context;
     for (;;) {
         uint64_t after = 0;
@@ -759,6 +822,7 @@ static int wait_clients(void *context, int control_fd, uint64_t timeout) {
             size_t count; uint64_t epoch; int whole;
             after = wait_snapshot(queue, control_fd, after, events, &count, &epoch, &whole);
             int ready = wait_events(events, count, 0);
+            if (ready > 0) drain_doorbells(queue, events, count, epoch);
             watch_lock(queue);
             int changed = epoch != queue->watch_epoch;
             watch_unlock(queue);
@@ -771,6 +835,7 @@ static int wait_clients(void *context, int control_fd, uint64_t timeout) {
         uint64_t following = wait_snapshot(queue, control_fd, queue->wait_after,
             events, &count, &epoch, &whole);
         int ready = wait_events(events, count, whole ? timeout : 1);
+        if (ready > 0) drain_doorbells(queue, events, count, epoch);
         queue->wait_after = following;
         watch_lock(queue);
         int changed = epoch != queue->watch_epoch;
@@ -834,9 +899,9 @@ int ph_fs_queue_init(struct ph_fs_queue *queue, void *core,
     /* Creation owns both FDs even if initialization fails. Keep them in a
      * packet until init takes ownership; every failure closes the remainder. */
     struct ph_ipc_packet inventory = {.fd_count = 2, .fds = {{.fd = pair[0]}, {.fd = pair[1]}}};
-    int error = ph_ipc_init(&queue->wake_tx, (int)pair[0], data->generation);
+    int error = ph_ipc_init(&queue->wake_tx, (pacha_fd_t)pair[0], data->generation);
     if (!error) { inventory.fds[0].fd = PH_IPC_NO_FD;
-        error = ph_ipc_init(&queue->wake_rx, (int)pair[1], data->generation); }
+        error = ph_ipc_init(&queue->wake_rx, (pacha_fd_t)pair[1], data->generation); }
     if (!error) inventory.fds[1].fd = PH_IPC_NO_FD;
     PH_OK(ph_ipc_packet_release(&inventory));
     if (error) { if (queue->wake_tx.generation) PH_OK(ph_ipc_destroy(&queue->wake_tx, data->generation)); return error; }

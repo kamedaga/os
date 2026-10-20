@@ -46,7 +46,7 @@ long native_test_raw(long n,long a,long b,long c,long d,long e,long f)
         else { assert(b==0);++request_maps; }
         return (long)memory[a];
     case PACHAOS_SYSCALL_MUNMAP:return 0;
-    case 41: {
+    case PACHAOS_SYSCALL_FD_GET_INFO: {
         assert(a>=16 && a<4096 && occupied[a]);
         struct {uint64_t kind,rights,flags,size,extra;} *info=(void *)b;
         *info=(typeof(*info)){memory[a] ? 4 : 5,
@@ -75,10 +75,9 @@ long native_test_raw(long n,long a,long b,long c,long d,long e,long f)
             response.result=-EACCES;
         } else assert(request.opcode==KB2_FILESYSTEM_OP_CLOSE);
         assert(kb2_fs_response_encode(memory[pending_vmo],KB2_FILESYSTEM_RESPONSE_SIZE,&response)==0);
-        pending.word1=(uint64_t)response.result;return allocate(0);
-    }
-    case PACHAOS_SYSCALL_IPC_RECV_WAIT: {
-        struct __pachaos_ipc_msg *reply=(void *)b;
+        pending.word1=(uint64_t)response.result;
+        assert(d == -1 && e == PACHAOS_WAIT_UNINTERRUPTIBLE);
+        struct __pachaos_ipc_msg *reply=(void *)c;
         reply->word0=pending.word0;reply->word1=pending.word1;
         reply->word2=KB2_FILESYSTEM_RESPONSE_SIZE;reply->word3=pending.word3;
         reply->fd_count=returned_vmo>=0;

@@ -36,8 +36,8 @@ long pacha_syscall2(uint64_t nr, uint64_t a0, uint64_t a1) {
                    a1 > INT_MAX ? INT_MAX : (int)a1, NULL, NULL, 0);
 }
 
-long pacha_syscall3(uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2) {
-    assert(nr == PACHA_RUNTIME_SYSCALL_FUTEX_WAIT && a2 == 0);
+long pacha_syscall4(uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t flags) {
+    assert(nr == PACHA_RUNTIME_SYSCALL_FUTEX_WAIT && a2 == 0 && flags == PACHA_WAIT_UNINTERRUPTIBLE);
     atomic_fetch_add(&waits, 1);
     atomic_store(&entered_wait, 1);
     while (atomic_load(&delay_wait)) sched_yield();

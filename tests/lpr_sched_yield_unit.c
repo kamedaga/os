@@ -19,10 +19,10 @@ int main(void)
     _Static_assert(PACHA_RUNTIME_SYSCALL_YIELD == PACHAOS_SYSCALL_YIELD,
                    "native ABI headers must agree");
     errno = EAGAIN;
-    assert(lpr_sys_sched_yield(0, 0, 0, 0, 0, 0) == 0);
+    assert(lpr_sys_sched_yield(0, 0, 0, 0, 0, 0, 0) == 0);
     assert(calls == 1 && errno == EAGAIN);
     native_result = PACHA_SYSCALL_ERR_ALLOC;
-    assert(lpr_sys_sched_yield(0, 0, 0, 0, 0, 0) == -ENOMEM);
+    assert(lpr_sys_sched_yield(0, 0, 0, 0, 0, 0, 0) == -ENOMEM);
     assert(calls == 2 && errno == EAGAIN);
     puts("sched_yield native forwarding PASS");
     return 0;

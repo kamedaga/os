@@ -9,5 +9,5 @@ for module in libipc libpacha personality daemons/common filed termd gpud inputd
 done
 clang -std=c11 -O2 -g -Wall -Wextra -Werror -ffunction-sections -fdata-sections -Wl,--gc-sections \
   -fsanitize=address,undefined -fno-omit-frame-pointer "${includes[@]}" \
-  -I"$repo_root/musl/pachaos/include" "$repo_root/tests/lpr_unix_cache_unit.c" -o "$out_dir/unit"
+  -I"$repo_root/userland" -I"$repo_root/kobox2/protocol/include" -I"$repo_root/kobox2/protocol/generated/include" -I"$repo_root/musl/pachaos/include" "$repo_root/tests/lpr_unix_cache_unit.c" -o "$out_dir/unit"
 "$out_dir/unit"

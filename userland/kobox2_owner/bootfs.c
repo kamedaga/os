@@ -83,7 +83,7 @@ int ph_bootfs_view(struct ph_bootfs *archive, const void *bytes, size_t size)
     return 0;
 }
 
-int ph_bootfs_open(struct ph_bootfs *archive, int fd, uint64_t size)
+int ph_bootfs_open(struct ph_bootfs *archive, pacha_fd_t fd, uint64_t size)
 {
     if (!archive || fd < 16 || size < 104 || size > SIZE_MAX - 4095)
         return -EINVAL;

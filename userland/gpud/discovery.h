@@ -1,3 +1,4 @@
+#include <pacha/abi.h>
 /* SPDX-License-Identifier: MIT */
 #pragma once
 #include <stddef.h>
@@ -16,6 +17,6 @@ struct gpud_discovery {
     uint32_t owned;
 };
 /* Snapshot only the granted PCI function. No driver/model selection. */
-int gpud_discovery_prepare(struct gpud_discovery *, int device_fd, int primary);
-int gpud_discovery_publish(struct gpud_discovery *, int filed_fd);
-int gpud_discovery_remove(struct gpud_discovery *, int filed_fd);
+int gpud_discovery_prepare(struct gpud_discovery *, pacha_fd_t device_fd, int primary);
+int gpud_discovery_publish(struct gpud_discovery *, pacha_fd_t filed_fd);
+int gpud_discovery_remove(struct gpud_discovery *, pacha_fd_t filed_fd);

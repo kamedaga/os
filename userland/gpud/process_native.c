@@ -23,9 +23,9 @@ static int check_generation(const struct gpud_native_process *process, uint64_t 
     return process->generation == generation ? 0 : -ESTALE;
 }
 
-int gpud_native_process_adopt(struct gpud_native_process *process, int fd,
+int gpud_native_process_adopt(struct gpud_native_process *process, pacha_fd_t fd,
     uint64_t generation) {
-    if (!process || fd < 16 || fd >= PACHA_FD_TABLE_LIMIT || !generation) return -EINVAL;
+    if (!process || fd < 16 || fd >= PACHA_THREAD_SELF_FD || !generation) return -EINVAL;
     if (process->fd) return -EBUSY;
     if (generation <= process->generation) return -ESTALE;
     struct pacha_fd_info info = {0};

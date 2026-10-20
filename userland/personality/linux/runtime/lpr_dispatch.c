@@ -72,8 +72,7 @@ static void lpr_linux_rlimits_init(void)
         lpr_linux_rlimits[i].max = UINT64_MAX;
     }
     lpr_linux_rlimits[LPR_LINUX_RLIMIT_STACK].cur = 8ull * 1024ull * 1024ull;
-    lpr_linux_rlimits[LPR_LINUX_RLIMIT_NOFILE].cur = LPR_LINUX_FD_LIMIT;
-    lpr_linux_rlimits[LPR_LINUX_RLIMIT_NOFILE].max = LPR_LINUX_FD_LIMIT;
+    /* NOFILE is owned by the FD table, under its publication lock. */
     lpr_linux_rlimits[LPR_LINUX_RLIMIT_MEMLOCK].cur = 64ull * 1024ull;
     lpr_linux_rlimits[LPR_LINUX_RLIMIT_MSGQUEUE].cur = 819200ull;
     lpr_linux_rlimits[LPR_LINUX_RLIMIT_NICE].cur = 0;
@@ -88,6 +87,11 @@ static int64_t lpr_linux_copy_out_rlimit(uint64_t resource, uint64_t out_raw)
     }
     if (out_raw == 0) {
         return -LPR_LINUX_EFAULT;
+    }
+    if (resource == LPR_LINUX_RLIMIT_NOFILE) {
+        lpr_fd_arrays_init();
+        return lpr_fd_table_prlimit(&lpr_control_fd_table, 0,
+            (uint64_t *)(uintptr_t)out_raw);
     }
     lpr_linux_rlimits_init();
     uint64_t *out = (uint64_t *)(uintptr_t)out_raw;
@@ -104,14 +108,16 @@ static int64_t lpr_linux_set_rlimit(uint64_t resource, uint64_t in_raw)
     if (in_raw == 0) {
         return -LPR_LINUX_EFAULT;
     }
+    if (resource == LPR_LINUX_RLIMIT_NOFILE) {
+        lpr_fd_arrays_init();
+        return lpr_fd_table_prlimit(&lpr_control_fd_table,
+            (const uint64_t *)(uintptr_t)in_raw, 0);
+    }
     const uint64_t *in = (const uint64_t *)(uintptr_t)in_raw;
     const uint64_t cur = in[0];
     const uint64_t max = in[1];
     if (cur > max) {
         return -LPR_LINUX_EINVAL;
-    }
-    if (resource == LPR_LINUX_RLIMIT_NOFILE && max > LPR_LINUX_FD_LIMIT) {
-        return -LPR_LINUX_EPERM;
     }
     lpr_linux_rlimits_init();
     lpr_linux_rlimits[resource].cur = cur;
@@ -123,6 +129,12 @@ static int64_t lpr_linux_prlimit64(uint64_t pid, uint64_t resource, uint64_t new
 {
     if (pid != 0 && pid != (uint64_t)lpr_linux_getpid()) {
         return -LPR_LINUX_ESRCH;
+    }
+    if (resource == LPR_LINUX_RLIMIT_NOFILE) {
+        lpr_fd_arrays_init();
+        return lpr_fd_table_prlimit(&lpr_control_fd_table,
+            (const uint64_t *)(uintptr_t)new_limit,
+            (uint64_t *)(uintptr_t)old_limit);
     }
     if (old_limit != 0) {
         const int64_t get_status = lpr_linux_copy_out_rlimit(resource, old_limit);
@@ -2077,7 +2089,7 @@ static int64_t lpr_map_private_file_image(
     return reservation;
 }
 
-int64_t lpr_backend_mmap(uint64_t addr, uint64_t len, uint64_t prot, uint64_t flags, uint64_t fd, uint64_t offset)
+int64_t lpr_backend_mmap(uint64_t addr, uint64_t len, uint64_t prot, uint64_t flags, uint64_t fd, uint64_t offset, unsigned *wait_not_ready __attribute__((unused)))
 {
     uint64_t pacha_flags;
     const int flag_status = lpr_linux_mmap_flags_to_pacha(flags, &pacha_flags);
@@ -2204,7 +2216,7 @@ int64_t lpr_backend_mmap(uint64_t addr, uint64_t len, uint64_t prot, uint64_t fl
             offset <= UINT64_MAX - map_len ? offset + map_len : 0;
         lpr_linux_stat_t fresh_stat;
         const int64_t fresh_stat_status = private_file ?
-            lpr_linux_fstat(fd, (uint64_t)(uintptr_t)&fresh_stat) :
+            lpr_linux_fstat(fd, (uint64_t)(uintptr_t)&fresh_stat, wait_not_ready) :
             -LPR_LINUX_EBADF;
         const int fresh_stat_valid = !fresh_stat_status && fresh_stat.st_size >= 0;
         /* File size is operation-local metadata, never an LPR cache validated
@@ -2513,12 +2525,12 @@ int64_t lpr_linux_mmap(
     uint64_t prot,
     uint64_t flags,
     uint64_t fd,
-    uint64_t offset)
+    uint64_t offset, unsigned *wait_not_ready __attribute__((unused)))
 {
     if ((flags & LPR_LINUX_MAP_ANONYMOUS) != 0) {
-        return lpr_backend_mmap(addr, len, prot, flags, fd, offset);
+        return lpr_backend_mmap(addr, len, prot, flags, fd, offset, wait_not_ready);
     }
-    return lpr_fd_dispatch_mmap(addr, len, prot, flags, fd, offset);
+    return lpr_fd_dispatch_mmap(addr, len, prot, flags, fd, offset, wait_not_ready);
 }
 
 static int64_t lpr_dispatch_msync(uint64_t addr, uint64_t len, uint64_t flags)
@@ -2579,7 +2591,7 @@ typedef int64_t (*lpr_syscall_handler_t)(
     uint64_t a2,
     uint64_t a3,
     uint64_t a4,
-    uint64_t a5);
+    uint64_t a5, unsigned *wait_not_ready);
 
 typedef struct lpr_syscall_entry {
     uint64_t nr;
@@ -2590,8 +2602,8 @@ typedef struct lpr_syscall_entry {
     uint8_t trace_socket;
 } lpr_syscall_entry_t;
 
-static int64_t lpr_sys_read(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a3; (void)a4; (void)a5; return lpr_linux_read(a0, a1, a2); }
-static int64_t lpr_sys_write(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) {
+static int64_t lpr_sys_read(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a3; (void)a4; (void)a5; return lpr_linux_read(a0, a1, a2, wait_not_ready); }
+static int64_t lpr_sys_write(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) {
     (void)a3; (void)a4; (void)a5;
 #if defined(LPR_GLYCIN_DIAG) && LPR_GLYCIN_DIAG
     if (a0 == 2u && lpr_glycin_diag_contains(
@@ -2602,25 +2614,25 @@ static int64_t lpr_sys_write(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
         lpr_glycin_diag_arm("warning");
     }
 #endif
-    return lpr_linux_write(a0, a1, a2);
+    return lpr_linux_write(a0, a1, a2, wait_not_ready);
 }
-static int64_t lpr_sys_open(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a3; (void)a4; (void)a5; return lpr_linux_openat(LPR_LINUX_AT_FDCWD, a0, a1, a2); }
+static int64_t lpr_sys_open(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a3; (void)a4; (void)a5; return lpr_linux_openat(LPR_LINUX_AT_FDCWD, a0, a1, a2, wait_not_ready); }
 /* Existing Linux tools still issue mknod, not mknodat. Both must enter the
  * same authenticated direct-queue path instead of returning ENOSYS here. */
-static int64_t lpr_sys_mknod(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a3; (void)a4; (void)a5; return lpr_linux_mknodat(LPR_LINUX_AT_FDCWD, a0, a1, a2); }
-static int64_t lpr_sys_close(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_close(a0); }
-static int64_t lpr_sys_close_range(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a3; (void)a4; (void)a5; return lpr_linux_close_range(a0, a1, a2); }
-static int64_t lpr_sys_sched_getaffinity(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a3; (void)a4; (void)a5; return lpr_dispatch_sched_getaffinity(a0, a1, a2); }
-static int64_t lpr_sys_faccessat2(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a4; (void)a5; return lpr_linux_faccessat(a0, a1, a2, a3); }
-static int64_t lpr_sys_stat(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_newfstatat(LPR_LINUX_AT_FDCWD, a0, a1, 0); }
-static int64_t lpr_sys_lstat(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_newfstatat(LPR_LINUX_AT_FDCWD, a0, a1, 0x100); }
-static int64_t lpr_sys_lseek(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a3; (void)a4; (void)a5; return lpr_linux_lseek(a0, a1, a2); }
+static int64_t lpr_sys_mknod(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a3; (void)a4; (void)a5; return lpr_linux_mknodat(LPR_LINUX_AT_FDCWD, a0, a1, a2); }
+static int64_t lpr_sys_close(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_close(a0); }
+static int64_t lpr_sys_close_range(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a3; (void)a4; (void)a5; return lpr_linux_close_range(a0, a1, a2); }
+static int64_t lpr_sys_sched_getaffinity(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a3; (void)a4; (void)a5; return lpr_dispatch_sched_getaffinity(a0, a1, a2); }
+static int64_t lpr_sys_faccessat2(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a4; (void)a5; return lpr_linux_faccessat(a0, a1, a2, a3); }
+static int64_t lpr_sys_stat(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_newfstatat(LPR_LINUX_AT_FDCWD, a0, a1, 0, wait_not_ready); }
+static int64_t lpr_sys_lstat(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_newfstatat(LPR_LINUX_AT_FDCWD, a0, a1, 0x100, wait_not_ready); }
+static int64_t lpr_sys_lseek(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a3; (void)a4; (void)a5; return lpr_linux_lseek(a0, a1, a2); }
 static int64_t lpr_sys_mmap(uint64_t a0, uint64_t a1, uint64_t a2,
-    uint64_t a3, uint64_t a4, uint64_t a5) {
-    return lpr_linux_mmap(a0, a1, a2, a3, a4, a5);
+    uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) {
+    return lpr_linux_mmap(a0, a1, a2, a3, a4, a5, wait_not_ready);
 }
-static int64_t lpr_sys_mremap(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a5; return lpr_linux_mremap(a0, a1, a2, a3, a4); }
-static int64_t lpr_sys_madvise(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5)
+static int64_t lpr_sys_mremap(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a5; return lpr_linux_mremap(a0, a1, a2, a3, a4); }
+static int64_t lpr_sys_madvise(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused)))
 {
     (void)a3; (void)a4; (void)a5;
     return pacha_kernel_status_to_errno(lpr_pacha_syscall3(PACHA_VM_SYSCALL_MADVISE, a0, a1, a2));
@@ -2631,7 +2643,7 @@ static int64_t lpr_sys_mprotect(
     uint64_t a2,
     uint64_t a3,
     uint64_t a4,
-    uint64_t a5)
+    uint64_t a5, unsigned *wait_not_ready __attribute__((unused)))
 {
     (void)a3;
     (void)a4;
@@ -2656,7 +2668,7 @@ static int64_t lpr_sys_mprotect(
     }
     return lpr_linux_pacha_status_to_errno(status);
 }
-static int64_t lpr_sys_munmap(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) {
+static int64_t lpr_sys_munmap(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) {
     (void)a2; (void)a3; (void)a4; (void)a5;
     const struct lpr_linux_user_frame *frame = lpr_current_linux_user_frame();
     if (frame != 0 && a1 != 0 && a0 <= UINT64_MAX - a1 &&
@@ -2679,19 +2691,19 @@ static int64_t lpr_sys_munmap(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3
     lpr_trace_mmap_call("munmap", a0, a1, 0, 0, 0, 0, result);
     return result;
 }
-static int64_t lpr_sys_msync(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a3; (void)a4; (void)a5; return lpr_dispatch_msync(a0, a1, a2); }
-static int64_t lpr_sys_brk(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_brk(a0); }
-static int64_t lpr_sys_rt_sigaction(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a4; (void)a5; return lpr_linux_rt_sigaction(a0, a1, a2, a3); }
-static int64_t lpr_sys_rt_sigprocmask(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a4; (void)a5; return lpr_linux_rt_sigprocmask(a0, a1, a2, a3); }
-static int64_t lpr_sys_rt_sigpending(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_rt_sigpending(a0, a1); }
-static int64_t lpr_sys_rt_sigtimedwait(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a4; (void)a5; return lpr_linux_rt_sigtimedwait(a0, a1, a2, a3); }
-static int64_t lpr_sys_rt_sigreturn(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a0; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; lpr_linux_rt_sigreturn_frame(lpr_current_linux_user_frame()); }
-static int64_t lpr_sys_sigaltstack(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_sigaltstack(a0, a1); }
-static int64_t lpr_sys_ioctl(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a3; (void)a4; (void)a5; return lpr_linux_ioctl(a0, a1, a2); }
-static int64_t lpr_sys_pread64(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a4; (void)a5; return lpr_linux_pread64(a0, a1, a2, a3); }
-static int64_t lpr_sys_pwrite64(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a4; (void)a5; return lpr_linux_pwrite64(a0, a1, a2, a3); }
-static int64_t lpr_sys_readv(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a3; (void)a4; (void)a5; return lpr_linux_readv(a0, a1, a2); }
-static int64_t lpr_sys_writev(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) {
+static int64_t lpr_sys_msync(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a3; (void)a4; (void)a5; return lpr_dispatch_msync(a0, a1, a2); }
+static int64_t lpr_sys_brk(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_brk(a0); }
+static int64_t lpr_sys_rt_sigaction(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a4; (void)a5; return lpr_linux_rt_sigaction(a0, a1, a2, a3); }
+static int64_t lpr_sys_rt_sigprocmask(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a4; (void)a5; return lpr_linux_rt_sigprocmask(a0, a1, a2, a3); }
+static int64_t lpr_sys_rt_sigpending(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_rt_sigpending(a0, a1); }
+static int64_t lpr_sys_rt_sigtimedwait(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a4; (void)a5; return lpr_linux_rt_sigtimedwait(a0, a1, a2, a3, wait_not_ready); }
+static int64_t lpr_sys_rt_sigreturn(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a0; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; lpr_linux_rt_sigreturn_frame(lpr_current_linux_user_frame()); }
+static int64_t lpr_sys_sigaltstack(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_sigaltstack(a0, a1); }
+static int64_t lpr_sys_ioctl(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a3; (void)a4; (void)a5; return lpr_linux_ioctl(a0, a1, a2, wait_not_ready); }
+static int64_t lpr_sys_pread64(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a4; (void)a5; return lpr_linux_pread64(a0, a1, a2, a3); }
+static int64_t lpr_sys_pwrite64(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a4; (void)a5; return lpr_linux_pwrite64(a0, a1, a2, a3); }
+static int64_t lpr_sys_readv(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a3; (void)a4; (void)a5; return lpr_linux_readv(a0, a1, a2, wait_not_ready); }
+static int64_t lpr_sys_writev(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) {
     (void)a3; (void)a4; (void)a5;
 #if defined(LPR_GLYCIN_DIAG) && LPR_GLYCIN_DIAG
     const lpr_linux_iovec_t *iov =
@@ -2709,53 +2721,53 @@ static int64_t lpr_sys_writev(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3
         }
     }
 #endif
-    return lpr_linux_writev(a0, a1, a2);
+    return lpr_linux_writev(a0, a1, a2, wait_not_ready);
 }
-static int64_t lpr_sys_access(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_access(a0, a1); }
-static int64_t lpr_sys_pipe(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_pipe2(a0, 0); }
-static int64_t lpr_sys_select(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a5; return lpr_linux_select(a0, a1, a2, a3, a4); }
-static int64_t lpr_sys_dup(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_dup(a0, 0, 0); }
-static int64_t lpr_sys_dup2(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_dup2(a0, a1, 0); }
-static int64_t lpr_sys_nanosleep(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_nanosleep(a0, a1); }
-static int64_t lpr_sys_getpid(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a0; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_getpid(); }
-static int64_t lpr_sys_socket(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a3; (void)a4; (void)a5; return lpr_linux_socket(a0, a1, a2); }
-static int64_t lpr_sys_socketpair(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a4; (void)a5; return lpr_linux_socketpair(a0, a1, a2, a3); }
-static int64_t lpr_epoll_note_result(uint64_t fd, uint32_t events, int64_t result)
+static int64_t lpr_sys_access(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_access(a0, a1); }
+static int64_t lpr_sys_pipe(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_pipe2(a0, 0); }
+static int64_t lpr_sys_select(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a5; return lpr_linux_select(a0, a1, a2, a3, a4, wait_not_ready); }
+static int64_t lpr_sys_dup(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_dup(a0, 0, 0); }
+static int64_t lpr_sys_dup2(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_dup2(a0, a1, 0); }
+static int64_t lpr_sys_nanosleep(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_nanosleep(a0, a1, wait_not_ready); }
+static int64_t lpr_sys_getpid(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a0; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_getpid(); }
+static int64_t lpr_sys_socket(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a3; (void)a4; (void)a5; return lpr_linux_socket(a0, a1, a2); }
+static int64_t lpr_sys_socketpair(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a4; (void)a5; return lpr_linux_socketpair(a0, a1, a2, a3); }
+static int64_t lpr_epoll_note_result(uint64_t fd, uint32_t events, int64_t result, unsigned *wait_not_ready __attribute__((unused)))
 {
-    lpr_epoll_note_fd_state(fd, events, result);
+    lpr_epoll_note_fd_state(fd, events, result, wait_not_ready);
     return result;
 }
-static int64_t lpr_sys_connect(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a3; (void)a4; (void)a5; return lpr_epoll_note_result(a0, LPR_EPOLL_IO_WRITE, lpr_linux_connect(a0, a1, a2)); }
-static int64_t lpr_sys_sendto(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { return lpr_epoll_note_result(a0, LPR_EPOLL_IO_WRITE, lpr_linux_sendto(a0, a1, a2, a3, a4, a5)); }
-static int64_t lpr_sys_recvfrom(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { return lpr_epoll_note_result(a0, LPR_EPOLL_IO_READ, lpr_linux_recvfrom(a0, a1, a2, a3, a4, a5)); }
-static int64_t lpr_sys_sendmsg(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a3; (void)a4; (void)a5; return lpr_epoll_note_result(a0, LPR_EPOLL_IO_WRITE, lpr_linux_sendmsg(a0, a1, a2)); }
-static int64_t lpr_sys_recvmsg(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a3; (void)a4; (void)a5; return lpr_epoll_note_result(a0, LPR_EPOLL_IO_READ, lpr_linux_recvmsg(a0, a1, a2)); }
-static int64_t lpr_sys_shutdown(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_shutdown(a0, a1); }
-static int64_t lpr_sys_bind(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a3; (void)a4; (void)a5; return lpr_linux_bind(a0, a1, a2); }
-static int64_t lpr_sys_getsockname(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a3; (void)a4; (void)a5; return lpr_linux_getsockname(a0, a1, a2); }
-static int64_t lpr_sys_getpeername(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a3; (void)a4; (void)a5; return lpr_linux_getpeername(a0, a1, a2); }
-static int64_t lpr_sys_setsockopt(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a5; return lpr_linux_setsockopt(a0, a1, a2, a3, a4); }
-static int64_t lpr_sys_getsockopt(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a5; return lpr_linux_getsockopt(a0, a1, a2, a3, a4); }
-static int64_t lpr_sys_clone(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a5; return lpr_linux_clone(a0, a1, a2, a3, a4); }
-static int64_t lpr_sys_fork(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a0; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_fork(); }
-static int64_t lpr_sys_vfork(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a0; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_vfork(); }
-static int64_t lpr_sys_execve(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a3; (void)a4; (void)a5; return lpr_linux_execve(a0, a1, a2); }
-static int64_t lpr_sys_exit(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; lpr_linux_exit_thread(a0); }
-static int64_t lpr_sys_exit_group(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; lpr_linux_exit_group(a0); }
-static int64_t lpr_sys_wait4(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a4; (void)a5; return lpr_linux_wait4(a0, a1, a2, a3); }
-static int64_t lpr_sys_kill(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_kill(a0, a1); }
-static int64_t lpr_sys_tkill(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_tkill(a0, a1); }
-static int64_t lpr_sys_tgkill(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a3; (void)a4; (void)a5; return lpr_linux_tgkill(a0, a1, a2); }
-static int64_t lpr_sys_uname(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_uname(a0); }
-static int64_t lpr_sys_fstat(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_fstat(a0, a1); }
-static int64_t lpr_sys_statfs(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_statfs(a0, a1); }
-static int64_t lpr_sys_fstatfs(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_fstatfs(a0, a1); }
-static int64_t lpr_sys_fsync(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_fsync(a0); }
-static int64_t lpr_sys_ftruncate(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_ftruncate(a0, a1); }
-static int64_t lpr_sys_fallocate(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a0; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; return -LPR_LINUX_EOPNOTSUPP; }
-static int64_t lpr_sys_sync(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a0; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_sync(); }
+static int64_t lpr_sys_connect(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a3; (void)a4; (void)a5; return lpr_epoll_note_result(a0, LPR_EPOLL_IO_WRITE, lpr_linux_connect(a0, a1, a2, wait_not_ready), wait_not_ready); }
+static int64_t lpr_sys_sendto(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { return lpr_epoll_note_result(a0, LPR_EPOLL_IO_WRITE, lpr_linux_sendto(a0, a1, a2, a3, a4, a5, wait_not_ready), wait_not_ready); }
+static int64_t lpr_sys_recvfrom(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { return lpr_epoll_note_result(a0, LPR_EPOLL_IO_READ, lpr_linux_recvfrom(a0, a1, a2, a3, a4, a5, wait_not_ready), wait_not_ready); }
+static int64_t lpr_sys_sendmsg(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a3; (void)a4; (void)a5; return lpr_epoll_note_result(a0, LPR_EPOLL_IO_WRITE, lpr_linux_sendmsg(a0, a1, a2, wait_not_ready), wait_not_ready); }
+static int64_t lpr_sys_recvmsg(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a3; (void)a4; (void)a5; return lpr_epoll_note_result(a0, LPR_EPOLL_IO_READ, lpr_linux_recvmsg(a0, a1, a2, wait_not_ready), wait_not_ready); }
+static int64_t lpr_sys_shutdown(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_shutdown(a0, a1); }
+static int64_t lpr_sys_bind(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a3; (void)a4; (void)a5; return lpr_linux_bind(a0, a1, a2, wait_not_ready); }
+static int64_t lpr_sys_getsockname(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a3; (void)a4; (void)a5; return lpr_linux_getsockname(a0, a1, a2); }
+static int64_t lpr_sys_getpeername(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a3; (void)a4; (void)a5; return lpr_linux_getpeername(a0, a1, a2); }
+static int64_t lpr_sys_setsockopt(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a5; return lpr_linux_setsockopt(a0, a1, a2, a3, a4); }
+static int64_t lpr_sys_getsockopt(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a5; return lpr_linux_getsockopt(a0, a1, a2, a3, a4); }
+static int64_t lpr_sys_clone(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a5; return lpr_linux_clone(a0, a1, a2, a3, a4); }
+static int64_t lpr_sys_fork(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a0; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_fork(); }
+static int64_t lpr_sys_vfork(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a0; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_vfork(); }
+static int64_t lpr_sys_execve(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a3; (void)a4; (void)a5; return lpr_linux_execve(a0, a1, a2); }
+static int64_t lpr_sys_exit(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; lpr_linux_exit_thread(a0); }
+static int64_t lpr_sys_exit_group(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; lpr_linux_exit_group(a0); }
+static int64_t lpr_sys_wait4(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a4; (void)a5; return lpr_linux_wait4(a0, a1, a2, a3, wait_not_ready); }
+static int64_t lpr_sys_kill(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_kill(a0, a1); }
+static int64_t lpr_sys_tkill(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_tkill(a0, a1); }
+static int64_t lpr_sys_tgkill(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a3; (void)a4; (void)a5; return lpr_linux_tgkill(a0, a1, a2); }
+static int64_t lpr_sys_uname(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_uname(a0); }
+static int64_t lpr_sys_fstat(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_fstat(a0, a1, wait_not_ready); }
+static int64_t lpr_sys_statfs(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_statfs(a0, a1); }
+static int64_t lpr_sys_fstatfs(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_fstatfs(a0, a1); }
+static int64_t lpr_sys_fsync(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_fsync(a0); }
+static int64_t lpr_sys_ftruncate(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_ftruncate(a0, a1); }
+static int64_t lpr_sys_fallocate(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a0; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; return -LPR_LINUX_EOPNOTSUPP; }
+static int64_t lpr_sys_sync(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a0; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_sync(); }
 static int64_t lpr_sys_reboot(uint64_t magic1, uint64_t magic2, uint64_t command,
-    uint64_t arg, uint64_t a4, uint64_t a5)
+    uint64_t arg, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused)))
 {
     (void)arg; (void)a4; (void)a5;
     if (magic1 != 0xfee1deadull || magic2 != 672274793ull)
@@ -2766,53 +2778,53 @@ static int64_t lpr_sys_reboot(uint64_t magic1, uint64_t magic2, uint64_t command
     else return -LPR_LINUX_EINVAL;
     return lpr_supervisor_call_token(op, lpr_supervisor_token, -1, NULL);
 }
-static int64_t lpr_sys_syncfs(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_syncfs(a0); }
-static int64_t lpr_sys_getcwd(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_getcwd(a0, a1); }
-static int64_t lpr_sys_chdir(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_chdir(a0); }
-static int64_t lpr_sys_fchdir(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_fchdir(a0); }
-static int64_t lpr_sys_rename(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_renameat(LPR_LINUX_AT_FDCWD, a0, LPR_LINUX_AT_FDCWD, a1); }
-static int64_t lpr_sys_mkdir(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_mkdirat(LPR_LINUX_AT_FDCWD, a0, a1); }
-static int64_t lpr_sys_rmdir(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_unlinkat(LPR_LINUX_AT_FDCWD, a0, LPR_LINUX_AT_REMOVEDIR); }
-static int64_t lpr_sys_link(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_linkat(LPR_LINUX_AT_FDCWD, a0, LPR_LINUX_AT_FDCWD, a1, 0); }
-static int64_t lpr_sys_unlink(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_unlinkat(LPR_LINUX_AT_FDCWD, a0, 0); }
-static int64_t lpr_sys_symlink(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_symlinkat(a0, LPR_LINUX_AT_FDCWD, a1); }
-static int64_t lpr_sys_readlink(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a3; (void)a4; (void)a5; return lpr_linux_readlink(a0, a1, a2); }
-static int64_t lpr_sys_chmod(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_fchmodat(LPR_LINUX_AT_FDCWD, a0, a1, 0); }
-static int64_t lpr_sys_fchmod(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_fchmod(a0, a1); }
-static int64_t lpr_sys_chown(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a3; (void)a4; (void)a5; return lpr_linux_fchownat(LPR_LINUX_AT_FDCWD, a0, a1, a2, 0); }
-static int64_t lpr_sys_fchown(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a3; (void)a4; (void)a5; return lpr_linux_fchownat(a0, (uint64_t)(uintptr_t)"", a1, a2, LPR_LINUX_AT_EMPTY_PATH); }
-static int64_t lpr_sys_lchown(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a3; (void)a4; (void)a5; return lpr_linux_fchownat(LPR_LINUX_AT_FDCWD, a0, a1, a2, LPR_LINUX_AT_SYMLINK_NOFOLLOW); }
-static int64_t lpr_sys_umask(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; const uint64_t previous = lpr_linux_umask_value; lpr_linux_umask_value = a0 & 0777ull; return (int64_t)previous; }
-static int64_t lpr_sys_getrlimit(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_copy_out_rlimit(a0, a1); }
-static int64_t lpr_sys_zero(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a0; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; return 0; }
-static int64_t lpr_sys_getgroups(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_getgroups(a0, a1); }
-static int64_t lpr_sys_setgroups(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_setgroups(a0, a1); }
-static int64_t lpr_sys_getuid(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a0; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_getuid(); }
-static int64_t lpr_sys_getgid(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a0; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_getgid(); }
-static int64_t lpr_sys_geteuid(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a0; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_geteuid(); }
-static int64_t lpr_sys_getegid(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a0; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_getegid(); }
-static int64_t lpr_sys_setuid(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_setuid(a0); }
-static int64_t lpr_sys_setgid(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_setgid(a0); }
-static int64_t lpr_sys_getresuid(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a3; (void)a4; (void)a5; return lpr_linux_getresuid(a0, a1, a2); }
-static int64_t lpr_sys_getresgid(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a3; (void)a4; (void)a5; return lpr_linux_getresgid(a0, a1, a2); }
-static int64_t lpr_sys_setreuid(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_setreuid(a0, a1); }
-static int64_t lpr_sys_setregid(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_setregid(a0, a1); }
-static int64_t lpr_sys_setresuid(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a3; (void)a4; (void)a5; return lpr_linux_setresuid(a0, a1, a2); }
-static int64_t lpr_sys_setresgid(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a3; (void)a4; (void)a5; return lpr_linux_setresgid(a0, a1, a2); }
-static int64_t lpr_sys_capget(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_capget(a0, a1, lpr_linux_getpid()); }
-static int64_t lpr_sys_capset(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_capset(a0, a1, lpr_linux_getpid()); }
-static int64_t lpr_sys_getppid(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a0; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_getppid(); }
-static int64_t lpr_sys_getpgrp(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a0; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_getpgrp(); }
-static int64_t lpr_sys_setpgid(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_setpgid(a0, a1); }
-static int64_t lpr_sys_getpgid(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_getpgid(a0); }
-static int64_t lpr_sys_setsid(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a0; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_setsid(); }
-static int64_t lpr_sys_getsid(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_getsid(a0); }
-static int64_t lpr_sys_setrlimit(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_set_rlimit(a0, a1); }
-static int64_t lpr_sys_prctl(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a5; return lpr_linux_prctl(a0, a1, a2, a3, a4); }
-static int64_t lpr_sys_arch_prctl(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_dispatch_arch_prctl(a0, a1); }
-static int64_t lpr_sys_unshare(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_unshare(a0); }
-static int64_t lpr_sys_gettid(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a0; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_gettid(); }
-static int64_t lpr_sys_set_tid_address(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_set_tid_address(a0); }
+static int64_t lpr_sys_syncfs(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_syncfs(a0); }
+static int64_t lpr_sys_getcwd(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_getcwd(a0, a1); }
+static int64_t lpr_sys_chdir(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_chdir(a0); }
+static int64_t lpr_sys_fchdir(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_fchdir(a0, wait_not_ready); }
+static int64_t lpr_sys_rename(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_renameat(LPR_LINUX_AT_FDCWD, a0, LPR_LINUX_AT_FDCWD, a1); }
+static int64_t lpr_sys_mkdir(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_mkdirat(LPR_LINUX_AT_FDCWD, a0, a1); }
+static int64_t lpr_sys_rmdir(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_unlinkat(LPR_LINUX_AT_FDCWD, a0, LPR_LINUX_AT_REMOVEDIR); }
+static int64_t lpr_sys_link(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_linkat(LPR_LINUX_AT_FDCWD, a0, LPR_LINUX_AT_FDCWD, a1, 0); }
+static int64_t lpr_sys_unlink(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_unlinkat(LPR_LINUX_AT_FDCWD, a0, 0); }
+static int64_t lpr_sys_symlink(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_symlinkat(a0, LPR_LINUX_AT_FDCWD, a1); }
+static int64_t lpr_sys_readlink(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a3; (void)a4; (void)a5; return lpr_linux_readlink(a0, a1, a2); }
+static int64_t lpr_sys_chmod(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_fchmodat(LPR_LINUX_AT_FDCWD, a0, a1, 0); }
+static int64_t lpr_sys_fchmod(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_fchmod(a0, a1); }
+static int64_t lpr_sys_chown(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a3; (void)a4; (void)a5; return lpr_linux_fchownat(LPR_LINUX_AT_FDCWD, a0, a1, a2, 0); }
+static int64_t lpr_sys_fchown(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a3; (void)a4; (void)a5; return lpr_linux_fchownat(a0, (uint64_t)(uintptr_t)"", a1, a2, LPR_LINUX_AT_EMPTY_PATH); }
+static int64_t lpr_sys_lchown(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a3; (void)a4; (void)a5; return lpr_linux_fchownat(LPR_LINUX_AT_FDCWD, a0, a1, a2, LPR_LINUX_AT_SYMLINK_NOFOLLOW); }
+static int64_t lpr_sys_umask(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; const uint64_t previous = lpr_linux_umask_value; lpr_linux_umask_value = a0 & 0777ull; return (int64_t)previous; }
+static int64_t lpr_sys_getrlimit(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_copy_out_rlimit(a0, a1); }
+static int64_t lpr_sys_zero(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a0; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; return 0; }
+static int64_t lpr_sys_getgroups(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_getgroups(a0, a1); }
+static int64_t lpr_sys_setgroups(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_setgroups(a0, a1); }
+static int64_t lpr_sys_getuid(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a0; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_getuid(); }
+static int64_t lpr_sys_getgid(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a0; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_getgid(); }
+static int64_t lpr_sys_geteuid(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a0; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_geteuid(); }
+static int64_t lpr_sys_getegid(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a0; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_getegid(); }
+static int64_t lpr_sys_setuid(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_setuid(a0); }
+static int64_t lpr_sys_setgid(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_setgid(a0); }
+static int64_t lpr_sys_getresuid(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a3; (void)a4; (void)a5; return lpr_linux_getresuid(a0, a1, a2); }
+static int64_t lpr_sys_getresgid(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a3; (void)a4; (void)a5; return lpr_linux_getresgid(a0, a1, a2); }
+static int64_t lpr_sys_setreuid(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_setreuid(a0, a1); }
+static int64_t lpr_sys_setregid(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_setregid(a0, a1); }
+static int64_t lpr_sys_setresuid(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a3; (void)a4; (void)a5; return lpr_linux_setresuid(a0, a1, a2); }
+static int64_t lpr_sys_setresgid(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a3; (void)a4; (void)a5; return lpr_linux_setresgid(a0, a1, a2); }
+static int64_t lpr_sys_capget(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_capget(a0, a1, lpr_linux_getpid()); }
+static int64_t lpr_sys_capset(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_capset(a0, a1, lpr_linux_getpid()); }
+static int64_t lpr_sys_getppid(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a0; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_getppid(); }
+static int64_t lpr_sys_getpgrp(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a0; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_getpgrp(); }
+static int64_t lpr_sys_setpgid(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_setpgid(a0, a1); }
+static int64_t lpr_sys_getpgid(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_getpgid(a0); }
+static int64_t lpr_sys_setsid(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a0; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_setsid(); }
+static int64_t lpr_sys_getsid(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_getsid(a0); }
+static int64_t lpr_sys_setrlimit(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_set_rlimit(a0, a1); }
+static int64_t lpr_sys_prctl(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a5; return lpr_linux_prctl(a0, a1, a2, a3, a4); }
+static int64_t lpr_sys_arch_prctl(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_dispatch_arch_prctl(a0, a1); }
+static int64_t lpr_sys_unshare(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_unshare(a0); }
+static int64_t lpr_sys_gettid(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a0; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_gettid(); }
+static int64_t lpr_sys_set_tid_address(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_set_tid_address(a0); }
 
 static int64_t lpr_futex_timeout_ticks(
     uint64_t timeout_raw,
@@ -2858,7 +2870,7 @@ static int64_t lpr_futex_timeout_ticks(
     return *out_ticks == 0 ? -LPR_LINUX_ETIMEDOUT : 0;
 }
 
-static int64_t lpr_sys_futex(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5)
+static int64_t lpr_sys_futex(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused)))
 {
     const uint64_t command = a1 & 0x7full;
     const uint64_t flags = a1 & ~0x7full;
@@ -2931,11 +2943,13 @@ static int64_t lpr_sys_futex(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
             LPR_LINUX_CLOCK_REALTIME : LPR_LINUX_CLOCK_MONOTONIC,
         &timeout_ticks);
     if (timeout_status != 0) return timeout_status;
-    const int64_t status = lpr_pacha_syscall3(
+    const int64_t status = lpr_pacha_syscall4(
         PACHAOS_SYSCALL_FUTEX_WAIT,
         a0,
         expected,
-        timeout_ticks);
+        timeout_ticks, 0);
+    if (wait_not_ready && (status == PACHA_SYSCALL_ERR_NOT_READY ||
+        status == -PACHA_SYSCALL_ERR_NOT_READY)) *wait_not_ready = 1;
     if (status == 0) {
         return 0;
     }
@@ -2945,7 +2959,7 @@ static int64_t lpr_sys_futex(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
     const int64_t error = lpr_linux_pacha_status_to_errno(status);
     return error;
 }
-static int64_t lpr_sys_getdents64(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a3; (void)a4; (void)a5; return lpr_linux_getdents64(a0, a1, a2); }
+static int64_t lpr_sys_getdents64(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a3; (void)a4; (void)a5; return lpr_linux_getdents64(a0, a1, a2); }
 
 typedef struct lpr_linux_timeval {
     int64_t tv_sec;
@@ -3016,7 +3030,7 @@ static void lpr_itimer_native_to_linux(
     lpr_itimer_ticks_to_timeval(native->interval_ticks, &out->interval);
 }
 
-static int64_t lpr_sys_getitimer(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5)
+static int64_t lpr_sys_getitimer(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused)))
 {
     (void)a2;
     (void)a3;
@@ -3037,7 +3051,7 @@ static int64_t lpr_sys_getitimer(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t
     return 0;
 }
 
-static int64_t lpr_sys_setitimer(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5)
+static int64_t lpr_sys_setitimer(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused)))
 {
     (void)a3;
     (void)a4;
@@ -3073,23 +3087,23 @@ static int64_t lpr_sys_setitimer(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t
     return 0;
 }
 
-static int64_t lpr_sys_rt_sigsuspend(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5)
+static int64_t lpr_sys_rt_sigsuspend(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused)))
 {
     (void)a2;
     (void)a3;
     (void)a4;
     (void)a5;
     if (a0 == 0) return -LPR_LINUX_EFAULT;
-    return lpr_linux_ppoll(0, 0, 0, a0, a1);
+    return lpr_linux_ppoll(0, 0, 0, a0, a1, wait_not_ready);
 }
 
-static int64_t lpr_sys_sched_yield(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5)
+static int64_t lpr_sys_sched_yield(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused)))
 {
     (void)a0; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
     return lpr_linux_pacha_status_to_errno(lpr_pacha_syscall0(PACHA_RUNTIME_SYSCALL_YIELD));
 }
 
-static int64_t lpr_sys_clock_gettime(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5)
+static int64_t lpr_sys_clock_gettime(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused)))
 {
     (void)a2;
     (void)a3;
@@ -3123,7 +3137,7 @@ static int64_t lpr_sys_clock_gettime(uint64_t a0, uint64_t a1, uint64_t a2, uint
              native_status == -PACHA_SYSCALL_ERR_NOT_READY);
     return lpr_linux_pacha_status_to_errno(native_status);
 }
-static int64_t lpr_sys_clock_getres(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5)
+static int64_t lpr_sys_clock_getres(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused)))
 {
     (void)a2;
     (void)a3;
@@ -3161,7 +3175,7 @@ static int64_t lpr_sys_clock_getres(uint64_t a0, uint64_t a1, uint64_t a2, uint6
  *
  * The argument checks keep the kernel's ordering, so a bad pointer or a
  * closed descriptor is still EFAULT/EBADF rather than a blanket refusal. */
-static int64_t lpr_sys_xattr_path(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5)
+static int64_t lpr_sys_xattr_path(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused)))
 {
     (void)a2;
     (void)a3;
@@ -3173,7 +3187,7 @@ static int64_t lpr_sys_xattr_path(uint64_t a0, uint64_t a1, uint64_t a2, uint64_
     return -LPR_LINUX_EOPNOTSUPP;
 }
 
-static int64_t lpr_sys_xattr_fd(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5)
+static int64_t lpr_sys_xattr_fd(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused)))
 {
     (void)a2;
     (void)a3;
@@ -3189,7 +3203,7 @@ static int64_t lpr_sys_xattr_fd(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t 
 }
 
 /* listxattr takes no name argument, so only the path/fd is checked. */
-static int64_t lpr_sys_listxattr_path(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5)
+static int64_t lpr_sys_listxattr_path(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused)))
 {
     (void)a1;
     (void)a2;
@@ -3202,7 +3216,7 @@ static int64_t lpr_sys_listxattr_path(uint64_t a0, uint64_t a1, uint64_t a2, uin
     return -LPR_LINUX_EOPNOTSUPP;
 }
 
-static int64_t lpr_sys_listxattr_fd(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5)
+static int64_t lpr_sys_listxattr_fd(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused)))
 {
     (void)a1;
     (void)a2;
@@ -3215,7 +3229,7 @@ static int64_t lpr_sys_listxattr_fd(uint64_t a0, uint64_t a1, uint64_t a2, uint6
     return -LPR_LINUX_EOPNOTSUPP;
 }
 
-static int64_t lpr_sys_fadvise64(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5)
+static int64_t lpr_sys_fadvise64(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused)))
 {
     (void)a4;
     (void)a5;
@@ -3234,45 +3248,45 @@ static int64_t lpr_sys_fadvise64(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t
      * readahead action is necessary. */
     return 0;
 }
-static int64_t lpr_sys_clock_nanosleep(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a4; (void)a5; return lpr_linux_clock_nanosleep(a0, a1, a2, a3); }
-static int64_t lpr_sys_openat(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a4; (void)a5; return lpr_linux_openat(a0, a1, a2, a3); }
-static int64_t lpr_sys_mkdirat(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a3; (void)a4; (void)a5; return lpr_linux_mkdirat(a0, a1, a2); }
-static int64_t lpr_sys_mknodat(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a4; (void)a5; return lpr_linux_mknodat(a0, a1, a2, a3); }
-static int64_t lpr_sys_fchownat(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a5; return lpr_linux_fchownat(a0, a1, a2, a3, a4); }
-static int64_t lpr_sys_newfstatat(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a4; (void)a5; return lpr_linux_newfstatat(a0, a1, a2, a3); }
-static int64_t lpr_sys_statx(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a5; return lpr_linux_statx(a0, a1, a2, a3, a4); }
-static int64_t lpr_sys_unlinkat(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a3; (void)a4; (void)a5; return lpr_linux_unlinkat(a0, a1, a2); }
-static int64_t lpr_sys_renameat(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a4; (void)a5; return lpr_linux_renameat(a0, a1, a2, a3); }
-static int64_t lpr_sys_linkat(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a5; return lpr_linux_linkat(a0, a1, a2, a3, a4); }
-static int64_t lpr_sys_symlinkat(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a3; (void)a4; (void)a5; return lpr_linux_symlinkat(a0, a1, a2); }
-static int64_t lpr_sys_fchmodat(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a3; (void)a4; (void)a5; return lpr_linux_fchmodat(a0, a1, a2, 0); }
-static int64_t lpr_sys_faccessat(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a3; (void)a4; (void)a5; return lpr_linux_faccessat(a0, a1, a2, 0); }
-static int64_t lpr_sys_pselect6(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { return lpr_linux_pselect6(a0, a1, a2, a3, a4, a5); }
-static int64_t lpr_sys_ppoll(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a5; return lpr_linux_ppoll(a0, a1, a2, a3, a4); }
-static int64_t lpr_sys_epoll_wait(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a4; (void)a5; return lpr_linux_epoll_wait(a0, a1, a2, a3); }
-static int64_t lpr_sys_epoll_ctl(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a4; (void)a5; return lpr_linux_epoll_ctl(a0, a1, a2, a3); }
-static int64_t lpr_sys_epoll_pwait(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { return lpr_linux_epoll_pwait(a0, a1, a2, a3, a4, a5); }
-static int64_t lpr_sys_epoll_create1(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_epoll_create1(a0); }
-static int64_t lpr_sys_utimensat(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a4; (void)a5; return lpr_linux_utimensat(a0, a1, a2, a3); }
-static int64_t lpr_sys_eventfd(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_eventfd2(a0, 0); }
-static int64_t lpr_sys_eventfd2(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_eventfd2(a0, a1); }
-static int64_t lpr_sys_inotify_init(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a0; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_inotify_init1(0); }
-static int64_t lpr_sys_inotify_init1(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_inotify_init1(a0); }
-static int64_t lpr_sys_inotify_add_watch(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a3; (void)a4; (void)a5; return lpr_linux_inotify_add_watch(a0, a1, a2); }
-static int64_t lpr_sys_inotify_rm_watch(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_inotify_rm_watch(a0, a1); }
-static int64_t lpr_sys_timerfd_create(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_timerfd_create(a0, a1); }
-static int64_t lpr_sys_timerfd_settime(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a4; (void)a5; return lpr_linux_timerfd_settime(a0, a1, a2, a3); }
-static int64_t lpr_sys_timerfd_gettime(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_timerfd_gettime(a0, a1); }
-static int64_t lpr_sys_signalfd4(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a4; (void)a5; return lpr_linux_signalfd4(a0, a1, a2, a3); }
-static int64_t lpr_sys_accept(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a3; (void)a4; (void)a5; return lpr_epoll_note_result(a0, LPR_EPOLL_IO_READ, lpr_linux_accept(a0, a1, a2, 0)); }
-static int64_t lpr_sys_listen(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_listen(a0, a1); }
-static int64_t lpr_sys_dup3(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a3; (void)a4; (void)a5; return lpr_linux_dup2(a0, a1, a2); }
-static int64_t lpr_sys_pipe2(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_pipe2(a0, a1); }
-static int64_t lpr_sys_recvmmsg(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a5; return lpr_epoll_note_result(a0, LPR_EPOLL_IO_READ, lpr_linux_recvmmsg(a0, a1, a2, a3, a4)); }
-static int64_t lpr_sys_prlimit64(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a4; (void)a5; return lpr_linux_prlimit64(a0, a1, a2, a3); }
-static int64_t lpr_sys_sendmmsg(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a4; (void)a5; return lpr_epoll_note_result(a0, LPR_EPOLL_IO_WRITE, lpr_linux_sendmmsg(a0, a1, a2, a3)); }
+static int64_t lpr_sys_clock_nanosleep(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a4; (void)a5; return lpr_linux_clock_nanosleep(a0, a1, a2, a3, wait_not_ready); }
+static int64_t lpr_sys_openat(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a4; (void)a5; return lpr_linux_openat(a0, a1, a2, a3, wait_not_ready); }
+static int64_t lpr_sys_mkdirat(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a3; (void)a4; (void)a5; return lpr_linux_mkdirat(a0, a1, a2); }
+static int64_t lpr_sys_mknodat(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a4; (void)a5; return lpr_linux_mknodat(a0, a1, a2, a3); }
+static int64_t lpr_sys_fchownat(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a5; return lpr_linux_fchownat(a0, a1, a2, a3, a4); }
+static int64_t lpr_sys_newfstatat(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a4; (void)a5; return lpr_linux_newfstatat(a0, a1, a2, a3, wait_not_ready); }
+static int64_t lpr_sys_statx(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a5; return lpr_linux_statx(a0, a1, a2, a3, a4, wait_not_ready); }
+static int64_t lpr_sys_unlinkat(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a3; (void)a4; (void)a5; return lpr_linux_unlinkat(a0, a1, a2); }
+static int64_t lpr_sys_renameat(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a4; (void)a5; return lpr_linux_renameat(a0, a1, a2, a3); }
+static int64_t lpr_sys_linkat(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a5; return lpr_linux_linkat(a0, a1, a2, a3, a4); }
+static int64_t lpr_sys_symlinkat(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a3; (void)a4; (void)a5; return lpr_linux_symlinkat(a0, a1, a2); }
+static int64_t lpr_sys_fchmodat(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a3; (void)a4; (void)a5; return lpr_linux_fchmodat(a0, a1, a2, 0); }
+static int64_t lpr_sys_faccessat(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a3; (void)a4; (void)a5; return lpr_linux_faccessat(a0, a1, a2, 0); }
+static int64_t lpr_sys_pselect6(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { return lpr_linux_pselect6(a0, a1, a2, a3, a4, a5, wait_not_ready); }
+static int64_t lpr_sys_ppoll(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a5; return lpr_linux_ppoll(a0, a1, a2, a3, a4, wait_not_ready); }
+static int64_t lpr_sys_epoll_wait(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a4; (void)a5; return lpr_linux_epoll_wait(a0, a1, a2, a3, wait_not_ready); }
+static int64_t lpr_sys_epoll_ctl(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a4; (void)a5; return lpr_linux_epoll_ctl(a0, a1, a2, a3); }
+static int64_t lpr_sys_epoll_pwait(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { return lpr_linux_epoll_pwait(a0, a1, a2, a3, a4, a5, wait_not_ready); }
+static int64_t lpr_sys_epoll_create1(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_epoll_create1(a0); }
+static int64_t lpr_sys_utimensat(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a4; (void)a5; return lpr_linux_utimensat(a0, a1, a2, a3); }
+static int64_t lpr_sys_eventfd(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_eventfd2(a0, 0); }
+static int64_t lpr_sys_eventfd2(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_eventfd2(a0, a1); }
+static int64_t lpr_sys_inotify_init(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a0; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_inotify_init1(0); }
+static int64_t lpr_sys_inotify_init1(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_inotify_init1(a0); }
+static int64_t lpr_sys_inotify_add_watch(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a3; (void)a4; (void)a5; return lpr_linux_inotify_add_watch(a0, a1, a2, wait_not_ready); }
+static int64_t lpr_sys_inotify_rm_watch(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_inotify_rm_watch(a0, a1); }
+static int64_t lpr_sys_timerfd_create(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_timerfd_create(a0, a1); }
+static int64_t lpr_sys_timerfd_settime(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a4; (void)a5; return lpr_linux_timerfd_settime(a0, a1, a2, a3); }
+static int64_t lpr_sys_timerfd_gettime(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_timerfd_gettime(a0, a1); }
+static int64_t lpr_sys_signalfd4(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a4; (void)a5; return lpr_linux_signalfd4(a0, a1, a2, a3); }
+static int64_t lpr_sys_accept(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a3; (void)a4; (void)a5; return lpr_epoll_note_result(a0, LPR_EPOLL_IO_READ, lpr_linux_accept(a0, a1, a2, 0, wait_not_ready), wait_not_ready); }
+static int64_t lpr_sys_listen(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_listen(a0, a1); }
+static int64_t lpr_sys_dup3(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a3; (void)a4; (void)a5; return a0 == a1 ? -LPR_LINUX_EINVAL : lpr_linux_dup2(a0, a1, a2); }
+static int64_t lpr_sys_pipe2(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_pipe2(a0, a1); }
+static int64_t lpr_sys_recvmmsg(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a5; return lpr_epoll_note_result(a0, LPR_EPOLL_IO_READ, lpr_linux_recvmmsg(a0, a1, a2, a3, a4, wait_not_ready), wait_not_ready); }
+static int64_t lpr_sys_prlimit64(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a4; (void)a5; return lpr_linux_prlimit64(a0, a1, a2, a3); }
+static int64_t lpr_sys_sendmmsg(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a4; (void)a5; return lpr_epoll_note_result(a0, LPR_EPOLL_IO_WRITE, lpr_linux_sendmmsg(a0, a1, a2, a3, wait_not_ready), wait_not_ready); }
 static int64_t lpr_sys_kcmp(uint64_t pid1, uint64_t pid2, uint64_t type,
-    uint64_t fd1, uint64_t fd2, uint64_t unused)
+    uint64_t fd1, uint64_t fd2, uint64_t unused, unsigned *wait_not_ready __attribute__((unused)))
 {
     (void)unused;
     /* Mesa checks KCMP_FILE to distinguish a dup from a second DRM open.
@@ -3288,9 +3302,9 @@ static int64_t lpr_sys_kcmp(uint64_t pid1, uint64_t pid2, uint64_t type,
         (lpr_linux_fd_t)fd1, (lpr_linux_fd_t)fd2);
     return comparison < 0 ? -LPR_LINUX_EBADF : comparison;
 }
-static int64_t lpr_sys_getrandom(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a3; (void)a4; (void)a5; return lpr_linux_getrandom(a0, a1, a2); }
-static int64_t lpr_sys_memfd_create(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_memfd_create(a0, a1); }
-static int64_t lpr_sys_membarrier(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5)
+static int64_t lpr_sys_getrandom(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a3; (void)a4; (void)a5; return lpr_linux_getrandom(a0, a1, a2); }
+static int64_t lpr_sys_memfd_create(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_memfd_create(a0, a1); }
+static int64_t lpr_sys_membarrier(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused)))
 {
     (void)a2;
     (void)a3;
@@ -3316,9 +3330,9 @@ static int64_t lpr_sys_membarrier(uint64_t a0, uint64_t a1, uint64_t a2, uint64_
         return -LPR_LINUX_EINVAL;
     }
 }
-static int64_t lpr_sys_fcntl(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a3; (void)a4; (void)a5; return lpr_linux_socket_fd_active(a0) ? lpr_linux_socket_fcntl(a0, a1, a2) : lpr_linux_fcntl(a0, a1, a2); }
-static int64_t lpr_sys_flock(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_flock(a0, a1); }
-static int64_t lpr_sys_poll(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a3; (void)a4; (void)a5; return lpr_linux_poll(a0, a1, a2); }
+static int64_t lpr_sys_fcntl(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a3; (void)a4; (void)a5; return lpr_linux_socket_fd_active(a0) ? lpr_linux_socket_fcntl(a0, a1, a2) : lpr_linux_fcntl(a0, a1, a2); }
+static int64_t lpr_sys_flock(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_flock(a0, a1); }
+static int64_t lpr_sys_poll(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a3; (void)a4; (void)a5; return lpr_linux_poll(a0, a1, a2, wait_not_ready); }
 
 #define LPR_SYSCALL_TRACE 1u
 #define LPR_SYSCALL(nr_value, name_value, class_value, backend_value, handler_value, trace_value) \
@@ -3789,7 +3803,7 @@ static int64_t lpr_dispatch_syscall_inner(const lpr_syscall_entry_t *entry,
                                           uint64_t a2,
                                           uint64_t a3,
                                           uint64_t a4,
-                                          uint64_t a5)
+                                          uint64_t a5, unsigned *wait_not_ready __attribute__((unused)))
 {
     if (entry == 0) {
         return -LPR_LINUX_ENOSYS;
@@ -3805,7 +3819,7 @@ static int64_t lpr_dispatch_syscall_inner(const lpr_syscall_entry_t *entry,
         result = lpr_linux_clone_frame(
             frame, 0x4000ull | 0x100ull | 17u, 0, 0, 0, 0);
     } else {
-        result = entry->handler(a0, a1, a2, a3, a4, a5);
+        result = entry->handler(a0, a1, a2, a3, a4, a5, wait_not_ready);
     }
     lpr_diag_leave();
     return result;
@@ -3829,6 +3843,7 @@ int64_t lpr_dispatch_syscall_frame(struct lpr_linux_user_frame *frame,
                                    uint64_t a3,
                                    uint64_t a4,
                                    uint64_t a5) {
+    unsigned wait_not_ready = 0; /* This invocation only; never stored in thread state. */
     /* The dynamic linker enters us for ARCH_SET_FS before musl has a usable
      * thread pointer. Registering native signal delivery first creates a
      * race: a pending signal can enter the LPR trampoline on the registration
@@ -3837,7 +3852,7 @@ int64_t lpr_dispatch_syscall_frame(struct lpr_linux_user_frame *frame,
     if (nr == LPR_LINUX_SYS_ARCH_PRCTL && a0 == LPR_LINUX_ARCH_SET_FS) {
         const lpr_syscall_entry_t *entry = lpr_syscall_lookup_entry(nr);
         const int64_t result = lpr_dispatch_syscall_inner(
-            entry, frame, a0, a1, a2, a3, a4, a5);
+            entry, frame, a0, a1, a2, a3, a4, a5, &wait_not_ready);
         if (result == 0) {
             lpr_linux_signal_runtime_init();
         }
@@ -3866,7 +3881,7 @@ int64_t lpr_dispatch_syscall_frame(struct lpr_linux_user_frame *frame,
     if (trace_socket_syscall) {
         lpr_trace_socket_syscall_event("enter", nr, a0, a1, a2, 0);
     }
-    lpr_linux_ensure_default_stdio();
+    lpr_linux_ensure_default_stdio(&wait_not_ready);
     if (nr == LPR_LINUX_SYS_EXIT_GROUP) unix_profile_dump();
 #if defined(LPR_GLYCIN_DIAG) && LPR_GLYCIN_DIAG
     const int glycin_diag_owner =
@@ -3932,7 +3947,7 @@ int64_t lpr_dispatch_syscall_frame(struct lpr_linux_user_frame *frame,
         const uint64_t gui_start = gui_main ? pacha_trace_read_tsc() : 0;
 #endif
         const uint64_t start_cycles = trace_metrics ? pacha_trace_read_tsc() : 0;
-        result = lpr_dispatch_syscall_inner(entry, frame, a0, a1, a2, a3, a4, a5);
+        result = lpr_dispatch_syscall_inner(entry, frame, a0, a1, a2, a3, a4, a5, &wait_not_ready);
         const uint64_t end_cycles = trace_metrics ? pacha_trace_read_tsc() : 0;
 #if defined(LPR_GUI_PROFILE) && LPR_GUI_PROFILE
         /* Delivering a signal can abandon this stack, so finish the span
@@ -3961,7 +3976,7 @@ int64_t lpr_dispatch_syscall_frame(struct lpr_linux_user_frame *frame,
             result = signal_status;
             break;
         }
-        lpr_linux_deliver_native_pending_frame(-LPR_LINUX_EINTR);
+        lpr_linux_deliver_native_pending_frame_after_wait(-LPR_LINUX_EINTR, &wait_not_ready);
         // A spurious wake or an ignored synthetic signal leaves no native
         // frame to deliver, so restart the syscall transparently.
     }
@@ -4028,6 +4043,6 @@ int64_t lpr_dispatch_syscall_frame(struct lpr_linux_user_frame *frame,
     if (result == -LPR_LINUX_ENOSYS) {
         lpr_trace_enosys_syscall(nr, a0, a1, a2, a3, a4, a5);
     }
-    lpr_linux_deliver_native_pending_frame(result);
+    lpr_linux_deliver_native_pending_frame_after_wait(result, &wait_not_ready);
     return result;
 }

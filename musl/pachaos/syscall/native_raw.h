@@ -1,6 +1,11 @@
+#include "../../../userland/libpacha/include/pacha/poll.h"
 /* SPDX-License-Identifier: MIT */
 #ifndef PACHAOS_NATIVE_RAW_H
 #define PACHAOS_NATIVE_RAW_H
+
+/* Internal completion waits defer signals; timeout and teardown still apply. */
+#define PACHAOS_THREAD_SELF_FD (UINT32_MAX - 1u)
+#define PACHAOS_WAIT_UNINTERRUPTIBLE (1ull << 1)
 #define __SYSCALL_LL_E(x) (x)
 #define __SYSCALL_LL_O(x) (x)
 
@@ -69,7 +74,11 @@
 #define PACHAOS_SYSCALL_IPC_RECV 73
 #define PACHAOS_SYSCALL_IPC_CALL 74
 #define PACHAOS_SYSCALL_IPC_REPLY 75
-#define PACHAOS_SYSCALL_IPC_RECV_WAIT 76
+#define PACHAOS_SYSCALL_IPC_REPLY_RECV 76
+#define PACHAOS_SYSCALL_IPC_REPLY_EXTRACT 77
+#define PACHAOS_SYSCALL_IPC_RECV_WAIT 78
+#define PACHAOS_SYSCALL_IPC_NOTIFY 79
+#define PACHAOS_SYSCALL_IPC_NOTIFY_WAIT 80
 
 #define PACHAOS_FD_FLAG_CLOEXEC 1
 #define PACHAOS_FD_FLAG_NONBLOCK 2
@@ -168,11 +177,7 @@ struct __pachaos_linux_pollfd {
 	short revents;
 };
 
-struct __pachaos_pollfd {
-	long fd;
-	long events;
-	long revents;
-};
+
 
 struct __pachaos_ipc_fd {
 	unsigned long long fd;
@@ -244,6 +249,7 @@ static __inline long __pachaos_raw1(long n, long a1)
 
 static __inline long __pachaos_raw2(long n, long a1, long a2)
 {
+    if (n == 51 || n == 52) return pacha_poll_registers(n, a1, a2, 0, 0);
 	unsigned long ret;
 	__asm__ __volatile__ ("syscall" : "=a"(ret) : "a"(n), "D"(a1), "S"(a2) : "rcx", "r11", "memory");
 	return ret;
@@ -251,6 +257,7 @@ static __inline long __pachaos_raw2(long n, long a1, long a2)
 
 static __inline long __pachaos_raw3(long n, long a1, long a2, long a3)
 {
+    if (n == 51 || n == 52) return pacha_poll_registers(n, a1, a2, a3, 0);
 	unsigned long ret;
 	__asm__ __volatile__ ("syscall" : "=a"(ret) : "a"(n), "D"(a1), "S"(a2), "d"(a3) : "rcx", "r11", "memory");
 	return ret;
@@ -258,6 +265,7 @@ static __inline long __pachaos_raw3(long n, long a1, long a2, long a3)
 
 static __inline long __pachaos_raw4(long n, long a1, long a2, long a3, long a4)
 {
+    if (n == 51 || n == 52) return pacha_poll_registers(n, a1, a2, a3, a4);
 	unsigned long ret;
 	register long r10 __asm__("r10") = a4;
 	__asm__ __volatile__ ("syscall" : "=a"(ret) : "a"(n), "D"(a1), "S"(a2), "d"(a3), "r"(r10) : "rcx", "r11", "memory");
@@ -266,15 +274,17 @@ static __inline long __pachaos_raw4(long n, long a1, long a2, long a3, long a4)
 
 static __inline long __pachaos_raw5(long n, long a1, long a2, long a3, long a4, long a5)
 {
+    if (n == 51 || n == 52) return pacha_poll_registers(n, a1, a2, a3, a4);
 	unsigned long ret;
 	register long r10 __asm__("r10") = a4;
 	register long r8 __asm__("r8") = a5;
-	__asm__ __volatile__ ("syscall" : "=a"(ret) : "a"(n), "D"(a1), "S"(a2), "d"(a3), "r"(r10), "r"(r8) : "rcx", "r11", "memory");
+	__asm__ __volatile__ ("syscall" : "=a"(ret), "+d"(a3) : "a"(n), "D"(a1), "S"(a2), "r"(r10), "r"(r8) : "rcx", "r11", "memory");
 	return ret;
 }
 
 static __inline long __pachaos_raw6(long n, long a1, long a2, long a3, long a4, long a5, long a6)
 {
+    if (n == 51 || n == 52) return pacha_poll_registers(n, a1, a2, a3, a4);
 	unsigned long ret;
 	register long r10 __asm__("r10") = a4;
 	register long r8 __asm__("r8") = a5;
@@ -488,6 +498,61 @@ static __inline long __pachaos_fd_flags_from_linux(long flags, long cloexec_bit,
 	if (flags & cloexec_bit) out |= PACHAOS_FD_FLAG_CLOEXEC;
 	if (flags & nonblock_bit) out |= PACHAOS_FD_FLAG_NONBLOCK;
 	return out;
+}
+
+struct __pachaos_ipc_extension { uint64_t send_array, send_count, receive_array, receive_capacity, received_count; };
+/* Named callee-saved register operands make the compiler preserve RBX/R12/R13/R15
+ * around the syscall while treating every payload register as an output. */
+static inline long __pachaos_ipc_registers(uint64_t nr, uint64_t fd, uint64_t flags,
+    uint64_t timeout, uint64_t words[4], struct __pachaos_ipc_extension *extension,
+    int *committed) {
+    register uint64_t r10 __asm__("r10") = words[0];
+    register uint64_t r8 __asm__("r8") = words[1];
+    register uint64_t r9 __asm__("r9") = words[2];
+    register uint64_t r12 __asm__("r12") = words[3];
+    /* Counts above the native limit are rejected before packing: truncating
+     * them could turn an invalid FD transfer into a successful empty one. */
+    if (extension && (extension->send_count > 19 || extension->receive_capacity > 19)) {
+        extension->received_count = 0;
+        if (committed) *committed = 0;
+        return 1; /* native INVALID */
+    }
+    register uint64_t r13 __asm__("r13") = extension ? extension->send_array : 0;
+    register uint64_t rbx __asm__("rbx") = extension ? extension->receive_array : 0;
+    register uint64_t r15 __asm__("r15") = extension ?
+        extension->send_count | (extension->receive_capacity << 32) : 0;
+    __asm__ volatile("syscall"
+        : "+a"(nr), "+d"(timeout), "+r"(r10), "+r"(r8), "+r"(r9), "+r"(r12), "+r"(r15)
+        : "D"(fd), "S"(flags), "r"(r13), "r"(rbx)
+        : "rcx", "r11", "memory");
+    words[0] = r10; words[1] = r8; words[2] = r9; words[3] = r12;
+    if (extension) extension->received_count = nr == 0 ? r15 : 0;
+    if (committed) *committed = (int)timeout;
+    return (long)nr;
+}
+static inline long __pachaos_ipc_message(uint64_t nr, uint64_t fd,
+    const struct __pachaos_ipc_msg *send, struct __pachaos_ipc_msg *receive,
+    uint64_t timeout, uint64_t flags, int *committed) {
+    uint64_t words[4] = {0, 0, 0, 0};
+    struct __pachaos_ipc_extension extension = {0};
+    if (send) {
+        words[0] = send->word0; words[1] = send->word1;
+        words[2] = send->word2; words[3] = send->word3;
+        extension.send_array = (uintptr_t)send->fds;
+        extension.send_count = send->fd_count;
+    }
+    if (receive) {
+        extension.receive_array = (uintptr_t)receive->fds;
+        extension.receive_capacity = receive->fd_capacity;
+    }
+    long status = __pachaos_ipc_registers(nr, fd, flags, timeout, words,
+        (extension.send_count || extension.receive_capacity) ? &extension : 0, committed);
+    if (receive) {
+        receive->word0 = words[0]; receive->word1 = words[1];
+        receive->word2 = words[2]; receive->word3 = words[3];
+        receive->fd_count = extension.received_count;
+    }
+    return status;
 }
 
 #endif

@@ -1,3 +1,4 @@
+#include "lpr_ipc_mock.h"
 #include "../userland/personality/linux/runtime/lpr_process/client.c"
 #include <assert.h>
 #include <stdio.h>
@@ -34,7 +35,7 @@ int64_t lpr_pacha_syscall1(uint64_t nr, uint64_t fd)
     return 0;
 }
 
-int64_t lpr_pacha_syscall2(uint64_t nr, uint64_t a0, uint64_t a1)
+static int64_t fixture_prepare_request(uint64_t nr, uint64_t a0, uint64_t a1)
 {
     if (nr == PACHAOS_SYSCALL_FD_GET_INFO) {
         assert((a0 == 20 && live_control) || (a0 == 21 && live_bootstrap) || (a0 == 22 && live_unix));
@@ -64,17 +65,17 @@ int64_t lpr_pacha_syscall2(uint64_t nr, uint64_t a0, uint64_t a1)
     return 30;
 }
 
-int64_t lpr_pacha_syscall4(uint64_t nr, uint64_t fd, uint64_t address, uint64_t timeout, uint64_t flags)
+static int64_t fixture_finish_request(uint64_t nr, uint64_t fd, uint64_t address, uint64_t timeout, uint64_t flags)
 {
     if (nr == PACHA_FD_SYSCALL_WAIT_MANY) {
         struct pacha_pollfd *pollfd = (void *)(uintptr_t)fd;
-        assert(address == 1 && timeout == PACHA_FD_WAIT_FOREVER && !flags);
+        assert(address == 1 && timeout == PACHA_FD_WAIT_FOREVER && flags == PACHA_WAIT_UNINTERRUPTIBLE);
         assert(pollfd->fd == 20 && pollfd->events == PACHA_FD_EVENT_WRITABLE);
         pollfd->revents = PACHA_FD_EVENT_WRITABLE;
         writable_waits++;
         return 1;
     }
-    assert(nr == PACHAOS_SYSCALL_IPC_RECV_WAIT && fd == 30 && live_reply && timeout == UINT64_MAX && !flags);
+    assert(nr == PACHAOS_SYSCALL_IPC_RECV_WAIT && fd == 30 && live_reply && timeout == UINT64_MAX && flags == PACHA_WAIT_UNINTERRUPTIBLE);
     struct pacha_ipc_msg *reply = (struct pacha_ipc_msg *)(uintptr_t)address;
     reply->word0 = PACHA_SERVICE_REPLY_MAGIC;
     reply->word3 = current_request;
@@ -129,7 +130,7 @@ int main(void)
         bad_session = test == 3;
         missing_unix_rights = test == 4 ? PACHA_FD_RIGHT_WAIT : test == 5 ? PACHA_FD_RIGHT_POLL : 0;
         uint64_t session = 123;
-        int fd = 99;
+        pacha_fd_t fd = 99;
         const int64_t result = lpr_process_client_unix_session(&request, status_to_errno,
             101, 40, page, &session, &fd);
         assert(!queue_full && writable_waits == 3);
@@ -140,7 +141,7 @@ int main(void)
         }
         assert(!live_reply && live_control && !cancelled);
     }
-    int handoff = -1;
+    pacha_fd_t handoff = -1;
     prepare_busy = 1;
     assert(lpr_process_client_prepare_exec(&request, status_to_errno, 101, 40, page,
         &handoff) == -LPR_LINUX_EAGAIN);
@@ -168,4 +169,32 @@ int main(void)
     assert(live_control && !live_bootstrap && !live_reply);
     lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, 20);
     puts("lpr process control: private/CLOEXEC validation, exec handoff, prepare rejection cleanup, old route retained passed");
+}
+
+/* Request preparation and reply rendering are fixture phases within one
+ * synchronous syscall. Their transaction tags never become caller FDs. */
+int64_t lpr_pacha_syscall2(uint64_t nr, uint64_t a, uint64_t b)
+{
+    assert(nr != PACHAOS_SYSCALL_IPC_CALL);
+    return fixture_prepare_request(nr, a, b);
+}
+int64_t lpr_pacha_syscall4(uint64_t nr, uint64_t a, uint64_t b, uint64_t c, uint64_t d)
+{
+    return fixture_finish_request(nr, a, b, c, d);
+}
+int64_t lpr_ipc_message(uint64_t nr, uint64_t endpoint,
+    uint64_t request, uint64_t reply, uint64_t timeout, uint64_t flags, int *sent)
+{
+    if (nr != PACHA_IPC_SYSCALL_CALL) return test_lpr_ipc_noncall(nr, endpoint, request, reply, timeout, flags, sent);
+
+    assert(nr == PACHAOS_SYSCALL_IPC_CALL && request && reply);
+    assert(timeout == UINT64_MAX && flags == PACHA_WAIT_UNINTERRUPTIBLE);
+    *sent = 0;
+    int64_t transaction = fixture_prepare_request(nr, endpoint, request);
+    if (transaction < 16) return transaction;
+    *sent = 1;
+    int64_t status = fixture_finish_request(PACHAOS_SYSCALL_IPC_RECV_WAIT,
+        (uint64_t)transaction, reply, timeout, flags);
+    live_reply = 0;
+    return status;
 }

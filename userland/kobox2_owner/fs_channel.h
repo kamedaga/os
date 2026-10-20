@@ -106,8 +106,9 @@ enum {
  * registered client; BIND carries the exact arena size, RW queue VMO and a
  * dedicated bidirectional doorbell. BOUND proves installation, not merely an
  * enqueued transfer. RELEASED proves no executing request or mapped lease
- * remains. Client endpoints accept only QUEUE_NOTIFY with correlation equal
- * to their binding, never PREPARE/BIND or an owner operation. */
+ * remains. Client doorbells carry no packets at all, only the kernel's
+ * IPC_NOTIFY latch: the binding already fixes which ring a doorbell names, so
+ * a payload could only restate it and never PREPARE/BIND or an owner operation. */
 #define PH_FS_CLIENT_DOORBELL_RIGHTS (PACHA_FD_RIGHT_INSPECT | \
     PACHA_FD_RIGHT_SEND | PACHA_FD_RIGHT_RECV | PACHA_FD_RIGHT_WAIT | PACHA_FD_RIGHT_POLL)
 

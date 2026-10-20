@@ -241,9 +241,17 @@ void lpr_linux_signal_runtime_init(void)
     if (status == PACHAOS_SYSCALL_OK) {
         /* Best effort: the hint only removes a syscall.  Letting it gate
          * registration would turn an optimisation failure into a runtime that
-         * re-registers on every syscall. */
-        /* Left inert: the hint is a separate line of work and would confound
-         * the netd notification-drain measurement. */
+         * re-registers on every syscall.  Without it every intercepted Linux
+         * syscall ends in DELIVER_PENDING_FRAME, a full kernel round trip that
+         * almost always finds nothing. */
+        if (lpr_pacha_syscall2(
+                PACHAOS_SYSCALL_PROCESS_SIGNAL_CTL,
+                PACHAOS_PROCESS_SIGNAL_CTL_SET_PENDING_HINT,
+                (uint64_t)(uintptr_t)&lpr_native_pending_hint) ==
+            PACHAOS_SYSCALL_OK)
+        {
+            lpr_native_pending_hint_active = 1;
+        }
         const uint64_t native_mask =
             lpr_linux_signal_mask & ~lpr_signalfd_union_mask();
         if (lpr_pacha_syscall2(
@@ -355,7 +363,7 @@ int64_t lpr_linux_rt_sigtimedwait(
     uint64_t set_raw,
     uint64_t info_raw,
     uint64_t timeout_raw,
-    uint64_t sigsetsize)
+    uint64_t sigsetsize, unsigned *wait_not_ready __attribute__((unused)))
 {
     lpr_signal_thread_state_t *state = lpr_signal_thread_state_current();
     lpr_wait_deadline_t deadline;
@@ -421,7 +429,7 @@ int64_t lpr_linux_rt_sigtimedwait(
          * scheduler.  Ask the existing return-frame bridge to claim it before
          * deciding that a zero timeout has expired.  A matching signal is
          * completed in lpr_linux_async_signal_prepare(). */
-        lpr_linux_deliver_native_pending_frame(-LPR_LINUX_EINTR);
+        lpr_linux_deliver_native_pending_frame_after_wait(-LPR_LINUX_EINTR, wait_not_ready);
     } else {
         deadline.expires_ns = state->sigwait_deadline_ns;
         deadline.finite = (uint8_t)state->sigwait_deadline_finite;
@@ -443,7 +451,7 @@ int64_t lpr_linux_rt_sigtimedwait(
 
         lpr_wait_graph_t graph;
         lpr_wait_graph_init(&graph);
-        status = lpr_wait_graph_block(&graph, &deadline);
+        status = lpr_wait_graph_block(&graph, &deadline, wait_not_ready);
         if (status == LPR_WAIT_RESTART_SYSCALL) {
             const uint32_t rescanned =
                 lpr_linux_sigwait_take_pending(state->sigwait_set);
@@ -456,15 +464,31 @@ int64_t lpr_linux_rt_sigtimedwait(
     }
 }
 
-void lpr_linux_deliver_native_pending_frame(int64_t interrupted_result)
+void lpr_linux_deliver_native_pending_frame_after_wait(
+    int64_t interrupted_result, unsigned *wait_not_ready)
 {
-    if (lpr_native_pending_hint_active && lpr_native_pending_hint == 0) return;
+    /* The kernel keeps one hint word per process, but a pending signal belongs
+     * to one thread.  With a sibling running, clearing the word here could
+     * consume the hint published for that sibling, which would then return to
+     * Linux code without asking.  Trust it only while this is the only thread;
+     * siblings never clear it, so the word can only gain a stale 1 meanwhile. */
+    const int use_hint = lpr_native_pending_hint_active &&
+        __atomic_load_n(&lpr_state.thread_count, __ATOMIC_ACQUIRE) <= 1u;
+    /* The interrupting kernel pending bit precedes the wake, but its hint
+     * copyout runs after the wake. A resumed wait can therefore see 0 before
+     * publication: skipping the query here would consume that interruption
+     * and let the dispatcher re-wait forever. EINTR must query the kernel;
+     * only ordinary completions may take the advisory-zero fast path. */
+    if (use_hint && !(wait_not_ready && *wait_not_ready) &&
+        interrupted_result != -LPR_LINUX_EINTR &&
+        lpr_native_pending_hint == 0) return;
     struct lpr_linux_user_frame *interrupted_frame =
         (struct lpr_linux_user_frame *)lpr_current_linux_user_frame();
     if (interrupted_frame == 0) return;
     /* Cleared before the ask: a signal queued while the syscall runs makes the
      * kernel set it again, so nothing is lost. */
-    if (lpr_native_pending_hint_active) lpr_native_pending_hint = 0;
+    if (use_hint) lpr_native_pending_hint = 0;
+    if (wait_not_ready) *wait_not_ready = 0;
     const uint64_t saved_rax = interrupted_frame->rax;
     interrupted_frame->rax = (uint64_t)interrupted_result;
     // A successful DELIVER_PENDING_FRAME redirects directly to the native
@@ -476,6 +500,11 @@ void lpr_linux_deliver_native_pending_frame(int64_t interrupted_result)
         (uint64_t)(uintptr_t)interrupted_frame);
     // Reached only when no signal frame was installed.
     interrupted_frame->rax = saved_rax;
+}
+
+void lpr_linux_deliver_native_pending_frame(int64_t interrupted_result)
+{
+    lpr_linux_deliver_native_pending_frame_after_wait(interrupted_result, 0);
 }
 
 static void lpr_signal_context_to_linux(

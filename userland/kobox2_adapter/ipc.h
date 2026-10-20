@@ -2,6 +2,7 @@
 #ifndef PACHA_KOBOX_IPC_H
 #define PACHA_KOBOX_IPC_H
 
+#include <pacha/abi.h>
 #include <pacha/ipc.h>
 
 #define PH_IPC_NO_FD UINT64_MAX
@@ -21,21 +22,24 @@ struct ph_ipc_packet {
 
 struct ph_ipc {
     uint64_t generation;
-    int fd;
+    pacha_fd_t fd;
     unsigned int admitted;
     /* Rejected received capabilities whose close has not succeeded yet. */
     struct ph_ipc_packet rejected;
 };
 
-/* Immutable FD-free send view. Its owner pins the endpoint through every
- * sender's return; revoke/close must wait for those references. Unlike ph_ipc,
- * this object has no receive inventory or mutable admission state. Native
- * SEND serializes enqueue; independent senders need no shared syscall buffer. */
+/* Notify-only doorbell view. Its owner pins the endpoint through every
+ * notifier's return; revoke/close must wait for those references. A doorbell
+ * is the kernel's per-side channel latch, not a packet: the capability proves
+ * the peer and the shared ring carries the work, so there is nothing to send
+ * or validate, and independent notifiers need no shared syscall buffer. */
 struct ph_ipc_notice {
-    int fd;
-    uint64_t operation, generation, correlation, value;
+    pacha_fd_t fd;
 };
+/* Latch the peer side. -EPIPE means the peer is gone. */
 int ph_ipc_notify(const struct ph_ipc_notice *notice);
+/* Consume this side's latch without blocking: 0 consumed, -EAGAIN not set. */
+int ph_ipc_notify_consume(pacha_fd_t fd);
 
 /* Single owner, no concurrent calls, closes, packet mutation or unmapping of
  * syscall buffers. Zero-initialize the endpoint. Successful init takes the FD;
@@ -43,7 +47,7 @@ int ph_ipc_notify(const struct ph_ipc_notice *notice);
  * After destroy, generation remains a watermark: reuse needs a greater value
  * and a fresh channel. The controller must never recycle generation numbers
  * or old channel objects, even when native FD numbers are recycled. */
-int ph_ipc_init(struct ph_ipc *ipc, int fd, uint64_t generation);
+int ph_ipc_init(struct ph_ipc *ipc, pacha_fd_t fd, uint64_t generation);
 int ph_ipc_send(struct ph_ipc *ipc, struct ph_ipc_packet *packet);
 /* out must have fd_count == 0; failures leave it untouched. Native receive
  * errors do not confer FD ownership, including partial copyout failures. */

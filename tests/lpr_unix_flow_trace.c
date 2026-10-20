@@ -31,7 +31,7 @@ static int write_all(uint64_t fd, const void *data, uint64_t length)
 {
     const unsigned char *cursor = data;
     while (length) {
-        int64_t result = lpr_linux_write(fd, (uint64_t)(uintptr_t)cursor, length);
+        int64_t result = lpr_linux_write(fd, (uint64_t)(uintptr_t)cursor, length, 0);
         if (result <= 0 || (uint64_t)result > length) return -1;
         cursor += result;
         length -= (uint64_t)result;
@@ -49,7 +49,7 @@ static void output(uint64_t now, unsigned count, unsigned missing)
     for (unsigned i = 0; i < 16; ++i)
         path[15+i] = "0123456789abcdef"[(pid >> (60-4*i)) & 15];
     lpr_memcpy(path+31, ".bin", 5);
-    int64_t fd = lpr_linux_openat((uint64_t)-100, (uint64_t)(uintptr_t)path, 0x241, 0600);
+    int64_t fd = lpr_linux_openat((uint64_t)-100, (uint64_t)(uintptr_t)path, 0x241, 0600, 0);
     if (fd < 0) return;
     unsigned stored = count < FLOW_CAPACITY ? count : FLOW_CAPACITY;
     struct flow_row footer = { .values = {now, pid, 0, 'Z', count, missing}, .ready = 1 };

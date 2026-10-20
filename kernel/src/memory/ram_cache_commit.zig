@@ -96,7 +96,7 @@ const NativeArch = struct {
         copy.retirePhysCopyWindowsForRange(self.kernel_cr3, base, bytes);
     }
     fn users(_: *@This()) void {
-        vm.flushAllUserIdentityContexts(0, 4096);
+        vm.flushAllUserContexts();
     }
     fn kernel(self: *@This(), drain: bool) void {
         if (drain) copy.flushTlbAndCachesForCr3Range(self.kernel_cr3, 0, 4096) else copy.flushTlbForCr3Range(self.kernel_cr3, 0, 4096);

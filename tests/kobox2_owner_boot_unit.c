@@ -43,7 +43,7 @@ int pacha_ipc_channel_create(struct pacha_ipc_channel_pair *pair, uint64_t right
     return 0;
 }
 
-int pacha_fd_close(int fd) {
+int pacha_fd_close(pacha_fd_t fd) {
     assert(fd == 20 || fd == 21);
     if (fail_close)
         return -EIO;
@@ -51,7 +51,7 @@ int pacha_fd_close(int fd) {
     return 0;
 }
 
-int ph_ipc_init(struct ph_ipc *ipc, int fd, uint64_t generation) {
+int ph_ipc_init(struct ph_ipc *ipc, pacha_fd_t fd, uint64_t generation) {
     if (fail_adopt)
         return -EIO;
     *ipc = (struct ph_ipc){.fd = fd, .generation = generation, .admitted = 1};

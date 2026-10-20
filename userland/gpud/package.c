@@ -52,7 +52,7 @@ static int make_blob(const void *bytes, size_t size, struct ph_bootstrap_item *i
     uint64_t mapped = (size + 4095) & ~UINT64_C(4095);
     const uint64_t rights = PACHA_FD_RIGHT_INSPECT | PACHA_FD_RIGHT_CLOSE |
         PACHA_FD_RIGHT_TRANSFER | PACHA_FD_RIGHT_MAP_READ | PACHA_FD_RIGHT_MAP_WRITE;
-    int fd = pacha_vmo_create(mapped, rights, 0);
+    pacha_fd_t fd = pacha_vmo_create(mapped, rights, 0);
     if (fd < 16)
         return fd < 0 ? fd : -12;
     void *view = pacha_mmap(fd, mapped,
@@ -75,7 +75,7 @@ static int make_blob(const void *bytes, size_t size, struct ph_bootstrap_item *i
     return 0;
 }
 
-static int load_blob_limited(int filed_fd, const char *path, const char *name,
+static int load_blob_limited(pacha_fd_t filed_fd, const char *path, const char *name,
     size_t max_bytes, struct ph_bootstrap_item *item, uint8_t digest[32]) {
     struct filed_client_module_image image = {0};
     int error = filed_client_load_module_image_limited(filed_fd, path, name,
@@ -88,7 +88,7 @@ static int load_blob_limited(int filed_fd, const char *path, const char *name,
     return error;
 }
 
-static int load_blob(int filed_fd, const char *path, const char *name,
+static int load_blob(pacha_fd_t filed_fd, const char *path, const char *name,
     struct ph_bootstrap_item *item, uint8_t digest[32]) {
     return load_blob_limited(filed_fd, path, name,
         FILED_CLIENT_MODULE_MAX_BYTES, item, digest);
@@ -113,7 +113,7 @@ static int make_manifest(struct gpud_package *package) {
         &package->manifest_size, &source) == KB2_PROTOCOL_OK ? 0 : -22;
 }
 
-static int adopt_device(struct gpud_package *package, int filed_fd, int device_fd) {
+static int adopt_device(struct gpud_package *package, pacha_fd_t filed_fd, pacha_fd_t device_fd) {
     if (!package || package->device_fd || filed_fd < 16 || device_fd < 16)
         return -22;
     struct pacha_capsule_info info = {0};
@@ -130,7 +130,7 @@ static int adopt_device(struct gpud_package *package, int filed_fd, int device_f
     return 0;
 }
 
-int gpud_package_open(struct gpud_package *package, int filed_fd, int device_fd) {
+int gpud_package_open(struct gpud_package *package, pacha_fd_t filed_fd, pacha_fd_t device_fd) {
     int error = adopt_device(package, filed_fd, device_fd);
     if (error)
         return error;
@@ -210,8 +210,8 @@ static int safe_artifact_name(kb2_closure_string_t name) {
     return 1;
 }
 
-int gpud_package_open_at(struct gpud_package *package, int filed_fd,
-    int device_fd, const char *package_root, const uint8_t firmware_sha256[32],
+int gpud_package_open_at(struct gpud_package *package, pacha_fd_t filed_fd,
+    pacha_fd_t device_fd, const char *package_root, const uint8_t firmware_sha256[32],
     const uint8_t manifest_sha256[32], const uint8_t sandbox_sha256[32]) {
     if (!safe_package_root(package_root) || !firmware_sha256 ||
         !manifest_sha256 || !sandbox_sha256)
@@ -386,7 +386,7 @@ int gpud_package_unbind(struct gpud_package *package, uint64_t generation) {
         return -22;
     uint64_t fd = package->items[1].capability.fd;
     if (fd >= 16) {
-        int error = pacha_fd_close((int)fd);
+        int error = pacha_fd_close((pacha_fd_t)fd);
         if (error)
             return error;
         package->items[1] = (struct ph_bootstrap_item){0};
@@ -491,7 +491,7 @@ int gpud_package_close(struct gpud_package *package) {
     for (size_t i = 0; i < package->artifact_count + 2; ++i) {
         uint64_t fd = package->items[i].capability.fd;
         if (fd >= 16) {
-            int error = pacha_fd_close((int)fd);
+            int error = pacha_fd_close((pacha_fd_t)fd);
             if (error && !first)
                 first = error;
             if (!error)

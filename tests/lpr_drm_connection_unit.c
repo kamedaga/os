@@ -1,3 +1,4 @@
+#include "lpr_ipc_mock.h"
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
@@ -11,7 +12,7 @@ static uint64_t allocation_size, allocation_flags, request_marker;
 static int creates, registrations, requests, closed[128], fail_recv, fail_call, bad_reply, bind_error;
 static uint64_t last_magic, last_id;
 static char diagnostic[256];
-int64_t lpr_linux_write(uint64_t fd, uint64_t data, uint64_t bytes)
+int64_t lpr_linux_write(uint64_t fd, uint64_t data, uint64_t bytes, unsigned *wait_not_ready __attribute__((unused)))
 {
     assert(fd == 2 && bytes < sizeof(diagnostic));
     memcpy(diagnostic, (const void *)(uintptr_t)data, bytes);
@@ -45,7 +46,7 @@ int64_t lpr_pacha_syscall3(uint64_t op, uint64_t address, uint64_t rights, uint6
     uint64_t *pair = (void *)(uintptr_t)address;
     pair[0] = 80; pair[1] = 81; ++creates; return 0;
 }
-int64_t lpr_pacha_syscall2(uint64_t op, uint64_t fd, uint64_t address)
+static int64_t fixture_prepare_request(uint64_t op, uint64_t fd, uint64_t address)
 {
     if (op == PACHAOS_SYSCALL_MUNMAP) {
         assert((fd == (uintptr_t)auxiliary && address == sizeof(auxiliary)) ||
@@ -82,9 +83,9 @@ int64_t lpr_pacha_syscall6(uint64_t op, uint64_t fd, uint64_t address,
     return mapping_failure ? PACHA_SYSCALL_ERR_ALLOC :
         (int64_t)(uintptr_t)(fd == 91 ? auxiliary : temporary);
 }
-int64_t lpr_pacha_syscall4(uint64_t op, uint64_t fd, uint64_t address, uint64_t ticks, uint64_t flags)
+static int64_t fixture_finish_request(uint64_t op, uint64_t fd, uint64_t address, uint64_t ticks, uint64_t flags)
 {
-    assert(op == PACHAOS_SYSCALL_IPC_RECV_WAIT && fd == 82 && ticks == UINT64_MAX && !flags);
+    assert(op == PACHAOS_SYSCALL_IPC_RECV_WAIT && fd == 82 && ticks == UINT64_MAX && flags == PACHA_WAIT_UNINTERRUPTIBLE);
     if (fail_recv && last_magic != GPUD_DRM_BIND_PAGE_REQUEST_MAGIC) return PACHA_SYSCALL_ERR_CLOSED;
     struct pacha_ipc_msg *reply = (void *)(uintptr_t)address;
     if (last_magic == GPUD_DRM_BIND_PAGE_REQUEST_MAGIC) {
@@ -128,7 +129,7 @@ static void kms_query_marshalling(void)
                 memcpy(snapshot + v->pointer, &pointer, 8);
                 if (v->second_pointer) memcpy(snapshot + v->second_pointer, &second_pointer, 8);
             }
-            int fd = -1; void *mapping = NULL; uint64_t map_size = 0;
+            pacha_fd_t fd = -1; void *mapping = NULL; uint64_t map_size = 0;
             assert(!lpr_kms_query_prepare(&request, &shape, snapshot, 0, &fd, &mapping, &map_size));
             assert(request.data_size == (large ? shape.scalar_size : shape.inline_size));
             memcpy(scalar, request.data, shape.scalar_size);
@@ -188,7 +189,7 @@ static void kms_query_marshalling(void)
 
 int main(void)
 {
-    assert(amdgpu_info_failure(22, 440, "validate", -22) == -22);
+    assert(amdgpu_info_failure(22, 440, "validate", -22, 0) == -22);
     assert(strstr(diagnostic, "phase=validate query=22 bytes=440 errno=22"));
     lpr_tty_wire_page_fd = 90; lpr_tty_wire_page = page;
     assert(!hello() && creates == 1 && registrations == 1 && requests == 1);
@@ -213,7 +214,7 @@ int main(void)
     assert(lpr_gpud_drm_bind_page(91, page) == LPR_GPUD_DRM_ENDPOINT_FD);
     fail_call = 0;
     assert(!hello());
-    int aux_fd; void *mapping; uint64_t bytes;
+    pacha_fd_t aux_fd; void *mapping; uint64_t bytes;
     allocation_failure = 1;
     assert(lpr_drm_aux_create(5284, 1, &aux_fd, &mapping, &bytes) < 0);
     assert(!lpr_drm_aux_cache);
@@ -239,7 +240,7 @@ int main(void)
     assert(maps == saved_maps && vmo_creates == saved_creates);
     /* A concurrent owner, a temporary control page, and an oversized payload
      * all keep the exact-size temporary path; the cache budget is not a limit. */
-    int tmp_fd; void *tmp; uint64_t tmp_bytes;
+    pacha_fd_t tmp_fd; void *tmp; uint64_t tmp_bytes;
     assert(!lpr_drm_aux_create(5284, 1, &tmp_fd, &tmp, &tmp_bytes));
     assert(tmp_fd == 92 && tmp_bytes == 8192 && !allocation_flags);
     lpr_drm_aux_destroy(tmp_fd, tmp, tmp_bytes);
@@ -268,7 +269,7 @@ int main(void)
     for(unsigned i=0;i<5;++i) pointers[i]=(uintptr_t)&chunks[i];
     gpud_drm_amdgpu_cs_t cs={.ctx_id=7,.num_chunks=5,.chunks=(uintptr_t)pointers};
     gpud_drm_ioctl_request_t request={0};
-    assert(!lpr_drm_prepare_amdgpu_cs((uintptr_t)&cs,0,&request,&tmp_fd,&tmp,&tmp_bytes));
+    assert(!lpr_drm_prepare_amdgpu_cs((uintptr_t)&cs,0,&request,&tmp_fd,&tmp,&tmp_bytes, 0));
     gpud_drm_amdgpu_cs_wire_t wire;
     memcpy(&wire,request.data,sizeof(wire));
     assert(wire.chunk_count==5 && request.aux_size==84);
@@ -276,12 +277,12 @@ int main(void)
     lpr_drm_aux_destroy(tmp_fd,tmp,tmp_bytes);
     chunks[1].length_dw=2; /* A sem array is valid, not just a single handle. */
     uint32_t sems[2]={5,6}; chunks[1].chunk_data=(uintptr_t)sems;
-    assert(!lpr_drm_prepare_amdgpu_cs((uintptr_t)&cs,0,&request,&tmp_fd,&tmp,&tmp_bytes));
+    assert(!lpr_drm_prepare_amdgpu_cs((uintptr_t)&cs,0,&request,&tmp_fd,&tmp,&tmp_bytes, 0));
     lpr_drm_aux_destroy(tmp_fd,tmp,tmp_bytes);
     chunks[1].chunk_id=99;
-    assert(lpr_drm_prepare_amdgpu_cs((uintptr_t)&cs,0,&request,&tmp_fd,&tmp,&tmp_bytes)==-LPR_LINUX_EOPNOTSUPP);
+    assert(lpr_drm_prepare_amdgpu_cs((uintptr_t)&cs,0,&request,&tmp_fd,&tmp,&tmp_bytes, 0)==-LPR_LINUX_EOPNOTSUPP);
     chunks[1].chunk_id=5; ib.pad=1;
-    assert(lpr_drm_prepare_amdgpu_cs((uintptr_t)&cs,0,&request,&tmp_fd,&tmp,&tmp_bytes)==-LPR_LINUX_EINVAL);
+    assert(lpr_drm_prepare_amdgpu_cs((uintptr_t)&cs,0,&request,&tmp_fd,&tmp,&tmp_bytes, 0)==-LPR_LINUX_EINVAL);
     assert(tmp_fd==-1 && !tmp && !tmp_bytes);
     kms_query_marshalling();
     {
@@ -293,7 +294,7 @@ int main(void)
         _Static_assert(sizeof(prefix) == 16, "original Linux GEM_OP prefix");
         gpud_drm_ioctl_request_t operation = {0};
         uint64_t pointer = 0, extent = 0;
-        int view_fd = -1; void *view = NULL;
+        pacha_fd_t view_fd = -1; void *view = NULL;
         assert(!lpr_drm_prepare_amdgpu_gem_op(GPUD_DRM_IOCTL_AMDGPU_GEM_OP,
             (uintptr_t)&prefix, 1, &operation, &pointer,
             &view_fd, &view, &extent));
@@ -305,7 +306,7 @@ int main(void)
             .value = UINT64_C(0x12345000)};
         uint64_t pointer = 0;
         gpud_drm_ioctl_request_t operation = {0};
-        int view_fd = -1; void *view = NULL; uint64_t extent = 0;
+        pacha_fd_t view_fd = -1; void *view = NULL; uint64_t extent = 0;
         const uint32_t command = extended ? GPUD_DRM_IOCTL_AMDGPU_GEM_OP_EXT :
             GPUD_DRM_IOCTL_AMDGPU_GEM_OP;
         assert(!lpr_drm_prepare_amdgpu_gem_op(command, (uintptr_t)&user, 1,
@@ -334,4 +335,32 @@ int main(void)
     puts("LPR Mesa CS: multiple IBs, ignored BO fields, sync/fence, rejects and cleanup PASS");
     puts("LPR page connection: one bind, no VMO per call, loss/no replay, fork, errors PASS");
     puts("LPR auxiliary reuse: zeroing, bounded retention, temporary fallback, fork and errors PASS");
+}
+
+/* Request preparation and reply rendering are fixture phases within one
+ * synchronous syscall. Their transaction tags never become caller FDs. */
+int64_t lpr_pacha_syscall2(uint64_t nr, uint64_t a, uint64_t b)
+{
+    assert(nr != PACHAOS_SYSCALL_IPC_CALL);
+    return fixture_prepare_request(nr, a, b);
+}
+int64_t lpr_pacha_syscall4(uint64_t nr, uint64_t a, uint64_t b, uint64_t c, uint64_t d)
+{
+    return fixture_finish_request(nr, a, b, c, d);
+}
+int64_t lpr_ipc_message(uint64_t nr, uint64_t endpoint,
+    uint64_t request, uint64_t reply, uint64_t timeout, uint64_t flags, int *sent)
+{
+    if (nr != PACHA_IPC_SYSCALL_CALL) return test_lpr_ipc_noncall(nr, endpoint, request, reply, timeout, flags, sent);
+
+    assert(nr == PACHAOS_SYSCALL_IPC_CALL && request && reply);
+    assert(timeout == UINT64_MAX && flags == PACHA_WAIT_UNINTERRUPTIBLE);
+    *sent = 0;
+    int64_t transaction = fixture_prepare_request(nr, endpoint, request);
+    if (transaction < 16) return transaction;
+    *sent = 1;
+    int64_t status = fixture_finish_request(PACHAOS_SYSCALL_IPC_RECV_WAIT,
+        (uint64_t)transaction, reply, timeout, flags);
+
+    return status;
 }

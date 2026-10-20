@@ -170,10 +170,10 @@ pub fn wakeThreadTargets(
 ) bool {
     var all_copies_ok = true;
     for (targets, 0..) |target, target_index| {
-        if (target.wait_token == 0 or target.group.isNull()) continue;
+        if (target.wait_token == 0 or (target.group.isNull() and target.receive_block.isNull())) continue;
         var already_handled = false;
         for (targets[0..target_index]) |earlier| {
-            if (sameFdWaitGroup(earlier, target)) {
+            if (!target.group.isNull() and sameFdWaitGroup(earlier, target)) {
                 already_handled = true;
                 break;
             }
@@ -194,11 +194,11 @@ pub fn wakeThreadTargets(
             .claimed => {},
         }
 
-        // Targets are snapshots.  Remove every registration in the group
-        // before touching userspace, while the scheduler claim keeps the
-        // target non-runnable and excludes timeout/signal completion.
-        state.cancelFdWaitGroup(target.group, target.wait_token);
-        if (target.recv_msg_va != 0) {
+        // Detach before staging/copyout; the claim keeps the thread
+        // non-runnable while stable group links retain every ready poll item.
+        state.detachFdWaitGroup(target.group, target.wait_token);
+        if (target.recv_memory.active) {
+            state.cancelFdWaitGroup(target.group, target.wait_token);
             // No message was dequeued by this generic wake path. In
             // particular, peer death must not masquerade as RECV success.
             _ = scheduler.publishClaimedWaitCompletion(
@@ -213,36 +213,9 @@ pub fn wakeThreadTargets(
             );
             continue;
         }
-        var ready_count: u64 = 0;
-        var copy_ok = true;
-        for (targets, 0..) |member, member_index| {
-            if (!sameFdWaitGroup(member, target) or member.pollfd_va == 0) continue;
-            var duplicate_poll_item = false;
-            for (targets[0..member_index]) |earlier| {
-                if (sameFdWaitGroup(earlier, target) and
-                    earlier.pollfd_va == member.pollfd_va)
-                {
-                    duplicate_poll_item = true;
-                    break;
-                }
-            }
-            if (duplicate_poll_item) continue;
-            var combined_revents: u64 = 0;
-            for (targets[member_index..]) |candidate| {
-                if (sameFdWaitGroup(candidate, target) and
-                    candidate.pollfd_va == member.pollfd_va)
-                {
-                    combined_revents |= candidate.revents;
-                }
-            }
-            if (!h.write_user_u64(
-                member.owner,
-                member.pollfd_va + fd_abi.pollfd_revents_offset,
-                combined_revents,
-            )) copy_ok = false;
-            if (combined_revents != 0) ready_count += 1;
-        }
-        const resume_rax = if (copy_ok) ready_count else sc.syscall_err_invalid;
+        const result = copyClaimedFdWaitGroup(h, state, target);
+        const copy_ok = result.copy_ok;
+        const resume_rax = result.status;
         _ = scheduler.publishClaimedWaitCompletion(
             target.thread_index,
             target.thread_generation,
@@ -255,16 +228,52 @@ pub fn wakeThreadTargets(
     return all_copies_ok;
 }
 
-fn wakePipeWaiters(h: anytype, state: *kernel.KernelState, pipe_ref: kernel.PipeRef, write_side: bool, ready_events: u64) bool {
-    var wake_storage: [max_pollfds]kernel.ThreadWakeTarget = undefined;
-    const wake_count = state.takePipeWaiters(pipe_ref, write_side, ready_events, wake_storage[0..]);
-    return wakeThreadTargets(h, state, wake_storage[0..wake_count]);
+pub fn copyClaimedFdWaitGroup(h: anytype, state: *kernel.KernelState, target: kernel.ThreadWakeTarget) struct { copy_ok: bool, status: u64 } {
+    var batch: [32]kernel.ThreadWakeTarget = undefined;
+    var cursor: u64 = 0;
+    var ready_count: u64 = 0;
+    var first: kernel.ThreadWakeTarget = undefined;
+    var copy_ok = true;
+    while (true) {
+        const count = state.takeFdWaitGroupReadyBatch(target.group, target.wait_token, &cursor, &batch);
+        if (count == 0) break;
+        for (batch[0..count]) |member| {
+            if (member.revents == 0) continue;
+            ready_count += 1;
+            if (ready_count == 1) {
+                first = member;
+                continue;
+            }
+            if (ready_count == 2 and !h.write_user_u64(first.owner, first.pollfd_va + fd_abi.pollfd_revents_offset, first.revents)) copy_ok = false;
+            if (!h.write_user_u64(member.owner, member.pollfd_va + fd_abi.pollfd_revents_offset, member.revents)) copy_ok = false;
+        }
+    }
+    if (ready_count == 1) {
+        const base = state.fd_wait_groups.get(target.group.index).?.pollfds_va;
+        // Claim excludes timeout/signal; K keeps group storage alive through staging.
+        copy_ok = scheduler.stagePollResult(target, (first.pollfd_va - base) / fd_abi.pollfd_size, first.revents);
+    }
+    state.cancelFdWaitGroup(target.group, target.wait_token);
+    return .{ .copy_ok = copy_ok, .status = if (copy_ok) ready_count else sc.syscall_err_invalid };
+}
+
+// Keep the seed batch separate from the admission frame; stable group links
+// retain readiness until claim, copy and publication finish under K.
+noinline fn wakePipeWaiters(h: anytype, state: *kernel.KernelState, pipe_ref: kernel.PipeRef, write_side: bool, ready_events: u64) bool {
+    var wake_storage: [32]kernel.ThreadWakeTarget = undefined;
+    var ok = true;
+    while (true) {
+        const wake_count = state.takePipeWaiters(pipe_ref, write_side, ready_events, wake_storage[0..]);
+        if (wake_count == 0) return ok;
+        if (!wakeThreadTargets(h, state, wake_storage[0..wake_count])) ok = false;
+    }
 }
 
 /// Retirement is a terminal event even for aliases already sleeping in
 /// WAIT_MANY. Reuse the same wait-group claim/copy/wake protocol as normal I/O.
-pub fn wakeRetiredIrqWaiters(h: anytype, state: *kernel.KernelState) void {
-    var targets: [max_pollfds]kernel.ThreadWakeTarget = undefined;
+/// Keep its seed-batch frame out of retirement/fault callers as well.
+pub noinline fn wakeRetiredIrqWaiters(h: anytype, state: *kernel.KernelState) void {
+    var targets: [32]kernel.ThreadWakeTarget = undefined;
     while (true) {
         const count = state.takeReadyIrqWaiters(&targets);
         if (count == 0) return;
@@ -282,10 +291,38 @@ fn ipcChannelHandleForFd(state: *kernel.KernelState, proc: kernel.PrincipalId, f
     };
 }
 
-fn wakeIpcChannelCloseWaiters(h: anytype, state: *kernel.KernelState, handle: kernel.IpcChannelHandle) bool {
-    var wake_storage: [max_pollfds]kernel.ThreadWakeTarget = undefined;
-    const wake_count = state.takeIpcChannelPeerCloseWaiters(handle, wake_storage[0..]);
-    return wakeThreadTargets(h, state, wake_storage[0..wake_count]);
+// Like pipe wake, keep this seed batch out of the teardown caller frame.
+noinline fn wakeIpcChannelCloseWaiters(h: anytype, state: *kernel.KernelState, handle: kernel.IpcChannelHandle) bool {
+    var wake_storage: [32]kernel.ThreadWakeTarget = undefined;
+    var ok = true;
+    while (true) {
+        const wake_count = state.takeIpcChannelPeerCloseWaiters(handle, wake_storage[0..]);
+        if (wake_count == 0) return ok;
+        if (!wakeThreadTargets(h, state, wake_storage[0..wake_count])) ok = false;
+    }
+}
+
+/// Completes a lean IPC_NOTIFY_WAIT waiter with `status`.  The waiter was
+/// already detached from its channel slot, so a stale token only means the
+/// thread left the wait (timeout, signal, exit) and owes nothing.
+pub fn completeIpcNotifyWaiter(target: kernel.ThreadWakeTarget, status: u64) scheduler.ClaimedWaitPublishResult {
+    return scheduler.claimAndPublishWaitCompletionPreferred(
+        target.thread_index,
+        target.thread_generation,
+        target.owner,
+        target.wait_token,
+        status,
+    );
+}
+
+fn wakeIpcChannelNotifyWaitersAfterClose(
+    state: *kernel.KernelState,
+    handle: kernel.IpcChannelHandle,
+    snapshot: [2]?kernel.ThreadWakeTarget,
+) void {
+    var targets: [2]kernel.ThreadWakeTarget = undefined;
+    const count = state.takeIpcChannelNotifyWaitersAfterClose(handle, snapshot, &targets);
+    for (targets[0..count]) |target| _ = completeIpcNotifyWaiter(target, sc.syscall_err_closed);
 }
 
 fn wakeReadyPipeWaiters(h: anytype, state: *kernel.KernelState, pipe_ref: kernel.PipeRef, write_side: bool) bool {
@@ -390,10 +427,14 @@ fn fdWrite(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, fd:
     var wake_storage: [max_fd_wake_owners]kernel.PrincipalId = undefined;
     const wake_count = state.eventWakeOwnersForFd(proc, fd, wake_storage[0..]) catch return sc.syscall_err_invalid;
     state.eventWriteCounter(proc, fd, value) catch return sc.syscall_err_invalid;
-    var target_storage: [max_pollfds]kernel.ThreadWakeTarget = undefined;
-    const target_count = state.takeObjectReadableWaiters(event_object, target_storage[0..]);
-    if (!wakeThreadTargets(h, state, target_storage[0..target_count]))
-        return sc.syscall_err_invalid;
+    var target_storage: [32]kernel.ThreadWakeTarget = undefined;
+    var copies_ok = true;
+    while (true) {
+        const target_count = state.takeObjectReadableWaiters(event_object, target_storage[0..]);
+        if (target_count == 0) break;
+        if (!wakeThreadTargets(h, state, target_storage[0..target_count])) copies_ok = false;
+    }
+    if (!copies_ok) return sc.syscall_err_invalid;
     wakeOwners(h, wake_storage[0..wake_count]);
     return 8;
 }
@@ -543,7 +584,7 @@ fn fdFcntl(state: *kernel.KernelState, proc: kernel.PrincipalId, fd: kernel.Fd, 
             state.setFdFlags(proc, fd, kernel.fdFlagsFromBits(@truncate(arg0)), kernel.fdFlagsFromBits(@truncate(arg1))) catch break :blk sc.syscall_err_invalid;
             break :blk sc.syscall_ok;
         },
-        fd_abi.fcntl_dup => state.dupFd(proc, fd, @intCast(arg0), kernel.fdRightsFromBits(arg1), .{}) catch sc.syscall_err_invalid,
+        fd_abi.fcntl_dup => if (arg0 >= kernel.fd_number_capacity) sc.syscall_err_invalid else state.dupFd(proc, fd, @intCast(arg0), kernel.fdRightsFromBits(arg1), .{}) catch sc.syscall_err_invalid,
         else => sc.syscall_err_invalid,
     };
 }
@@ -560,35 +601,21 @@ fn pollNowNs(state: *kernel.KernelState, proc: kernel.PrincipalId, fd: kernel.Fd
     return sample;
 }
 
-fn pollOnce(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, pollfds_va: u64, count: u64) ?u64 {
-    if (pollfds_va == 0 or count > fd_abi.max_pollfds) return null;
-    var now: ?u64 = null;
-    var ready_count: u64 = 0;
-    var i: u64 = 0;
-    while (i < count) : (i += 1) {
-        const item_va = pollfds_va + i * fd_abi.pollfd_size;
-        const fd_u64 = h.read_user_u64(proc, item_va + fd_abi.pollfd_fd_offset) orelse return null;
-        const events = h.read_user_u64(proc, item_va + fd_abi.pollfd_events_offset) orelse return null;
-        if ((events & ~fd_abi.event_known_mask) != 0) return null;
-        const now_ns = pollNowNs(state, proc, @intCast(fd_u64), events, &now);
-        const revents = state.fdPollEvents(proc, @intCast(fd_u64), events, now_ns) orelse return null;
-        if (!h.write_user_u64(proc, item_va + fd_abi.pollfd_revents_offset, revents)) return null;
-        if (revents != 0) ready_count += 1;
-    }
-    return ready_count;
-}
-
 fn readPollItems(h: anytype, proc: kernel.PrincipalId, pollfds_va: u64, count: u64, out: []PollItem) ?[]PollItem {
     if (pollfds_va == 0 or count > fd_abi.max_pollfds or count > out.len) return null;
+    _ = std_rc.math.add(u64, pollfds_va, count * fd_abi.pollfd_size) catch return null;
+    var wire_storage: [max_pollfds * fd_abi.pollfd_size]u8 = undefined;
+    const bytes = wire_storage[0 .. @as(usize, @intCast(count)) * fd_abi.pollfd_size];
+    // One bounded snapshot avoids per-entry user walks and TOCTOU re-reads.
+    if (count != 0 and !h.copy_user_bytes_from_va(proc, pollfds_va, bytes)) return null;
     var i: usize = 0;
     while (i < count) : (i += 1) {
         const item_va = pollfds_va + @as(u64, @intCast(i)) * fd_abi.pollfd_size;
-        var wire: [fd_abi.pollfd_size]u8 = undefined;
-        if (!h.copy_user_bytes_from_va(proc, item_va, &wire)) return null;
+        const wire = bytes[i * fd_abi.pollfd_size ..][0..fd_abi.pollfd_size];
         const fd_u64 = @import("std").mem.readInt(u64, wire[fd_abi.pollfd_fd_offset..][0..8], .little);
         const events = @import("std").mem.readInt(u64, wire[fd_abi.pollfd_events_offset..][0..8], .little);
-        const min_write_bytes = @import("std").mem.readInt(u64, wire[fd_abi.pollfd_revents_offset..][0..8], .little);
-        if ((events & ~fd_abi.event_known_mask) != 0) return null;
+        const min_write_bytes = @import("std").mem.readInt(u64, wire[fd_abi.pollfd_min_write_bytes_offset..][0..8], .little);
+        if (fd_u64 >= kernel.fd_number_capacity or (events & ~fd_abi.event_known_mask) != 0) return null;
         out[i] = .{
             .fd = @intCast(fd_u64),
             .events = events,
@@ -599,18 +626,18 @@ fn readPollItems(h: anytype, proc: kernel.PrincipalId, pollfds_va: u64, count: u
     return out[0..@intCast(count)];
 }
 
-test "poll item snapshot copies each ABI item once and preserves validation" {
+test "poll item snapshot copies one range and preserves validation" {
     const std = @import("std");
     const Mock = struct {
         const base: u64 = 0x1ff0; // Forward a page-crossing item unchanged.
-        var bytes: [48]u8 = undefined;
+        var bytes: [max_pollfds * fd_abi.pollfd_size]u8 = undefined;
         var calls: usize = 0;
         var fail_at: usize = 0;
         fn copy(_: kernel.PrincipalId, va: u64, dest: []u8) bool {
             calls += 1;
             if (calls == fail_at) return false;
-            std.debug.assert(dest.len == fd_abi.pollfd_size);
-            std.debug.assert(va == base + (calls - 1) * fd_abi.pollfd_size);
+            std.debug.assert(dest.len <= bytes.len and dest.len % fd_abi.pollfd_size == 0);
+            std.debug.assert(va == base);
             const offset: usize = @intCast(va - base);
             @memcpy(dest, bytes[offset..][0..dest.len]);
             return true;
@@ -619,37 +646,74 @@ test "poll item snapshot copies each ABI item once and preserves validation" {
     const h = .{ .copy_user_bytes_from_va = Mock.copy };
     const owner = kernel.processPrincipalFromIndex(0).?;
     var storage: [2]PollItem = undefined;
-    for ([_]u64{ 16, fd_abi.event_readable, 999, 17, fd_abi.event_writable, 123 }, 0..) |value, i|
+    for ([_]u64{ 16, fd_abi.event_readable, 999, 0xffff, 17, fd_abi.event_writable, 123, 0xffff }, 0..) |value, i|
         std.mem.writeInt(u64, Mock.bytes[i * 8 ..][0..8], value, .little);
     Mock.calls = 0;
     Mock.fail_at = 0;
     const items = readPollItems(&h, owner, Mock.base, 2, &storage).?;
-    try std.testing.expectEqual(@as(usize, 2), Mock.calls);
+    try std.testing.expectEqual(@as(usize, 1), Mock.calls);
     try std.testing.expectEqualDeep(PollItem{ .fd = 16, .events = fd_abi.event_readable, .min_write_bytes = 0, .item_va = Mock.base }, items[0]);
-    try std.testing.expectEqualDeep(PollItem{ .fd = 17, .events = fd_abi.event_writable, .min_write_bytes = 123, .item_va = Mock.base + 24 }, items[1]);
+    try std.testing.expectEqualDeep(PollItem{ .fd = 17, .events = fd_abi.event_writable, .min_write_bytes = 123, .item_va = Mock.base + 32 }, items[1]);
     Mock.calls = 0;
     try std.testing.expect(readPollItems(&h, owner, 0, 1, &storage) == null);
     try std.testing.expect(readPollItems(&h, owner, Mock.base, fd_abi.max_pollfds + 1, &storage) == null);
     try std.testing.expect(readPollItems(&h, owner, Mock.base, 3, &storage) == null);
     try std.testing.expectEqual(@as(usize, 0), readPollItems(&h, owner, Mock.base, 0, &storage).?.len);
     try std.testing.expectEqual(@as(usize, 0), Mock.calls);
-    Mock.fail_at = 2;
+    Mock.fail_at = 1;
     try std.testing.expect(readPollItems(&h, owner, Mock.base, 2, &storage) == null);
-    try std.testing.expectEqual(@as(usize, 2), Mock.calls);
+    try std.testing.expectEqual(@as(usize, 1), Mock.calls);
     Mock.fail_at = 0;
     Mock.calls = 0;
     std.mem.writeInt(u64, Mock.bytes[8..16], 1 << 63, .little);
     try std.testing.expect(readPollItems(&h, owner, Mock.base, 1, &storage) == null);
+    std.mem.writeInt(u64, Mock.bytes[8..16], fd_abi.event_readable, .little);
+    for ([_]u64{ 4097, 0x80000000, kernel.fd_number_capacity - 1 }) |fd| {
+        Mock.calls = 0;
+        std.mem.writeInt(u64, Mock.bytes[0..8], fd, .little);
+        try std.testing.expectEqual(fd, readPollItems(&h, owner, Mock.base, 1, &storage).?[0].fd);
+    }
+    for ([_]u64{ fd_abi.thread_self_fd, std.math.maxInt(u32), (@as(u64, 1) << 32) | 16 }) |fd| {
+        Mock.calls = 0;
+        std.mem.writeInt(u64, Mock.bytes[0..8], fd, .little);
+        try std.testing.expect(readPollItems(&h, owner, Mock.base, 1, &storage) == null);
+    }
+    var many: [max_pollfds]PollItem = undefined;
+    for (0..max_pollfds) |i| {
+        const wire = Mock.bytes[i * fd_abi.pollfd_size ..][0..fd_abi.pollfd_size];
+        std.mem.writeInt(u64, wire[0..8], 16, .little);
+        std.mem.writeInt(u64, wire[8..16], fd_abi.event_writable, .little);
+        std.mem.writeInt(u64, wire[16..24], 58, .little);
+        std.mem.writeInt(u64, wire[24..32], std.math.maxInt(u64), .little);
+    }
+    Mock.calls = 0;
+    try std.testing.expectEqual(max_pollfds, readPollItems(&h, owner, Mock.base, max_pollfds, &many).?.len);
+    try std.testing.expectEqual(@as(usize, 1), Mock.calls);
+    try std.testing.expectEqual(@as(u64, 58), many[max_pollfds - 1].min_write_bytes);
+    try std.testing.expect(readPollItems(&h, owner, std.math.maxInt(u64) - 8, 1, &many) == null);
 }
 
-fn pollCached(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, items: []const PollItem) ?u64 {
+fn pollCached(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, items: []const PollItem, frame: *TrapFrame) ?u64 {
     var ready_count: u64 = 0;
+    var first_index: usize = 0;
+    var first_events: u64 = 0;
     var now: ?u64 = null;
-    for (items) |item| {
+    for (items, 0..) |item, index| {
         const now_ns = pollNowNs(state, proc, item.fd, item.events, &now);
         const revents = state.fdPollEventsWithWriteMin(proc, item.fd, item.events, now_ns, item.min_write_bytes) orelse return null;
-        if (!h.write_user_u64(proc, item.item_va + fd_abi.pollfd_revents_offset, revents)) return null;
-        if (revents != 0) ready_count += 1;
+        if (revents == 0) continue;
+        ready_count += 1;
+        if (ready_count == 1) {
+            first_index = index;
+            first_events = revents;
+        } else {
+            if (ready_count == 2 and !h.write_user_u64(proc, items[first_index].item_va + fd_abi.pollfd_revents_offset, first_events)) return null;
+            if (!h.write_user_u64(proc, item.item_va + fd_abi.pollfd_revents_offset, revents)) return null;
+        }
+    }
+    if (ready_count == 1) {
+        frame.r10 = first_index;
+        frame.r8 = first_events;
     }
     return ready_count;
 }
@@ -703,16 +767,11 @@ fn registerCachedWaitersForPoll(
 }
 
 pub fn reclaimStaleFdWaitGroups(state: *kernel.KernelState) void {
-    var snapshots: [kernel.max_fd_wait_groups]kernel.FdWaitGroupSnapshot = undefined;
-    const count = state.snapshotFdWaitGroups(snapshots[0..]);
-    for (snapshots[0..count]) |snapshot| {
-        if (scheduler.waitTokenIsCurrent(
-            snapshot.owner,
-            snapshot.thread_index,
-            snapshot.thread_generation,
-            snapshot.wait_token,
-        )) continue;
-        state.cancelFdWaitGroup(snapshot.group, snapshot.wait_token);
+    var groups = state.fd_wait_groups.iterator();
+    while (groups.next()) |entry| {
+        const slot = entry.value;
+        if (scheduler.waitTokenIsCurrent(slot.owner, slot.thread_index, slot.thread_generation, slot.wait_token)) continue;
+        state.cancelFdWaitGroup(.{ .index = entry.ref.index, .generation = entry.ref.generation }, slot.wait_token);
     }
 }
 
@@ -729,7 +788,7 @@ pub fn beginFdWaitGroupWithReclaim(
         thread_generation,
         wait_token,
     ) catch |err| switch (err) {
-        kernel.KernelError.TableFull => {
+        kernel.KernelError.TableFull, kernel.KernelError.OutOfFreePages => {
             reclaimStaleFdWaitGroups(state);
             return state.beginFdWaitGroup(
                 owner,
@@ -760,8 +819,12 @@ fn timerNowNs() u64 {
     return @import("../realtime_clock.zig").monotonicNs() orelse scheduler.lapic_tick_count * 1_000_000;
 }
 
-fn fdPoll(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, pollfds_va: u64, count: u64) u64 {
-    return pollOnce(h, state, proc, pollfds_va, count) orelse sc.syscall_err_invalid;
+fn fdPoll(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, frame: *TrapFrame) u64 {
+    frame.r10 = 0;
+    frame.r8 = 0;
+    var storage: [max_pollfds]PollItem = undefined;
+    const items = readPollItems(h, proc, frame.rdi, frame.rsi, &storage) orelse return sc.syscall_err_invalid;
+    return pollCached(h, state, proc, items, frame) orelse sc.syscall_err_invalid;
 }
 
 fn fdWaitMany(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, frame: *TrapFrame) u64 {
@@ -769,15 +832,19 @@ fn fdWaitMany(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, 
     const count = frame.rsi;
     const timeout_ticks = frame.rdx;
     const flags = frame.r10;
-    if (flags != 0) return sc.syscall_err_invalid;
+    // INVALID and singleton count both have numeric value 1. A nonzero
+    // event register distinguishes success, including error returns before block.
+    frame.r10 = 0;
+    frame.r8 = 0;
+    if ((flags & ~fd_abi.wait_uninterruptible) != 0) return sc.syscall_err_invalid;
     var poll_items_storage: [max_pollfds]PollItem = undefined;
     const poll_items = readPollItems(h, proc, pollfds_va, count, poll_items_storage[0..]) orelse return sc.syscall_err_invalid;
-    const ready = pollCached(h, state, proc, poll_items) orelse return sc.syscall_err_invalid;
+    const ready = pollCached(h, state, proc, poll_items, frame) orelse return sc.syscall_err_invalid;
     if (ready != 0) return ready;
     if (timeout_ticks == 0) return sc.syscall_err_not_ready;
 
     const current_thread = scheduler.currentThread();
-    const current_generation = scheduler.generationOfThread(current_thread) orelse return sc.syscall_err_invalid;
+    const current_generation = scheduler.currentThreadGeneration() orelse return sc.syscall_err_invalid;
     state.unregisterFdWaitersForThread(proc, current_thread, current_generation);
     const wait_token = scheduler.reserveCurrentWaitToken(current_generation) orelse
         return sc.syscall_err_invalid;
@@ -791,6 +858,7 @@ fn fdWaitMany(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, 
         scheduler.cancelCurrentWaitToken(current_generation, wait_token);
         return statusFromKernelError(err);
     };
+    state.fd_wait_groups.get(group.index).?.pollfds_va = pollfds_va;
     const register_start = ipc_metric.timestamp();
     registerCachedWaitersForPoll(
         state,
@@ -812,7 +880,7 @@ fn fdWaitMany(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, 
     };
     ipc_metric.record(.wait_register, register_start);
     const repoll_start = ipc_metric.timestamp();
-    const ready_after_register = pollCached(h, state, proc, poll_items) orelse {
+    const ready_after_register = pollCached(h, state, proc, poll_items, frame) orelse {
         scheduler.cancelCurrentWaitToken(current_generation, wait_token);
         state.cancelFdWaitGroup(group, wait_token);
         return sc.syscall_err_invalid;
@@ -828,6 +896,7 @@ fn fdWaitMany(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, 
     if (h.block_current_thread_for_event(
         frame,
         true,
+        (flags & fd_abi.wait_uninterruptible) != 0,
         wait_token,
         block_ticks,
         sc.syscall_err_not_ready,
@@ -980,6 +1049,7 @@ fn revokeVmoFd(
 ) u64 {
     user_vm.lockAllVmTransactions();
     defer user_vm.unlockAllVmTransactions();
+    if (comptime @import("../state/reference_check.zig").enabled) @import("../state/reference_check.zig").check(state) catch |err| @import("../state/reference_check.zig").failure(err);
     const vmo_ref = state.nativeVmoRefForRevokeFd(proc, fd) catch return sc.syscall_err_invalid;
     if (state.nativeVmoTreeMappingsOverlapPinnedUserObjects(vmo_ref)) return sc.syscall_err_invalid;
     _ = state.revokeVmoFdWithFreeList(proc, fd, free_list, VmoRevokeUnmapper{}) catch |err| switch (err) {
@@ -1000,7 +1070,7 @@ fn createPageViewVmoFd(
     flags_bits: u64,
 ) u64 {
     if (indices_va == 0 or page_count_u64 == 0 or
-        page_count_u64 > kernel.max_vmo_backing_pages or
+        page_count_u64 > kernel.max_vmo_logical_pages or
         page_count_u64 > (@import("std").math.maxInt(u64) / fd_abi.vmo_page_view_index_size) or
         indices_va > @import("std").math.maxInt(u64) -
             page_count_u64 * fd_abi.vmo_page_view_index_size or
@@ -1104,12 +1174,9 @@ fn mapVmoFd(
     vmo_offset: u64,
 ) u64 {
     if (size_bytes == 0) return sc.syscall_err_invalid;
-    const aligned_size = pageAlignUp(size_bytes) orelse return sc.syscall_err_invalid;
+    const aligned_size = @as(u64, kernel.checkedVmoPageCount(size_bytes) catch return sc.syscall_err_invalid) * 4096;
     var prot = protFromBits(prot_bits) orelse return sc.syscall_err_invalid;
     const flags = mmapFlagsFromBits(flags_bits) orelse return sc.syscall_err_invalid;
-    const sparse_reservation = flags.anonymous and flags.private and !flags.shared and flags.noreserve;
-    const page_limit = if (sparse_reservation) kernel.max_vmo_logical_pages else kernel.max_vmo_backing_pages;
-    if (aligned_size / 4096 > page_limit) return sc.syscall_err_invalid;
     if (flags.anonymous and vmo_offset != 0) return sc.syscall_err_invalid;
     if ((vmo_offset & 0xFFF) != 0) return sc.syscall_err_invalid;
     if (requested_va == 0 and (flags.fixed or flags.fixed_noreplace)) return sc.syscall_err_invalid;
@@ -1137,8 +1204,6 @@ fn mapVmoFd(
         (state.userMapRangeIsFree(proc, requested_va, aligned_size) catch false);
     const base_va = if (flags.fixed or flags.fixed_noreplace or use_requested_hint)
         requested_va
-    else if (sparse_reservation and aligned_size / 4096 > kernel.max_vmo_backing_pages)
-        findMremapMoveTarget(state, proc, aligned_size) orelse return sc.syscall_err_map
     else
         state.findRandomizedFreeUserMapVa(proc, aligned_size, 0x4644_4d4d_4150_0000 ^ scheduler.lapic_tick_count ^ @as(u64, fd)) catch |err| blk: {
             // Exhausting the preferred arena is a placement issue for every
@@ -1167,7 +1232,7 @@ fn mapVmoFd(
             @intCast(aligned_size),
         );
         const reservation_slots = reservation_slots_result orelse return sc.syscall_err_map;
-        if (reservation_slots > user_vm.freeUserReservationSlotCount(proc)) return sc.syscall_err_alloc;
+        if (!user_vm.prepareUserReservationSlots(proc, reservation_slots)) return sc.syscall_err_alloc;
         const anonymous_max_prot = kernel.VmaProt{
             .read = true,
             .write = true,
@@ -1271,20 +1336,23 @@ fn mapVmoFd(
     // Device PTEs must carry the admitted PAT slot; the ordinary eager
     // shared-RAM path below deliberately has no device-cache parameter.
     if (state.nativeVmoDevicePatSlot(mapped_vmo) != null) return base_va;
-    var paddrs: [kernel.max_vmo_backing_pages]u64 = undefined;
     const page_count: usize = @intCast(aligned_size / 4096);
-    var map_prot: ?kernel.MapProt = null;
-    var i: usize = 0;
-    while (i < page_count) : (i += 1) {
-        const mapping = state.nativeVmaInitialMapping(proc, base_va + @as(u64, @intCast(i)) * 4096) orelse {
-            state.munmapRangeWithFreeList(proc, base_va, aligned_size, free_list) catch {};
-            return sc.syscall_err_map;
-        };
-        paddrs[i] = mapping.paddr;
-        if (map_prot == null) map_prot = mapping.prot;
+    const first = state.nativeVmaInitialMapping(proc, base_va) orelse {
+        state.munmapRangeWithFreeList(proc, base_va, aligned_size, free_list) catch {};
+        return sc.syscall_err_map;
+    };
+    const pages = user_vm.InitialVmaPages{ .state = state, .principal = proc, .base = base_va, .prot = first.prot };
+    // Preserve the old PROT_NONE path's whole-source validation without PTEs.
+    if (!prot.read and !prot.write and !prot.exec) {
+        for (0..page_count) |index| {
+            _ = pages.at(index) orelse {
+                state.munmapRangeWithFreeList(proc, base_va, aligned_size, free_list) catch {};
+                return sc.syscall_err_map;
+            };
+        }
+        return base_va;
     }
-    if (!prot.read and !prot.write and !prot.exec) return base_va;
-    if (!user_vm.mapTrustedUserPaddrsWithProt(proc, base_va, paddrs[0..page_count], map_prot orelse .{})) {
+    if (!user_vm.mapTrustedUserPageSequence(proc, base_va, page_count, pages, user_vm.InitialVmaPages.at, first.prot, false)) {
         state.munmapRangeWithFreeList(proc, base_va, aligned_size, free_list) catch {};
         return sc.syscall_err_map;
     }
@@ -1299,8 +1367,7 @@ fn mprotectVmaRange(
     prot_bits: u64,
 ) u64 {
     if (size_bytes == 0 or (base_va & 0xFFF) != 0) return sc.syscall_err_invalid;
-    const aligned_size = pageAlignUp(size_bytes) orelse return sc.syscall_err_invalid;
-    if (aligned_size / 4096 > kernel.max_vmo_logical_pages) return sc.syscall_err_invalid;
+    const aligned_size = @as(u64, kernel.checkedVmoPageCount(size_bytes) catch return sc.syscall_err_invalid) * 4096;
     var prot = protFromBits(prot_bits) orelse return sc.syscall_err_invalid;
 
     if (!user_vm.lockVmTransaction(proc)) return sc.syscall_err_invalid;
@@ -1352,10 +1419,11 @@ fn findMremapMoveTarget(
     const page_count = size_bytes / 4096;
     const align_pages = @import("kernel_abi_root").process_abi.user_aslr_granule / 4096;
     // Each retry jumps to the end of an entire colliding VMA/object.  The
-    // bounded count now reflects distinct blockers, not pages inside a large
-    // un-faulted PROT_NONE arena.
-    const max_attempts = kernel.max_vmas_per_process + kernel.max_fd_objects + 1;
-    var attempt: usize = 0;
+    // K stabilizes the live blocker counts for this search. A fixed former
+    // pool capacity would prematurely reject a gap after table growth.
+    const vmas: u64 = if (state.getVmaTableConst(proc)) |table| table.active_count else 0;
+    const max_attempts = vmas + @as(u64, state.fd_objects.live) + 1;
+    var attempt: u64 = 0;
     while (attempt < max_attempts) : (attempt += 1) {
         const candidate = user_vm.findFreeUserMappingRange(proc, page_count, align_pages) orelse return null;
         const collision_end = state.userMapCollisionEndVa(proc, candidate, size_bytes) orelse
@@ -1408,9 +1476,8 @@ fn mremapVmaRange(
 ) u64 {
     if ((old_va & 0xFFF) != 0 or old_len == 0 or new_len == 0) return sc.syscall_err_invalid;
     if (new_va != 0 and (new_va & 0xFFF) != 0) return sc.syscall_err_invalid;
-    const old_size = pageAlignUp(old_len) orelse return sc.syscall_err_invalid;
-    const new_size = pageAlignUp(new_len) orelse return sc.syscall_err_invalid;
-    if (old_size / 4096 > kernel.max_vmo_backing_pages or new_size / 4096 > kernel.max_vmo_backing_pages) return sc.syscall_err_invalid;
+    const old_size = @as(u64, kernel.checkedVmoPageCount(old_len) catch return sc.syscall_err_invalid) * 4096;
+    const new_size = @as(u64, kernel.checkedVmoPageCount(new_len) catch return sc.syscall_err_invalid) * 4096;
     if ((flags_bits & ~vm_abi.mremap_known_flags) != 0) return sc.syscall_err_invalid;
     const may_move = (flags_bits & vm_abi.mremap_maymove) != 0;
     const fixed = (flags_bits & vm_abi.mremap_fixed) != 0;
@@ -1485,7 +1552,7 @@ fn mremapVmaRange(
             @intCast(new_size),
         ) orelse return sc.syscall_err_map;
     }
-    if (reservation_split_slots > user_vm.freeUserReservationSlotCount(proc)) {
+    if (!user_vm.prepareUserReservationSlots(proc, reservation_split_slots)) {
         @import("../kernel_log.zig").writeFmt("vm: mremap reservation capacity failed principal={} slots={}\n", .{ @intFromEnum(proc), reservation_split_slots });
         return sc.syscall_err_alloc;
     }
@@ -1641,12 +1708,13 @@ fn fdIoctl(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, fd:
 // without an FD-capacity-sized stack array or a truncated wake snapshot.
 pub fn closeProcessFdsWithWakes(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, cloexec_only: bool) void {
     const table = state.getFdTableConst(proc) orelse return;
-    for (0..table.slots().len) |index| {
-        const entry = table.slots()[index];
+    for (0..table.capacity) |index| {
+        const entry = table.at(index).*;
         if (entry.object.isNull() or (cloexec_only and !entry.flags.cloexec)) continue;
         const fd: kernel.Fd = @intCast(index);
         const endpoint = state.pipeEndpointForFd(proc, fd);
         const channel = ipcChannelHandleForFd(state, proc, fd);
+        const notify_snapshot = if (channel) |handle| state.ipcChannelNotifyWaiterSnapshot(handle) else [2]?kernel.ThreadWakeTarget{ null, null };
         // The MMIO last-close destructor acquires all VM locks itself when
         // it owns a WC identity lease. Holding any VM lock here would nest
         // that acquisition and deadlock process teardown. Other descriptors
@@ -1661,14 +1729,23 @@ pub fn closeProcessFdsWithWakes(h: anytype, state: *kernel.KernelState, proc: ke
                 if (ready != 0) _ = wakePipeWaiters(h, state, pipe.pipe, !pipe.write, ready);
             }
         }
-        if (channel) |handle| _ = wakeIpcChannelCloseWaiters(h, state, handle);
+        if (channel) |handle| {
+            _ = wakeIpcChannelCloseWaiters(h, state, handle);
+            wakeIpcChannelNotifyWaitersAfterClose(state, handle, notify_snapshot);
+        }
     }
 }
 
 pub fn dispatch(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, frame: *TrapFrame) ?u64 {
+    // Validate the wire width before narrowing, so high bits cannot alias a
+    // low descriptor or turn malformed input into a kernel overflow trap.
+    switch (frame.rax) {
+        sc.syscall_fd_close, sc.syscall_fd_get_info, sc.syscall_fd_set_flags, sc.syscall_fd_read, sc.syscall_fd_write, sc.syscall_fd_readv, sc.syscall_fd_writev, sc.syscall_fd_fcntl, sc.syscall_fd_ioctl, sc.syscall_fd_stat, sc.syscall_timerfd_settime, sc.syscall_timerfd_gettime, sc.syscall_vmo_revoke => if (frame.rdi >= kernel.fd_number_capacity) return sc.syscall_err_invalid,
+        else => {},
+    }
     return switch (frame.rax) {
         sc.syscall_fd_table => blk: {
-            if (frame.rdi > fd_abi.fd_table_limit or frame.rsi == 0 or
+            if (frame.rdi > kernel.fd_number_capacity or frame.rsi == 0 or
                 frame.rsi > @import("std").math.maxInt(u64) - fd_abi.fd_table_info_size)
                 break :blk sc.syscall_err_invalid;
             // Check the output before allocating. The returned free count is
@@ -1679,8 +1756,8 @@ pub fn dispatch(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId
                 break :blk statusFromKernelError(err);
             const table = state.getFdTableConst(proc) orelse break :blk sc.syscall_err_invalid;
             const free = state.fdFreeCountFrom(proc, first_dynamic_fd) catch break :blk sc.syscall_err_invalid;
-            @import("std").mem.writeInt(u64, bytes[0..8], table.slots().len, .little);
-            @import("std").mem.writeInt(u64, bytes[8..16], fd_abi.fd_table_limit, .little);
+            @import("std").mem.writeInt(u64, bytes[0..8], table.capacity, .little);
+            @import("std").mem.writeInt(u64, bytes[8..16], kernel.fd_number_capacity, .little);
             @import("std").mem.writeInt(u64, bytes[16..24], free, .little);
             if (!h.copy_bytes_to_user_va(proc, frame.rsi, &bytes)) break :blk sc.syscall_err_invalid;
             break :blk sc.syscall_ok;
@@ -1689,6 +1766,7 @@ pub fn dispatch(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId
             const fd: kernel.Fd = @intCast(frame.rdi);
             const pipe_endpoint = state.pipeEndpointForFd(proc, fd);
             const channel_handle = ipcChannelHandleForFd(state, proc, fd);
+            const notify_snapshot = if (channel_handle) |handle| state.ipcChannelNotifyWaiterSnapshot(handle) else [2]?kernel.ThreadWakeTarget{ null, null };
             state.closeFdWithFreeList(proc, fd, h.free_list) catch break :blk sc.syscall_err_invalid;
             if (pipe_endpoint) |endpoint| {
                 const wake_side_write = !endpoint.write;
@@ -1697,17 +1775,19 @@ pub fn dispatch(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId
                 }
             }
             if (channel_handle) |handle| {
+                wakeIpcChannelNotifyWaitersAfterClose(state, handle, notify_snapshot);
                 if (!wakeIpcChannelCloseWaiters(h, state, handle)) break :blk sc.syscall_err_invalid;
             }
             break :blk sc.syscall_ok;
         },
         sc.syscall_fd_dup => blk: {
+            if (frame.rsi >= kernel.fd_number_capacity or frame.rdi > fd_abi.thread_self_fd) break :blk sc.syscall_err_invalid;
             if (frame.rdi == fd_abi.thread_self_fd) {
                 if ((frame.rdx & ~fd_abi.thread_self_rights_mask) != 0 or
                     (frame.r10 & ~@as(u64, fd_abi.known_flags_mask)) != 0 or
-                    frame.rsi >= fd_abi.fd_table_limit) break :blk sc.syscall_err_invalid;
+                    frame.rsi >= kernel.fd_number_capacity) break :blk sc.syscall_err_invalid;
                 const current = scheduler.currentThread();
-                const generation = scheduler.generationOfThread(current) orelse
+                const generation = scheduler.currentThreadGeneration() orelse
                     break :blk sc.syscall_err_not_ready;
                 break :blk state.createThreadFd(proc, .{
                     .owner_principal_raw = @intFromEnum(proc),
@@ -1735,7 +1815,7 @@ pub fn dispatch(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId
         sc.syscall_fd_readv => fdReadv(h, state, proc, @intCast(frame.rdi), frame.rsi, frame.rdx),
         sc.syscall_fd_writev => fdWritev(h, state, proc, @intCast(frame.rdi), frame.rsi, frame.rdx),
         sc.syscall_fd_fcntl => fdFcntl(state, proc, @intCast(frame.rdi), frame.rsi, frame.rdx, frame.r10),
-        sc.syscall_fd_poll => fdPoll(h, state, proc, frame.rdi, frame.rsi),
+        sc.syscall_fd_poll => fdPoll(h, state, proc, frame),
         sc.syscall_fd_wait_many => fdWaitMany(h, state, proc, frame),
         sc.syscall_fd_ioctl => fdIoctl(h, state, proc, @intCast(frame.rdi), frame.rsi, frame.rdx, frame),
         sc.syscall_fd_stat => writeFdStat(h, state, proc, @intCast(frame.rdi), frame.rsi),
@@ -1862,9 +1942,9 @@ pub fn dispatch(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId
             smp_perf.munmapElapsed(.reservation_validate_cycles, profile_stage);
             const reservation_slots = reservation_slots_result orelse break :blk sc.syscall_err_map;
             profile_stage = smp_perf.timestamp();
-            const free_slots = user_vm.freeUserReservationSlotCount(proc);
+            const slots_ready = user_vm.prepareUserReservationSlots(proc, reservation_slots);
             smp_perf.munmapElapsed(.reservation_count_cycles, profile_stage);
-            if (reservation_slots > free_slots) break :blk sc.syscall_err_alloc;
+            if (!slots_ready) break :blk sc.syscall_err_alloc;
             profile_stage = smp_perf.timestamp();
             const prepared_result = state.prepareMunmapRangeWithFreeList(
                 proc,
@@ -1896,4 +1976,66 @@ pub fn dispatch(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId
         sc.syscall_madvise => madviseVmaRange(state, proc, frame.rdi, frame.rsi, frame.rdx),
         else => null,
     };
+}
+
+// Host tests enter the actual frontend without compiling unrelated dispatch arms.
+pub const WaitTestSupport = if (@import("builtin").is_test) struct {
+    pub const wait = fdWaitMany;
+    pub const channelHandle = ipcChannelHandleForFd;
+    pub const closeWake = wakeIpcChannelCloseWaiters;
+    pub const closeNotify = wakeIpcChannelNotifyWaitersAfterClose;
+} else struct {};
+
+test "poll item snapshot ready zero single multiple maximum and fault" {
+    const std = @import("std");
+    const arena = try std.testing.allocator.alignedAlloc(u8, .fromByteUnits(4096), kernel.runtimeStorageBytes());
+    defer std.testing.allocator.free(arena);
+    try std.testing.expect(kernel.initRuntimeStorage(arena));
+    const state = try std.testing.allocator.create(kernel.KernelState);
+    defer std.testing.allocator.destroy(state);
+    try state.initFromDetectedRegionsInPlace(1);
+    defer state.deinitPools();
+    const owner = kernel.processPrincipalFromIndex(0).?;
+    const pair = try state.createPipePairFds(owner, .{}, 16);
+    const Copy = struct {
+        var calls: usize = 0;
+        var fail: bool = false;
+        fn write(_: kernel.PrincipalId, va: u64, value: u64) bool {
+            std.debug.assert((va - 0x1000) % 32 == 24);
+            std.debug.assert(value == fd_abi.event_writable);
+            calls += 1;
+            return !fail;
+        }
+    };
+    const h = .{ .write_user_u64 = Copy.write };
+    var frame = std.mem.zeroes(TrapFrame);
+    var items: [max_pollfds]PollItem = undefined;
+    for (&items, 0..) |*item, i| item.* = .{ .fd = pair.read, .events = fd_abi.event_readable, .item_va = 0x1000 + i * 32 };
+    Copy.calls = 0;
+    Copy.fail = false;
+    try std.testing.expectEqual(@as(?u64, 0), pollCached(h, state, owner, &items, &frame));
+    items[199].fd = pair.write;
+    items[199].events = fd_abi.event_writable;
+    items[199].min_write_bytes = 58;
+    try std.testing.expectEqual(@as(?u64, 1), pollCached(h, state, owner, &items, &frame));
+    try std.testing.expectEqual(@as(u64, 199), frame.r10);
+    try std.testing.expectEqual(fd_abi.event_writable, frame.r8);
+    try std.testing.expectEqual(@as(usize, 0), Copy.calls);
+    items[0].fd = pair.write;
+    items[0].events = fd_abi.event_writable;
+    try std.testing.expectEqual(@as(?u64, 2), pollCached(h, state, owner, &items, &frame));
+    try std.testing.expectEqual(@as(usize, 2), Copy.calls);
+    Copy.fail = true;
+    try std.testing.expect(pollCached(h, state, owner, &items, &frame) == null);
+    Copy.fail = false;
+    Copy.calls = 0;
+    for (&items) |*item| {
+        item.fd = pair.write;
+        item.events = fd_abi.event_writable;
+    }
+    try std.testing.expectEqual(@as(?u64, max_pollfds), pollCached(h, state, owner, &items, &frame));
+    try std.testing.expectEqual(max_pollfds, Copy.calls);
+    // Minimum is input-only and zero means a one-byte request.
+    items[0].min_write_bytes = std.math.maxInt(u64);
+    try std.testing.expectEqual(@as(?u64, 0), pollCached(h, state, owner, items[0..1], &frame));
 }

@@ -10,7 +10,7 @@ struct lpr_unix_socket {
     uint32_t mapped;
     uint64_t send_timeout_ns, receive_timeout_ns;
     uint32_t listening;
-    int32_t handoff_fd;
+    pacha_fd_t handoff_fd;
     uint32_t adopt_lock;
     struct lpr_unix_mapping mapping;
 };
@@ -23,12 +23,12 @@ int64_t lpr_unix_socket_create(uint64_t type, uint64_t protocol);
 int64_t lpr_unix_socket_pair(uint64_t type, uint64_t protocol, uint64_t output);
 int64_t lpr_unix_socket_close(void *state);
 int64_t lpr_unix_socket_io(const lpr_fd_pin_t *pin, uint64_t buffer, uint64_t length,
-    int writing, uint64_t flags);
+    int writing, uint64_t flags, unsigned *wait_not_ready __attribute__((unused)));
 int64_t lpr_unix_socket_iov(const lpr_fd_pin_t *pin, uint64_t vectors, uint64_t count,
-    int writing, uint64_t flags, uint32_t *message_flags);
+    int writing, uint64_t flags, uint32_t *message_flags, unsigned *wait_not_ready __attribute__((unused)));
 int64_t lpr_unix_socket_message_iov(const lpr_fd_pin_t *pin, uint64_t vectors, uint64_t count,
-    int writing, uint64_t flags, uint32_t *message_flags, struct lpr_unix_ancillary *ancillary);
-int64_t lpr_unix_socket_message(uint64_t fd, uint64_t message, uint64_t flags, int writing);
+    int writing, uint64_t flags, uint32_t *message_flags, struct lpr_unix_ancillary *ancillary, unsigned *wait_not_ready __attribute__((unused)));
+int64_t lpr_unix_socket_message(uint64_t fd, uint64_t message, uint64_t flags, int writing, unsigned *wait_not_ready __attribute__((unused)));
 int lpr_unix_address_encode(uint64_t raw, uint64_t length, struct unix_address *out);
 int lpr_unix_address_copy(const struct unix_address *name, uint64_t address, uint64_t length);
 struct lpr_linux_iovec;
@@ -36,18 +36,18 @@ void lpr_unix_copy_iov(const struct lpr_linux_iovec *vectors, unsigned count,
     const struct unix_const_span spans[2], int writing);
 int64_t lpr_unix_dgram_io(const lpr_fd_pin_t *pin, const struct lpr_linux_iovec *vectors,
     unsigned count, uint64_t length, int writing, uint64_t flags,
-    uint32_t *message_flags, struct lpr_unix_ancillary *ancillary);
+    uint32_t *message_flags, struct lpr_unix_ancillary *ancillary, unsigned *wait_not_ready __attribute__((unused)));
 int64_t lpr_unix_socket_address_io(uint64_t fd, uint64_t buffer, uint64_t length,
-    int writing, uint64_t flags, uint64_t address, uint64_t address_length);
+    int writing, uint64_t flags, uint64_t address, uint64_t address_length, unsigned *wait_not_ready __attribute__((unused)));
 int64_t lpr_unix_socket_option(uint64_t fd, uint64_t level, uint64_t option,
     uint64_t value, uint64_t length, int setting);
 int64_t lpr_unix_socket_ioctl(const lpr_fd_pin_t *pin, uint64_t request, uint64_t value);
 int lpr_unix_socket_flags(const lpr_fd_pin_t *pin, uint32_t *flags, int setting);
 int64_t lpr_unix_socket_sendrecv(uint64_t fd, uint64_t buffer, uint64_t length,
-    int writing, uint64_t flags);
+    int writing, uint64_t flags, unsigned *wait_not_ready __attribute__((unused)));
 int64_t lpr_unix_socket_stat(const lpr_fd_pin_t *pin, uint64_t output);
 int64_t lpr_unix_socket_shutdown(uint64_t fd, uint64_t how);
-int64_t lpr_unix_socket_address(uint64_t fd, uint64_t operation, uint64_t address, uint64_t length);
+int64_t lpr_unix_socket_address(uint64_t fd, uint64_t operation, uint64_t address, uint64_t length, unsigned *wait_not_ready __attribute__((unused)));
 int64_t lpr_unix_socket_listen(uint64_t fd, uint64_t backlog);
-int64_t lpr_unix_socket_accept(uint64_t fd, uint64_t address, uint64_t length, uint64_t flags);
+int64_t lpr_unix_socket_accept(uint64_t fd, uint64_t address, uint64_t length, uint64_t flags, unsigned *wait_not_ready __attribute__((unused)));
 int64_t lpr_unix_socket_name(uint64_t fd, uint64_t address, uint64_t length, int peer);

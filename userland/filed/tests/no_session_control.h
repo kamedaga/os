@@ -5,7 +5,7 @@ int filed_storage_owner_client_config(struct filed_storage_owner *owner, uint64_
     uint64_t minimum, struct ph_fs_channel_config *config)
 { (void)owner; (void)client; (void)minimum; (void)config; abort(); }
 int filed_storage_owner_client_bind(struct filed_storage_owner *owner,
-    const struct ph_fs_channel_config *config, int vmo, int doorbell)
+    const struct ph_fs_channel_config *config, pacha_fd_t vmo, pacha_fd_t doorbell)
 { (void)owner; (void)config; (void)vmo; (void)doorbell; abort(); }
 int filed_storage_owner_client_release(struct filed_storage_owner *owner, uint64_t id)
 { (void)owner; (void)id; abort(); }

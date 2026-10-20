@@ -187,6 +187,7 @@ void lpr_fd_table_init(
     table->backends = backends;
     table->backend_count = backend_count;
     table->generation = 1;
+    table->nofile_soft = table->nofile_hard = ((uint64_t)INT32_MAX + 1u);
     if (entries != 0) {
         lpr_fd_zero(entries, (uint64_t)entry_count * sizeof(entries[0]));
     }
@@ -204,7 +205,7 @@ static int lpr_fd_install_unlocked(
     const lpr_fd_install_t *install)
 {
     lpr_fd_entry_t *entry = lpr_fd_entry(table, fd);
-    if (entry == 0 || entry->active || install == 0 ||
+    if (entry == 0 || fd >= table->nofile_soft || entry->active || install == 0 ||
         install->ops_id == LPR_FD_OPS_NONE || install->ops_id >= LPR_FD_OPS_COUNT ||
         install->backend_state == 0 || install->backend_state_bytes == 0)
     {
@@ -269,7 +270,7 @@ int lpr_fd_table_alloc(
         lpr_fd_table_unlock(table);
         return -1;
     }
-    for (lpr_linux_fd_t fd = min_fd; fd < table->entry_count; fd++) {
+    for (lpr_linux_fd_t fd = min_fd; fd < table->entry_count && fd < table->nofile_soft; fd++) {
         if (!table->entries[fd].active && lpr_fd_install_unlocked(table, fd, install) == 0) {
             *out_fd = fd;
             lpr_fd_table_unlock(table);
@@ -309,7 +310,7 @@ static int alloc_batch(
     }
     uint32_t selected = 0;
     for (lpr_linux_fd_t fd = min_fd;
-         fd < table->entry_count && selected < install_count;
+         fd < table->entry_count && fd < table->nofile_soft && selected < install_count;
          ++fd)
     {
         if (table->entries[fd].active) continue;
@@ -366,7 +367,7 @@ int lpr_fd_table_publish_batch(lpr_fd_table_t *table,
     lpr_fd_table_lock(table);
     for (uint32_t i = 0; i < count; i++) {
         lpr_fd_entry_t *entry = lpr_fd_entry(table, fds[i]);
-        if (!entry || entry->active != 2) { lpr_fd_table_unlock(table); return -1; }
+        if (!entry || entry->active != 2 || fds[i] >= table->nofile_soft) { lpr_fd_table_unlock(table); return -1; }
     }
     for (uint32_t i = 0; i < count; i++) table->entries[fds[i]].active = 1;
     (void)lpr_fd_next_generation(table);
@@ -474,13 +475,16 @@ int lpr_fd_table_dup_excluding(lpr_fd_table_t *table,
     const lpr_fd_entry_t *old_entry = lpr_fd_entry_const(table, old_fd);
     lpr_ofd_t *ofd = lpr_fd_ofd_for_entry(table, old_entry);
     if (old_entry == 0 || ofd == 0 || ofd->closing ||
-        (old_entry->effective_rights & LPR_FD_RIGHT_DUP) == 0 || out_fd == 0 ||
-        min_fd >= table->entry_count)
+        (old_entry->effective_rights & LPR_FD_RIGHT_DUP) == 0 || out_fd == 0)
     {
         lpr_fd_table_unlock(table);
         return -1;
     }
-    for (lpr_linux_fd_t fd = min_fd; fd < table->entry_count; fd++) {
+    if (min_fd >= table->nofile_soft) {
+        lpr_fd_table_unlock(table);
+        return -22; /* F_DUPFD: invalid starting number, not exhaustion. */
+    }
+    for (lpr_linux_fd_t fd = min_fd; fd < table->entry_count && fd < table->nofile_soft; fd++) {
         uint32_t i = 0;
         while (i < excluded_count && excluded[i] != fd) ++i;
         if (i != excluded_count) continue;
@@ -509,7 +513,7 @@ int lpr_fd_table_dup_replace(lpr_fd_table_t *table,
     lpr_fd_entry_t *target = lpr_fd_entry(table, new_fd);
     lpr_ofd_t *source = lpr_fd_ofd_for_entry(table, old_entry);
     lpr_ofd_t *displaced = lpr_fd_ofd_for_entry(table, target);
-    if (!old_entry || !target || !source || source->closing ||
+    if (new_fd >= table->nofile_soft || !old_entry || !target || !source || source->closing ||
         !(old_entry->effective_rights & LPR_FD_RIGHT_DUP) ||
         target->active == 2 || (target->active && (!displaced || displaced->closing))) {
         lpr_fd_table_unlock(table);
@@ -540,7 +544,7 @@ int lpr_fd_table_dup_at(
     const lpr_fd_entry_t *old_entry = lpr_fd_entry_const(table, old_fd);
     lpr_fd_entry_t *new_entry = lpr_fd_entry(table, new_fd);
     lpr_ofd_t *ofd = lpr_fd_ofd_for_entry(table, old_entry);
-    if (old_entry == 0 || new_entry == 0 || ofd == 0 || ofd->closing ||
+    if (new_fd >= table->nofile_soft || old_entry == 0 || new_entry == 0 || ofd == 0 || ofd->closing ||
         (old_entry->effective_rights & LPR_FD_RIGHT_DUP) == 0)
     {
         lpr_fd_table_unlock(table);
@@ -829,4 +833,36 @@ uint32_t lpr_fd_table_live_ofd_count(const lpr_fd_table_t *table)
     }
     lpr_fd_table_unlock((lpr_fd_table_t *)table);
     return count;
+}
+
+int lpr_fd_table_prlimit(lpr_fd_table_t *table, const uint64_t *new_limit,
+    uint64_t *old_limit)
+{
+    /* Capture inputs before writing outputs: prlimit permits aliasing buffers. */
+    const uint64_t soft = new_limit ? new_limit[0] : 0;
+    const uint64_t hard = new_limit ? new_limit[1] : 0;
+    lpr_fd_table_lock(table);
+    int status = 0;
+    if (new_limit && soft > hard) status = -22; /* EINVAL */
+    else if (new_limit && hard > table->nofile_hard) status = -1; /* EPERM */
+    if (!status) {
+        if (old_limit) {
+            old_limit[0] = table->nofile_soft;
+            old_limit[1] = table->nofile_hard;
+        }
+        if (new_limit) {
+            table->nofile_soft = soft;
+            table->nofile_hard = hard;
+        }
+    }
+    lpr_fd_table_unlock(table);
+    return status;
+}
+
+uint64_t lpr_fd_table_soft_limit(lpr_fd_table_t *table)
+{
+    lpr_fd_table_lock(table);
+    const uint64_t limit = table->nofile_soft;
+    lpr_fd_table_unlock(table);
+    return limit;
 }

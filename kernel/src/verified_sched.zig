@@ -22,6 +22,7 @@ pub const Entity = extern struct {
     thread_id: i64,
     generation: i64,
     weight: i64,
+    inv_weight: u64 = 0,
     slice_ns: i64,
     service_ns: i64,
     vruntime: i64,

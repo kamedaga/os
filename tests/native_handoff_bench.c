@@ -42,8 +42,8 @@ static uint64_t ticks(void) {
 }
 static void await(unsigned self) {
     while (!LOAD(permit[self])) {
-        long rc = pacha_syscall3(PACHA_RUNTIME_SYSCALL_FUTEX_WAIT,
-            (uintptr_t)&permit[self], 0, 1000);
+        long rc = pacha_syscall4(PACHA_RUNTIME_SYSCALL_FUTEX_WAIT,
+            (uintptr_t)&permit[self], 0, 1000, 0);
         if (rc && rc != PACHA_SYSCALL_ERR_NOT_READY) finish(2);
     }
 }
@@ -52,7 +52,7 @@ static void transfer(unsigned self) {
     STORE(permit[1 - self], 1);
     uint64_t count;
     long rc = pacha_futex_wake_wait((uintptr_t)&permit[1 - self],
-        (uintptr_t)&permit[self], 0, 1000, &count);
+        (uintptr_t)&permit[self], 0, 1000, 0, &count);
     /* A rejected inbound wait may already have published the outbound wake.
      * Only wait for our permit again; never replay the compound operation. */
     if (count > 1 || (rc && rc != PACHA_SYSCALL_ERR_NOT_READY)) finish(3);

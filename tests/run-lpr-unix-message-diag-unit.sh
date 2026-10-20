@@ -9,6 +9,6 @@ for module in libipc libpacha personality filed termd gpud inputd netd unixd lpr
 done
 clang -std=c11 -O2 -g -Wall -Wextra -Werror \
   -fsanitize=address,undefined -fno-omit-frame-pointer \
-  "${includes[@]}" -I"$repo_root/musl/pachaos/include" \
+  "${includes[@]}" -I"$repo_root/userland" -I"$repo_root/kobox2/protocol/include" -I"$repo_root/kobox2/protocol/generated/include" -I"$repo_root/musl/pachaos/include" \
   "$repo_root/tests/lpr_unix_message_diag_unit.c" -o "$out_dir/unit"
 "$out_dir/unit"

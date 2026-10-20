@@ -39,7 +39,19 @@ static struct native_file *lookup(long fd)
     for (struct native_file *p=files;p;p=p->next) if (p->fd==fd) return p;
     return NULL;
 }
-static long fd_status(long s) { return s>=16 ? s : s<0 ? s : -EIO; }
+static long fd_status(long s) { return s>=16 && (uint64_t)s<PACHAOS_THREAD_SELF_FD ? s : s<0 ? s : -EIO; }
+/* Native transport may use every non-reserved u32 number. POSIX returns an
+ * int: reject an unrepresentable result before the upstream wrapper narrows it,
+ * closing the newly owned capability on that failure. */
+static long posix_fd_result(long result)
+{
+    long fd=fd_status(result);
+    if (fd>INT_MAX) {
+        (void)__pachaos_raw1(PACHAOS_SYSCALL_FD_CLOSE,fd);
+        return -EMFILE;
+    }
+    return fd;
+}
 static long native_status(long s) { return s ? s<0 ? s : -EIO : 0; }
 static int descriptor_room(size_t minimum,size_t spare)
 {
@@ -62,8 +74,8 @@ static int descriptor_room(size_t minimum,size_t spare)
 #ifndef PACHAOS_NATIVE_TEST
 static int fs_call(kb2_fs_request_t *r,const char *path,const char *second,
     const void *data,size_t data_size,void *out,size_t capacity,
-    kb2_fs_response_t *response,const int *sources,size_t source_count,
-    int *received,size_t *received_count)
+    kb2_fs_response_t *response,const long *sources,size_t source_count,
+    long *received,size_t *received_count)
 {
     static uint64_t sequence;
     size_t n1=path ? strlen(path)+1 : 0,n2=second ? strlen(second)+1 : 0;
@@ -83,7 +95,7 @@ static int fs_call(kb2_fs_request_t *r,const char *path,const char *second,
     if (!r->sequence) return -EOVERFLOW;
     uint64_t rights=PACHAOS_FD_RIGHT_INSPECT|PACHAOS_FD_RIGHT_CLOSE|
         PACHAOS_FD_RIGHT_MAP_READ|PACHAOS_FD_RIGHT_MAP_WRITE;
-    int vmo=(int)fd_status(__pachaos_raw3(PACHAOS_SYSCALL_VMO_CREATE,size,
+    long vmo=fd_status(__pachaos_raw3(PACHAOS_SYSCALL_VMO_CREATE,size,
         rights|PACHAOS_FD_RIGHT_TRANSFER,PACHAOS_FD_FLAG_CLOEXEC));
     if (vmo<0) return vmo;
     uint8_t *p=(void *)__pachaos_raw6(PACHAOS_SYSCALL_MMAP,vmo,0,size,
@@ -108,14 +120,7 @@ static int fs_call(kb2_fs_request_t *r,const char *path,const char *second,
     struct __pachaos_ipc_fd got[19]={{0}};
     struct __pachaos_ipc_msg reply={.fds=got,.fd_capacity=19};
     if (!status) {
-        int reply_fd=(int)fd_status(__pachaos_raw2(PACHAOS_SYSCALL_IPC_CALL,FILE_ENDPOINT,(long)&message));
-        if (reply_fd<0) status=reply_fd;
-        else {
-            long s;
-            do { s=__pachaos_raw4(PACHAOS_SYSCALL_IPC_RECV_WAIT,reply_fd,(long)&reply,-1,0); } while (s==2);
-            status=(int)native_status(s);
-            (void)__pachaos_raw1(PACHAOS_SYSCALL_FD_CLOSE,reply_fd);
-        }
+        status=(int)native_status(__pachaos_ipc_message(PACHAOS_SYSCALL_IPC_CALL, FILE_ENDPOINT, (struct __pachaos_ipc_msg *)(uintptr_t)((long)&message), (struct __pachaos_ipc_msg *)(uintptr_t)((long)&reply), -1, PACHAOS_WAIT_UNINTERRUPTIBLE, 0));
     }
     if (!status && (reply.word0!=r->opcode || reply.word3!=r->sequence ||
         reply.word2<KB2_FILESYSTEM_RESPONSE_SIZE || reply.word2>response_size ||
@@ -128,7 +133,7 @@ static int fs_call(kb2_fs_request_t *r,const char *path,const char *second,
     if (count>reply.fd_count) count=reply.fd_count;
     if (status) count=0;
     for (size_t i=0;i<reply.fd_count;++i) {
-        if (i<count) received[i]=(int)got[i].fd;
+        if (i<count) received[i]=(long)got[i].fd;
         else (void)__pachaos_raw1(PACHAOS_SYSCALL_FD_CLOSE,got[i].fd);
     }
     if (received_count) *received_count=count;
@@ -139,7 +144,7 @@ static int fs_call(kb2_fs_request_t *r,const char *path,const char *second,
 }
 #else
 extern int fs_call(kb2_fs_request_t *,const char *,const char *,const void *,size_t,
-    void *,size_t,kb2_fs_response_t *,const int *,size_t,int *,size_t *);
+    void *,size_t,kb2_fs_response_t *,const long *,size_t,long *,size_t *);
 #endif
 static long request(kb2_fs_request_t *r,const char *a,const char *b,
                      const void *data,size_t size,void *out,size_t capacity)
@@ -173,10 +178,10 @@ static int reserve_fd(int minimum,int cloexec)
     uint64_t rights=PACHAOS_FD_RIGHT_INSPECT|PACHAOS_FD_RIGHT_CLOSE|(1ull<<1)|PACHAOS_FD_RIGHT_SET_FLAGS;
     int room=descriptor_room((size_t)minimum+1,3);
     if (room) return room;
-    int fd=(int)fd_status(__pachaos_raw3(PACHAOS_SYSCALL_EVENTFD_CREATE,0,rights,
+    long fd=posix_fd_result(__pachaos_raw3(PACHAOS_SYSCALL_EVENTFD_CREATE,0,rights,
         cloexec ? PACHAOS_FD_FLAG_CLOEXEC : 0));
     if (fd>=0 && fd<minimum) {
-        int copy=(int)fd_status(__pachaos_raw4(PACHAOS_SYSCALL_FD_DUP,fd,minimum,rights,
+        long copy=posix_fd_result(__pachaos_raw4(PACHAOS_SYSCALL_FD_DUP,fd,minimum,rights,
             cloexec ? PACHAOS_FD_FLAG_CLOEXEC : 0));
         (void)__pachaos_raw1(PACHAOS_SYSCALL_FD_CLOSE,fd); fd=copy;
     }
@@ -305,7 +310,7 @@ static long fcntl_file(long fd,long command,long value)
         if (!p) {
             struct { uint64_t kind,rights,flags,size,extra; } info;
             long s=native_status(__pachaos_raw2(PACHAOS_SYSCALL_FD_GET_INFO,fd,(long)&info));
-            return s ? s : fd_status(__pachaos_raw4(PACHAOS_SYSCALL_FD_DUP,fd,value,info.rights,
+            return s ? s : posix_fd_result(__pachaos_raw4(PACHAOS_SYSCALL_FD_DUP,fd,value,info.rights,
                 command==F_DUPFD_CLOEXEC ? PACHAOS_FD_FLAG_CLOEXEC : 0));
         }
         kb2_fs_request_t r={.opcode=KB2_FILESYSTEM_OP_DUP,.handle=p->handle};
@@ -320,13 +325,13 @@ static long fcntl_file(long fd,long command,long value)
 }
 static long poll_native(struct __pachaos_linux_pollfd *fds,long count,long timeout)
 {
-    if (count<0 || (size_t)count>SIZE_MAX/sizeof(struct __pachaos_pollfd)) return -EINVAL;
+    if (count<0 || (size_t)count>SIZE_MAX/sizeof(struct pacha_pollfd)) return -EINVAL;
     if (count && !fds) return -EFAULT;
     struct { uint64_t capacity,maximum,free_slots; } table;
     long status=native_status(__pachaos_raw2(PACHAOS_SYSCALL_FD_TABLE,0,(long)&table));
     if (status) return status;
     if ((uint64_t)count>table.maximum) return -EINVAL;
-    struct __pachaos_pollfd *native=calloc(count ? (size_t)count : 1,sizeof(*native));
+    struct pacha_pollfd *native=calloc(count ? (size_t)count : 1,sizeof(*native));
     if (!native) return -ENOMEM;
     size_t active=0;
     for (long i=0;i<count;++i) {
@@ -365,7 +370,7 @@ static long mmap_file(long addr,long len,long prot,long flags,long fd,long offse
         .handle=p->handle,.offset=offset,.length=(uint64_t)len,
         .flags=(prot&PROT_EXEC ? FILED_FILE_VMO_EXEC : 0)|(prot&PROT_WRITE ? FILED_FILE_VMO_WRITE : 0)};
     kb2_fs_response_t reply;
-    int vmo=-1; size_t count=1;
+    long vmo=-1; size_t count=1;
     long s=fs_call(&r,NULL,NULL,NULL,0,NULL,0,&reply,NULL,0,&vmo,&count);
     if (s) return s;
     if (count!=1 || vmo<16) return -EPROTO;
@@ -460,7 +465,7 @@ static long exec_file(const char *path,char *const *argv,char *const *envp)
     unsigned char *state=calloc(1,state_size);
     long status=0;
     uint8_t *payload=NULL; size_t payload_size=0;
-    int bootstrap=-1; unsigned char *mapping=NULL; size_t mapped_size=0;
+    long bootstrap=-1; unsigned char *mapping=NULL; size_t mapped_size=0;
     if (!state || (exec.inherit_handle_count && (!exec.inherit_handles || !exec.fd_patches))) { status=-ENOMEM; goto done; }
     wr64(state,NATIVE_STATE_MAGIC); wr64(state+8,count); wr64(state+24,creation_mask);
     pos=0;
@@ -480,7 +485,7 @@ static long exec_file(const char *path,char *const *argv,char *const *envp)
     mapped_size=(state_size+4095)&~(size_t)4095;
     status=descriptor_room(0,3);
     if (status) goto done;
-    bootstrap=(int)fd_status(__pachaos_raw3(PACHAOS_SYSCALL_VMO_CREATE,mapped_size,rights,PACHAOS_FD_FLAG_CLOEXEC));
+    bootstrap=fd_status(__pachaos_raw3(PACHAOS_SYSCALL_VMO_CREATE,mapped_size,rights,PACHAOS_FD_FLAG_CLOEXEC));
     if (bootstrap<0) { status=bootstrap; goto done; }
     mapping=(void *)__pachaos_raw6(PACHAOS_SYSCALL_MMAP,bootstrap,0,mapped_size,
         PACHAOS_PROT_READ|PACHAOS_PROT_WRITE,PACHAOS_MMAP_SHARED,0);
@@ -496,7 +501,7 @@ static long exec_file(const char *path,char *const *argv,char *const *envp)
     kb2_fs_request_t r={.opcode=KB2_FILESYSTEM_OP_EXEC_PATH,.flags=exec.flags};
     status=path_directory(AT_FDCWD,path,&r.handle);
     if (status) goto done;
-    int sources[2]={FILE_ENDPOINT,bootstrap},received[2]={-1,-1}; size_t received_count=2;
+    long sources[2]={FILE_ENDPOINT,bootstrap},received[2]={-1,-1}; size_t received_count=2;
     kb2_fs_response_t reply;
     status=fs_call(&r,path,NULL,payload,payload_size,NULL,0,&reply,sources,2,received,&received_count);
     if (!status && received_count!=2) status=-EPROTO;
@@ -652,13 +657,13 @@ static long dispatch(long n,long a,long b,long c,long d,long e,long f)
     case SYS_poll: return poll_native((void *)a,b,c);
     case SYS_eventfd2:
         if (b&~(O_CLOEXEC|O_NONBLOCK)) return -EINVAL;
-        return fd_status(__pachaos_raw3(PACHAOS_SYSCALL_EVENTFD_CREATE,a,
+        return posix_fd_result(__pachaos_raw3(PACHAOS_SYSCALL_EVENTFD_CREATE,a,
             PACHAOS_FD_RIGHT_INSPECT|PACHAOS_FD_RIGHT_CLOSE|PACHAOS_FD_RIGHT_WAIT|
             PACHAOS_FD_RIGHT_POLL|PACHAOS_FD_RIGHT_READ|PACHAOS_FD_RIGHT_WRITE,
             __pachaos_fd_flags_from_linux(b,O_CLOEXEC,O_NONBLOCK)));
     case SYS_timerfd_create:
         if (a!=1 || (b&~(O_CLOEXEC|O_NONBLOCK))) return -EINVAL;
-        return fd_status(__pachaos_raw6(PACHAOS_SYSCALL_TIMERFD_CREATE,a,0,0,0,
+        return posix_fd_result(__pachaos_raw6(PACHAOS_SYSCALL_TIMERFD_CREATE,a,0,0,0,
             PACHAOS_FD_RIGHT_INSPECT|PACHAOS_FD_RIGHT_CLOSE|PACHAOS_FD_RIGHT_WAIT|
             PACHAOS_FD_RIGHT_POLL|PACHAOS_FD_RIGHT_READ|PACHAOS_FD_RIGHT_WRITE,
             __pachaos_fd_flags_from_linux(b,O_CLOEXEC,O_NONBLOCK)));

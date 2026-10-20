@@ -1,0 +1,310 @@
+{
+  "kernel/src/boot/entry.zig": {
+    "mentions": {
+      "createProcessDescriptor": 1,
+      "resetProcessRuntimeTables": 2
+    },
+    "reviewed_bodies": {
+      "teardownFaultedProcess": "e76f56f34c73c0bd98d0bb1e2f236fa286f6708887c5baa206b915e506b8aae0",
+      "teardownExitedProcess": "53c1bc17a24c37a7e7c1a667742c6b439f60e3f3159af0ccecb2693f486831e4",
+      "constructBootProcesses": "df2ac00e51d4e6779a31944cd6cf275945289f11ecce22c4f50addc51a39d9da"
+    }
+  },
+  "kernel/src/boot/process_factory.zig": {
+    "mentions": {
+      "ensureProcessDescriptor": 1
+    },
+    "reviewed_bodies": {
+      "tryCreateUserProcess": "ae4ac532f3d471a3327502e546f745fc679b57bb8c6bfb1887e003361e86410c"
+    }
+  },
+  "kernel/src/kernel.zig": {
+    "mentions": {
+      "clearPrincipalState": 2,
+      "clearPrincipalTablesForReuse": 2,
+      "commitFixedMmapPrepared": 2,
+      "commitMremapPrepared": 2,
+      "commitMunmapPrepared": 2,
+      "createProcessDescriptor": 2,
+      "createProcessDescriptorWithCapacity": 2,
+      "createProcessDescriptorWithCapacityLimit": 2,
+      "createProcessDescriptorWithCapacityLimitChecked": 2,
+      "createProcessDescriptorWithUserAddressSpaceChecked": 2,
+      "discardFixedMmapPrepared": 2,
+      "discardMremapPrepared": 2,
+      "discardMunmapPrepared": 2,
+      "ensureProcessDescriptor": 2,
+      "fdEntryConst": 2,
+      "fdPayloadWithRights": 2,
+      "fdPayloadWithRightsConst": 2,
+      "fdTableForActiveProcess": 2,
+      "fdTableForActiveProcessConst": 2,
+      "fdTableForProcessIndex": 2,
+      "fdTableForProcessIndexConst": 2,
+      "getFdTable": 2,
+      "getFdTableConst": 2,
+      "getVmaTable": 2,
+      "getVmaTableConst": 2,
+      "initDynamicPrincipalState": 2,
+      "initPrincipalState": 2,
+      "prepareFixedAnonymousMmap": 2,
+      "prepareFixedFdMmap": 2,
+      "prepareFixedFdMmapIntoProcess": 2,
+      "prepareMremapWithFreeList": 2,
+      "prepareMunmapRangeWithFreeList": 2,
+      "resetProcessRuntimeTables": 2,
+      "vmaTableForProcessIndex": 2,
+      "vmaTableForProcessIndexConst": 2
+    },
+    "reviewed_bodies": {}
+  },
+  "kernel/src/scheduler_connection.zig": {
+    "mentions": {
+      "copyPendingSignalHint": 3,
+      "deliverSignal": 1,
+      "deliverSignalLocked": 4
+    },
+    "reviewed_bodies": {
+      "publishPendingSignalHint": "09beff49e76f9bbb2d1457fef81d19aa5e5a1ddaeca86019c28b18fb6fa979e8",
+      "deliverSignal": "ef6fd0dfe45773fe877f1860fa25509e10e6887a9fdfb2768fbd7472f571a385",
+      "deliverThreadSignal": "069be190dabfad56f4f3c8e993e490d383c5e39650ad751e6028a816e0eee13a",
+      "deliverSignalLocked": "d4d52c69d74ae7d7c3177f6537e8ea4d7e8efc21a59f38008798c410184a5d55",
+      "testUninterruptibleWaitFrontendMatrix": "5f174f8a8ff154197397c449f1767b0e953c7be5398e81cb25be2074aaed2557"
+    }
+  },
+  "kernel/src/state/fd.zig": {
+    "mentions": {
+      "fdEntryConst": 11,
+      "fdPayloadWithRights": 5,
+      "fdPayloadWithRightsConst": 5,
+      "fdTableForActiveProcess": 10,
+      "fdTableForActiveProcessConst": 4,
+      "fdTableForProcessIndex": 2,
+      "fdTableForProcessIndexConst": 1,
+      "getFdTable": 2,
+      "getFdTableConst": 2,
+      "vmaTableForProcessIndex": 1
+    },
+    "reviewed_bodies": {}
+  },
+  "kernel/src/state/fd_capability.zig": {
+    "mentions": {
+      "fdEntryConst": 2,
+      "fdTableForProcessIndex": 2
+    },
+    "reviewed_bodies": {}
+  },
+  "kernel/src/state/ipc.zig": {
+    "mentions": {
+      "fdEntryConst": 15,
+      "fdPayloadWithRightsConst": 1,
+      "fdTableForActiveProcessConst": 4,
+      "fdTableForProcessIndexConst": 2
+    },
+    "reviewed_bodies": {}
+  },
+  "kernel/src/state/memory.zig": {
+    "mentions": {
+      "initDynamicPrincipalState": 1,
+      "initPrincipalState": 2
+    },
+    "reviewed_bodies": {}
+  },
+  "kernel/src/state/pipe.zig": {
+    "mentions": {
+      "fdEntryConst": 4,
+      "fdPayloadWithRightsConst": 2
+    },
+    "reviewed_bodies": {}
+  },
+  "kernel/src/state/process.zig": {
+    "mentions": {
+      "clearPrincipalState": 3,
+      "clearPrincipalTablesForReuse": 3,
+      "createProcessDescriptor": 3,
+      "createProcessDescriptorBelow": 4,
+      "createProcessDescriptorBelowChecked": 6,
+      "createProcessDescriptorWithCapacity": 1,
+      "createProcessDescriptorWithCapacityLimit": 1,
+      "createProcessDescriptorWithCapacityLimitChecked": 1,
+      "createProcessDescriptorWithUserAddressSpaceChecked": 1,
+      "ensureProcessDescriptor": 2,
+      "fdPayloadWithRights": 2,
+      "fdPayloadWithRightsConst": 2,
+      "fdTableForActiveProcess": 2,
+      "fdTableForActiveProcessConst": 2,
+      "fdTableForProcessIndex": 2,
+      "fdTableForProcessIndexConst": 2,
+      "getFdTable": 2,
+      "getFdTableConst": 1,
+      "initDynamicPrincipalState": 1,
+      "initPrincipalState": 1,
+      "process_timers.release": 1,
+      "process_timers.reserve": 2,
+      "resetProcessRuntimeTables": 2,
+      "vmaTableForProcessIndex": 2,
+      "vmaTableForProcessIndexConst": 1
+    },
+    "reviewed_bodies": {
+      "clearPrincipalTablesForReuse": "30eac660779991ad976a2641e778a65cadd540810768b5d5a044fb34cac3801a",
+      "createProcessDescriptorBelowChecked": "c1e0d940aa7b9a7332ccae7a23f48030c6901794dab416c4659b3d8b93882757",
+      "ensureProcessDescriptor": "642b5529500e898c9d218814072e1ca0e2408d5bacfc0af431ffe8d512655f86",
+      "clearPrincipalState": "e713fbd3c389766299893e8a8dd605841225c9bf294ae6bfc634a1afe8faee13",
+      "initPrincipalState": "7a595066decf80cf8a6889b7322e447ed2f30ccdb40ea942096c423d5e6d908b",
+      "releaseProcessTimer": "b719365cdf1f1c626143c5400d06bac0377000067be488244e26b2bee5956581",
+      "initDynamicPrincipalState": "e908c7bdcabe2f8a0ecd1ba6ac47a3ce97e4c3ea08649ec44287b77a36fae59d"
+    }
+  },
+  "kernel/src/state/process_timer.zig": {
+    "mentions": {
+      "process_timers.cancel": 1,
+      "process_timers.set": 1
+    },
+    "reviewed_bodies": {}
+  },
+  "kernel/src/state/reference_check.zig": {
+    "mentions": {
+      "fdTableForProcessIndex": 1,
+      "vmaTableForProcessIndex": 6
+    },
+    "reviewed_bodies": {}
+  },
+  "kernel/src/state/vma.zig": {
+    "mentions": {
+      "commitFixedMmapPrepared": 1,
+      "commitMremapPrepared": 2,
+      "commitMunmapPrepared": 1,
+      "discardFixedMmapPrepared": 4,
+      "discardMremapPrepared": 4,
+      "discardMunmapPrepared": 1,
+      "fdEntryConst": 3,
+      "fdTableForActiveProcessConst": 1,
+      "fdTableForProcessIndex": 2,
+      "getVmaTable": 26,
+      "getVmaTableConst": 5,
+      "prepareFixedAnonymousMmap": 1,
+      "prepareFixedFdMmap": 1,
+      "prepareFixedFdMmapIntoProcess": 2,
+      "prepareFixedMmapSlots": 3,
+      "prepareMremapWithFreeList": 2,
+      "prepareMunmapRangeWithFreeList": 1,
+      "resetProcessRuntimeTables": 1,
+      "vmaTableForProcessIndex": 6,
+      "vmaTableForProcessIndexConst": 1
+    },
+    "reviewed_bodies": {}
+  },
+  "kernel/src/state/vmo.zig": {
+    "mentions": {
+      "fdEntryConst": 3,
+      "fdTableForActiveProcess": 2,
+      "vmaTableForProcessIndex": 2,
+      "vmaTableForProcessIndexConst": 3
+    },
+    "reviewed_bodies": {}
+  },
+  "kernel/src/syscall/capsule.zig": {
+    "mentions": {
+      "fdEntryConst": 2,
+      "fdPayloadWithRights": 2,
+      "fdPayloadWithRightsConst": 6
+    },
+    "reviewed_bodies": {
+      "writeFdSnapshot": "9e1b83d64999c8ff3c38a14e42dd03b8d1a61f39414e8e264ab70f468363bd5a",
+      "dispatch": "5ce3c79c9548c07bead7eefdf6698434870e6fd880fe800e0c8bca3881d01bbe"
+    }
+  },
+  "kernel/src/syscall/fd.zig": {
+    "mentions": {
+      "commitFixedMmapPrepared": 1,
+      "commitMremapPrepared": 1,
+      "commitMunmapPrepared": 1,
+      "discardFixedMmapPrepared": 1,
+      "discardMremapPrepared": 1,
+      "discardMunmapPrepared": 1,
+      "fdEntryConst": 2,
+      "fdPayloadWithRightsConst": 7,
+      "getFdTableConst": 2,
+      "getVmaTableConst": 1,
+      "prepareFixedAnonymousMmap": 1,
+      "prepareFixedFdMmap": 1,
+      "prepareMremapWithFreeList": 1,
+      "prepareMunmapRangeWithFreeList": 1
+    },
+    "reviewed_bodies": {
+      "ipcChannelHandleForFd": "22f397fa3fc8104b37432bf5f7aa82e8f610b987734876bf0832b79b4f95e73d",
+      "fdRead": "5392b3107bbf509d60626ea9c60a66fa30ad1ebca2a091a8764e4288b28c8646",
+      "fdWrite": "7106309edae5e436fa8f913e889e1f74637996f93560033214a711f6b484b96f",
+      "fdWritev": "14d48b71601edfa531cf87a4e4454671d74fc1c122656e482574c498206af5f1",
+      "pollNowNs": "d2eca7bbfc7e631633ed3e3e4080c0e7e28482bf72dcf33f35e8cb1c924c08c0",
+      "createPageViewVmoFd": "b0f4ed406f3b80193565d56ddb7f081911bc30241c917d3d2d0700068c4acb5c",
+      "mapVmoFd": "cf94be86da55cb19dbbfda39327ee849dff36428f536f533e12f0c3f4bac53b5",
+      "findMremapMoveTarget": "077f4fe8696efe17fccbe32cf90d508fc424466bb5304160f7ca1f7a03c8e873",
+      "mremapVmaRange": "93d258f8a6ef71768324084a94573e44f2cbac89fa90706ea743357285e26e0e",
+      "fdIoctl": "2bed82bc8feaae36af69ee44cb71492e07f382edc0cf36be138363d2066d4ce8",
+      "closeProcessFdsWithWakes": "733cdc1572c041bc127af3f5250464a7ef4fd95e4c85bec6798b51d7687edc83",
+      "dispatch": "ba0b94d38f94fdd02055c7608d67da8bde8a1f5a4a68210cfef08e976d7fc0fd"
+    }
+  },
+  "kernel/src/syscall/native_ipc.zig": {
+    "mentions": {
+      "fdPayloadWithRightsConst": 3
+    },
+    "reviewed_bodies": {
+      "recvWaitArgs": "21c1185c65056f7d79ea62779c34c246dca80af18275455da25aadb9735cebf7",
+      "callSync": "8a706f49f0830bb4e1cbee534e4f5a70dcea8ca9fdbf1fc016e158ec126b367b",
+      "sendReply": "61137b658a749dc180e771d368975ac1bae8686adee59a1f198c5b393fa89e11"
+    }
+  },
+  "kernel/src/syscall/process.zig": {
+    "mentions": {
+      "commitFixedMmapPrepared": 1,
+      "commitMunmapPrepared": 1,
+      "createProcessDescriptorWithUserAddressSpaceChecked": 2,
+      "deliverSignal": 1,
+      "discardFixedMmapPrepared": 1,
+      "discardMunmapPrepared": 1,
+      "getFdTableConst": 1,
+      "getVmaTable": 1,
+      "prepareFixedAnonymousMmap": 1,
+      "prepareFixedFdMmapIntoProcess": 1,
+      "prepareMunmapRangeWithFreeList": 1,
+      "process_timer.get": 1,
+      "process_timer.set": 1,
+      "quiescePrincipalForLifecycle": 4,
+      "resetProcessRuntimeTables": 2
+    },
+    "reviewed_bodies": {
+      "writeProtectForkCowVmas": "4d853a2fbdbd302b04ee07ef4c6308064cd1b245bc65eecd12023b906ee3f28e",
+      "cleanupProcess": "f85d805402bf99e5ec4a00e73346f525bad17f07f7f54bdafa486936c72bf51e",
+      "exitProcessAfterTeardown": "dc44ded64cc0d0e7cc473ea0b5066725f43a0c76754faac90ba1c331fc7283a9",
+      "createProcess": "986965386055c50173b876750413c5281c18a6a892738cf1403ef88814ee522d",
+      "cloneCurrentProcessForFork": "2d259128610636bccc56417d245903f27126774a9a06e24fdcd88184887430b4",
+      "killProcess": "cc48cc32fd3d14e58b00c8467fcb49abebf3482509dc8d5bace548d3cd48c489",
+      "signalProcess": "d0f30567ca163c930207b3c7416a67028b6fd2c24f5f5cc86b64c2fd32f86228",
+      "signalControl": "7cc3b6fe99e19d9379d5622f283d8baed2819b9a273ebe96505152d5732bca2a",
+      "stopProcess": "6ac74bfd681cd61200cede61b493b244e328441477a7f8429034a8cf797652ba",
+      "installProcessMapLocked": "dc0a82c19b6f4fc3367a15764aa49c8bb510367155934a58c0bc259062d5ef07",
+      "unmapFromProcess": "d659a36463463353e14a1d43c309583cdc3499f6f5cdaf472b5aa368fc564c55"
+    }
+  },
+  "kernel/src/syscalls.zig": {
+    "mentions": {
+      "completeProcessSignalTimerLocked": 2,
+      "completeProcessSignalTimersFromInterrupt": 1,
+      "deliverSignal": 1,
+      "process_timer.clear": 1,
+      "process_timers.take": 1
+    },
+    "reviewed_bodies": {
+      "completeProcessSignalTimersFromInterrupt": "0aba2c605ed8b6f75dc1ae2214abee0c15b5f92b7b924f32a74fdb4cb86889af",
+      "completeProcessSignalTimerLocked": "c2ce64348c0ad2f333fea765dc49f416acd69bf18553b2ffbcf14dbb8257ab79"
+    }
+  },
+  "kernel/src/traps.zig": {
+    "mentions": {
+      "completeProcessSignalTimersFromInterrupt": 1
+    },
+    "reviewed_bodies": {}
+  }
+}

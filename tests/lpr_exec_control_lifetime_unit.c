@@ -17,7 +17,7 @@ int64_t lpr_pacha_status_to_errno(int64_t status)
     return -LPR_LINUX_EIO;
 }
 
-int64_t lpr_supervisor_call_token(uint32_t op, uint64_t token, int transfer, uint64_t *result)
+int64_t lpr_supervisor_call_token(uint32_t op, uint64_t token, pacha_fd_t transfer, uint64_t *result)
 {
     assert(op == LPRS_OP_PROCESS_EXEC_COMMIT_CANCEL && token == 101 && transfer == -1 && !result);
     cancelled++;
@@ -145,4 +145,10 @@ int main(void)
         lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, LPR_BOOTSTRAP_FD);
     }
     puts("lpr exec control lifetime: cancellation ownership, fork isolation, handoff retained until exec, repeated cleanup passed");
+}
+
+#include "lpr_ipc_mock.h"
+int64_t lpr_ipc_message(uint64_t nr, uint64_t fd, uint64_t send, uint64_t receive,
+    uint64_t timeout, uint64_t flags, int *committed) {
+    return test_lpr_ipc_noncall(nr, fd, send, receive, timeout, flags, committed);
 }

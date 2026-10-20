@@ -21,7 +21,7 @@ static int make_blob(const void *bytes, size_t size, struct ph_bootstrap_item *i
     uint64_t mapped = (size + 4095) & ~UINT64_C(4095);
     const uint64_t rights = PACHA_FD_RIGHT_INSPECT | PACHA_FD_RIGHT_CLOSE |
         PACHA_FD_RIGHT_TRANSFER | PACHA_FD_RIGHT_MAP_READ | PACHA_FD_RIGHT_MAP_WRITE;
-    int fd = pacha_vmo_create(mapped, rights, 0);
+    pacha_fd_t fd = pacha_vmo_create(mapped, rights, 0);
     if (fd < 16) return fd < 0 ? fd : -12;
     void *view = pacha_mmap(fd, mapped,
         PACHA_PROT_READ | PACHA_PROT_WRITE, PACHA_MMAP_SHARED, 0);
@@ -36,7 +36,7 @@ static int make_blob(const void *bytes, size_t size, struct ph_bootstrap_item *i
     return 0;
 }
 
-static int load_blob(int filed_fd, const char *path, const char *name,
+static int load_blob(pacha_fd_t filed_fd, const char *path, const char *name,
     struct ph_bootstrap_item *item, uint8_t digest[32])
 {
     struct filed_client_module_image image = {0};
@@ -49,7 +49,7 @@ static int load_blob(int filed_fd, const char *path, const char *name,
     return error;
 }
 
-static int load_manifest(int filed_fd, struct netd_kobox2_package *package)
+static int load_manifest(pacha_fd_t filed_fd, struct netd_kobox2_package *package)
 {
     struct filed_client_module_image image = {0};
     int error = filed_client_load_module_image(filed_fd,
@@ -95,7 +95,7 @@ static int safe_module_name(kb2_closure_string_t name)
 }
 
 int netd_kobox2_package_open(struct netd_kobox2_package *package,
-    int filed_fd, int device_fd)
+    pacha_fd_t filed_fd, pacha_fd_t device_fd)
 {
     if (!package || package->device_fd || filed_fd < 16 || device_fd < 16)
         return -22;
@@ -201,7 +201,7 @@ int netd_kobox2_package_unbind(struct netd_kobox2_package *package,
         package->device.generation != generation) return -22;
     uint64_t fd = package->items[1].capability.fd;
     if (fd >= 16) {
-        int error = pacha_fd_close((int)fd);
+        int error = pacha_fd_close((pacha_fd_t)fd);
         if (error) return error;
         package->items[1] = (struct ph_bootstrap_item){0};
     }
@@ -299,7 +299,7 @@ int netd_kobox2_package_close(struct netd_kobox2_package *package)
     for (size_t i = 0; i < package->artifact_count + 2; ++i) {
         uint64_t fd = package->items[i].capability.fd;
         if (fd >= 16) {
-            int error = pacha_fd_close((int)fd);
+            int error = pacha_fd_close((pacha_fd_t)fd);
             if (error && !first) first = error;
             if (!error) package->items[i].capability.fd = 0;
         }

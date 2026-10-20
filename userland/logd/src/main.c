@@ -31,7 +31,7 @@ struct logd_pending {
 };
 
 struct logd_state {
-    int filed_fd;
+    pacha_fd_t filed_fd;
     uint64_t line_sequence;
     unsigned next_slot;
     struct logd_pending pending[LOGD_PENDING_SLOTS];
@@ -41,7 +41,7 @@ struct logd_state {
     size_t kernel_used;
     uint64_t kernel_cursor;
     uint64_t kernel_dropped;
-    int kernel_timer_fd;
+    pacha_fd_t kernel_timer_fd;
     unsigned kernel_publish_pending;
 };
 
@@ -243,7 +243,7 @@ static int accept_fragment(struct logd_state *state,
 int main(int argc, char **argv)
 {
     (void)argc;
-    const int bootstrap = pacha_bootstrap_fd_from_argv(argv);
+    const pacha_fd_t bootstrap = pacha_bootstrap_fd_from_argv(argv);
     struct logd_boot_config config = {0};
     if (bootstrap < 16 ||
         pacha_fd_read(bootstrap, &config, sizeof(config)) != (long)sizeof(config) ||
@@ -253,7 +253,7 @@ int main(int argc, char **argv)
         return 2;
     (void)pacha_fd_close(bootstrap);
     struct logd_state state = {
-        .filed_fd = (int)config.filed_endpoint_fd,
+        .filed_fd = (pacha_fd_t)config.filed_endpoint_fd,
         .kernel_timer_fd = -1,
     };
     int status = ensure_directory(&state);
@@ -288,8 +288,8 @@ int main(int argc, char **argv)
         .word0 = LOGD_READY_MAGIC,
         .word1 = (uint64_t)(int64_t)status,
     };
-    const int ready_status = pacha_ipc_send((int)config.ready_channel_fd, &ready);
-    (void)pacha_fd_close((int)config.ready_channel_fd);
+    const int ready_status = pacha_ipc_send((pacha_fd_t)config.ready_channel_fd, &ready);
+    (void)pacha_fd_close((pacha_fd_t)config.ready_channel_fd);
     if (status != 0 || ready_status != 0) {
         fprintf(stderr, "[logd] RAM log setup failed status=%d\n",
             status != 0 ? status : ready_status);
@@ -299,10 +299,10 @@ int main(int argc, char **argv)
         struct pacha_ipc_msg message = {0};
         if (state.kernel_timer_fd >= 16) {
             struct pacha_pollfd waits[2] = {
-                { .fd = (int)config.endpoint_fd, .events = PACHA_FD_EVENT_READABLE },
+                { .fd = (pacha_fd_t)config.endpoint_fd, .events = PACHA_FD_EVENT_READABLE },
                 { .fd = state.kernel_timer_fd, .events = PACHA_FD_EVENT_READABLE },
             };
-            status = (int)pacha_fd_wait_many(waits, 2, PACHA_FD_WAIT_FOREVER);
+            status = (pacha_fd_t)pacha_fd_wait_many(waits, 2, PACHA_FD_WAIT_FOREVER);
             if (status < 0) break;
             if (waits[1].revents & PACHA_FD_EVENT_READABLE) {
                 uint64_t expirations = 0;
@@ -316,7 +316,7 @@ int main(int argc, char **argv)
             }
             if (!(waits[0].revents & PACHA_FD_EVENT_READABLE)) continue;
         }
-        status = pacha_ipc_recv((int)config.endpoint_fd, &message);
+        status = pacha_ipc_recv((pacha_fd_t)config.endpoint_fd, &message);
         if (status != 0) continue;
         unsigned dirty = accept_fragment(&state, &message);
         /* Drain a bounded burst before touching filed. This keeps Linux
@@ -324,7 +324,7 @@ int main(int argc, char **argv)
          * filesystem RPCs per individual line. */
         for (unsigned i = 0; i < 127; ++i) {
             message = (struct pacha_ipc_msg){0};
-            if (pacha_ipc_recv((int)config.endpoint_fd, &message) != 0) break;
+            if (pacha_ipc_recv((pacha_fd_t)config.endpoint_fd, &message) != 0) break;
             dirty |= (unsigned)accept_fragment(&state, &message);
         }
         if (dirty) {

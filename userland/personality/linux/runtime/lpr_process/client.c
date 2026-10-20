@@ -16,7 +16,7 @@
 #endif
 #include "../lpr_common/boot_diagnostic.h"
 
-static int lpr_process_control_fd = -1;
+static pacha_fd_t lpr_process_control_fd = -1;
 
 #if defined(LPR_GLYCIN_DIAG) && LPR_GLYCIN_DIAG
 static char *lpr_process_rpc_diag_text(
@@ -57,7 +57,7 @@ static char *lpr_process_rpc_diag_i64(
 static void lpr_process_rpc_diag(
     const char *stage,
     uint64_t request_id,
-    int64_t reply_fd,
+    int64_t endpoint,
     int64_t status,
     uint64_t word0,
     uint64_t word3)
@@ -69,8 +69,8 @@ static void lpr_process_rpc_diag(
     out = lpr_process_rpc_diag_text(out, end, stage);
     out = lpr_process_rpc_diag_text(out, end, " request=");
     out = lpr_process_rpc_diag_u64(out, end, request_id);
-    out = lpr_process_rpc_diag_text(out, end, " reply_fd=");
-    out = lpr_process_rpc_diag_i64(out, end, reply_fd);
+    out = lpr_process_rpc_diag_text(out, end, " endpoint=");
+    out = lpr_process_rpc_diag_i64(out, end, endpoint);
     out = lpr_process_rpc_diag_text(out, end, " status=");
     out = lpr_process_rpc_diag_i64(out, end, status);
     out = lpr_process_rpc_diag_text(out, end, " word0=");
@@ -98,13 +98,13 @@ int64_t lpr_process_client_call_with_transfer_rights(
     uint64_t *request_counter,
     int64_t (*status_to_errno)(int64_t status),
     uint32_t op,
-    int page_fd,
+    pacha_fd_t page_fd,
     void *page,
     uint32_t payload_size,
-    int transfer_fd,
+    pacha_fd_t transfer_fd,
     uint64_t transfer_rights,
     uint64_t *out_result,
-    int *out_reply_fd)
+    pacha_fd_t *out_reply_fd)
 {
     if (request_counter == 0 ||
         status_to_errno == 0 ||
@@ -140,7 +140,7 @@ int64_t lpr_process_client_call_with_transfer_rights(
         PACHA_FD_RIGHT_MAP_WRITE;
     fd_count++;
     if (transfer_fd >= 16) {
-        fds[fd_count].fd = (uint64_t)(uint32_t)transfer_fd;
+        fds[fd_count].fd = (uint64_t)transfer_fd;
         fds[fd_count].rights = transfer_rights;
         fd_count++;
     }
@@ -153,37 +153,6 @@ int64_t lpr_process_client_call_with_transfer_rights(
         .fds = fds,
         .fd_count = fd_count,
     };
-    /* Session acquisition can arrive concurrently from every Linux thread.
-     * As with socket RPCs, wait only for explicit pre-enqueue backpressure. */
-    if (op == LPRS_OP_PROCESS_FILED_SESSION)
-        lpr_boot_diagnostic_fs_emit("fs.supervisor.call", op, request_id,
-            lpr_process_control_fd, 0, 0);
-    const int64_t reply_fd = lpr_native_ipc_call_wait(
-        (uint64_t)(uint32_t)lpr_process_control_fd, &request);
-    if (op == LPRS_OP_PROCESS_FILED_SESSION)
-        lpr_boot_diagnostic_fs_emit("fs.supervisor.called", op, request_id, reply_fd,
-            reply_fd < 16 ? status_to_errno(reply_fd) : 0, reply_fd);
-#if defined(LPR_GLYCIN_DIAG) && LPR_GLYCIN_DIAG
-    if (op == LPRS_OP_PROCESS_WAIT4) {
-        lpr_process_rpc_diag("call-return", request_id, reply_fd, 0, 0, 0);
-    }
-#endif
-    if (reply_fd < 16) {
-        const int64_t err = status_to_errno(reply_fd);
-        lpr_trace_error_record(
-            LPR_ERROR_DOMAIN_KERNEL,
-            op,
-            LPR_ERROR_STAGE_CHILD_RPC_CALL,
-            err,
-            reply_fd,
-            request_id,
-            fd_count,
-            (uint64_t)(uint32_t)lpr_process_control_fd,
-            0,
-            "lpr process supervisor ipc_call failed");
-        return err;
-    }
-
     struct pacha_ipc_msg reply;
     struct pacha_ipc_fd reply_item;
     lpr_memset(&reply, 0, sizeof(reply));
@@ -194,46 +163,24 @@ int64_t lpr_process_client_call_with_transfer_rights(
         reply.fd_capacity = 1;
     }
 #if defined(LPR_GLYCIN_DIAG) && LPR_GLYCIN_DIAG
-    if (op == LPRS_OP_PROCESS_WAIT4) {
-        lpr_process_rpc_diag("recv-enter", request_id, reply_fd, 0, 0, 0);
-    }
+    if (op == LPRS_OP_PROCESS_WAIT4)
+        lpr_process_rpc_diag("call-enter", request_id, lpr_process_control_fd, 0, 0, 0);
 #endif
     if (op == LPRS_OP_PROCESS_FILED_SESSION)
-        lpr_boot_diagnostic_fs_emit("fs.supervisor.recv", op, request_id, reply_fd, 0, 0);
-    const int64_t recv_status = lpr_native_ipc_recv_wait(
-        (uint64_t)(uint32_t)reply_fd,
-        &reply);
+        lpr_boot_diagnostic_fs_emit("fs.supervisor.call", op, request_id,
+            lpr_process_control_fd, 0, 0);
+    const int64_t recv_status = lpr_native_ipc_call_wait(
+        (uint64_t)lpr_process_control_fd, &request, &reply, NULL);
+#if defined(LPR_GLYCIN_DIAG) && LPR_GLYCIN_DIAG
+    if (op == LPRS_OP_PROCESS_WAIT4)
+        lpr_process_rpc_diag("call-return", request_id, lpr_process_control_fd,
+            recv_status, reply.word0, reply.word3);
+#endif
     if (op == LPRS_OP_PROCESS_FILED_SESSION)
         lpr_boot_diagnostic_fs_emit("fs.supervisor.received", reply.word0,
             reply.word3, reply.word2,
             recv_status ? status_to_errno(recv_status) : (int64_t)reply.word1, recv_status);
-#if defined(LPR_GLYCIN_DIAG) && LPR_GLYCIN_DIAG
-    if (op == LPRS_OP_PROCESS_WAIT4) {
-        lpr_process_rpc_diag(
-            "recv-return",
-            request_id,
-            reply_fd,
-            recv_status,
-            reply.word0,
-            reply.word3);
-    }
-#endif
-    (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, (uint64_t)(uint32_t)reply_fd);
-    if (recv_status != 0) {
-        const int64_t err = status_to_errno(recv_status);
-        lpr_trace_error_record(
-            LPR_ERROR_DOMAIN_KERNEL,
-            op,
-            LPR_ERROR_STAGE_CHILD_RPC_RECV,
-            err,
-            recv_status,
-            request_id,
-            fd_count,
-            (uint64_t)(uint32_t)reply_fd,
-            0,
-            "lpr process supervisor reply recv failed");
-        return err;
-    }
+    if (recv_status != 0) return status_to_errno(recv_status);
 
     const pacha_service_envelope_t *reply_header = (const pacha_service_envelope_t *)page;
     if (reply.word0 != PACHA_SERVICE_REPLY_MAGIC ||
@@ -280,7 +227,7 @@ int64_t lpr_process_client_call_with_transfer_rights(
             (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, reply_item.fd);
         return -LPR_LINUX_EIO;
     }
-    if (out_reply_fd != 0) *out_reply_fd = (int)(uint32_t)reply_item.fd;
+    if (out_reply_fd != 0) *out_reply_fd = (pacha_fd_t)reply_item.fd;
     if (out_result != 0) {
         *out_result = reply.word2;
     }
@@ -301,12 +248,12 @@ int64_t lpr_process_client_call_with_reply_fd(
     uint64_t *request_counter,
     int64_t (*status_to_errno)(int64_t status),
     uint32_t op,
-    int page_fd,
+    pacha_fd_t page_fd,
     void *page,
     uint32_t payload_size,
-    int transfer_fd,
+    pacha_fd_t transfer_fd,
     uint64_t *out_result,
-    int *out_reply_fd)
+    pacha_fd_t *out_reply_fd)
 {
     return lpr_process_client_call_with_transfer_rights(
         request_counter,
@@ -325,10 +272,10 @@ int64_t lpr_process_client_call(
     uint64_t *request_counter,
     int64_t (*status_to_errno)(int64_t status),
     uint32_t op,
-    int page_fd,
+    pacha_fd_t page_fd,
     void *page,
     uint32_t payload_size,
-    int transfer_fd,
+    pacha_fd_t transfer_fd,
     uint64_t *out_result)
 {
     return lpr_process_client_call_with_reply_fd(
@@ -344,16 +291,16 @@ int64_t lpr_process_client_call(
 }
 
 int64_t lpr_process_client_activate(uint64_t *request_counter,
-    int64_t (*status_to_errno)(int64_t), int bootstrap_fd, uint64_t token,
-    int page_fd, void *page)
+    int64_t (*status_to_errno)(int64_t), pacha_fd_t bootstrap_fd, uint64_t token,
+    pacha_fd_t page_fd, void *page)
 {
-    if (bootstrap_fd < 16 || bootstrap_fd >= PACHAOS_FD_TABLE_LIMIT || !token || !page) return -LPR_LINUX_EINVAL;
+    if (bootstrap_fd < 16 || bootstrap_fd >= PACHAOS_THREAD_SELF_FD || !token || !page) return -LPR_LINUX_EINVAL;
     /* This is a single-threaded startup operation, including fork children.
      * A copied parent descriptor number is never used for child requests. */
     lpr_process_control_fd = bootstrap_fd;
     lprs_token_request_t *payload = lpr_process_client_payload(page);
     *payload = (lprs_token_request_t){ .token = token };
-    int control = -1;
+    pacha_fd_t control = -1;
     int64_t status = lpr_process_client_call_with_reply_fd(request_counter, status_to_errno,
         LPRS_OP_PROCESS_ACTIVATE, page_fd, page, sizeof(*payload), -1, NULL, &control);
     lpr_process_control_fd = -1;
@@ -361,7 +308,7 @@ int64_t lpr_process_client_activate(uint64_t *request_counter,
     struct pacha_fd_info info;
     const uint64_t allowed = PACHA_FD_RIGHT_INSPECT | PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_CALL |
         PACHA_FD_RIGHT_WAIT | PACHA_FD_RIGHT_POLL;
-    if (control < 16 || control >= PACHAOS_FD_TABLE_LIMIT || lpr_pacha_syscall2(PACHAOS_SYSCALL_FD_GET_INFO,
+    if (control < 16 || control >= PACHAOS_THREAD_SELF_FD || lpr_pacha_syscall2(PACHAOS_SYSCALL_FD_GET_INFO,
             (uint64_t)(uint32_t)control, (uint64_t)(uintptr_t)&info) != 0 ||
         info.kind != PACHA_FD_KIND_CHANNEL || info.rights != allowed ||
         info.flags != (PACHA_FD_FLAG_PRIVATE | PACHA_FD_FLAG_CLOEXEC)) {
@@ -376,20 +323,20 @@ int64_t lpr_process_client_activate(uint64_t *request_counter,
 
 int64_t lpr_process_client_prepare_exec(uint64_t *request_counter,
     int64_t (*status_to_errno)(int64_t), uint64_t token,
-    int page_fd, void *page, int *out_bootstrap_fd)
+    pacha_fd_t page_fd, void *page, pacha_fd_t *out_bootstrap_fd)
 {
     if (!token || !page || !out_bootstrap_fd) return -LPR_LINUX_EINVAL;
     *out_bootstrap_fd = -1;
     lprs_token_request_t *payload = lpr_process_client_payload(page);
     *payload = (lprs_token_request_t){ .token = token };
-    int bootstrap = -1;
+    pacha_fd_t bootstrap = -1;
     int64_t status = lpr_process_client_call_with_reply_fd(request_counter, status_to_errno,
         LPRS_OP_PROCESS_EXEC_PREPARE, page_fd, page, sizeof(*payload), -1, NULL, &bootstrap);
     if (status != 0) return status;
     struct pacha_fd_info info;
     const uint64_t allowed = PACHA_FD_RIGHT_INSPECT | PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_CALL |
         PACHA_FD_RIGHT_WAIT | PACHA_FD_RIGHT_POLL;
-    if (bootstrap < 16 || bootstrap >= PACHAOS_FD_TABLE_LIMIT || lpr_pacha_syscall2(PACHAOS_SYSCALL_FD_GET_INFO,
+    if (bootstrap < 16 || bootstrap >= PACHAOS_THREAD_SELF_FD || lpr_pacha_syscall2(PACHAOS_SYSCALL_FD_GET_INFO,
             (uint64_t)(uint32_t)bootstrap, (uint64_t)(uintptr_t)&info) != 0 ||
         info.kind != PACHA_FD_KIND_CHANNEL || info.rights != allowed ||
         info.flags != PACHA_FD_FLAG_PRIVATE) {
@@ -408,14 +355,14 @@ int64_t lpr_process_client_prepare_exec(uint64_t *request_counter,
 
 int64_t lpr_process_client_service_session(uint32_t op, uint64_t *request_counter,
     int64_t (*status_to_errno)(int64_t), uint64_t token,
-    int page_fd, void *page, uint64_t *out_session, int *out_fd)
+    pacha_fd_t page_fd, void *page, uint64_t *out_session, pacha_fd_t *out_fd)
 {
     if (!token || !page || !out_session || !out_fd) return -LPR_LINUX_EINVAL;
     *out_session = 0;
     *out_fd = -1;
     lprs_token_request_t *payload = lpr_process_client_payload(page);
     *payload = (lprs_token_request_t){ .token = token };
-    int fd = -1;
+    pacha_fd_t fd = -1;
     uint64_t session = 0;
     const int64_t status = lpr_process_client_call_with_reply_fd(request_counter, status_to_errno,
         op, page_fd, page, sizeof(*payload), -1, &session, &fd);
@@ -423,7 +370,7 @@ int64_t lpr_process_client_service_session(uint32_t op, uint64_t *request_counte
     struct pacha_fd_info info;
     const uint64_t rights = PACHA_FD_RIGHT_INSPECT | PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_CALL |
         PACHA_FD_RIGHT_WAIT | PACHA_FD_RIGHT_POLL;
-    if (!session || fd < 16 || fd >= PACHAOS_FD_TABLE_LIMIT || lpr_pacha_syscall2(PACHAOS_SYSCALL_FD_GET_INFO,
+    if (!session || fd < 16 || fd >= PACHAOS_THREAD_SELF_FD || lpr_pacha_syscall2(PACHAOS_SYSCALL_FD_GET_INFO,
             (uint64_t)(uint32_t)fd, (uint64_t)(uintptr_t)&info) != 0 ||
         info.kind != PACHA_FD_KIND_CHANNEL || info.rights != rights ||
         info.flags != (PACHA_FD_FLAG_PRIVATE | PACHA_FD_FLAG_CLOEXEC)) {
@@ -437,7 +384,7 @@ int64_t lpr_process_client_service_session(uint32_t op, uint64_t *request_counte
 
 int64_t lpr_process_client_unix_session(uint64_t *counter,
     int64_t (*convert)(int64_t), uint64_t token,
-    int page_fd, void *page, uint64_t *session, int *fd)
+    pacha_fd_t page_fd, void *page, uint64_t *session, pacha_fd_t *fd)
 {
     return lpr_process_client_service_session(LPRS_OP_PROCESS_UNIX_SESSION,
         counter, convert, token, page_fd, page, session, fd);
@@ -446,18 +393,18 @@ int64_t lpr_process_client_unix_session(uint64_t *counter,
 int64_t lpr_process_client_call_token(
     uint64_t *request_counter,
     int64_t (*status_to_errno)(int64_t status),
-    int (*create_page)(void **out_page),
-    void (*destroy_page)(int fd, void *page),
+    pacha_fd_t (*create_page)(void **out_page),
+    void (*destroy_page)(pacha_fd_t fd, void *page),
     uint32_t op,
     uint64_t token,
-    int transfer_fd,
+    pacha_fd_t transfer_fd,
     uint64_t *out_result)
 {
     if (create_page == 0 || destroy_page == 0 || token == 0) {
         return -LPR_LINUX_EINVAL;
     }
     void *page = 0;
-    const int page_fd = create_page(&page);
+    const pacha_fd_t page_fd = create_page(&page);
     if (page_fd < 0) {
         return page_fd;
     }

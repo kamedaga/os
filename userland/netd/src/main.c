@@ -58,7 +58,7 @@ static int report_link_status(const struct netd_boot_config *cfg,
             (unsigned long long)stage, status, diagnostic->step,
             diagnostic->detail, diagnostic->loaded, diagnostic->pci_bound);
         if (size > 0 && (size_t)size < sizeof(line))
-            (void)pacha_log_emit((int)cfg->log_endpoint_fd,
+            (void)pacha_log_emit((pacha_fd_t)cfg->log_endpoint_fd,
                 PACHA_LOG_SOURCE_NETD, line, (size_t)size);
     }
     if (cfg->status_channel_fd < 16) return 0;
@@ -94,7 +94,7 @@ static int report_link_status(const struct netd_boot_config *cfg,
         .word2 = metadata,
         .word3 = detail,
     };
-    return pacha_ipc_send((int)cfg->status_channel_fd, &report);
+    return pacha_ipc_send((pacha_fd_t)cfg->status_channel_fd, &report);
 }
 
 static int netd_wait_set_failure(
@@ -125,7 +125,7 @@ static int netd_try_ipv4_policy(struct netd_runtime *runtime, int *state)
         !ipv4.address[2] && !ipv4.address[3]) {
         char text[512];
         size_t text_size = 0;
-        int error = netd_policy_file_read((int)cfg->filed_endpoint_fd,
+        int error = netd_policy_file_read((pacha_fd_t)cfg->filed_endpoint_fd,
             text, sizeof(text), &text_size);
         if (error) {
             if (error != -ENOENT && error != last_policy_error)
@@ -166,7 +166,7 @@ static int netd_try_ipv4_policy(struct netd_runtime *runtime, int *state)
      * readiness event so dependent services cannot race the TCP/IP stack. */
     (void)report_link_status(cfg, 0, NETD_BOOT_STAGE_IPV4);
     int resolver_status = netd_resolver_file_create(
-        (int)cfg->filed_endpoint_fd, ipv4.dns);
+        (pacha_fd_t)cfg->filed_endpoint_fd, ipv4.dns);
     if (resolver_status == 0) {
         netd_status_file_note(cfg,
             "DNS resolver configured from live network policy");
@@ -195,7 +195,7 @@ int main(int argc, char **argv)
     (void)setenv("KOBOX_DAEMON_NAME", "netd", 1);
     struct netd_boot_config config;
     memset(&config, 0, sizeof(config));
-    const int bootstrap_fd = pacha_bootstrap_fd_from_argv(argv);
+    const pacha_fd_t bootstrap_fd = pacha_bootstrap_fd_from_argv(argv);
     if (bootstrap_fd < 16 ||
         pacha_fd_read(bootstrap_fd, &config, sizeof(config)) != (long)sizeof(config) ||
         !validate_boot_config(&config)) {
@@ -245,7 +245,7 @@ int main(int argc, char **argv)
      * latency without making libuinet or the controller multi-threaded. */
     const uint64_t timer_rights = PACHA_FD_RIGHT_READ | PACHA_FD_RIGHT_WAIT |
         PACHA_FD_RIGHT_POLL | PACHA_FD_RIGHT_CLOSE;
-    int timer_fd = pacha_timerfd_create(UINT64_C(10000000),
+    pacha_fd_t timer_fd = pacha_timerfd_create(UINT64_C(10000000),
         UINT64_C(10000000), timer_rights, 0);
     if (timer_fd < 16) {
         (void)report_link_status(cfg, timer_fd < 0 ? timer_fd : -5,
@@ -288,7 +288,7 @@ int main(int argc, char **argv)
             policy_attempted_ack != dhcp->acks) {
             policy_attempted_ack = dhcp->acks;
             int policy_status = netd_policy_file_create(
-                (int)cfg->filed_endpoint_fd, &dhcp->lease);
+                (pacha_fd_t)cfg->filed_endpoint_fd, &dhcp->lease);
             if (policy_status == 0) {
                 dhcp_owned = 1;
                 netd_status_file_note(cfg,
@@ -310,7 +310,7 @@ int main(int argc, char **argv)
         const int busy = netd_socket_service_poll();
         static struct pacha_service_wait_set wait_set;
         status = pacha_service_wait_init(
-            &wait_set, (int)cfg->socket_endpoint_fd);
+            &wait_set, (pacha_fd_t)cfg->socket_endpoint_fd);
         if (status != 0)
             return netd_wait_set_failure(
                 "service_wait_init", status, &wait_set);

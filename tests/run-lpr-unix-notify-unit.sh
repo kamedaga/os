@@ -10,7 +10,7 @@ done
 clang -std=c11 -O2 -g -Wall -Wextra -Werror \
   -ffunction-sections -fdata-sections -Wl,--gc-sections \
   -fsanitize=address,undefined -fno-omit-frame-pointer \
-  "${includes[@]}" -I"$repo_root/musl/pachaos/include" \
+  "${includes[@]}" -I"$repo_root/userland" -I"$repo_root/kobox2/protocol/include" -I"$repo_root/kobox2/protocol/generated/include" -I"$repo_root/musl/pachaos/include" \
   "$repo_root/userland/unixd/src/notify_client.c" "$repo_root/userland/unixd/src/notify.c" \
   "$repo_root/userland/unixd/src/transport.c" "$repo_root/userland/libipc/src/status.c" \
   "$repo_root/tests/lpr_unix_notify_unit.c" -o "$out_dir/unit"

@@ -2,6 +2,7 @@
 #ifndef PACHA_KOBOX_DEVICE_H
 #define PACHA_KOBOX_DEVICE_H
 
+#include <pacha/abi.h>
 #include "device_pci.h"
 #include "device_dma.h"
 #include "device_irq.h"
@@ -9,12 +10,13 @@
 
 #define PH_DEVICE_MMIO_MAPPINGS 64u
 /* Each live mapping owns a native FD; inventory must not impose a lower limit. */
-#define PH_DEVICE_DMA_MAPPINGS PACHA_FD_TABLE_LIMIT
+/* Adapter admission inventory; unrelated to the kernel FD number range. */
+#define PH_DEVICE_DMA_MAPPINGS 4096u
 
 struct ph_image;
 
 struct ph_device_config {
-    int device_fd;
+    pacha_fd_t device_fd;
     uint64_t generation;
     uint32_t segment, bus, devfn;
     uint64_t *irq_cookie_sequence;

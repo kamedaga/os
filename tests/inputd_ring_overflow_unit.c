@@ -13,7 +13,7 @@ enum {
 static inputd_registry_entry_t test_registry[2];
 static kb_input_device_snapshot_t ioctl_snapshot;
 
-int pacha_ipc_send(int fd, const struct pacha_ipc_msg *message)
+int pacha_ipc_send(pacha_fd_t fd, const struct pacha_ipc_msg *message)
 {
     (void)fd;
     (void)message;

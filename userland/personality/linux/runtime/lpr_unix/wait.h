@@ -12,7 +12,7 @@ struct lpr_unix_waiter {
     const struct lpr_unix_client *client;
     uint64_t process_token, owner, request;
     uint32_t id, attempt;
-    int fd;
+    pacha_fd_t fd;
     unsigned next;
     /* Bound retained control-plane registrations by the existing poll graph
      * capacity. Active references are never evicted; idle entries own no FD
@@ -45,4 +45,4 @@ int lpr_unix_waiter_add_graph(struct lpr_unix_waiter *waiter, lpr_wait_graph_t *
 int64_t lpr_unix_waiter_wait(struct lpr_unix_waiter *waiter,
     struct unix_wait_bank *bank, const uint64_t *first_changes,
     const uint64_t *second_changes, int (*ready)(void *), void *context,
-    const lpr_wait_deadline_t *deadline);
+    const lpr_wait_deadline_t *deadline, unsigned *wait_not_ready __attribute__((unused)));

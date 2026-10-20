@@ -8,7 +8,7 @@
 #include <stdint.h>
 
 static inline int lpr_native_wait_pair_flags(
-    int *out_local, int *out_remote, uint64_t flags)
+    pacha_fd_t *out_local, pacha_fd_t *out_remote, uint64_t flags)
 {
     if (out_local == 0 || out_remote == 0) return -22;
     uint64_t pair[2] = {0, 0};
@@ -21,24 +21,24 @@ static inline int lpr_native_wait_pair_flags(
         rights,
         flags);
     if (status != 0 || pair[0] < 16 || pair[1] < 16 ||
-        pair[0] > INT32_MAX || pair[1] > INT32_MAX)
+        pair[0] >= PACHA_THREAD_SELF_FD || pair[1] >= PACHA_THREAD_SELF_FD)
     {
         if (pair[0] >= 16) (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, pair[0]);
         if (pair[1] >= 16) (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, pair[1]);
         return status == 0 ? -PACHA_LINUX_EMFILE : (int)pacha_kernel_status_to_errno(status);
     }
-    *out_local = (int)pair[0];
-    *out_remote = (int)pair[1];
+    *out_local = (pacha_fd_t)pair[0];
+    *out_remote = (pacha_fd_t)pair[1];
     return 0;
 }
 
-static inline int lpr_native_wait_pair(int *out_local, int *out_remote)
+static inline int lpr_native_wait_pair(pacha_fd_t *out_local, pacha_fd_t *out_remote)
 {
     return lpr_native_wait_pair_flags(
         out_local, out_remote, PACHA_FD_FLAG_INHERIT);
 }
 
-static inline uint64_t lpr_native_wait_drain_events(int fd)
+static inline uint64_t lpr_native_wait_drain_events(pacha_fd_t fd)
 {
     if (fd < 16) return 0;
     uint64_t events = 0;
@@ -47,17 +47,14 @@ static inline uint64_t lpr_native_wait_drain_events(int fd)
      * describe the same observation. */
     for (unsigned i = 0; i < 8; ++i) {
         struct pacha_ipc_msg message = {0};
-        const int64_t status = lpr_pacha_syscall2(
-            PACHAOS_SYSCALL_IPC_RECV,
-            (uint64_t)(uint32_t)fd,
-            (uint64_t)(uintptr_t)&message);
+        const int64_t status = lpr_ipc_message(PACHAOS_SYSCALL_IPC_RECV, (uint64_t)fd, 0, (uint64_t)(uintptr_t)((uint64_t)(uintptr_t)&message), 0, 0, 0);
         if (status != 0) break;
         events |= message.word0;
     }
     return events;
 }
 
-static inline void lpr_native_wait_drain(int fd)
+static inline void lpr_native_wait_drain(pacha_fd_t fd)
 {
     (void)lpr_native_wait_drain_events(fd);
 }
@@ -68,16 +65,9 @@ static inline int64_t lpr_native_ipc_recv_wait(
 {
     int64_t status;
     do {
-        status = lpr_pacha_syscall4(
-            PACHAOS_SYSCALL_IPC_RECV_WAIT,
-            fd,
-            (uint64_t)(uintptr_t)message,
-            UINT64_MAX,
-            0);
-        // A native signal may cancel the kernel waiter while the Linux syscall
-        // is still inside an internal service RPC.  The reply FD remains the
-        // authoritative completion, so finish that transport wait before
-        // exposing the signal at the Linux return-frame boundary.
+        status = lpr_ipc_message(PACHAOS_SYSCALL_IPC_RECV_WAIT, fd, 0, (uint64_t)(uintptr_t)((uint64_t)(uintptr_t)message), UINT64_MAX, PACHA_WAIT_UNINTERRUPTIBLE, 0);
+        // Internal channel waits defer signals. A racing readiness edge may
+        // require another receive on the same channel.
     } while (status == PACHA_SYSCALL_ERR_NOT_READY);
     return status;
 }
@@ -86,7 +76,7 @@ static inline int64_t lpr_native_fd_wait_writable(uint64_t fd)
 {
     for (;;) {
         struct pacha_pollfd pollfd = {
-            .fd = (int)(uint32_t)fd,
+            .fd = (pacha_fd_t)fd,
             .events = PACHA_FD_EVENT_WRITABLE,
             .revents = 0,
         };
@@ -95,7 +85,7 @@ static inline int64_t lpr_native_fd_wait_writable(uint64_t fd)
             (uint64_t)(uintptr_t)&pollfd,
             1,
             PACHA_FD_WAIT_FOREVER,
-            0);
+            PACHA_WAIT_UNINTERRUPTIBLE);
         if (status > 0 && pollfd.revents != 0) {
             return 0;
         }
@@ -112,10 +102,7 @@ static inline int64_t lpr_native_ipc_send_wait(
     const struct pacha_ipc_msg *message)
 {
     for (;;) {
-        const int64_t status = lpr_pacha_syscall2(
-            PACHAOS_SYSCALL_IPC_SEND,
-            fd,
-            (uint64_t)(uintptr_t)message);
+        const int64_t status = lpr_ipc_message(PACHAOS_SYSCALL_IPC_SEND, fd, (uint64_t)(uintptr_t)((uint64_t)(uintptr_t)message), 0, 0, 0, 0);
         if (status == 0) {
             return 0;
         }
@@ -132,22 +119,20 @@ static inline int64_t lpr_native_ipc_send_wait(
 }
 
 static inline int64_t lpr_native_ipc_call_wait(
-    uint64_t fd,
-    const struct pacha_ipc_msg *message)
+    uint64_t fd, const struct pacha_ipc_msg *message,
+    struct pacha_ipc_msg *reply, int *published)
 {
+    if (published) *published = 0;
     for (;;) {
-        const int64_t reply_fd = lpr_pacha_syscall2(
-            PACHAOS_SYSCALL_IPC_CALL,
-            fd,
-            (uint64_t)(uintptr_t)message);
-        if (reply_fd != PACHA_SYSCALL_ERR_NOT_READY &&
-            reply_fd != -PACHA_SYSCALL_ERR_NOT_READY)
-        {
-            return reply_fd;
-        }
+        int sent = 0;
+        const int64_t status = lpr_ipc_message(
+            PACHAOS_SYSCALL_IPC_CALL, fd, (uint64_t)(uintptr_t)message,
+            (uint64_t)(uintptr_t)reply, UINT64_MAX,
+            PACHA_WAIT_UNINTERRUPTIBLE, &sent);
+        if (published) *published = sent;
+        if (sent || (status != PACHA_SYSCALL_ERR_NOT_READY &&
+                     status != -PACHA_SYSCALL_ERR_NOT_READY)) return status;
         const int64_t wait_status = lpr_native_fd_wait_writable(fd);
-        if (wait_status != 0) {
-            return wait_status;
-        }
+        if (wait_status != 0) return wait_status;
     }
 }

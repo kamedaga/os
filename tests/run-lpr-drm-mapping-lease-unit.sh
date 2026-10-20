@@ -11,13 +11,13 @@ done
 /usr/bin/clang -std=c11 -O1 -g -Wall -Wextra -Werror \
   -ffunction-sections -fdata-sections -Wl,--gc-sections \
   -fsanitize=address,undefined -pthread "${includes[@]}" \
-  -I"$repo_root/musl/pachaos/include" \
+  -I"$repo_root/kobox2/protocol/include" -I"$repo_root/kobox2/protocol/generated/include" -I"$repo_root/userland" -I"$repo_root/musl/pachaos/include" \
   "$repo_root/tests/lpr_drm_mapping_lease_unit.c" -o "$out/unit"
 "$out/unit"
 /usr/bin/clang -std=c11 -O1 -g -Wall -Wextra -Werror \
   -DLPR_UNMAP_PROFILE=1 \
   -ffunction-sections -fdata-sections -Wl,--gc-sections \
   -fsanitize=address,undefined -pthread "${includes[@]}" \
-  -I"$repo_root/musl/pachaos/include" \
+  -I"$repo_root/kobox2/protocol/include" -I"$repo_root/kobox2/protocol/generated/include" -I"$repo_root/userland" -I"$repo_root/musl/pachaos/include" \
   "$repo_root/tests/lpr_drm_mapping_lease_unit.c" -o "$out/profile-unit"
 "$out/profile-unit"

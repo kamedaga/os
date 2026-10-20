@@ -111,6 +111,7 @@ void pacha_eevdf_copy_runqueue(
     dst->entities[i].thread_id = src->entities[i].thread_id;
     dst->entities[i].generation = src->entities[i].generation;
     dst->entities[i].weight = src->entities[i].weight;
+    dst->entities[i].inv_weight = src->entities[i].inv_weight;
     dst->entities[i].slice_ns = src->entities[i].slice_ns;
     dst->entities[i].service_ns = src->entities[i].service_ns;
     dst->entities[i].vruntime = src->entities[i].vruntime;
@@ -153,7 +154,7 @@ static int weighted_fractional_10(
   return 1;
 }
 
-static int weighted_delta(int64_t runtime_ns, int64_t weight, int64_t *out) {
+static int weighted_delta_slow(int64_t runtime_ns, int64_t weight, int64_t *out) {
   if (!i64_nonnegative(runtime_ns)) {
     return 0;
   }
@@ -182,9 +183,36 @@ static int weighted_delta(int64_t runtime_ns, int64_t weight, int64_t *out) {
   return 1;
 }
 
-static int weighted_slice(int64_t slice_ns, int64_t weight, int64_t *out) {
+// Positive weights are validated at creation. This cold division is paid
+// once per entity, never once per charge/wake. Unsigned wrap encodes weight 1.
+static uint64_t inverse_weight(int64_t weight) {
+  return UINT64_MAX / (uint64_t)weight + 1;
+}
+
+static int weighted_delta(int64_t runtime_ns, const pacha_eevdf_entity *entity, int64_t *out) {
+  const int64_t weight = entity->weight;
+  if (runtime_ns < 0 || weight <= 0) return 0;
+  if (weight == PACHA_EEVDF_DEFAULT_WEIGHT) {
+    *out = runtime_ns;
+    return 1;
+  }
+  // For n < 2^64 and m=ceil(2^64/w), high(n*m) is floor(n/w)
+  // or exactly one greater. Compare the full-width product to correct it.
+  // Extremely large runtimes keep the original overflow-safe exact routine.
+  if ((uint64_t)runtime_ns > (UINT64_MAX >> 10))
+    return weighted_delta_slow(runtime_ns, weight, out);
+  const uint64_t n = (uint64_t)runtime_ns << 10;
+  uint64_t q = weight == 1 ? n :
+      (uint64_t)(((__uint128_t)n * entity->inv_weight) >> 64);
+  if ((__uint128_t)q * (uint64_t)weight > n) --q;
+  if (q > INT64_MAX) return 0;
+  *out = (int64_t)q;
+  return 1;
+}
+
+static int weighted_slice(int64_t slice_ns, const pacha_eevdf_entity *entity, int64_t *out) {
   int64_t delta;
-  if (!weighted_delta(slice_ns, weight, &delta)) {
+  if (!weighted_delta(slice_ns, entity, &delta)) {
     return 0;
   }
   *out = z_max(1, delta);
@@ -197,7 +225,7 @@ static int refresh_deadline(
     pacha_eevdf_entity *out) {
   int64_t slice;
   int64_t deadline;
-  if (!weighted_slice(entity->slice_ns, entity->weight, &slice)) {
+  if (!weighted_slice(entity->slice_ns, entity, &slice)) {
     return 0;
   }
   int64_t eligible = z_max(entity->vruntime, floor_vruntime);
@@ -301,6 +329,7 @@ void pacha_eevdf_empty_entity(pacha_eevdf_entity *out) {
   out->thread_id = PACHA_EEVDF_NO_THREAD_ID;
   out->generation = 0;
   out->weight = 0;
+  out->inv_weight = 0;
   out->slice_ns = 0;
   out->service_ns = 0;
   out->vruntime = 0;
@@ -346,12 +375,13 @@ pacha_eevdf_rc pacha_eevdf_entity_validate(
       !valid_positive(entity->slice_ns)) {
     return PACHA_EEVDF_ERR_INVALID;
   }
+  if (entity->inv_weight != inverse_weight(entity->weight) && entity->weight != PACHA_EEVDF_DEFAULT_WEIGHT) return PACHA_EEVDF_ERR_STATE;
   if (!i64_nonnegative(entity->service_ns) ||
       !i64_nonnegative(entity->vruntime) ||
       entity->eligible_time < entity->vruntime) {
     return PACHA_EEVDF_ERR_STATE;
   }
-  if (!weighted_slice(entity->slice_ns, entity->weight, &slice) ||
+  if (!weighted_slice(entity->slice_ns, entity, &slice) ||
       !checked_add_i64(entity->eligible_time, slice, &expected_deadline)) {
     return PACHA_EEVDF_ERR_OVERFLOW;
   }
@@ -359,6 +389,18 @@ pacha_eevdf_rc pacha_eevdf_entity_validate(
     return PACHA_EEVDF_ERR_STATE;
   }
   return PACHA_EEVDF_OK;
+}
+
+#ifndef PACHA_EEVDF_CHECKED
+#define PACHA_EEVDF_CHECKED 1
+#endif
+static inline pacha_eevdf_rc validate_hot(const pacha_eevdf_entity *entity) {
+#if PACHA_EEVDF_CHECKED
+  return pacha_eevdf_entity_validate(entity);
+#else
+  (void)entity;
+  return PACHA_EEVDF_OK;
+#endif
 }
 
 pacha_eevdf_rc pacha_eevdf_entity_init(
@@ -381,6 +423,7 @@ pacha_eevdf_rc pacha_eevdf_entity_init(
   entity.thread_id = thread_id;
   entity.generation = generation;
   entity.weight = weight;
+  entity.inv_weight = inverse_weight(weight);
   entity.slice_ns = slice_ns;
   entity.vruntime = floor_vruntime;
   entity.state = PACHA_EEVDF_RUNNABLE;
@@ -396,7 +439,7 @@ pacha_eevdf_rc pacha_eevdf_entity_wake(
     int64_t floor_vruntime,
     pacha_eevdf_entity *out) {
   pacha_eevdf_entity next;
-  pacha_eevdf_rc validation = pacha_eevdf_entity_validate(entity);
+  pacha_eevdf_rc validation = validate_hot(entity);
   if (validation != PACHA_EEVDF_OK) {
     return fail_entity(validation, entity, out);
   }
@@ -418,7 +461,7 @@ pacha_eevdf_rc pacha_eevdf_entity_wake(
 pacha_eevdf_rc pacha_eevdf_entity_block(
     const pacha_eevdf_entity *entity,
     pacha_eevdf_entity *out) {
-  pacha_eevdf_rc validation = pacha_eevdf_entity_validate(entity);
+  pacha_eevdf_rc validation = validate_hot(entity);
   if (validation != PACHA_EEVDF_OK) {
     return fail_entity(validation, entity, out);
   }
@@ -433,7 +476,7 @@ pacha_eevdf_rc pacha_eevdf_entity_block(
 pacha_eevdf_rc pacha_eevdf_entity_exit(
     const pacha_eevdf_entity *entity,
     pacha_eevdf_entity *out) {
-  pacha_eevdf_rc validation = pacha_eevdf_entity_validate(entity);
+  pacha_eevdf_rc validation = validate_hot(entity);
   if (validation != PACHA_EEVDF_OK) {
     return fail_entity(validation, entity, out);
   }
@@ -455,7 +498,7 @@ pacha_eevdf_rc pacha_eevdf_entity_charge(
   int64_t vruntime;
   int64_t service_ns;
   pacha_eevdf_entity next;
-  pacha_eevdf_rc validation = pacha_eevdf_entity_validate(entity);
+  pacha_eevdf_rc validation = validate_hot(entity);
   if (validation != PACHA_EEVDF_OK) {
     return fail_entity(validation, entity, out);
   }
@@ -465,7 +508,7 @@ pacha_eevdf_rc pacha_eevdf_entity_charge(
   if (!i64_nonnegative(runtime_ns) || !i64_nonnegative(floor_vruntime)) {
     return fail_entity(PACHA_EEVDF_ERR_INVALID, entity, out);
   }
-  if (!weighted_delta(runtime_ns, entity->weight, &delta) ||
+  if (!weighted_delta(runtime_ns, entity, &delta) ||
       !checked_add_i64(entity->vruntime, delta, &vruntime) ||
       !checked_add_i64(entity->service_ns, runtime_ns, &service_ns)) {
     return fail_entity(PACHA_EEVDF_ERR_OVERFLOW, entity, out);
@@ -482,7 +525,7 @@ pacha_eevdf_rc pacha_eevdf_entity_charge(
 pacha_eevdf_rc pacha_eevdf_entity_mark_running(
     const pacha_eevdf_entity *entity,
     pacha_eevdf_entity *out) {
-  pacha_eevdf_rc validation = pacha_eevdf_entity_validate(entity);
+  pacha_eevdf_rc validation = validate_hot(entity);
   if (validation != PACHA_EEVDF_OK) {
     return fail_entity(validation, entity, out);
   }
@@ -497,7 +540,7 @@ pacha_eevdf_rc pacha_eevdf_entity_mark_running(
 pacha_eevdf_rc pacha_eevdf_entity_finish(
     const pacha_eevdf_entity *entity,
     pacha_eevdf_entity *out) {
-  pacha_eevdf_rc validation = pacha_eevdf_entity_validate(entity);
+  pacha_eevdf_rc validation = validate_hot(entity);
   if (validation != PACHA_EEVDF_OK) {
     return fail_entity(validation, entity, out);
   }
@@ -514,7 +557,7 @@ pacha_eevdf_rc pacha_eevdf_entity_migrate(
     int64_t floor_vruntime,
     pacha_eevdf_entity *out) {
   pacha_eevdf_entity next;
-  pacha_eevdf_rc validation = pacha_eevdf_entity_validate(entity);
+  pacha_eevdf_rc validation = validate_hot(entity);
   if (validation != PACHA_EEVDF_OK) {
     return fail_entity(validation, entity, out);
   }
@@ -577,6 +620,7 @@ pacha_eevdf_rc pacha_eevdf_add(
   entity.thread_id = thread_id;
   entity.generation = generation;
   entity.weight = weight;
+  entity.inv_weight = inverse_weight(weight);
   entity.slice_ns = slice_ns;
   entity.vruntime = rq->min_vruntime;
   entity.eligible_time = rq->min_vruntime;
@@ -674,7 +718,7 @@ pacha_eevdf_rc pacha_eevdf_charge(
   if (!runnable_or_running(&entity)) {
     return fail_runqueue(PACHA_EEVDF_ERR_STATE, rq, out);
   }
-  if (!weighted_delta(runtime_ns, entity.weight, &delta)) {
+  if (!weighted_delta(runtime_ns, &entity, &delta)) {
     return fail_runqueue(PACHA_EEVDF_ERR_OVERFLOW, rq, out);
   }
   if (!checked_add_i64(entity.vruntime, delta, &vruntime)) {

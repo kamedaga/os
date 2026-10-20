@@ -17,7 +17,7 @@ int main(int argc, char **argv)
     (void)argc;
     struct termd_boot_config config;
     memset(&config, 0, sizeof(config));
-    const int bootstrap_fd = pacha_bootstrap_fd_from_argv(argv);
+    const pacha_fd_t bootstrap_fd = pacha_bootstrap_fd_from_argv(argv);
     const struct termd_boot_config *cfg = &config;
     if (bootstrap_fd < 16 ||
         pacha_fd_read(bootstrap_fd, &config, sizeof(config)) != (long)sizeof(config) ||
@@ -124,8 +124,8 @@ int main(int argc, char **argv)
             termd_linux_tty_island_pump(&tty_island);
         if (status == PACHA_ERR_EMPTY || status == PACHA_ERR_NOT_READY) {
             static struct pacha_service_wait_set wait_set;
-            static int notify_fds[PACHA_SERVICE_WAIT_MAX_FDS];
-            if (pacha_service_wait_init(&wait_set, (int)cfg->tty_endpoint_fd) != 0)
+            static pacha_fd_t notify_fds[PACHA_SERVICE_WAIT_MAX_FDS];
+            if (pacha_service_wait_init(&wait_set, (pacha_fd_t)cfg->tty_endpoint_fd) != 0)
                 return 1;
             if (tty_island.wake_irq_fd >= 16 &&
                 pacha_service_wait_add(

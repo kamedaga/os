@@ -182,7 +182,7 @@ static int wait_for_catalog(struct installer_runtime *runtime,
     if (!runtime || !source_count) return -EINVAL;
     const uint64_t rights = PACHA_FD_RIGHT_READ | PACHA_FD_RIGHT_WAIT |
         PACHA_FD_RIGHT_POLL | PACHA_FD_RIGHT_CLOSE;
-    const int timer = pacha_timerfd_create(UINT64_C(100000000),
+    const pacha_fd_t timer = pacha_timerfd_create(UINT64_C(100000000),
         UINT64_C(100000000), rights, 0);
     if (timer < 16) return timer < 0 ? timer : -EIO;
     int status = -ETIMEDOUT;
@@ -262,7 +262,7 @@ static int make_port_pair(struct pacha_ipc_channel_pair *pair) {
 static int wait_runner_done(struct installer_runtime *runtime, uint64_t id) {
     struct pacha_ipc_msg reply = {0};
     const int status = pacha_ipc_recv_wait(
-        (int)runtime->boot->control_fd, &reply, PACHA_FD_WAIT_FOREVER);
+        (pacha_fd_t)runtime->boot->control_fd, &reply, PACHA_FD_WAIT_FOREVER);
     if (status) return status;
     if (reply.fd_count || reply.word0 != PACHA_INSTALLER_MSG_RUNNER_DONE ||
         reply.word1 != id) return -EPROTO;
@@ -328,7 +328,7 @@ static int run_linux_tools(struct installer_runtime *runtime,
         PACHA_FD_RIGHT_TRANSFER | PACHA_FD_RIGHT_MAP_READ |
         PACHA_FD_RIGHT_MAP_WRITE;
     runtime->diagnostic_phase = "plan-vmo";
-    int plan_fd = pacha_vmo_create(4096, vmo_rights, 0);
+    pacha_fd_t plan_fd = pacha_vmo_create(4096, vmo_rights, 0);
     if (plan_fd < 16) { status = plan_fd < 0 ? plan_fd : -EIO; goto ports; }
     runtime->diagnostic_phase = "plan-map";
     void *mapped = pacha_mmap(plan_fd, 4096,
@@ -358,7 +358,7 @@ static int run_linux_tools(struct installer_runtime *runtime,
         .word0 = PACHA_INSTALLER_MSG_PLAN, .word1 = id,
         .fds = fds, .fd_count = 4};
     runtime->diagnostic_phase = "runner-launch";
-    status = pacha_ipc_send((int)runtime->boot->control_fd, &message);
+    status = pacha_ipc_send((pacha_fd_t)runtime->boot->control_fd, &message);
     (void)pacha_fd_close(target_pair.b); target_pair.b = -1;
     (void)pacha_fd_close(media_pair.b); media_pair.b = -1;
     (void)pacha_fd_close(root_pair.b); root_pair.b = -1;
@@ -384,7 +384,7 @@ static int run_linux_tools(struct installer_runtime *runtime,
              .events = PACHA_FD_EVENT_READABLE | PACHA_FD_EVENT_HANGUP},
             {.fd = media_port.fd,
              .events = PACHA_FD_EVENT_READABLE | PACHA_FD_EVENT_HANGUP},
-            {.fd = (int)runtime->boot->control_fd,
+            {.fd = (pacha_fd_t)runtime->boot->control_fd,
              .events = PACHA_FD_EVENT_READABLE | PACHA_FD_EVENT_HANGUP},
             {.fd = root_port.fd,
              .events = PACHA_FD_EVENT_READABLE | PACHA_FD_EVENT_HANGUP},
@@ -457,12 +457,12 @@ static void send_complete(const struct pacha_installer_bootstrap *boot,
     const struct pacha_ipc_msg message = {
         .word0 = PACHA_INSTALLER_MSG_COMPLETE, .word1 = result,
         .word2 = (uint64_t)(int64_t)status};
-    (void)pacha_ipc_send((int)boot->ready_fd, &message);
+    (void)pacha_ipc_send((pacha_fd_t)boot->ready_fd, &message);
 }
 
 int main(int argc, char **argv) {
     (void)argc;
-    const int bootstrap_fd = pacha_bootstrap_fd_from_argv(argv);
+    const pacha_fd_t bootstrap_fd = pacha_bootstrap_fd_from_argv(argv);
     struct pacha_installer_bootstrap boot = {0};
     if (bootstrap_fd < 16 ||
         pacha_fd_read(bootstrap_fd, &boot, sizeof(boot)) != (long)sizeof(boot) ||
@@ -482,7 +482,7 @@ int main(int argc, char **argv) {
     int status = 0;
     for (uint32_t i = 0; i < boot.source_count; ++i) {
         status = installer_block_source_open(&runtime->sources[i],
-            (int)boot.sources[i].fd, boot.sources[i].resource_id);
+            (pacha_fd_t)boot.sources[i].fd, boot.sources[i].resource_id);
         if (status) break;
     }
     if (!status) status = wait_for_catalog(runtime, boot.source_count);
@@ -494,7 +494,7 @@ int main(int argc, char **argv) {
         .notify_fd = -1};
     FILE *output = NULL;
     unsigned tty_rows = 24, tty_columns = 80;
-    if (!status) status = installer_tty_open(&tty, (int)boot.termd_fd,
+    if (!status) status = installer_tty_open(&tty, (pacha_fd_t)boot.termd_fd,
         boot.pts_index, &output);
     if (!status && installer_tty_get_size(&tty, &tty_rows, &tty_columns)) {
         tty_rows = 24;

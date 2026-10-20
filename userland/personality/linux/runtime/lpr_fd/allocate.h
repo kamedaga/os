@@ -22,7 +22,7 @@ static inline int lpr_fd_alloc_initialized_batch(
             lpr_fd_allocation_excluded, sizeof(lpr_fd_allocation_excluded) /
                 sizeof(lpr_fd_allocation_excluded[0]), fds) != 0) {
         const uint64_t capacity = lpr_fd_table_capacity;
-        if (capacity >= LPR_FD_TABLE_MAX_SIZE ||
+        if (capacity >= lpr_fd_table_soft_limit(&lpr_control_fd_table) ||
             lpr_fd_table_ensure_capacity(capacity + 1) != 0)
             return -LPR_LINUX_EMFILE;
     }

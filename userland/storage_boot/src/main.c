@@ -59,7 +59,7 @@ enum {
 
 static const char storage_boot_seed0root_argv0[] = "/sbin/seed0root.elf";
 
-static int create_inherited_vmo_from_bytes(const void *data, uint64_t size, const char *label)
+static pacha_fd_t create_inherited_vmo_from_bytes(const void *data, uint64_t size, const char *label)
 {
     if (data == NULL || size == 0) {
         return -1;
@@ -76,9 +76,9 @@ static int create_inherited_vmo_from_bytes(const void *data, uint64_t size, cons
         PACHA_FD_RIGHT_READ |
         PACHA_FD_RIGHT_MAP_READ |
         PACHA_FD_RIGHT_MAP_WRITE;
-    const int fd = pacha_vmo_create(map_size, rights, 0);
+    const pacha_fd_t fd = pacha_vmo_create(map_size, rights, 0);
     if (fd < 16) {
-        fprintf(stderr, "[storage_boot] %s: vmo_create failed status=%d\n", label, fd);
+        fprintf(stderr, "[storage_boot] %s: vmo_create failed status=%ld\n", label, fd);
         return -3;
     }
     unsigned char *mapped = pacha_mmap(
@@ -97,7 +97,7 @@ static int create_inherited_vmo_from_bytes(const void *data, uint64_t size, cons
     return fd;
 }
 
-static int read_fd_exact(int fd, void *out, uint64_t size, const char *label)
+static int read_fd_exact(pacha_fd_t fd, void *out, uint64_t size, const char *label)
 {
     if (fd < 16 || out == NULL || size == 0) {
         return -1;
@@ -107,7 +107,7 @@ static int read_fd_exact(int fd, void *out, uint64_t size, const char *label)
     while (done < size) {
         const long got = pacha_fd_read(fd, cursor + done, size - done);
         if (got <= 0) {
-            fprintf(stderr, "[storage_boot] %s: fd_read failed fd=%d got=%ld done=%llu size=%llu\n",
+            fprintf(stderr, "[storage_boot] %s: fd_read failed fd=%ld got=%ld done=%llu size=%llu\n",
                 label,
                 fd,
                 got,
@@ -120,7 +120,7 @@ static int read_fd_exact(int fd, void *out, uint64_t size, const char *label)
     return 0;
 }
 
-static int find_bootstrap_fd(char **argv, int *out_fd)
+static int find_bootstrap_fd(char **argv, pacha_fd_t *out_fd)
 {
     if (argv == NULL || out_fd == NULL) {
         return -1;
@@ -141,7 +141,7 @@ static int find_bootstrap_fd(char **argv, int *out_fd)
         if (key == STORAGE_BOOT_AT_NULL) {
             break;
         }
-        if (key == PACHA_AT_BOOTSTRAP_FD && value >= 16 && value <= UINT32_MAX) {
+        if (key == PACHA_AT_BOOTSTRAP_FD && value >= 16 && value < PACHA_THREAD_SELF_FD) {
             *out_fd = (int)value;
             return 0;
         }
@@ -205,7 +205,7 @@ static uint64_t prot_from_elf_flags(uint32_t flags)
 }
 
 struct storage_boot_loaded_process {
-    int process_fd;
+    pacha_fd_t process_fd;
     uint64_t runtime_entry;
     uint64_t load_bias;
     uint64_t phdr_va;
@@ -264,7 +264,7 @@ static int validate_elf_header(const char *path, const unsigned char *image, uin
 
 static int map_elf_segment(
     const char *path,
-    int process_fd,
+    pacha_fd_t process_fd,
     uint64_t target_va,
     const unsigned char *image,
     uint64_t image_size,
@@ -301,14 +301,14 @@ static int map_elf_segment(
         PACHA_FD_RIGHT_MAP_READ |
         PACHA_FD_RIGHT_MAP_WRITE |
         PACHA_FD_RIGHT_MAP_EXEC;
-    const int vmo_fd = pacha_vmo_create(map_size, vmo_rights, 0);
+    const pacha_fd_t vmo_fd = pacha_vmo_create(map_size, vmo_rights, 0);
     if (vmo_fd < 16) {
-        fprintf(stderr, "[storage_boot] exec: vmo_create failed segment=%u status=%d\n", index, vmo_fd);
+        fprintf(stderr, "[storage_boot] exec: vmo_create failed segment=%u status=%ld\n", index, vmo_fd);
         return -3;
     }
     unsigned char *mapped = pacha_mmap(vmo_fd, map_size, STORAGE_BOOT_PROT_READ | STORAGE_BOOT_PROT_WRITE, STORAGE_BOOT_MMAP_SHARED, 0);
     if (mapped == NULL) {
-        fprintf(stderr, "[storage_boot] exec: mmap staging VMO failed segment=%u fd=%d\n", index, vmo_fd);
+        fprintf(stderr, "[storage_boot] exec: mmap staging VMO failed segment=%u fd=%ld\n", index, vmo_fd);
         (void)pacha_fd_close(vmo_fd);
         return -4;
     }
@@ -322,7 +322,7 @@ static int map_elf_segment(
     (void)pacha_fd_close(vmo_fd);
     if (map_result < 4096) {
         fprintf(stderr,
-            "[storage_boot] exec: process_map failed segment=%u process_fd=%d status=%ld\n",
+            "[storage_boot] exec: process_map failed segment=%u process_fd=%ld status=%ld\n",
             index,
             process_fd,
             map_result);
@@ -604,7 +604,7 @@ static int load_elf_process_single_window(
         PACHA_FD_RIGHT_MAP_READ |
         PACHA_FD_RIGHT_MAP_WRITE |
         PACHA_FD_RIGHT_MAP_EXEC;
-    const int vmo_fd = pacha_vmo_create(window_size, vmo_rights, 0);
+    const pacha_fd_t vmo_fd = pacha_vmo_create(window_size, vmo_rights, 0);
     if (vmo_fd < 16) {
         return -2;
     }
@@ -731,9 +731,9 @@ static int load_elf_process(
         PACHA_FD_RIGHT_SPAWN |
         PACHA_FD_RIGHT_MAP_INTO |
         PACHA_FD_RIGHT_SET_CONTEXT;
-    const int process_fd = pacha_process_create(process_rights, 0, grants, grant_count);
+    const pacha_fd_t process_fd = pacha_process_create(process_rights, 0, grants, grant_count);
     if (process_fd < 16) {
-        fprintf(stderr, "[storage_boot] exec: process_create failed status=%d\n", process_fd);
+        fprintf(stderr, "[storage_boot] exec: process_create failed status=%ld\n", process_fd);
         for (uint64_t i = 0; i < grant_count; ++i) {
             struct pacha_fd_info info;
             memset(&info, 0, sizeof(info));
@@ -828,23 +828,23 @@ static int push_u64(unsigned char *stack, uint64_t *sp, uint64_t value)
 static int start_loaded_process(
     const struct storage_boot_loaded_process *loaded,
     const char *argv0,
-    int bootstrap_fd)
+    pacha_fd_t bootstrap_fd)
 {
     if (loaded == NULL || loaded->process_fd < 16 || loaded->runtime_entry == 0 ||
         loaded->phdr_va == 0 || loaded->phent == 0 || loaded->phnum == 0 || argv0 == NULL) {
         return -1;
     }
 
-    const int process_fd = loaded->process_fd;
+    const pacha_fd_t process_fd = loaded->process_fd;
     const uint64_t stack_rights =
         PACHA_FD_RIGHT_INSPECT |
         PACHA_FD_RIGHT_TRANSFER |
         PACHA_FD_RIGHT_CLOSE |
         PACHA_FD_RIGHT_MAP_READ |
         PACHA_FD_RIGHT_MAP_WRITE;
-    const int stack_fd = pacha_vmo_create(PACHA_PROCESS_DEFAULT_STACK_SIZE, stack_rights, 0);
+    const pacha_fd_t stack_fd = pacha_vmo_create(PACHA_PROCESS_DEFAULT_STACK_SIZE, stack_rights, 0);
     if (stack_fd < 16) {
-        fprintf(stderr, "[storage_boot] exec: stack vmo_create failed status=%d\n", stack_fd);
+        fprintf(stderr, "[storage_boot] exec: stack vmo_create failed status=%ld\n", stack_fd);
         return -2;
     }
     unsigned char *stack = pacha_mmap(
@@ -927,14 +927,14 @@ static int start_loaded_process(
         PACHA_FD_RIGHT_KILL |
         PACHA_FD_RIGHT_START |
         PACHA_FD_RIGHT_SET_CONTEXT;
-    const int thread_fd = pacha_thread_create(process_fd, loaded->runtime_entry, stack_base + sp, 0, 0, thread_rights);
+    const pacha_fd_t thread_fd = pacha_thread_create(process_fd, loaded->runtime_entry, stack_base + sp, 0, 0, thread_rights);
     if (thread_fd < 16) {
-        fprintf(stderr, "[storage_boot] exec: thread_create failed status=%d\n", thread_fd);
+        fprintf(stderr, "[storage_boot] exec: thread_create failed status=%ld\n", thread_fd);
         return -7;
     }
     const int start_status = pacha_thread_start(thread_fd);
     if (start_status != 0) {
-        fprintf(stderr, "[storage_boot] exec: thread_start failed thread_fd=%d status=%d\n", thread_fd, start_status);
+        fprintf(stderr, "[storage_boot] exec: thread_start failed thread_fd=%ld status=%d\n", thread_fd, start_status);
         (void)pacha_fd_close(thread_fd);
         return -8;
     }
@@ -950,7 +950,7 @@ static int launch_seed0root(const struct storage_boot_config *boot_config,
     int status = ph_bootfs_find(archive, "/sbin/seed0root.elf", &image, &image_size);
     if (!status) status = ph_bootfs_find(archive, "/sbin/filed.elf", &filed_image, &filed_image_size);
     if (status || !image_size || !filed_image_size) return status ? status : -22;
-    const int filed_image_fd = create_inherited_vmo_from_bytes(filed_image, filed_image_size, "filed.elf");
+    const pacha_fd_t filed_image_fd = create_inherited_vmo_from_bytes(filed_image, filed_image_size, "filed.elf");
     if (filed_image_fd < 16) return filed_image_fd;
     const uint64_t device_fd = boot_config->device_fd;
     const uint64_t ready_channel_fd = boot_config->ready_channel_fd;
@@ -977,7 +977,7 @@ static int launch_seed0root(const struct storage_boot_config *boot_config,
     };
     storage_seed0root_bootstrap_t bootstrap_package = bootstrap;
     memcpy(bootstrap_package.root_uuid, root_uuid, 16);
-    const int bootstrap_fd = create_inherited_vmo_from_bytes(&bootstrap_package, sizeof(bootstrap_package), "seed0root bootstrap fd");
+    const pacha_fd_t bootstrap_fd = create_inherited_vmo_from_bytes(&bootstrap_package, sizeof(bootstrap_package), "seed0root bootstrap fd");
     if (bootstrap_fd < 16) {
         (void)pacha_fd_close(filed_image_fd);
         return 32;
@@ -1020,7 +1020,7 @@ static int launch_seed0root(const struct storage_boot_config *boot_config,
 int main(int argc, char **argv)
 {
     (void)argc;
-    int bootstrap_fd = -1;
+    pacha_fd_t bootstrap_fd = -1;
     if (find_bootstrap_fd(argv, &bootstrap_fd)) return 2;
     struct storage_boot_config config = {0};
     int error = read_fd_exact(bootstrap_fd, &config, sizeof(config), "boot config");
@@ -1030,7 +1030,7 @@ int main(int argc, char **argv)
         config.ready_channel_fd < 16 || config.root_handoff_channel_fd < 16 ||
         config.power_channel_fd < 16 || config.bootfs_fd < 16) return 2;
     struct ph_bootfs archive = {0};
-    error = ph_bootfs_open(&archive, (int)config.bootfs_fd, config.bootfs_size);
+    error = ph_bootfs_open(&archive, (pacha_fd_t)config.bootfs_fd, config.bootfs_size);
     const unsigned char *bytes = NULL;
     size_t size = 0;
     uint8_t root_uuid[16];
@@ -1050,7 +1050,7 @@ int main(int argc, char **argv)
      * bootstrap loader neither opens a disk nor guesses a GPT partition. */
     if (!error) error = launch_seed0root(&config, &archive, root_uuid, policy);
     int closed = ph_bootfs_close(&archive);
-    (void)pacha_fd_close((int)config.bootfs_fd);
+    (void)pacha_fd_close((pacha_fd_t)config.bootfs_fd);
     if (!error) error = closed;
     if (error) fprintf(stderr, "[storage_boot] bootfs launch failed status=%d\n", error);
     else puts("[storage_boot] bootfs root launcher done");

@@ -9,7 +9,7 @@
 
 static unsigned char image[240], valid[240];
 static unsigned calls;
-void *pacha_mmap(int fd, uint64_t size, uint64_t prot, uint64_t flags, uint64_t offset)
+void *pacha_mmap(pacha_fd_t fd, uint64_t size, uint64_t prot, uint64_t flags, uint64_t offset)
 { (void)fd; (void)size; (void)prot; (void)flags; (void)offset; ++calls; return image; }
 int pacha_munmap(void *address, uint64_t size)
 { (void)address; (void)size; return 0; }

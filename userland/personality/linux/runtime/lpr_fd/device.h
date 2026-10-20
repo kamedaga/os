@@ -19,4 +19,4 @@ int64_t lpr_device_description_unmap(lpr_device_backend_t *device);
 int64_t lpr_device_description_close(lpr_device_backend_t *device);
 uint32_t lpr_device_description_flags(const lpr_device_backend_t *device);
 void lpr_device_description_set_flags(lpr_device_backend_t *device, uint32_t flags);
-int lpr_device_description_capability_valid(int fd);
+int lpr_device_description_capability_valid(pacha_fd_t fd);

@@ -11,6 +11,7 @@ static void assert_entity_equal(
   assert(lhs->thread_id == rhs->thread_id);
   assert(lhs->generation == rhs->generation);
   assert(lhs->weight == rhs->weight);
+  assert(lhs->inv_weight == rhs->inv_weight);
   assert(lhs->slice_ns == rhs->slice_ns);
   assert(lhs->service_ns == rhs->service_ns);
   assert(lhs->vruntime == rhs->vruntime);
@@ -271,7 +272,57 @@ static void test_scalar_entity_lifecycle(void) {
   assert_entity_equal(&failed, &empty);
 }
 
+/* Independent wide-division oracle: the production hot path uses a
+ * reciprocal multiply and the old exceptional path avoids wide division. */
+static void check_reciprocal(int64_t weight, int64_t runtime) {
+  pacha_eevdf_entity initial, out;
+  assert(pacha_eevdf_entity_init(1, 1, weight, 1, 0, &initial) == PACHA_EEVDF_OK);
+  const __uint128_t exact = ((__uint128_t)(uint64_t)runtime * 1024) / (uint64_t)weight;
+  const __uint128_t slice = 1024 / (uint64_t)weight > 0 ? 1024 / (uint64_t)weight : 1;
+  const int overflow = exact + slice > INT64_MAX;
+  const pacha_eevdf_rc rc = pacha_eevdf_entity_charge(&initial, runtime, 0, &out);
+  assert(rc == (overflow ? PACHA_EEVDF_ERR_OVERFLOW : PACHA_EEVDF_OK));
+  if (!overflow) {
+    assert(out.vruntime == (int64_t)exact);
+    assert(out.service_ns == runtime);
+    assert(out.deadline == (int64_t)(exact + slice));
+  } else assert_entity_equal(&initial, &out);
+}
+static void test_reciprocal_precision(void) {
+  const int64_t weights[] = {1, 2, 3, 15, 1023, 1024, 1025, 88761, INT32_MAX, INT64_MAX/2, INT64_MAX-1, INT64_MAX};
+  const int64_t runtimes[] = {0, 1, 2, 1023, 1024, 1025, (INT64_C(1)<<54)-1, INT64_C(1)<<54, (INT64_C(1)<<54)+1, INT64_MAX-1, INT64_MAX};
+  for (size_t w=0; w<sizeof(weights)/sizeof(weights[0]); ++w)
+    for (size_t r=0; r<sizeof(runtimes)/sizeof(runtimes[0]); ++r)
+      check_reciprocal(weights[w], runtimes[r]);
+  uint64_t seed = 0x3197ecdb;
+  for (unsigned i=0; i<100000; ++i) {
+    seed = seed * UINT64_C(6364136223846793005) + 1;
+    const int64_t weight = (int64_t)(seed >> 1) | 1;
+    seed = seed * UINT64_C(6364136223846793005) + 1;
+    check_reciprocal(weight, (int64_t)(seed >> (i%2 ? 10 : 1)));
+    check_reciprocal((int64_t)(i%4096)+1, (int64_t)(seed >> 10));
+  }
+}
+
+static void test_checked_hot_boundary(void) {
+  pacha_eevdf_entity entity, out;
+  assert(pacha_eevdf_entity_init(1, 1, 3, 1, 0, &entity) == PACHA_EEVDF_OK);
+  entity.deadline++;
+  assert(pacha_eevdf_entity_validate(&entity) == PACHA_EEVDF_ERR_STATE);
+#if !defined(PACHA_EEVDF_CHECKED) || PACHA_EEVDF_CHECKED
+  assert(pacha_eevdf_entity_block(&entity, &out) == PACHA_EEVDF_ERR_STATE);
+#else
+  /* Off omits only the internal redundant validation; explicit audit still
+   * rejects corruption and operation state checks still reject double block. */
+  assert(pacha_eevdf_entity_block(&entity, &out) == PACHA_EEVDF_OK);
+  entity = out;
+  assert(pacha_eevdf_entity_block(&entity, &out) == PACHA_EEVDF_ERR_STATE);
+#endif
+}
+
 int main(void) {
+  test_checked_hot_boundary();
+  test_reciprocal_precision();
   test_reset_and_add();
   test_pick_tie_breaks_by_thread_id();
   test_mark_requeue_and_charge();

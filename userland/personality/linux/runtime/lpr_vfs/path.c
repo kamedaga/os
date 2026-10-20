@@ -3,7 +3,7 @@
 #include "session.h"
 #include "../lpr_common/boot_diagnostic.h"
 
-static int lpr_filed_adopt_on_connection(uint64_t lease_handle, int lease_fd, uint64_t *handle);
+static int lpr_filed_adopt_on_connection(uint64_t lease_handle, pacha_fd_t lease_fd, uint64_t *handle);
 
 int64_t lpr_filed_fd_binding(uint64_t fd)
 {
@@ -31,7 +31,7 @@ int64_t lpr_filed_endpoint_ready(void)
     lpr_linux_process_state_init();
     if (!lpr_supervisor_enabled) { status = -LPR_LINUX_ENOSYS; goto done; }
     void *page = 0;
-    const int page_fd = lpr_create_standalone_wire_page(&page);
+    const pacha_fd_t page_fd = lpr_create_standalone_wire_page(&page);
     if (page_fd < 16) { status = page_fd; goto done; }
     lpr_boot_diagnostic_fs_emit("fs.session.enter", LPRS_OP_PROCESS_FILED_SESSION,
         page_fd, 0, 0, 0);
@@ -76,7 +76,7 @@ done:
     return status;
 }
 
-int lpr_filed_lease_pair(int *local, int *remote)
+int lpr_filed_lease_pair(pacha_fd_t *local, pacha_fd_t *remote)
 {
     uint64_t pair[2] = {0};
     const uint64_t rights = PACHA_FD_RIGHT_INSPECT | PACHA_FD_RIGHT_CLOSE |
@@ -86,27 +86,19 @@ int lpr_filed_lease_pair(int *local, int *remote)
     int64_t status = lpr_pacha_syscall3(PACHAOS_SYSCALL_IPC_CHANNEL_CREATE,
         (uint64_t)(uintptr_t)pair, rights, 0);
     if (status) return (int)lpr_pacha_status_to_errno(status);
-    *local = (int)pair[0];
-    *remote = (int)pair[1];
+    *local = (pacha_fd_t)pair[0];
+    *remote = (pacha_fd_t)pair[1];
     return 0;
 }
 
-static int lpr_filed_adopt_on_connection(uint64_t lease_handle, int lease_fd, uint64_t *handle)
+static int lpr_filed_adopt_on_connection(uint64_t lease_handle, pacha_fd_t lease_fd, uint64_t *handle)
 {
     struct pacha_ipc_msg request = { .word0 = FILED_LEASE_MAGIC, .word1 = lease_handle,
         .word2 = lpr_filed_client_id, .word3 = lease_handle };
     lpr_boot_diagnostic_fs_emit("fs.adopt.call", lease_handle, lease_fd,
         lpr_filed_client_id, 0, 0);
-    int64_t reply_fd = lpr_native_ipc_call_wait((uint64_t)lease_fd, &request);
-    lpr_boot_diagnostic_fs_emit("fs.adopt.called", lease_handle, lease_fd, reply_fd,
-        reply_fd < 16 ? lpr_pacha_status_to_errno(reply_fd) : 0, reply_fd);
-    if (reply_fd < 16) return (int)lpr_pacha_status_to_errno(reply_fd);
     struct pacha_ipc_msg reply = {0};
-    lpr_boot_diagnostic_fs_emit("fs.adopt.recv", lease_handle, reply_fd, 0, 0, 0);
-    int status = (int)lpr_native_ipc_recv_wait((uint64_t)reply_fd, &reply);
-    lpr_boot_diagnostic_fs_emit("fs.adopt.received", lease_handle, reply.word0,
-        reply.word2, status ? lpr_pacha_status_to_errno(status) : (int64_t)reply.word1, status);
-    (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, (uint64_t)reply_fd);
+    int status = (int)lpr_native_ipc_call_wait((uint64_t)lease_fd, &request, &reply, NULL);
     if (status) return (int)lpr_pacha_status_to_errno(status);
     if (reply.word0 != FILED_LEASE_MAGIC || reply.word3 != lease_handle ||
         (!reply.word1 && !reply.word2))
@@ -115,13 +107,13 @@ static int lpr_filed_adopt_on_connection(uint64_t lease_handle, int lease_fd, ui
     return (int)(int64_t)reply.word1;
 }
 
-int lpr_filed_adopt(uint64_t *handle, int lease_fd)
+int lpr_filed_adopt(uint64_t *handle, pacha_fd_t lease_fd)
 {
     int status = (int)lpr_filed_endpoint_ready();
     return status ? status : lpr_filed_adopt_on_connection(*handle, lease_fd, handle);
 }
 
-int lpr_create_tty_wire_page(void **out_page)
+pacha_fd_t lpr_create_tty_wire_page(void **out_page)
 {
     if (out_page == 0) {
         return -LPR_LINUX_EINVAL;
@@ -163,14 +155,14 @@ int lpr_create_tty_wire_page(void **out_page)
     }
     *out_page = (void *)(uintptr_t)mapped;
     if (!lpr_tty_wire_page_busy && lpr_tty_wire_page_fd < 16 && lpr_tty_wire_page == 0) {
-        lpr_tty_wire_page_fd = (int)fd;
+        lpr_tty_wire_page_fd = (pacha_fd_t)fd;
         lpr_tty_wire_page = *out_page;
         lpr_tty_wire_page_busy = 1;
     }
-    return (int)fd;
+    return (pacha_fd_t)fd;
 }
 
-void lpr_destroy_tty_wire_page(int fd, void *page)
+void lpr_destroy_tty_wire_page(pacha_fd_t fd, void *page)
 {
     if (fd == lpr_tty_wire_page_fd && page == lpr_tty_wire_page) {
         lpr_tty_wire_page_busy = 0;
@@ -198,6 +190,17 @@ void lpr_reset_fork_child_rpc_state(void)
     lpr_state.filed_rpc.lock_word = 0;
     lpr_state.filed_rpc.readv_lock_word = 0;
     lpr_state.termd_rpc.lock_word = 0;
+    /* Fork copies the process-local RPC lock, but this VMO mapping is shared.
+     * Keeping the parent's cached page lets independent parent/child requests
+     * overwrite an in-flight reply (including exec's TTY transfer response).
+     * Drop only the child's inherited ownership before any child RPC; the
+     * parent retains its mapping/capability and the child allocates its own. */
+    const pacha_fd_t inherited_tty_fd = lpr_tty_wire_page_fd;
+    void *const inherited_tty_page = lpr_tty_wire_page;
+    lpr_tty_wire_page_fd = -1;
+    lpr_tty_wire_page = 0;
+    lpr_tty_wire_page_busy = 0;
+    lpr_destroy_standalone_wire_page(inherited_tty_fd, inherited_tty_page);
     lpr_state.netd_rpc.lock_word = 0;
     lpr_state.netd_rpc.endpoint_checked = 0;
     lpr_netd_page_pool_after_fork_child();
@@ -205,7 +208,7 @@ void lpr_reset_fork_child_rpc_state(void)
 
 }
 
-int lpr_create_standalone_wire_page(void **out_page)
+pacha_fd_t lpr_create_standalone_wire_page(void **out_page)
 {
     if (out_page == 0) {
         return -LPR_LINUX_EINVAL;
@@ -237,10 +240,10 @@ int lpr_create_standalone_wire_page(void **out_page)
         return (int)lpr_pacha_status_to_errno(mapped);
     }
     *out_page = (void *)(uintptr_t)mapped;
-    return (int)fd;
+    return (pacha_fd_t)fd;
 }
 
-void lpr_destroy_standalone_wire_page(int fd, void *page)
+void lpr_destroy_standalone_wire_page(pacha_fd_t fd, void *page)
 {
     if (page != 0) {
         (void)lpr_pacha_syscall2(PACHAOS_SYSCALL_MUNMAP, (uint64_t)(uintptr_t)page, LPR_CONTROL_PAGE_BYTES);
@@ -257,10 +260,10 @@ void *lpr_supervisor_payload(void *page)
 
 int64_t lpr_supervisor_call(
     uint32_t op,
-    int page_fd,
+    pacha_fd_t page_fd,
     void *page,
     uint32_t payload_size,
-    int transfer_fd,
+    pacha_fd_t transfer_fd,
     uint64_t *out_result)
 {
     return lpr_process_client_call(
@@ -277,7 +280,7 @@ int64_t lpr_supervisor_call(
 int64_t lpr_supervisor_call_token(
     uint32_t op,
     uint64_t token,
-    int transfer_fd,
+    pacha_fd_t transfer_fd,
     uint64_t *out_result)
 {
     return lpr_process_client_call_token(
@@ -297,7 +300,7 @@ int64_t lpr_supervisor_kill_pid(int32_t pid, uint32_t sig, uint64_t *out_deliver
         return -LPR_LINUX_EINVAL;
     }
     void *page = 0;
-    const int page_fd = lpr_create_standalone_wire_page(&page);
+    const pacha_fd_t page_fd = lpr_create_standalone_wire_page(&page);
     if (page_fd < 0) {
         return page_fd;
     }
@@ -320,14 +323,14 @@ int64_t lpr_supervisor_kill_pid(int32_t pid, uint32_t sig, uint64_t *out_deliver
     return status;
 }
 
-int lpr_supervisor_get_owner(lprs_process_state_t *out_state, int *out_process_fd)
+int lpr_supervisor_get_owner(lprs_process_state_t *out_state, pacha_fd_t *out_process_fd)
 {
     if (out_state == 0 || out_process_fd == 0 || lpr_supervisor_token == 0) {
         return -LPR_LINUX_EINVAL;
     }
     *out_process_fd = -1;
     void *page = 0;
-    const int page_fd = lpr_create_standalone_wire_page(&page);
+    const pacha_fd_t page_fd = lpr_create_standalone_wire_page(&page);
     if (page_fd < 0) {
         return page_fd;
     }
@@ -362,7 +365,7 @@ int lpr_supervisor_get_owner(lprs_process_state_t *out_state, int *out_process_f
 
 int lpr_supervisor_get_state(lprs_process_state_t *out_state)
 {
-    int process_fd = -1;
+    pacha_fd_t process_fd = -1;
     const int status = lpr_supervisor_get_owner(out_state, &process_fd);
     if (process_fd >= 16)
         (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)process_fd);
@@ -386,7 +389,7 @@ int lpr_supervisor_list_processes(
     *out_count = 0;
 
     void *page = 0;
-    const int page_fd = lpr_create_standalone_wire_page(&page);
+    const pacha_fd_t page_fd = lpr_create_standalone_wire_page(&page);
     if (page_fd < 0) return page_fd;
     lpr_memset(page, 0, PACHA_SERVICE_PAGE_BYTES);
     lprs_process_list_t *list =
@@ -426,7 +429,7 @@ int lpr_supervisor_set_comm(const char *path)
     while (base > 0 && path[base - 1u] != '/') base -= 1u;
 
     void *page = 0;
-    const int page_fd = lpr_create_standalone_wire_page(&page);
+    const pacha_fd_t page_fd = lpr_create_standalone_wire_page(&page);
     if (page_fd < 0) return page_fd;
     lpr_memset(page, 0, PACHA_SERVICE_PAGE_BYTES);
     lprs_process_set_comm_t *req =
@@ -468,14 +471,14 @@ int lpr_supervisor_diag_attach(void)
     if (lpr_diag_slot != 0) return 0;
 
     void *diag_page = 0;
-    const int diag_fd = lpr_create_standalone_wire_page(&diag_page);
+    const pacha_fd_t diag_fd = lpr_create_standalone_wire_page(&diag_page);
     if (diag_fd < 0) return diag_fd;
     lpr_memset(diag_page, 0, PACHA_SERVICE_PAGE_BYTES);
     lprs_diag_slot_t *slot = (lprs_diag_slot_t *)diag_page;
     slot->syscall_nr = LPRS_DIAG_SYSCALL_NONE;
 
     void *page = 0;
-    const int page_fd = lpr_create_standalone_wire_page(&page);
+    const pacha_fd_t page_fd = lpr_create_standalone_wire_page(&page);
     if (page_fd < 0) {
         lpr_destroy_standalone_wire_page(diag_fd, diag_page);
         return page_fd;
@@ -521,7 +524,7 @@ int lpr_supervisor_query_process(uint64_t pid, lprs_process_query_t *out)
         return -LPR_LINUX_EINVAL;
     }
     void *page = 0;
-    const int page_fd = lpr_create_standalone_wire_page(&page);
+    const pacha_fd_t page_fd = lpr_create_standalone_wire_page(&page);
     if (page_fd < 0) return page_fd;
     lpr_memset(page, 0, PACHA_SERVICE_PAGE_BYTES);
     lprs_process_query_t *req =

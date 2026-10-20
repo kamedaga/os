@@ -8,7 +8,7 @@ static int first_result, retry_result, query_result, grow_result;
 static uint64_t growth_target;
 static int grow_without_slots;
 
-int pacha_vmo_create(uint64_t size, uint64_t rights, uint32_t flags)
+pacha_fd_t pacha_vmo_create(uint64_t size, uint64_t rights, uint32_t flags)
 {
     assert(size == 12288 && rights == 0x123 && flags == 7);
     assert(creates < 2);

@@ -5,7 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-int storage_bootfs_read_file(int fd, uint64_t archive_size, const char *path,
+int storage_bootfs_read_file(pacha_fd_t fd, uint64_t archive_size, const char *path,
     unsigned char **out_data, uint64_t *out_size)
 {
     if (!out_data || !out_size) return -EINVAL;

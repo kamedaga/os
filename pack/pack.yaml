@@ -125,14 +125,17 @@ apps:
         - "tools/derive_input_id.py"
     out: "ROOT"
     rootfs: "/"
-  virtio_gpu_sysfs:
+  # gpud publishes DRM nodes and discovery from its actual device grant;
+  # preinstalled GPU indexes collide with that publisher (EEXIST).
+  # Keep only the independent udmabuf fixture, not fabricated GPU topology.
+  virtio_gpu_udmabuf:
     file:
-      path: ".artifacts/userland-fixtures/virtio-gpu-sysfs"
+      path: ".artifacts/userland-fixtures/virtio-gpu-sysfs/dev/udmabuf"
       rebuild: ["bash", "tools/build_virtio_gpu_sysfs.sh"]
       input:
         - "tools/build_virtio_gpu_sysfs.sh"
-    out: "ROOT"
-    rootfs: "/"
+    out: "UDMABUF"
+    rootfs: "/dev/udmabuf"
   alpine_clang:
     file:
       path: ".artifacts/userland-fixtures/alpine-clang-root"
@@ -1507,28 +1510,6 @@ apps:
         - "userland/libcapsule/src"
     out: "NATDEV.ELF"
     rootfs: "/cmd/native_device_contract.elf"
-  process_create_grants_native:
-    file:
-      path: ".artifacts/tests/process-create-grants/process_create_grants.elf"
-      rebuild: ["bash", "tests/build-process-create-grants-native.sh"]
-      input:
-        - "tests/build-process-create-grants-native.sh"
-        - "tests/process_create_grants_native.c"
-        - "tests/filed_identity_native.h"
-        - "userland/filed/include"
-        - "userland/libpacha/include"
-        - "userland/libpacha/src"
-        - "userland/libipc/include"
-        - "userland/libipc/src"
-        - "musl/pachaos/build/build-smokes.sh"
-        - "musl/pachaos/include"
-        - "musl/pachaos/syscall"
-        - "kobox2/protocol"
-        - "userland/filed/src/exec_payload.c"
-        - "userland/filed/include/filed/exec.h"
-        - "userland/filed/include/filed/payload.h"
-    out: "GRANTS.ELF"
-    rootfs: "/cmd/process_create_grants.elf"
   unix_native_contract:
     file:
       path: ".artifacts/tests/unix-native/unix_native_contract.elf"

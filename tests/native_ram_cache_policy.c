@@ -86,7 +86,7 @@ int main(void) {
         PACHA_FD_RIGHT_REVOKE | PACHA_FD_RIGHT_SHARE |
         PACHA_FD_RIGHT_CACHE_POLICY;
     const long fd = call(PACHA_FD_SYSCALL_VMO_CREATE, VMO_BYTES, rights, 0, 0, 0, 0);
-    if (fd < 16 || fd >= PACHA_FD_TABLE_LIMIT) { log_text(message_create); log_hex(fd); finish(1); }
+    if (fd < 16 || fd >= PACHA_THREAD_SELF_FD) { log_text(message_create); log_hex(fd); finish(1); }
     const long requested = 0x200000000L;
     for (unsigned alias = 0; alias < CACHE_POLICY_ALIAS_COUNT; ++alias) {
         /* Repeated mappings of one VMO exercise real PTE-alias withdrawal
@@ -117,7 +117,7 @@ int main(void) {
     const long filler_fd = call(PACHA_FD_SYSCALL_VMO_CREATE, filler_size,
         PACHA_FD_RIGHT_MAP_READ | PACHA_FD_RIGHT_MAP_WRITE | PACHA_FD_RIGHT_CLOSE,
         0, 0, 0, 0);
-    if (filler_fd < 16 || filler_fd >= PACHA_FD_TABLE_LIMIT) {
+    if (filler_fd < 16 || filler_fd >= PACHA_THREAD_SELF_FD) {
         log_text(message_scatter); log_hex(filler_fd); finish(1);
     }
     const long filler_address = requested + 64L * (2L * VMO_BYTES);
@@ -163,7 +163,7 @@ int main(void) {
                     (long)(uintptr_t)delay, 0, 0, 0, 0, 0);
             }
         }
-        if (child < 16 || child >= PACHA_FD_TABLE_LIMIT) {
+        if (child < 16 || child >= PACHA_THREAD_SELF_FD) {
             log_text(message_clone); log_hex(child); finish(1);
         }
         children[i] = child;
@@ -191,7 +191,7 @@ int main(void) {
     const long view_fd = call(PACHA_FD_SYSCALL_VMO_CREATE_PAGE_VIEW, fd,
         (long)(uintptr_t)page_view_indices, RANGE_BYTES / 4096, view_rights,
         PACHA_FD_FLAG_CLOEXEC, 0);
-    if (view_fd < 16 || view_fd >= PACHA_FD_TABLE_LIMIT) {
+    if (view_fd < 16 || view_fd >= PACHA_THREAD_SELF_FD) {
         log_text(message_view_failure); log_hex(view_fd); finish(1);
     }
     const long view_address = 0x10000000000L;

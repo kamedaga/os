@@ -21,6 +21,8 @@ parser.add_argument('--qmp', required=True)
 parser.add_argument('--elf', required=True)
 parser.add_argument('--serial', required=True, type=Path)
 parser.add_argument('--out', required=True, type=Path)
+parser.add_argument('--lock-profile', choices=['begin', 'snapshot'], help='Use exact-ELF stage7 histograms instead of legacy counters')
+parser.add_argument('--gdb', help='QEMU GDB Unix socket for stopped diagnostic epoch writes')
 args = parser.parse_args()
 args.out.mkdir(exist_ok=False)
 bases = {key: int(value, 16) for key, value in re.findall(
@@ -29,20 +31,41 @@ symbols = subprocess.check_output(['nm', '-n', args.elf], text=True)
 snapshot = dict(host_monotonic=time.monotonic(), counters={})
 qmp = QMP(args.qmp)
 try:
+    if args.lock_profile:
+        if not args.gdb:
+            raise ValueError('--lock-profile requires --gdb')
+        from kernel_lock_profile import Profile
+        profile = Profile(args.elf, qmp, args.gdb, bases, args.out, resume_after_attach=False)
+        try:
+            if args.lock_profile == 'begin':
+                profile.begin()
+                snapshot['epoch'] = profile.epoch
+            else:
+                snapshot['distributions'] = profile.end('snapshot')
+            (args.out/'counters.json').write_text(json.dumps(snapshot,indent=2)+'\n')
+        finally:
+            profile.rsp.close()
+        print(json.dumps(dict(out=str(args.out), mode=args.lock_profile)))
+        raise SystemExit(0)
+    # The diagnostic row grew as IPC stages were split. Read its exact-ELF
+    # layout rather than silently applying the old sixteen-word CPU stride.
+    ipc_columns = 16
+    layout = re.search(r'^([0-9a-f]+) [BD] ipc_perf_layout$', symbols, re.M)
+    if layout:
+        address = int(layout[1], 16) - bases['Virtual'] + bases['Physical']
+        path = (args.out / 'ipc-layout.bin').resolve()
+        qmp.execute('pmemsave', dict(val=address, size=24, filename=str(path)))
+        _, ipc_columns, syscall_columns = struct.unpack('<3Q', path.read_bytes())
+        if not 0 < ipc_columns <= 4096 or ipc_columns % 2 or syscall_columns != 256:
+            raise ValueError('invalid IPC diagnostic layout')
     for name, columns in [('smp_perf_counters', 16), ('munmap_perf_counters', 16),
-                          ('vmo_perf_counters', 16), ('ipc_perf_counters', 16),
+                          ('vmo_perf_counters', 16), ('ipc_perf_counters', ipc_columns),
                           ('ipc_syscall_counts', 256), ('timer_scan_perf_counters', 4),
-                          ('runtime_path_perf_counters', 32), ('unmap_skip_counts', 16),
+                          ('runtime_path_perf_counters', 96 if 'smp_perf_layout' in symbols else 32), ('unmap_skip_counts', 16),
                           ('pt_retire_perf_counters', 16)]:
-        match = re.search(r'^([0-9a-f]+) B ' + name + r'$', symbols, re.M)
-        if not match:
-            continue
-        physical = int(match[1], 16) - bases['Virtual'] + bases['Physical']
-        path = (args.out / (name + '.bin')).resolve()
-        qmp.execute('pmemsave', dict(val=physical, size=64*columns*8, filename=str(path)))
-        words = struct.unpack('<' + str(64*columns) + 'Q', path.read_bytes())
-        snapshot['counters'][name] = [sum(words[cpu*columns+i] for cpu in range(64))
-                                      for i in range(columns)]
+        if not re.search(r'^[0-9a-f]+ [BD] '+name+r'$',symbols,re.M):continue
+        from kernel_lock_profile import read_counter_rows
+        snapshot['counters'][name]=read_counter_rows(args.elf,qmp,bases,args.out,name,columns,'snapshot')
     principal_symbol = re.search(r'^([0-9a-f]+) B ipc_principal_syscall_counts$', symbols, re.M)
     if principal_symbol:
         # Decode the exact ELF's layout, not guessed Zig struct offsets.
@@ -70,16 +93,18 @@ try:
         extra_address = state_address + offset(state_type, 'process_descriptors_extra')
         shape = read_va(extra_address, 16, 'descriptor-shape-before')
         extra_ptr, extra_len = struct.unpack('<QQ', shape)
-        if extra_len > 65536-32:
+        if extra_len > (1 << 31)-32:
             raise ValueError('invalid descriptor capacity')
         descriptors = read_va(state_address + offset(state_type, 'process_descriptors'),
                               32*desc_size, 'descriptors-inline')
         if extra_len:
             descriptors += read_va(extra_ptr, extra_len*desc_size, 'descriptors-extra')
-        raw = read_va(int(principal_symbol[1], 16), 65536*6*8, 'principal-counts')
-        snapshot['principal_counts'] = {
-            str(index): list(row) for index, row in enumerate(struct.iter_unpack('<6Q', raw)) if any(row)
-        }
+        counts_offset = offset(desc_type, 'syscall_counts')
+        snapshot['principal_counts'] = {}
+        for index in range(32 + extra_len):
+            row = struct.unpack_from('<6Q', descriptors, index*desc_size + counts_offset)
+            if any(row):
+                snapshot['principal_counts'][str(index)] = list(row)
         snapshot['descriptor_shape_stable'] = shape == read_va(extra_address, 16, 'descriptor-shape-after')
         snapshot['descriptors'] = {}
         label_cache = {}

@@ -1,3 +1,4 @@
+#include <pacha/abi.h>
 #pragma once
 
 #include "unixd/ipc_protocol.h"
@@ -12,8 +13,8 @@ struct unix_session;
 struct unix_direction {
     struct unix_tx *tx;
     struct unix_rx *rx;
-    int tx_fd;
-    int rx_fd;
+    pacha_fd_t tx_fd;
+    pacha_fd_t rx_fd;
 };
 
 struct unix_broker_platform {

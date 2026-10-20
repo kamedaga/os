@@ -18,7 +18,7 @@ int64_t lpr_pacha_syscall1(uint64_t nr, uint64_t fd)
 int64_t lpr_fs_call(kb2_fs_request_t *request, const char *path,
     const char *second, const void *data, uint64_t data_bytes,
     void *output, uint64_t output_bytes, kb2_fs_response_t *response,
-    int transfer, int *cap)
+    pacha_fd_t transfer, pacha_fd_t *cap)
 {
     assert(!path && !second && !data && !data_bytes && !output &&
         !output_bytes && transfer == -1 && request->handle == 123);

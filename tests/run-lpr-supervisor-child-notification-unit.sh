@@ -14,6 +14,8 @@ mkdir -p "$(dirname "$out")"
   -Iuserland/lpr_supervisor/include \
   -Iuserland/libaccount/include \
   -Iuserland/filed/include \
+  -Iuserland/libfiled_client/include \
+  -Ikobox2/protocol/include -Ikobox2/protocol/generated/include \
   -Iuserland/unixd/include \
   -Iuserland/libipc/include \
   -Iuserland/libpacha/include \

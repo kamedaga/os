@@ -1,3 +1,4 @@
+#include <pacha/abi.h>
 /* SPDX-License-Identifier: MIT */
 #ifndef PACHA_INSTALLER_DISK_PORT_H
 #define PACHA_INSTALLER_DISK_PORT_H
@@ -41,8 +42,8 @@ struct installer_disk_port {
     uint64_t writable_first;
     uint64_t writable_end;
     int allow_progress;
-    int fd;
-    int page_fd;
+    pacha_fd_t fd;
+    pacha_fd_t page_fd;
     struct installer_disk_port_page *page;
     uint64_t sequence;
     /* The transport page is shared with the Linux client.  Once a reply is

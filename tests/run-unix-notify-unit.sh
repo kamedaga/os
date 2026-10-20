@@ -6,7 +6,7 @@ mkdir -p "$out_dir"
 ulimit -c 0
 clang -std=c11 -O2 -g -Wall -Wextra -Werror \
   -fsanitize=address,undefined -fno-omit-frame-pointer \
-  -I"$repo_root/userland/unixd/include" \
+  -I"$repo_root/userland/libpacha/include" -I"$repo_root/userland/unixd/include" \
   "$repo_root/userland/unixd/src/transport.c" \
   "$repo_root/userland/unixd/src/notify.c" \
   "$repo_root/userland/unixd/src/notify_client.c" \

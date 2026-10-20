@@ -8,10 +8,10 @@
 lpr_state_t lpr_state;
 static _Alignas(8) char wire[PACHA_SERVICE_PAGE_BYTES];
 void *lpr_memcpy(void *d, const void *s, size_t n) { return memcpy(d,s,n); }
-int lpr_create_standalone_wire_page(void **page) { *page = wire; return 16; }
-void lpr_destroy_standalone_wire_page(int fd, void *page) { assert(fd == 16 && page == wire); }
+pacha_fd_t lpr_create_standalone_wire_page(void **page) { *page = wire; return 16; }
+void lpr_destroy_standalone_wire_page(pacha_fd_t fd, void *page) { assert(fd == 16 && page == wire); }
 void *lpr_supervisor_payload(void *page) { return (char *)page + PACHA_SERVICE_HEADER_BYTES; }
-int64_t lpr_supervisor_call(uint32_t op, int fd, void *page, uint32_t size, int transfer, uint64_t *result)
+int64_t lpr_supervisor_call(uint32_t op, pacha_fd_t fd, void *page, uint32_t size, pacha_fd_t transfer, uint64_t *result)
 {
     assert(op == LPRS_OP_PROCESS_CREDENTIALS && fd == 16 && page == wire &&
         size == sizeof(lprs_credential_request_t) && transfer == -1 && !result);

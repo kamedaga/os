@@ -36,7 +36,7 @@ static int last_status;
 
 /* Native netd uses its granted filed endpoint; personality libc is not
  * present here. Request VMOs grow to the actual payload, not an inline cap. */
-static int status_file_call(int endpoint, kb2_fs_request_t *request,
+static int status_file_call(pacha_fd_t endpoint, kb2_fs_request_t *request,
     const char *path, const void *data, size_t bytes, void *output, size_t capacity,
     kb2_fs_response_t *response)
 {
@@ -44,7 +44,7 @@ static int status_file_call(int endpoint, kb2_fs_request_t *request,
         output, capacity, response, NULL, 0, NULL, NULL);
     return status ? status : response->result < 0 ? (int)response->result : 0;
 }
-static int status_file_write(int endpoint, const char *path,
+static int status_file_write(pacha_fd_t endpoint, const char *path,
     const char *text, size_t length, uint64_t flags)
 {
     if (endpoint < 16 || !path || (!text && length)) return -EINVAL;
@@ -81,7 +81,7 @@ static int status_file_write(int endpoint, const char *path,
     }
     return result;
 }
-static int policy_dir_create(int endpoint)
+static int policy_dir_create(pacha_fd_t endpoint)
 {
     kb2_fs_request_t request = {.opcode = KB2_FILESYSTEM_OP_MKDIRAT, .mode = 0755};
     kb2_fs_response_t response;
@@ -89,7 +89,7 @@ static int policy_dir_create(int endpoint)
         NULL, 0, NULL, 0, &response);
     return result == -EEXIST ? 0 : result;
 }
-int netd_policy_file_create(int filed_endpoint_fd,
+int netd_policy_file_create(pacha_fd_t filed_endpoint_fd,
     const struct netd_dhcp_lease *lease)
 {
     if (lease == NULL) return -EINVAL;
@@ -111,7 +111,7 @@ int netd_policy_file_create(int filed_endpoint_fd,
         text, (size_t)length, O_CREAT | O_EXCL);
 }
 
-int netd_resolver_file_create(int filed_endpoint_fd, const uint8_t dns[4])
+int netd_resolver_file_create(pacha_fd_t filed_endpoint_fd, const uint8_t dns[4])
 {
     if (dns == NULL) return -EINVAL;
     if (!(dns[0] | dns[1] | dns[2] | dns[3])) return -ENODATA;
@@ -127,7 +127,7 @@ int netd_resolver_file_create(int filed_endpoint_fd, const uint8_t dns[4])
         text, (size_t)length, O_CREAT | O_EXCL);
 }
 
-int netd_policy_file_read(int endpoint, char *text,
+int netd_policy_file_read(pacha_fd_t endpoint, char *text,
     size_t capacity, size_t *out_length)
 {
     if (endpoint < 16 || !text || !out_length || capacity < 2) return -EINVAL;
@@ -231,7 +231,7 @@ void netd_status_file_publish(const struct netd_boot_config *cfg,
             (size_t)dhcp_summary >= sizeof(report) - used) return;
         used += (size_t)dhcp_summary;
     }
-    const int written = status_file_write((int)cfg->filed_endpoint_fd,
+    const int written = status_file_write((pacha_fd_t)cfg->filed_endpoint_fd,
         NETD_STATUS_PATH, report, used,
         O_CREAT | O_TRUNC);
     if (written != 0)
@@ -247,7 +247,7 @@ void netd_status_file_note(const struct netd_boot_config *cfg,
     ++progress_sequence;
     if (progress_count < NETD_STATUS_LOG_LINES) ++progress_count;
     if (cfg->log_endpoint_fd < 16 ||
-        pacha_log_emit((int)cfg->log_endpoint_fd,
+        pacha_log_emit((pacha_fd_t)cfg->log_endpoint_fd,
             PACHA_LOG_SOURCE_NETD, phase, strlen(phase)) != 0) {
         printf("[netd] progress #%u %s\n", progress_sequence, phase);
         fflush(stdout);
@@ -265,7 +265,7 @@ static void status_file_progress(const struct netd_boot_config *cfg,
     ++progress_sequence;
     if (progress_count < NETD_STATUS_LOG_LINES) ++progress_count;
     if (cfg->log_endpoint_fd < 16 ||
-        pacha_log_emit((int)cfg->log_endpoint_fd,
+        pacha_log_emit((pacha_fd_t)cfg->log_endpoint_fd,
             source, phase, strlen(phase)) != 0) {
         printf("[netd] nic progress #%u %s\n", progress_sequence, phase);
         fflush(stdout);

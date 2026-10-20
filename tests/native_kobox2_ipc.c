@@ -19,7 +19,7 @@ int strcmp(const char *left, const char *right) {
 
 static uint64_t new_vmo(size_t size, uint64_t rights) {
     long fd = pacha_syscall3(PACHA_FD_SYSCALL_VMO_CREATE, size, rights, 0);
-    IPC_CHECK(fd >= 16 && fd < PACHA_FD_TABLE_LIMIT);
+    IPC_CHECK(fd >= 16 && fd < PACHA_THREAD_SELF_FD);
     return (uint64_t)fd;
 }
 
@@ -146,7 +146,7 @@ static void stale_peer_round(struct ph_ipc *ipc, const void *image, size_t image
     /* Bypass the sender port only to inject an old peer generation. */
     struct pacha_ipc_msg stale = {.word0 = IPC_TEST_SHARE, .word1 = 11,
         .fds = outgoing.fds, .fd_count = outgoing.fd_count};
-    IPC_CHECK(!pacha_syscall2(PACHA_IPC_SYSCALL_SEND, ipc->fd, (uintptr_t)&stale));
+    IPC_CHECK(!pacha_ipc_message_syscall(PACHA_IPC_SYSCALL_SEND, ipc->fd, (struct pacha_ipc_msg *)(uintptr_t)((uintptr_t)&stale), 0, 0, 0, 0));
     reap_child(ipc, &child, 0);
     IPC_CHECK(!ph_ipc_packet_release(&outgoing));
 }
@@ -224,7 +224,7 @@ static void bootstrap_round(struct ph_ipc *ipc, const void *image, size_t image_
         if (malformed && sender.next == 5) {
             struct pacha_ipc_msg invalid = {.word0 = PH_BOOTSTRAP_BLOB, .word1 = generation,
                 .word2 = 99, .word3 = items[5].size, .fds = &items[5].capability, .fd_count = 1};
-            IPC_CHECK(!pacha_syscall2(PACHA_IPC_SYSCALL_SEND, ipc->fd, (uintptr_t)&invalid));
+            IPC_CHECK(!pacha_ipc_message_syscall(PACHA_IPC_SYSCALL_SEND, ipc->fd, (struct pacha_ipc_msg *)(uintptr_t)((uintptr_t)&invalid), 0, 0, 0, 0));
             break;
         }
         int result = ph_bootstrap_send_next(&sender, ipc);
@@ -484,24 +484,19 @@ static void timed_receive_round(const void *image, size_t image_size) {
     IPC_CHECK(!pacha_syscall3(PACHA_IPC_SYSCALL_CHANNEL_CREATE,
         (uintptr_t)pair, rights, 0));
     struct pacha_ipc_msg message = {0};
-    IPC_CHECK(pacha_syscall4(PACHA_IPC_SYSCALL_RECV_WAIT, pair[0],
-        (uintptr_t)&message, 0, 0) == PACHA_SYSCALL_ERR_EMPTY);
-    IPC_CHECK(pacha_syscall4(PACHA_IPC_SYSCALL_RECV_WAIT, pair[0],
-        (uintptr_t)&message, 1, 0) == PACHA_SYSCALL_ERR_NOT_READY);
+    IPC_CHECK(pacha_ipc_message_syscall(PACHA_IPC_SYSCALL_RECV_WAIT, pair[0], 0, (struct pacha_ipc_msg *)(uintptr_t)((uintptr_t)&message), 0, 0, 0) == PACHA_SYSCALL_ERR_EMPTY);
+    IPC_CHECK(pacha_ipc_message_syscall(PACHA_IPC_SYSCALL_RECV_WAIT, pair[0], 0, (struct pacha_ipc_msg *)(uintptr_t)((uintptr_t)&message), 1, 0, 0) == PACHA_SYSCALL_ERR_NOT_READY);
     long duplicate = pacha_syscall4(PACHA_FD_SYSCALL_DUP, pair[1], 16, rights, 0);
     IPC_CHECK(duplicate >= 16);
     ipc_test_close(pair[1]);
-    IPC_CHECK(pacha_syscall4(PACHA_IPC_SYSCALL_RECV_WAIT, pair[0],
-        (uintptr_t)&message, 1, 0) == PACHA_SYSCALL_ERR_NOT_READY);
+    IPC_CHECK(pacha_ipc_message_syscall(PACHA_IPC_SYSCALL_RECV_WAIT, pair[0], 0, (struct pacha_ipc_msg *)(uintptr_t)((uintptr_t)&message), 1, 0, 0) == PACHA_SYSCALL_ERR_NOT_READY);
     message.word0 = 789;
-    IPC_CHECK(!pacha_syscall2(PACHA_IPC_SYSCALL_SEND, duplicate, (uintptr_t)&message));
+    IPC_CHECK(!pacha_ipc_message_syscall(PACHA_IPC_SYSCALL_SEND, duplicate, (struct pacha_ipc_msg *)(uintptr_t)((uintptr_t)&message), 0, 0, 0, 0));
     ipc_test_close(duplicate);
     message.word0 = 0;
-    IPC_CHECK(!pacha_syscall4(PACHA_IPC_SYSCALL_RECV_WAIT, pair[0],
-        (uintptr_t)&message, 1000, 0));
+    IPC_CHECK(!pacha_ipc_message_syscall(PACHA_IPC_SYSCALL_RECV_WAIT, pair[0], 0, (struct pacha_ipc_msg *)(uintptr_t)((uintptr_t)&message), 1000, 0, 0));
     IPC_CHECK(message.word0 == 789);
-    IPC_CHECK(pacha_syscall4(PACHA_IPC_SYSCALL_RECV_WAIT, pair[0],
-        (uintptr_t)&message, 0, 0) == PACHA_SYSCALL_ERR_CLOSED);
+    IPC_CHECK(pacha_ipc_message_syscall(PACHA_IPC_SYSCALL_RECV_WAIT, pair[0], 0, (struct pacha_ipc_msg *)(uintptr_t)((uintptr_t)&message), 0, 0, 0) == PACHA_SYSCALL_ERR_CLOSED);
     ipc_test_close(pair[0]);
     ipc_test_log("NATIVE_KOBOX2_IPC_TIMED=PASS timeout late-fd huge-wait hangup queued-no-poll\n");
 }

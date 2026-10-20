@@ -16,9 +16,6 @@ const fd_syscalls = @import("fd.zig");
 const TrapFrame = interrupts.TrapFrame;
 const page_size: u64 = 4096;
 const first_dynamic_fd: kernel.Fd = abi_root.fd_abi.first_dynamic_fd;
-// Capsule syscalls run under the global kernel-state lock, so this bounded
-// page-resolution scratch array cannot be used concurrently by two derives.
-var dma_resolved_paddrs: [kernel.max_vmo_backing_pages]u64 = undefined;
 
 fn statusFromKernelError(err: kernel.KernelError) u64 {
     return switch (err) {
@@ -106,7 +103,10 @@ fn mmioCacheForRange(flags: u64, paddr: u64, bytes: u64) MmioCacheError!user_vm.
     const kind = (flags & capsule_abi.mmio_map_cache_mask) >> capsule_abi.mmio_map_cache_shift;
     // Explicit UC does not require the UC_MINUS MTRR proof. Preserve its
     // existing admission path even when CPU cache evidence is unavailable.
-    if (kind == @intFromEnum(capsule_abi.MmioCache.uc)) return .uc;
+    if (kind == @intFromEnum(capsule_abi.MmioCache.uc)) {
+        if (bytes != 0 and !x86_platform.kernelDeviceCacheAllowed(paddr, bytes, false)) return error.Invalid;
+        return .uc;
+    }
     if (kind == @intFromEnum(capsule_abi.MmioCache.wc)) {
         if (bytes == 0 or ((paddr | bytes) & 4095) != 0 or
             paddr > std.math.maxInt(u64) - bytes) return error.Invalid;
@@ -117,16 +117,11 @@ fn mmioCacheForRange(flags: u64, paddr: u64, bytes: u64) MmioCacheError!user_vm.
                 else => error.Invalid,
             };
         };
-        const high_identity_start = @import("../arch/x86_64/platform.zig").phys_copy_window_va + (1 << 21);
-        const high_identity_end = @import("../arch/x86_64/platform.zig").phys_copy_window_va +
-            (@as(u64, @import("../arch/x86_64/platform.zig").high_mmio_pdp_table_count) << 30);
-        if (paddr < high_identity_end and paddr + bytes > high_identity_start) {
-            kernel_log.writeFmt("mmio: WC refused high identity alias paddr=0x{x} bytes=0x{x}\n", .{ paddr, bytes });
-            return error.Invalid;
-        }
+        if (@import("../boot/boot_diag.zig").enabled or !x86_platform.kernelDeviceCacheAllowed(paddr, bytes, true)) return error.Invalid;
         return user_vm.MmioCache.wcForPatSlot(proof.pat_slot) orelse error.Invalid;
     }
     if (kind != @intFromEnum(capsule_abi.MmioCache.uc_minus)) return error.Invalid;
+    if (!x86_platform.kernelDeviceCacheAllowed(paddr, bytes, false)) return error.Invalid;
     return mmioCacheWithEvidence(flags, smp.ucMinusMmioStatus(paddr, bytes));
 }
 
@@ -138,18 +133,10 @@ fn mmioCacheErrorStatus(err: MmioCacheError) u64 {
 }
 
 fn flushRemovedWcPhysicalRange(base: u64, bytes: u64) void {
-    const identity_limit = @import("../arch/x86_64/physical_layout.zig").identity_limit;
-    const low_size = if (base < identity_limit) @min(bytes, identity_limit - base) else 0;
     user_copy.retirePhysCopyWindowsForRange(x86_platform.kernel_cr3_value, base, @intCast(bytes));
-    if (low_size != 0) user_vm.flushAllUserIdentityContexts(base, @intCast(low_size));
     // A syscall can execute on a process CR3; the kernel's own CR3 must be
     // invalidated explicitly rather than assuming readCr3() names it.
     user_copy.flushTlbAndCachesForCr3Range(x86_platform.kernel_cr3_value, base, @intCast(bytes));
-}
-
-fn flushRestoredLowIdentityRange(base: u64, bytes: u64) void {
-    user_copy.flushTlbForCr3Range(x86_platform.kernel_cr3_value, base, @intCast(bytes));
-    user_vm.flushAllUserIdentityContexts(base, @intCast(bytes));
 }
 
 test "MMIO cache admission distinguishes evidence, unsafe mode and explicit UC" {
@@ -202,9 +189,10 @@ const ResolvedDmaRange = struct {
     first_page_va: u64,
     first_page_offset: u64,
     page_count: usize,
+    pages: []const u64,
 
     fn paddrs(self: ResolvedDmaRange) []const u64 {
-        return dma_resolved_paddrs[0..self.page_count];
+        return self.pages;
     }
 };
 
@@ -213,6 +201,7 @@ const DmaPolicyError = error{ Invalid, Map };
 fn resolveUserDmaPages(
     state: *kernel.KernelState,
     free_list: *kernel.FreePageList,
+    scratch: *@import("../memory/owned_storage.zig").Transaction,
     proc: kernel.PrincipalId,
     user_va: u64,
     size: u64,
@@ -227,8 +216,11 @@ fn resolveUserDmaPages(
     if (span_overflow != 0) return null;
     const page_span = pageAlignUp(span) orelse return null;
     const page_count = page_span / page_size;
-    if (page_count == 0 or page_count > kernel.max_vmo_backing_pages) return null;
+    if (page_count == 0 or page_count > kernel.max_vmo_logical_pages) return null;
     if (page_span > std.math.maxInt(usize)) return null;
+    // Only PFN values live in this invocation's workspace. DMA backing remains
+    // owned by VMO/IOMMU lifetimes, including quarantine after failed invalidation.
+    const pages = scratch.reserve(u64, @intCast(page_count), .replaceable) catch return null;
 
     if (!user_vm.lockAddressSpace(proc)) return null;
     defer user_vm.unlockAddressSpace(proc);
@@ -256,12 +248,13 @@ fn resolveUserDmaPages(
             page_va,
             device_writes,
         ) orelse return null;
-        dma_resolved_paddrs[@intCast(page_index)] = paddr;
+        pages[@intCast(page_index)] = paddr;
     }
     return .{
         .first_page_va = first_page_va,
         .first_page_offset = offset,
         .page_count = @intCast(page_count),
+        .pages = pages,
     };
 }
 
@@ -358,7 +351,7 @@ fn mapResolvedDmaPages(
     else blk: {
         if ((iova_arg & (page_size - 1)) != resolved.first_page_offset)
             return DmaPolicyError.Invalid;
-        const base = pageAlignDown(iova_arg);
+        const base = iommu.IovaAddress.fromInt(pageAlignDown(iova_arg));
         if (!iommu.reserveIova(device, base, resolved.page_count)) return DmaPolicyError.Map;
         break :blk base;
     };
@@ -366,7 +359,7 @@ fn mapResolvedDmaPages(
         iommu.freeIova(device, iova_base, resolved.page_count);
         return DmaPolicyError.Map;
     }
-    return iova_base + resolved.first_page_offset;
+    return iova_base.toInt() + resolved.first_page_offset;
 }
 
 fn releaseDeviceIova(device: kernel.DmaDeviceId, iova: u64, size: u64) void {
@@ -376,8 +369,8 @@ fn releaseDeviceIova(device: kernel.DmaDeviceId, iova: u64, size: u64) void {
     if (overflow != 0) return;
     const aligned_span = pageAlignUp(span) orelse return;
     const page_count: usize = @intCast(aligned_span / page_size);
-    if (!iommu.unmapRangeForDevice(device, iova, size)) return;
-    iommu.freeIova(device, iova_base, page_count);
+    if (!iommu.unmapRangeForDevice(device, .fromInt(iova), size)) return;
+    iommu.freeIova(device, .fromInt(iova_base), page_count);
 }
 
 fn rightsForMmio(parent: kernel.FdRights, write: bool) kernel.FdRights {
@@ -530,15 +523,7 @@ pub fn drainDeviceMemoryRetirements(state: *kernel.KernelState) void {
         const token = slot.backing.device.wc_lease_token;
         if (token != 0) {
             const range = state.deviceMemoryPhysicalBounds(ref) orelse unreachable;
-            const limit = @import("../arch/x86_64/physical_layout.zig").identity_limit;
-            const low = if (range.base < limit) @min(range.size, limit - range.base) else 0;
-            if (low != 0) x86_platform.wcIdentityRelease(range.base, low);
             flushRemovedWcPhysicalRange(range.base, range.size);
-            if (low != 0) {
-                x86_platform.wcIdentityRestore(range.base, low);
-                user_vm.restorePrivateIdentityMarkers(range.base, low);
-                flushRestoredLowIdentityRange(range.base, low);
-            }
             user_copy.releaseWcPhysicalWindowLease(token);
         }
         state.finishDeviceMemoryRetirement(ref) catch unreachable;
@@ -547,7 +532,7 @@ pub fn drainDeviceMemoryRetirements(state: *kernel.KernelState) void {
 
 fn exportDeviceMemoryVmo(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, frame: *TrapFrame, device: kernel.DmaDeviceId, bar_index: u32, flags: u64, bar: pci.BarInfo) u64 {
     if (frame.r9 != 0 or frame.rdx == 0 or frame.r10 == 0 or frame.r10 % 4096 != 0 or
-        frame.r10 / 4096 > dma_resolved_paddrs.len or
+        frame.r10 / 4096 > kernel.max_vmo_logical_pages or
         flags & capsule_abi.mmio_map_flag_replace_existing != 0)
         return sc.syscall_err_invalid;
     const count: usize = @intCast(frame.r10 / 4096);
@@ -558,10 +543,10 @@ fn exportDeviceMemoryVmo(h: anytype, state: *kernel.KernelState, proc: kernel.Pr
     const kind = (flags & capsule_abi.mmio_map_cache_mask) >> capsule_abi.mmio_map_cache_shift;
     if (kind != @intFromEnum(capsule_abi.MmioCache.uc) and
         kind != @intFromEnum(capsule_abi.MmioCache.wc)) return sc.syscall_err_invalid;
-    for (dma_resolved_paddrs[0..count], 0..) |*offset, index| {
-        offset.* = h.read_user_u64(proc, frame.rdx + @as(u64, @intCast(index)) * 8) orelse return sc.syscall_err_invalid;
-        _ = pci.barMappingPaddr(bar, offset.*, 4096) orelse return sc.syscall_err_invalid;
-    }
+    var scratch = state.beginInvocationStorage(h.free_list);
+    defer scratch.rollback() catch @panic("invalid invocation storage rollback");
+    const offsets = scratch.reserve(u64, count, .replaceable) catch return sc.syscall_err_alloc;
+    if (!readDevicePageOffsets(h, proc, frame.rdx, bar, offsets)) return sc.syscall_err_invalid;
     const wc = kind == @intFromEnum(capsule_abi.MmioCache.wc);
     user_vm.lockAllVmTransactions();
     defer user_vm.unlockAllVmTransactions();
@@ -569,40 +554,23 @@ fn exportDeviceMemoryVmo(h: anytype, state: *kernel.KernelState, proc: kernel.Pr
         .device = device,
         .bar_index = @intCast(bar_index),
         .cache = if (wc) .wc else .uc,
-    }, first, bar_bytes, dma_resolved_paddrs[0..count], h.free_list) catch |err| return statusFromKernelError(err);
+    }, first, bar_bytes, offsets, h.free_list) catch |err| return statusFromKernelError(err);
     var owned = true;
     defer if (owned) state.releaseNativeVmo(ref);
     const range = state.deviceMemoryPhysicalBounds(ref) orelse return sc.syscall_err_invalid;
     const cache = mmioCacheForRange(flags, range.base, range.size) catch |err| return mmioCacheErrorStatus(err);
     if (state.mmioPhysicalCacheConflict(range.base, range.size, wc)) return sc.syscall_err_invalid;
-    const limit = @import("../arch/x86_64/physical_layout.zig").identity_limit;
-    const low = if (range.base < limit) @min(range.size, limit - range.base) else 0;
-    var token: u16 = 0;
-    var hidden = false;
+    var token: u64 = 0;
     defer if (token != 0) {
-        if (hidden) x86_platform.wcIdentityRelease(range.base, low);
         flushRemovedWcPhysicalRange(range.base, range.size);
-        if (hidden) {
-            x86_platform.wcIdentityRestore(range.base, low);
-            user_vm.restorePrivateIdentityMarkers(range.base, low);
-            flushRestoredLowIdentityRange(range.base, low);
-        }
         user_copy.releaseWcPhysicalWindowLease(token);
     };
     if (wc) {
         token = user_copy.acquireWcPhysicalWindowLease(range.base, range.size) orelse return sc.syscall_err_alloc;
-        if (low != 0) {
-            if (@import("../boot/boot_diag.zig").enabled or
-                !user_vm.privateIdentityAliasesCanHide(range.base, low) or
-                !x86_platform.wcIdentityCanAcquire(range.base, low)) return sc.syscall_err_invalid;
-            x86_platform.wcIdentityAcquire(range.base, low);
-            hidden = true;
-        }
         flushRemovedWcPhysicalRange(range.base, range.size);
     }
     state.activateNativeDeviceMemory(ref, cache.patSlot(), token) catch return sc.syscall_err_invalid;
     token = 0;
-    hidden = false;
     const object = state.createKernelObject(.vmo, .{ .vmo = ref }) catch |err| return statusFromKernelError(err);
     owned = false;
     const rights = kernel.FdRights{ .inspect = true, .dup = true, .transfer = true, .close = true, .revoke = true, .map_read = true, .map_write = flags & capsule_abi.mmio_map_flag_read_only == 0 };
@@ -639,7 +607,7 @@ pub fn dispatch(
                 break :blk exportDeviceMemoryVmo(h, state, proc, frame, device.device, bar_index, flags, bar);
             // An absent address space is not a failed MMIO PTE publication.
             // Keep it distinct from a caller-supplied, non-virgin VA below.
-            // Cache admission inspects every process-private identity copy.
+            // Cache admission excludes live kernel borrows and user leases.
             // The global KernelState lock serializes descriptor publication;
             // taking VM locks in canonical order excludes concurrent faults.
             user_vm.lockAllVmTransactions();
@@ -657,46 +625,13 @@ pub fn dispatch(
                 if (requested_wc) kernel_log.writeFmt("mmio: WC refused live physical cache lease paddr=0x{x} bytes=0x{x}\n", .{ paddr, frame.r10 });
                 break :blk sc.syscall_err_invalid;
             }
-            const identity_limit = @import("../arch/x86_64/physical_layout.zig").identity_limit;
-            const low_size = if (paddr < identity_limit)
-                @min(frame.r10, identity_limit - paddr)
-            else
-                0;
-            var wc_window_token: u16 = 0;
-            var wc_hidden = false;
+            var wc_window_token: u64 = 0;
             defer if (wc_window_token != 0) {
-                if (wc_hidden) x86_platform.wcIdentityRelease(paddr, low_size);
                 flushRemovedWcPhysicalRange(paddr, frame.r10);
-                if (wc_hidden) {
-                    x86_platform.wcIdentityRestore(paddr, low_size);
-                    user_vm.restorePrivateIdentityMarkers(paddr, low_size);
-                    flushRestoredLowIdentityRange(paddr, low_size);
-                }
                 user_copy.releaseWcPhysicalWindowLease(wc_window_token);
             };
             if (requested_wc) {
-                wc_window_token = user_copy.acquireWcPhysicalWindowLease(paddr, frame.r10) orelse {
-                    kernel_log.writeFmt("mmio: WC physical lease table full paddr=0x{x} bytes=0x{x}\n", .{ paddr, frame.r10 });
-                    break :blk sc.syscall_err_alloc;
-                };
-            }
-            if (requested_wc and low_size != 0) {
-                // Diagnostic GOP can still write this aperture without a
-                // user FD. The normal build has that path compiled out.
-                if (@import("../boot/boot_diag.zig").enabled) {
-                    kernel_log.write("mmio: WC refused diagnostic GOP still active\n");
-                    break :blk sc.syscall_err_invalid;
-                }
-                if (!user_vm.privateIdentityAliasesCanHide(paddr, low_size)) {
-                    kernel_log.writeFmt("mmio: WC refused private identity alias paddr=0x{x} bytes=0x{x}\n", .{ paddr, low_size });
-                    break :blk sc.syscall_err_invalid;
-                }
-                if (!x86_platform.wcIdentityCanAcquire(paddr, low_size)) {
-                    kernel_log.writeFmt("mmio: WC refused low identity transition paddr=0x{x} bytes=0x{x}\n", .{ paddr, low_size });
-                    break :blk sc.syscall_err_invalid;
-                }
-                x86_platform.wcIdentityAcquire(paddr, low_size);
-                wc_hidden = true;
+                wc_window_token = user_copy.acquireWcPhysicalWindowLease(paddr, frame.r10) orelse break :blk sc.syscall_err_alloc;
             }
             if (requested_wc) {
                 // AMD APM Vol. 2 §7.8.7: retire every old alias and drain
@@ -730,11 +665,8 @@ pub fn dispatch(
                     state.closeFd(proc, fd) catch unreachable;
                     break :blk sc.syscall_err_map;
                 }
-                const published = state.fdPayloadWithRights(proc, fd, .{}) orelse unreachable;
-                published.payload.mmio_region.user_va = frame.rdx;
-                published.payload.mmio_region.wc_window_lease_token = wc_window_token;
+                state.publishMmioOverlayAddress(proc, fd, frame.rdx, wc_window_token);
                 wc_window_token = 0;
-                wc_hidden = false;
                 break :blk fd;
             }
             if (!mapPciBarIntoUser(state, proc, frame.rdx, frame.r10, flags, bar, frame.r9)) break :blk sc.syscall_err_map;
@@ -756,7 +688,6 @@ pub fn dispatch(
             const published = state.fdPayloadWithRights(proc, fd, .{}) orelse unreachable;
             published.payload.mmio_region.wc_window_lease_token = wc_window_token;
             wc_window_token = 0;
-            wc_hidden = false;
             break :blk fd;
         },
         sc.syscall_capsule_dma_set_enabled => blk: {
@@ -787,9 +718,12 @@ pub fn dispatch(
                 else => break :blk sc.syscall_err_invalid,
             };
             const flags = flagsArg(frame.r8, capsule_abi.dma_buffer_known_flags_mask) orelse break :blk sc.syscall_err_invalid;
+            var scratch = state.beginInvocationStorage(h.free_list);
+            defer scratch.rollback() catch @panic("invalid invocation storage rollback");
             const resolved = resolveUserDmaPages(
                 state,
                 h.free_list,
+                &scratch,
                 proc,
                 frame.rsi,
                 frame.r10,
@@ -833,9 +767,12 @@ pub fn dispatch(
                 break :blk sc.syscall_err_invalid;
             }
             const flags = flagsArg(frame.r9, capsule_abi.dma_mapping_known_flags_mask) orelse break :blk sc.syscall_err_invalid;
+            var scratch = state.beginInvocationStorage(h.free_list);
+            defer scratch.rollback() catch @panic("invalid invocation storage rollback");
             const resolved = resolveUserDmaPages(
                 state,
                 h.free_list,
+                &scratch,
                 proc,
                 frame.rsi,
                 frame.r10,
@@ -947,10 +884,10 @@ pub fn dispatch(
                     iommu.freeIova(device.device, iova_base, layout.page_count);
                     break :blk sc.syscall_err_map;
                 }
-                mapping_iova = iova_base + layout.first_page_offset;
+                mapping_iova = iova_base.toInt() + layout.first_page_offset;
                 page_index = 0;
                 while (page_index < layout.page_count) : (page_index += 1) {
-                    page_addresses[page_index] = iova_base + @as(u64, @intCast(page_index)) * page_size;
+                    page_addresses[page_index] = iova_base.toInt() + @as(u64, @intCast(page_index)) * page_size;
                 }
                 page_addresses[0] += layout.first_page_offset;
             } else {
@@ -964,7 +901,8 @@ pub fn dispatch(
             // userspace range mapped and unchanged until this FD is closed.
             // This capability deliberately records that lifetime contract;
             // extending it with VMO/COW page pins is a separate design.
-            const mapping_fd = state.createDmaMappingFd(proc, .{
+            page_addresses[0] &= ~@as(u64, 4095);
+            const mapping_fd = state.createDmaMappingFdWithBacking(proc, .{
                 .device = device.device,
                 .user_va = frame.rsi,
                 .iova = mapping_iova,
@@ -972,11 +910,12 @@ pub fn dispatch(
                 .page_count = @intCast(layout.page_count),
                 .direction = direction,
                 .flags = 0,
-            }, rightsForDmaMapping(view.rights, direction), .{}, first_dynamic_fd) catch |err| {
+            }, rightsForDmaMapping(view.rights, direction), .{}, first_dynamic_fd, page_addresses[0..layout.page_count]) catch |err| {
                 releaseDeviceIova(device.device, mapping_iova, frame.rdx);
                 break :blk statusFromKernelError(err);
             };
 
+            page_addresses[0] += layout.first_page_offset;
             const output = std.mem.sliceAsBytes(page_addresses[0..layout.page_count]);
             if (!h.copy_bytes_to_user_va(proc, frame.r8, output)) {
                 state.closeFdWithFreeList(proc, mapping_fd, h.free_list) catch {};
@@ -994,9 +933,12 @@ pub fn dispatch(
             }
             const flags = flagsArg(frame.r8, capsule_abi.dma_mapping_known_flags_mask) orelse break :blk sc.syscall_err_invalid;
             if (frame.rdx == 0 or frame.rdx > buffer.size) break :blk sc.syscall_err_invalid;
+            var scratch = state.beginInvocationStorage(h.free_list);
+            defer scratch.rollback() catch @panic("invalid invocation storage rollback");
             const resolved = resolveUserDmaPages(
                 state,
                 h.free_list,
+                &scratch,
                 proc,
                 buffer.user_va,
                 frame.rdx,
@@ -1243,4 +1185,49 @@ pub fn dispatch(
         },
         else => null,
     };
+}
+
+fn readDevicePageOffsets(h: anytype, proc: kernel.PrincipalId, user_va: u64, bar: pci.BarInfo, offsets: []u64) bool {
+    const bytes = std.math.mul(u64, offsets.len, 8) catch return false;
+    _ = std.math.add(u64, user_va, bytes) catch return false;
+    // Copy each untrusted offset once. Validation and backing creation consume
+    // this same immutable snapshot, never a second user-memory read.
+    for (offsets, 0..) |*offset, index| {
+        offset.* = h.read_user_u64(proc, user_va + @as(u64, @intCast(index)) * 8) orelse return false;
+        _ = pci.barMappingPaddr(bar, offset.*, 4096) orelse return false;
+    }
+    return true;
+}
+
+test "MMIO capsule offsets are copied once into invocation workspace with late rejection" {
+    const owned = @import("../memory/owned_storage.zig");
+    const Fake = struct {
+        calls: usize = 0,
+        bad: ?usize = null,
+        fail: ?usize = null,
+        fn read_user_u64(self: *@This(), _: kernel.PrincipalId, va: u64) ?u64 {
+            const i: usize = @intCast((va - 0x1000) / 8);
+            std.debug.assert(i == self.calls); // a second read is not a snapshot
+            self.calls += 1;
+            if (self.fail == i) return null;
+            return i * 4096 + @as(u64, if (self.bad == i) 1 else 0);
+        }
+    };
+    var backend = owned.TestAllocator{};
+    defer backend.deinit();
+    var owner = owned.Owner{};
+    for ([_]usize{ 511, 512, 513, 131072, 131073 }) |count| {
+        var scratch = owned.Transaction.init(&owner, backend.interface());
+        defer scratch.rollback() catch unreachable;
+        const offsets = try scratch.reserve(u64, count, .replaceable);
+        const bar = pci.BarInfo{ .start = 0x80000000, .size = count * 4096, .flags = pci.bar_flag_mem };
+        for (0..3) |mode| {
+            var h = Fake{};
+            if (mode == 1) h.bad = count - 1;
+            if (mode == 2) h.fail = count - 1;
+            try std.testing.expectEqual(mode == 0, readDevicePageOffsets(&h, kernel.processPrincipalFromIndex(0).?, 0x1000, bar, offsets));
+            try std.testing.expectEqual(count, h.calls);
+            if (mode == 0) try std.testing.expectEqual(@as(u64, (count - 1) * 4096), offsets[count - 1]);
+        }
+    }
 }

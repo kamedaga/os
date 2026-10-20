@@ -25,7 +25,7 @@ long pacha_syscall2(uint64_t nr, uint64_t address, uint64_t bytes)
     return log_status;
 }
 
-int pacha_timerfd_create(uint64_t initial, uint64_t interval, uint64_t rights,
+pacha_fd_t pacha_timerfd_create(uint64_t initial, uint64_t interval, uint64_t rights,
     uint32_t flags)
 {
     assert(initial == 2000000000ull && interval == initial);
@@ -35,14 +35,14 @@ int pacha_timerfd_create(uint64_t initial, uint64_t interval, uint64_t rights,
     return timer_result;
 }
 
-int pacha_fd_close(int fd)
+int pacha_fd_close(pacha_fd_t fd)
 {
     assert(fd == 70);
     ++closes;
     return 0;
 }
 
-long pacha_fd_read(int fd, void *buffer, uint64_t bytes)
+long pacha_fd_read(pacha_fd_t fd, void *buffer, uint64_t bytes)
 {
     assert(fd == 70 && bytes == 8);
     *(uint64_t *)buffer = 1;
@@ -50,7 +50,7 @@ long pacha_fd_read(int fd, void *buffer, uint64_t bytes)
     return read_status;
 }
 
-int pacha_fd_get_info(int fd, struct pacha_fd_info *info)
+int pacha_fd_get_info(pacha_fd_t fd, struct pacha_fd_info *info)
 {
     assert(fd == 90 || fd == 91 || fd == 92 || fd == 95);
     ++inspections;

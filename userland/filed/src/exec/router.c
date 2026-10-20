@@ -6,8 +6,8 @@
 #include "pacha/launch.h"
 
 int filed_exec_build_grants(struct filed_runtime *runtime,
-    const filed_exec_path_t *request, const int *sources, uint64_t source_count,
-    int bootstrap_fd, struct pacha_process_fd_grant *grants, uint64_t *count)
+    const filed_exec_path_t *request, const pacha_fd_t *sources, uint64_t source_count,
+    pacha_fd_t bootstrap_fd, struct pacha_process_fd_grant *grants, uint64_t *count)
 {
     if (!runtime || !request || !grants || !count ||
         source_count > PACHA_PROCESS_CREATE_MAX_GRANTS - 7 ||
@@ -18,7 +18,7 @@ int filed_exec_build_grants(struct filed_runtime *runtime,
     for (unsigned i = 0; i < 2; ++i) grants[(*count)++] = logs[i];
     for (uint64_t i = 0; i < source_count; ++i) {
         const filed_exec_fd_grant_t *spec = &request->fd_grants[i];
-        if (sources[i] < 16 || spec->target < 16 || spec->target >= PACHA_FD_TABLE_LIMIT)
+        if (sources[i] < 16 || spec->target < 16 || spec->target >= PACHA_THREAD_SELF_FD)
             return -22;
         grants[(*count)++] = (struct pacha_process_fd_grant){
             .source_fd = (uint64_t)sources[i], .target_fd = spec->target,
@@ -49,7 +49,7 @@ int filed_exec_build_grants(struct filed_runtime *runtime,
         };
         for (unsigned i = 0; i < sizeof(clients) / sizeof(clients[0]); ++i)
             if (services & (FILED_EXEC_SERVICE_NETD << i)) {
-                if (clients[i].source_fd < 16 || clients[i].source_fd >= PACHA_FD_TABLE_LIMIT)
+                if (clients[i].source_fd < 16 || clients[i].source_fd >= PACHA_THREAD_SELF_FD)
                     return -107;
                 grants[(*count)++] = clients[i];
             }
@@ -65,11 +65,11 @@ int filed_exec_handle(
     struct filed_runtime *runtime,
     filed_handle_id_t handle_id,
     const filed_exec_path_t *request,
-    const int *inherit_fds,
+    const pacha_fd_t *inherit_fds,
     uint64_t inherit_fd_count,
-    int bootstrap_fd,
-    int *out_process_fd,
-    int *out_thread_fd)
+    pacha_fd_t bootstrap_fd,
+    pacha_fd_t *out_process_fd,
+    pacha_fd_t *out_thread_fd)
 {
     if (request != 0 && (request->flags & FILED_EXEC_LINUX_LPR) != 0) {
         return filed_exec_linux_lpr_handle(

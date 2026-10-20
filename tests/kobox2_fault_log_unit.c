@@ -6,7 +6,7 @@
 
 static char last[257];
 static unsigned records;
-int pacha_log_emit(int fd, unsigned source, const char *text, size_t length) {
+int pacha_log_emit(pacha_fd_t fd, unsigned source, const char *text, size_t length) {
     assert(fd == 23 && source == PACHA_LOG_SOURCE_KOBOX2_GPU);
     assert(length <= 256);
     memcpy(last, text, length);

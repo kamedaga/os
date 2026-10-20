@@ -3,9 +3,9 @@
 
 
 int lpr_create_wire_page(void **out_page);
-void lpr_destroy_wire_page(int page_fd, void *page);
-int lpr_create_tty_wire_page(void **out_page);
-void lpr_destroy_tty_wire_page(int page_fd, void *page);
+void lpr_destroy_wire_page(pacha_fd_t page_fd, void *page);
+pacha_fd_t lpr_create_tty_wire_page(void **out_page);
+void lpr_destroy_tty_wire_page(pacha_fd_t page_fd, void *page);
 void lpr_linux_process_state_init(void);
 int lpr_linux_pump_tty_signals(void);
 void lpr_linux_raise_sigpipe(void);
@@ -14,19 +14,19 @@ void lpr_fill_termd_caller(uint64_t *session_id, uint64_t *process_id, uint64_t 
 void lpr_fill_termd_signal_state(uint64_t *signal_mask, uint64_t *signal_ignored);
 int64_t lpr_supervisor_call(
     uint32_t op,
-    int page_fd,
+    pacha_fd_t page_fd,
     void *page,
     uint32_t payload_size,
-    int transfer_fd,
+    pacha_fd_t transfer_fd,
     uint64_t *out_result);
 int64_t lpr_supervisor_call_token(
     uint32_t op,
     uint64_t token,
-    int transfer_fd,
+    pacha_fd_t transfer_fd,
     uint64_t *out_result);
 int64_t lpr_supervisor_kill_pid(int32_t pid, uint32_t sig, uint64_t *out_delivered);
 int lpr_supervisor_get_state(lprs_process_state_t *out_state);
-int64_t lpr_tty_wait(uint64_t fd, uint32_t events);
+int64_t lpr_tty_wait(uint64_t fd, uint32_t events, unsigned *wait_not_ready __attribute__((unused)));
 void lpr_fd_after_fork_child(void);
 void lpr_cwd_init(void);
 int64_t lpr_filed_dup_handle(uint64_t handle, uint64_t fd_flags, uint64_t *out_handle);
@@ -39,7 +39,7 @@ int64_t lpr_filed_session_drop(void)
      * hold that lock across the session-lock/RPC path or close before ACK. */
     const int64_t status = lpr_fs_session_drop();
     lpr_state_lock(&lpr_state.filed_rpc.connection_lock);
-    const int client = lpr_filed_client_fd;
+    const pacha_fd_t client = lpr_filed_client_fd;
     lpr_filed_client_id = 0;
     /* Teardown is terminal for this image. Prevent a sibling control request
      * from re-binding after the final queue ACK; fork/new-image resets it. */
@@ -65,11 +65,11 @@ void lpr_zero_bytes(void *ptr, uint64_t len)
 
 static void lpr_fd_lock_futex_wait(volatile uint32_t *word, uint32_t expected)
 {
-    (void)lpr_pacha_syscall3(
+    (void)lpr_pacha_syscall4(
         PACHA_RUNTIME_SYSCALL_FUTEX_WAIT,
         (uint64_t)(uintptr_t)word,
         expected,
-        0);
+        0, PACHA_WAIT_UNINTERRUPTIBLE);
 }
 
 static void lpr_fd_lock_futex_wake(volatile uint32_t *word, uint32_t count)

@@ -1,3 +1,4 @@
+#include <pacha/abi.h>
 /* SPDX-License-Identifier: MIT */
 #ifndef PACHA_GPUD_LAUNCH_NATIVE_H
 #define PACHA_GPUD_LAUNCH_NATIVE_H
@@ -28,7 +29,7 @@ struct gpud_launch_request {
 
 struct gpud_native_launch {
     struct gpud_native_process process;
-    int thread_fd, scratch_fd;
+    pacha_fd_t thread_fd, scratch_fd;
     void *scratch_view;
     size_t scratch_size;
     unsigned int prepared, started, failed;

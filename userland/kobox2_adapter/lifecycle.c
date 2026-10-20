@@ -179,13 +179,23 @@ static void async_unpark(struct ph_lifecycle *lifecycle, unsigned state) {
         ph_wake(&lifecycle->work);
 }
 
+/* Advances between control receives while no wake reports one. Every
+ * advance in a request's round trip lies on the client's critical path, and
+ * an empty native RECV there cost about as much as executing a stat. */
+#define CONTROL_QUANTUM 16u
+
 static int async_advance(void *context, void *service) {
     struct ph_lifecycle *lifecycle = context;
     atomic_exchange_explicit(&lifecycle->work, WORK_BUSY, memory_order_acquire);
     bool progressed = false;
-    if (!atomic_load_explicit(&lifecycle->quiescing, memory_order_acquire)) {
-        /* Check control once per bounded ring quantum. A hot data queue
-         * cannot hide credential changes or QUIESCE from its sole owner. */
+    /* Check control once per bounded ring quantum. A hot data queue cannot
+     * hide credential changes or QUIESCE from its sole owner. Between those,
+     * control is received when the helper's wait ended: an idle owner sleeps
+     * only after the helper waits on the control endpoint too. */
+    bool control = atomic_exchange_explicit(&lifecycle->control_hint, 0,
+        memory_order_acquire) || ++lifecycle->control_skips >= CONTROL_QUANTUM;
+    if (control && !atomic_load_explicit(&lifecycle->quiescing, memory_order_acquire)) {
+        lifecycle->control_skips = 0;
         struct ph_ipc_packet packet = {0};
         int result = ph_ipc_receive(lifecycle->ipc, lifecycle->generation, &packet);
         if (!result) {
@@ -276,6 +286,9 @@ static int receive_async(struct ph_lifecycle *lifecycle) {
         }
         if (atomic_load_explicit(&lifecycle->work, memory_order_acquire) == WORK_DONE)
             return 0;
+        /* Which endpoint ended the wait is not reported; control is cheap to
+         * check once per helper wake, which is never per request. */
+        atomic_store_explicit(&lifecycle->control_hint, 1, memory_order_release);
         if (result) {
             async_fault(lifecycle, result);
             async_signal_linux(lifecycle);
@@ -416,12 +429,15 @@ static int start_service(struct ph_lifecycle *lifecycle, struct ph_ipc *ipc,
     atomic_init(&lifecycle->quiescing, 0);
     atomic_init(&lifecycle->async_error, 0);
     atomic_init(&lifecycle->helper_parked, 0);
+    atomic_init(&lifecycle->control_hint, 1); /* First advance receives control. */
+    lifecycle->control_skips = 0;
     if (!atomic_is_lock_free(&lifecycle->terminal) || !atomic_is_lock_free(&lifecycle->start) ||
         !atomic_is_lock_free(&lifecycle->work) ||
         !atomic_is_lock_free(&lifecycle->monitor_abort) ||
         !atomic_is_lock_free(&lifecycle->quiescing) ||
         !atomic_is_lock_free(&lifecycle->async_error) ||
-        !atomic_is_lock_free(&lifecycle->helper_parked)) {
+        !atomic_is_lock_free(&lifecycle->helper_parked) ||
+        !atomic_is_lock_free(&lifecycle->control_hint)) {
         *lifecycle = (struct ph_lifecycle){0};
         return -EOPNOTSUPP;
     }

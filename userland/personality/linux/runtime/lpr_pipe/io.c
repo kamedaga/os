@@ -88,13 +88,10 @@ uint32_t lpr_linux_pipe_poll_events(uint64_t fd, uint32_t events)
      * requirement, unlike the generic native FD_POLL operation. */
     int64_t status;
     if ((events & 0x0004u) != 0) {
-        pollfd.revents = LPR_LINUX_PIPE_BUF_BYTES;
+        pollfd.min_write_bytes = LPR_LINUX_PIPE_BUF_BYTES;
         status = lpr_pacha_syscall4(
             PACHA_FD_SYSCALL_WAIT_MANY,
             (uint64_t)(uintptr_t)&pollfd, 1, 0, 0);
-        /* An invalid native descriptor leaves the input-only write minimum
-         * untouched; it is not an event mask returned by a successful probe. */
-        if (pollfd.revents == LPR_LINUX_PIPE_BUF_BYTES) return 0x0020u;
         if (pollfd.revents == 0 &&
             (status == PACHA_SYSCALL_ERR_NOT_READY ||
              status == -PACHA_SYSCALL_ERR_NOT_READY)) return 0;
@@ -107,7 +104,7 @@ uint32_t lpr_linux_pipe_poll_events(uint64_t fd, uint32_t events)
         0x0020u : lpr_pipe_poll_events_from_pacha(pollfd.revents);
 }
 
-int64_t lpr_pipe_wait(uint64_t fd, uint32_t events, uint64_t min_write_bytes)
+int64_t lpr_pipe_wait(uint64_t fd, uint32_t events, uint64_t min_write_bytes, unsigned *wait_not_ready __attribute__((unused)))
 {
     const lpr_pipe_backend_t *pipe = lpr_pipe_backend(fd);
     if (pipe == 0 || pipe->native.raw < 0) {
@@ -124,7 +121,7 @@ int64_t lpr_pipe_wait(uint64_t fd, uint32_t events, uint64_t min_write_bytes)
     if (status == 0)
         status = lpr_wait_deadline_init(&deadline, -1);
     if (status == 0)
-        status = lpr_wait_graph_block(&graph, &deadline);
+        status = lpr_wait_graph_block(&graph, &deadline, wait_not_ready);
     if (status != 0)
         return status;
     const uint32_t revents = lpr_pipe_poll_events_from_pacha(

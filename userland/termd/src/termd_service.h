@@ -1,3 +1,4 @@
+#include <pacha/abi.h>
 #pragma once
 
 #include "linux_tty_island.h"
@@ -18,7 +19,7 @@ enum {
 typedef struct termd_service {
     const struct termd_boot_config *cfg;
     struct termd_linux_tty_island *tty;
-    int signal_supervisor_endpoint_fd;
+    pacha_fd_t signal_supervisor_endpoint_fd;
     uint64_t signal_supervisor_request_id;
 } termd_service_t;
 

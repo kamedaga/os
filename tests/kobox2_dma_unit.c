@@ -16,7 +16,7 @@
 static struct pacha_capsule_info device;
 static long query_result = 11, derive_result = 100, close_result, enable_result;
 static long view_result = VIEW_FD, mmap_result = VIEW;
-static long table_result, view_close_result;
+static long table_result, table_growth_result, view_close_result;
 static unsigned int failure_logs, table_queries;
 static char failure_log[384];
 static unsigned int calls, enables, last_enabled, munmaps, page_views;
@@ -58,14 +58,15 @@ long pacha_syscall3(uint64_t nr, uint64_t fd, uint64_t out, uint64_t words) {
 long pacha_syscall2(uint64_t nr, uint64_t first, uint64_t second) {
     ++calls;
     if (nr == PACHA_FD_SYSCALL_TABLE) {
-        assert(first == 0 || first == PACHA_FD_TABLE_LIMIT);
+        assert(first == 0 || first == 19);
         if (!first) ++table_queries;
         *(struct pacha_fd_table_info *)(uintptr_t)second =
             (struct pacha_fd_table_info) {
-                .capacity = PACHA_FD_TABLE_LIMIT,
-                .free_slots = PACHA_FD_TABLE_LIMIT,
+                .capacity = first ? 256 : 16,
+                .maximum = PACHA_THREAD_SELF_FD,
+                .free_slots = first ? 240 : 0,
             };
-        return first ? 0 : table_result;
+        return first ? table_growth_result : table_result;
     }
     if (nr == PACHA_VM_SYSCALL_MUNMAP) {
         assert(first == VIEW && second == last_length);
@@ -111,7 +112,7 @@ long pacha_syscall1(uint64_t nr, uint64_t fd) {
         assert(nr == PACHA_FD_SYSCALL_CLOSE);
         return view_close_result;
     }
-    assert(nr == PACHA_FD_SYSCALL_CLOSE && fd == 100);
+    assert(nr == PACHA_FD_SYSCALL_CLOSE && (fd == 100 || fd == 0x80000000u || fd == 0xfffffffdu));
     return close_result;
 }
 
@@ -133,6 +134,8 @@ int main(void) {
             PACHA_FD_RIGHT_DMA_READ | PACHA_FD_RIGHT_DMA_WRITE | PACHA_FD_RIGHT_BUS_MASTER,
     };
     assert(!ph_dma_init(&dma, &config));
+    assert(table_queries == 1);
+    table_queries = 0;
     assert(enables == 1 && !last_enabled && dma.drained && !dma.enabled);
     assert(dma.host.aperture_start == IOVA && dma.host.aperture_end == IOVA + 0xffff);
     assert(dma.host.coherent == 1 && dma.host.context == &dma);
@@ -257,12 +260,20 @@ int main(void) {
     assert(failure_logs == 5 && table_queries == 5);
     table_result = 0;
 
-    const long errors[] = {0, 1, 2, 3, 4, 5, 6, PACHA_FD_TABLE_LIMIT};
+    const long errors[] = {0, 1, 2, 3, 4, 5, 6, PACHA_THREAD_SELF_FD};
     for (size_t i = 0; i < sizeof(errors) / sizeof(errors[0]); ++i) {
         derive_result = errors[i];
         assert(host->map(&dma, IOVA, 0, 4096, 3) < 0);
         assert(!mappings[0].length);
     }
+    const long high_fds[] = {0x80000000L, 0xfffffffdL};
+    for (unsigned i = 0; i < 2; i++) {
+        derive_result = high_fds[i];
+        assert(!host->map(&dma, IOVA, 0, 4096, 3));
+        assert(mappings[0].fd == high_fds[i]);
+        assert(!host->unmap(&dma, IOVA, 4096));
+    }
+    derive_result = PACHA_SYSCALL_ERR_ALLOC;
     expect_fatal = 1;
     device.flags = PACHA_CAPSULE_DMA_QUARANTINED;
     if (!setjmp(fatal_jump)) {
@@ -308,6 +319,13 @@ int main(void) {
     device.iova = IOVA + 1;
     assert(ph_dma_init(&dma, &config) == -ERANGE && enables == before);
     device.iova = IOVA;
+    table_result = 0;
+    table_growth_result = 3; /* native out-of-memory */
+    assert(ph_dma_init(&dma, &config) == -ENOMEM && enables == before);
+    table_growth_result = 0;
+    config.mapping_capacity = PACHA_THREAD_SELF_FD;
+    assert(ph_dma_init(&dma, &config) == -EOVERFLOW && enables == before);
+    config.mapping_capacity = 2;
     config.ram = (void *)(UINTPTR_MAX - 4095);
     assert(ph_dma_init(&dma, &config) == -EINVAL);
     puts("kobox2 DMA native-call/ownership unit: PASS");

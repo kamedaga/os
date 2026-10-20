@@ -22,7 +22,7 @@ long pacha_syscall2(uint64_t nr, uint64_t fd, uint64_t address) {
     assert(nr == PACHA_FD_SYSCALL_GET_INFO && fd == 40);
     *(struct pacha_fd_info *)(uintptr_t)address = event_info; return 0;
 }
-int pacha_fd_close(int fd) { assert(fd == 40); closed++; return 0; }
+int pacha_fd_close(pacha_fd_t fd) { assert(fd == 40); closed++; return 0; }
 int pacha_munmap(void *address, size_t size) {
     (void)address; (void)size; assert(0); return 0;
 }

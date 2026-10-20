@@ -1,3 +1,4 @@
+#error "Archived IPC ABI is unsupported; migrate synchronous CALL/reply before enabling this target"
 #include "vfs_protocol.h"
 
 #define VFS_PROFILE_READ_BULK 0

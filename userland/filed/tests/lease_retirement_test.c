@@ -10,7 +10,7 @@ int filed_storage_close(filed_runtime_t *rt,uint64_t handle)
     assert(rt && handle==123);
     ++file_closes;return file_error;
 }
-int pacha_fd_close(int fd)
+int pacha_fd_close(pacha_fd_t fd)
 {
     assert(fd==70);
     ++endpoint_closes;return endpoint_error;

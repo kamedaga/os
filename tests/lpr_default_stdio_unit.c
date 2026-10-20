@@ -40,7 +40,7 @@ int lpr_fd_linux_visible_active(uint64_t fd)
     assert(fd < 16);
     return active[fd];
 }
-int64_t lpr_linux_openat(uint64_t dirfd, uint64_t path, uint64_t flags, uint64_t mode)
+int64_t lpr_linux_openat(uint64_t dirfd, uint64_t path, uint64_t flags, uint64_t mode, unsigned *wait_not_ready __attribute__((unused)))
 {
     assert(dirfd == (uint64_t)LPR_LINUX_AT_FDCWD && mode == 0);
     assert(!strcmp((const char *)(uintptr_t)path, expected_path));
@@ -87,38 +87,38 @@ static void reset(uint64_t flags, const char *ctty)
 int main(void)
 {
     reset(LPR_MANIFEST_FLAG_DEFAULT_STDIO, "");
-    lpr_linux_ensure_default_stdio();
+    lpr_linux_ensure_default_stdio(0);
     assert(active[0] && active[1] && active[2]);
     assert(opened == 1 && duplicated == 2 && !closed);
     /* Closing stdin for an async child must not trigger another bootstrap. */
     active[0] = 0;
-    lpr_linux_ensure_default_stdio();
+    lpr_linux_ensure_default_stdio(0);
     assert(!active[0] && opened == 1);
 
     reset(LPR_MANIFEST_FLAG_DEFAULT_STDIO | LPR_MANIFEST_FLAG_STDIO_NOCTTY, "/dev/pts/0");
     active[0] = active[2] = 1;
-    lpr_linux_ensure_default_stdio();
+    lpr_linux_ensure_default_stdio(0);
     assert(active[0] && active[1] && active[2] && opened == 1 && !duplicated);
 
     reset(LPR_MANIFEST_FLAG_DEFAULT_STDIO, "");
     active[0] = active[1] = active[2] = 1;
-    lpr_linux_ensure_default_stdio();
+    lpr_linux_ensure_default_stdio(0);
     assert(!opened);
 
     /* An ordinary exec inherits its table, including intentionally absent
      * stdio; it must not receive the service-launch defaults. */
     reset(0, "");
-    lpr_linux_ensure_default_stdio();
+    lpr_linux_ensure_default_stdio(0);
     assert(!opened && !active[0] && !active[1] && !active[2]);
     reset(LPR_MANIFEST_FLAG_DEFAULT_STDIO, "");
     have_manifest = 0;
-    lpr_linux_ensure_default_stdio();
+    lpr_linux_ensure_default_stdio(0);
     assert(!opened);
 
 #if defined(LPR_BOOT_DIAGNOSTICS) && LPR_BOOT_DIAGNOSTICS
     reset(LPR_MANIFEST_FLAG_DEFAULT_STDIO, "/dev/hvc0");
     log_result = 19;
-    lpr_linux_ensure_default_stdio();
+    lpr_linux_ensure_default_stdio(0);
     assert(active[0] && active[1] && active[2] && duplicated == 2);
     assert(log_calls == 1 && lpr_boot_diagnostic_state.last_log_status == 19);
     assert(lpr_boot_diagnostic_state.failed == 1);
@@ -184,4 +184,14 @@ int main(void)
     assert(!evaluated && !log_calls && !snapshot_calls);
 #endif
     puts("default stdio: console, headless service, inherited/closed descriptors: PASS");
+}
+
+#include "lpr_ipc_mock.h"
+int64_t lpr_ipc_message(uint64_t nr, uint64_t fd, uint64_t send, uint64_t receive,
+    uint64_t timeout, uint64_t flags, int *committed) {
+    return test_lpr_ipc_noncall(nr, fd, send, receive, timeout, flags, committed);
+}
+
+int64_t lpr_pacha_syscall4(uint64_t nr,uint64_t a,uint64_t b,uint64_t c,uint64_t d) {
+    (void)nr;(void)a;(void)b;(void)c;(void)d;abort();
 }

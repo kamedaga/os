@@ -1,10 +1,6 @@
 const std = @import("std");
 
 const header_bytes: usize = 48;
-pub const max_units: usize = 8;
-pub const max_rules_per_unit: usize = 512;
-pub const max_memory_ranges: usize = 128;
-pub const max_special_sources: usize = 128;
 
 pub const SpecialSource = struct { source: u16 = 0, settings: u8 = 0 };
 
@@ -29,14 +25,35 @@ pub const Unit = struct {
     mmio_base: u64 = 0,
     segment: u16 = 0,
     default_settings: ?u8 = null,
-    rules: [max_rules_per_unit]Rule = [_]Rule{.{}} ** max_rules_per_unit,
+    entry_bytes: []const u8 = &.{},
     rule_count: usize = 0,
-    special_sources: [max_special_sources]SpecialSource = [_]SpecialSource{.{}} ** max_special_sources,
+
     special_count: usize = 0,
+
+    pub fn rawRules(self: Unit) Rules(false) {
+        return .{ .entries = .{ .bytes = self.entry_bytes } };
+    }
+    pub fn rules(self: Unit) Rules(true) {
+        return .{ .entries = .{ .bytes = self.entry_bytes } };
+    }
+    pub fn specials(self: Unit) Specials {
+        return .{ .entries = .{ .bytes = self.entry_bytes } };
+    }
+    pub fn ruleAt(self: Unit, index: usize) Rule {
+        var it = self.rules();
+        for (0..index) |_| _ = it.next().?;
+        return it.next().?;
+    }
+    pub fn specialAt(self: Unit, index: usize) SpecialSource {
+        var it = self.specials();
+        for (0..index) |_| _ = it.next().?;
+        return it.next().?;
+    }
 
     fn ordinaryRuleFor(self: *const Unit, device_id: u16) ?Rule {
         var best: ?Rule = null;
-        for (self.rules[0..self.rule_count]) |rule| {
+        var iterator = self.rawRules();
+        while (iterator.next()) |rule| {
             if (rule.alias or device_id < rule.first or device_id > rule.last) continue;
             // A narrower explicit range is more specific than broad firmware
             // coverage. Equal-width conflicting settings are rejected on input.
@@ -46,7 +63,8 @@ pub const Unit = struct {
     }
 
     pub fn ruleFor(self: *const Unit, device_id: u16) ?Rule {
-        for (self.rules[0..self.rule_count]) |rule| {
+        var iterator = self.rawRules();
+        while (iterator.next()) |rule| {
             // An alias names the DMA requester. It wins over ordinary
             // coverage independently of the IVHD entry order; conflicting
             // overlapping aliases are rejected while parsing.
@@ -63,11 +81,13 @@ pub const Unit = struct {
         var settings: u8 = if (direct != null and direct.?.sourceFor(source).? == source) direct.?.settings else 0;
         // The alias target is the hardware DTE index, even when an ordinary
         // range also covers that ID. Parsing checks conflicting target flags.
-        for (self.rules[0..self.rule_count]) |rule| {
+        var iterator = self.rawRules();
+        while (iterator.next()) |rule| {
             if (rule.alias and rule.source == source) settings = rule.settings;
         }
-        for (self.special_sources[0..self.special_count]) |special| {
-            if (special.source == source and special.settings != 0) settings = special.settings;
+        var entries = Entries{ .bytes = self.entry_bytes };
+        while (entries.next()) |entry| {
+            if (entry == .special and entry.special.source == source and entry.special.settings != 0) settings = entry.special.settings;
         }
         return settings;
     }
@@ -83,11 +103,195 @@ pub const MemoryRange = struct {
     length: u64 = 0,
 };
 
+/// Borrowed firmware view: bytes must remain immutable and non-reclaimable
+/// until every Info/Unit/iterator user has finished. Production ACPI memory is
+/// excluded from PMM usable input. No selected-unit or decoded-output arrays.
 pub const Info = struct {
-    units: [max_units]Unit = [_]Unit{.{}} ** max_units,
+    bytes: []const u8 = &.{},
     unit_count: usize = 0,
-    memory_ranges: [max_memory_ranges]MemoryRange = [_]MemoryRange{.{}} ** max_memory_ranges,
     memory_range_count: usize = 0,
+    pub fn units(self: Info) Units {
+        return .{ .blocks = .{ .bytes = self.bytes } };
+    }
+    pub fn memories(self: Info) Memories {
+        return .{ .blocks = .{ .bytes = self.bytes } };
+    }
+    pub fn unitAt(self: Info, index: usize) Unit {
+        var it = self.units();
+        for (0..index) |_| _ = it.next().?;
+        return it.next().?;
+    }
+    pub fn memoryAt(self: Info, index: usize) MemoryRange {
+        var it = self.memories();
+        for (0..index) |_| _ = it.next().?;
+        return it.next().?;
+    }
+};
+
+const Blocks = struct {
+    bytes: []const u8,
+    offset: usize = 0,
+    fn next(self: *Blocks) ?[]const u8 {
+        if (self.offset == self.bytes.len) return null;
+        const block = self.bytes[self.offset..][0..le16(self.bytes, self.offset + 2)];
+        self.offset += block.len;
+        return block;
+    }
+};
+fn isIvhd(block: []const u8) bool {
+    return block[0] == 0x10 or block[0] == 0x11 or block[0] == 0x40;
+}
+fn sameUnit(a: []const u8, b: []const u8) bool {
+    return isIvhd(b) and le64(a, 8) == le64(b, 8) and le16(a, 16) == le16(b, 16);
+}
+// At the first occurrence of a unit, find its highest revision. This scan is
+// boot/discovery work; runtime DTE lookup uses the selected Unit view directly.
+fn selectBlock(bytes: []const u8, first: []const u8) ParseError![]const u8 {
+    var chosen = first;
+    var conflict = false;
+    var blocks = Blocks{ .bytes = bytes };
+    while (blocks.next()) |block| {
+        if (!sameUnit(first, block)) continue;
+        if (le16(first, 4) != le16(block, 4) or le16(first, 6) != le16(block, 6)) return error.InvalidBlock;
+        if (block[0] > chosen[0]) {
+            chosen = block;
+            conflict = false;
+        } else if (block[0] == chosen[0] and !std.mem.eql(u8, chosen, block)) conflict = true;
+    }
+    if (conflict) return error.InvalidBlock;
+    return chosen;
+}
+fn definition(block: []const u8) Unit {
+    return .{ .block_type = block[0], .flags = block[1], .device_id = le16(block, 4), .capability_offset = le16(block, 6), .mmio_base = le64(block, 8), .segment = le16(block, 16), .entry_bytes = block[if (block[0] == 0x10) @as(usize, 24) else 40..] };
+}
+pub const Units = struct {
+    blocks: Blocks,
+    fn nextBlock(self: *Units) ParseError!?[]const u8 {
+        while (true) {
+            const start = self.blocks.offset;
+            const block = self.blocks.next() orelse return null;
+            if (!isIvhd(block)) continue;
+            var prior = Blocks{ .bytes = self.blocks.bytes[0..start] };
+            var seen = false;
+            while (prior.next()) |previous| {
+                if (sameUnit(block, previous)) {
+                    seen = true;
+                    break;
+                }
+            }
+            if (!seen) return try selectBlock(self.blocks.bytes, block);
+        }
+    }
+    pub fn next(self: *Units) ?Unit {
+        const block = (self.nextBlock() catch unreachable) orelse return null;
+        var unit = definition(block);
+        var entries = Entries{ .bytes = unit.entry_bytes };
+        while (entries.next()) |entry| switch (entry) {
+            .all => |settings| unit.default_settings = settings,
+            else => {},
+        };
+        var rules = unit.rules();
+        while (rules.next() != null) unit.rule_count += 1;
+        var specials = unit.specials();
+        while (specials.next() != null) unit.special_count += 1;
+        return unit;
+    }
+};
+pub const Memories = struct {
+    blocks: Blocks,
+    pub fn next(self: *Memories) ?MemoryRange {
+        while (self.blocks.next()) |block| {
+            const kind = block[0];
+            if (isIvhd(block)) continue;
+            const first: u16 = if (kind == 0x20) 0 else le16(block, 4);
+            return .{ .flags = block[1], .first_device = first, .last_device = if (kind == 0x20) 0xffff else if (kind == 0x21) first else le16(block, 6), .segment = if (kind == 0x20) 0 else le16(block, 8), .all_segments = kind == 0x20, .base = le64(block, 16), .length = le64(block, 24) };
+        }
+        return null;
+    }
+};
+const Entry = union(enum) { rule: Rule, special: SpecialSource, all: u8 };
+// Only validated complete entries (or their complete prefixes during checking)
+// reach this decoder. Pending range starts in a prefix emit no partial rule.
+const Entries = struct {
+    bytes: []const u8,
+    offset: usize = 0,
+    fn next(self: *Entries) ?Entry {
+        var pending: ?Rule = null;
+        while (self.offset < self.bytes.len) {
+            const e = self.bytes[self.offset..];
+            const kind = e[0];
+            const length: usize = if (kind < 0x40) 4 else if (kind < 0x80) 8 else 22 + @as(usize, e[21]);
+            self.offset += length;
+            const id = le16(e, 1);
+            if (pending) |start| {
+                var rule = start;
+                rule.last = id;
+                return .{ .rule = rule };
+            }
+            switch (kind) {
+                0x01 => return .{ .all = e[3] },
+                0x02, 0x46 => return .{ .rule = .{ .first = id, .last = id, .settings = e[3] } },
+                0x03, 0x47 => pending = .{ .first = id, .settings = e[3] },
+                0x42 => return .{ .rule = .{ .first = id, .last = id, .source = le16(e, 5), .settings = e[3], .alias = true } },
+                0x43 => pending = .{ .first = id, .source = le16(e, 5), .settings = e[3], .alias = true },
+                0x48 => return .{ .special = .{ .source = le16(e, 5), .settings = e[3] } },
+                0xf0 => return .{ .special = .{ .source = id, .settings = e[3] } },
+                else => {},
+            }
+        }
+        return null;
+    }
+};
+// Discovery needs canonical counts; runtime lookup must never carry the
+// quadratic deduplication branch. Specialize the same decoder at compile time.
+pub fn Rules(comptime unique: bool) type {
+    return struct {
+        entries: Entries,
+        pub fn next(self: *@This()) ?Rule {
+            while (true) {
+                const start = self.entries.offset;
+                const entry = self.entries.next() orelse return null;
+                if (entry != .rule) continue;
+                if (unique) {
+                    var prior = Rules(false){ .entries = .{ .bytes = self.entries.bytes[0..start] } };
+                    var seen = false;
+                    while (prior.next()) |rule| {
+                        if (std.meta.eql(rule, entry.rule)) {
+                            seen = true;
+                            break;
+                        }
+                    }
+                    if (seen) continue;
+                }
+                return entry.rule;
+            }
+        }
+    };
+}
+pub const Specials = struct {
+    entries: Entries,
+    pub fn next(self: *Specials) ?SpecialSource {
+        while (true) {
+            const start = self.entries.offset;
+            const entry = self.entries.next() orelse return null;
+            if (entry != .special) continue;
+            var prior = Entries{ .bytes = self.entries.bytes[0..start] };
+            var seen = false;
+            while (prior.next()) |p| {
+                if (p == .special and p.special.source == entry.special.source) {
+                    seen = true;
+                    break;
+                }
+            }
+            if (seen) continue;
+            var result = entry.special;
+            var tail = self.entries;
+            while (tail.next()) |p| {
+                if (p == .special and p.special.source == result.source and p.special.settings != 0) result.settings = p.special.settings;
+            }
+            return result;
+        }
+    }
 };
 
 pub const ParseError = error{
@@ -98,10 +302,6 @@ pub const ParseError = error{
     InvalidBlock,
     InvalidDeviceEntry,
     OverlappingRule,
-    TooManyUnits,
-    TooManyRules,
-    TooManyMemoryRanges,
-    TooManySpecialSources,
 };
 
 fn le16(bytes: []const u8, offset: usize) u16 {
@@ -118,7 +318,8 @@ fn le64(bytes: []const u8, offset: usize) u64 {
 
 fn addRule(unit: *Unit, rule: Rule) ParseError!void {
     if (rule.first > rule.last) return error.InvalidDeviceEntry;
-    for (unit.rules[0..unit.rule_count]) |existing| {
+    var rules = unit.rawRules();
+    while (rules.next()) |existing| {
         if (std.meta.eql(existing, rule)) return;
         // One requester ID has only one DTE. Disjoint alias ranges may share
         // a target, but cannot demand different settings for that target.
@@ -138,13 +339,12 @@ fn addRule(unit: *Unit, rule: Rule) ParseError!void {
             return error.OverlappingRule;
         }
     }
-    if (unit.rule_count == unit.rules.len) return error.TooManyRules;
-    unit.rules[unit.rule_count] = rule;
     unit.rule_count += 1;
 }
 
 fn validateAliasTargets(unit: *const Unit) ParseError!void {
-    for (unit.rules[0..unit.rule_count]) |rule| {
+    var rules = unit.rawRules();
+    while (rules.next()) |rule| {
         if (!rule.alias) continue;
         // An alias target is a DTE index, not another alias hop. A directly
         // described ordinary source must agree on flags; DEV_ALL is merely
@@ -159,19 +359,20 @@ fn validateAliasTargets(unit: *const Unit) ParseError!void {
 }
 
 fn addSpecial(unit: *Unit, source: u16, settings: u8) ParseError!void {
-    for (unit.special_sources[0..unit.special_count]) |*existing| {
-        if (existing.source == source) {
-            // HPET and IOAPIC may share one requester ID. A zero setting
-            // contributes no DTE flags; preserve the nonzero definition,
-            // while refusing conflicting nonzero flags for the same source.
-            if (existing.settings == 0) existing.settings = settings;
-            if (settings != 0 and existing.settings != settings) return error.InvalidDeviceEntry;
-            return;
-        }
+    // The prefix has already been validated. Scan its raw entries once,
+    // rather than recomputing the merged special-source iterator for every
+    // insertion (which would make validation cubic in the input size).
+    var entries = Entries{ .bytes = unit.entry_bytes };
+    var seen = false;
+    while (entries.next()) |entry| {
+        if (entry != .special or entry.special.source != source) continue;
+        seen = true;
+        const prior = entry.special.settings;
+        // Shared HPET/IOAPIC zero settings add no flags; conflicting nonzero
+        // settings for one DTE requester must still reject the entire table.
+        if (prior != 0 and settings != 0 and prior != settings) return error.InvalidDeviceEntry;
     }
-    if (unit.special_count == max_special_sources) return error.TooManySpecialSources;
-    unit.special_sources[unit.special_count] = .{ .source = source, .settings = settings };
-    unit.special_count += 1;
+    if (!seen) unit.special_count += 1;
 }
 
 fn parseDeviceEntries(comptime allow_zero_pad: bool, unit: *Unit, bytes: []const u8) ParseError!void {
@@ -191,6 +392,7 @@ fn parseDeviceEntries(comptime allow_zero_pad: bool, unit: *Unit, bytes: []const
         if ((kind == 0x46 or kind == 0x47) and (le32(entry, 4) & 0x7fff_ffff) != 0) return error.InvalidDeviceEntry;
         const id = le16(entry, 1);
         const settings = entry[3];
+        unit.entry_bytes = bytes[0..offset];
         if (pending) |start| {
             if (kind != 0x04 or settings != 0) return error.InvalidDeviceEntry;
             var range = start;
@@ -225,6 +427,7 @@ fn parseDeviceEntries(comptime allow_zero_pad: bool, unit: *Unit, bytes: []const
         offset += length;
     }
     if (pending != null) return error.InvalidDeviceEntry;
+    unit.entry_bytes = bytes;
     try validateAliasTargets(unit);
 }
 
@@ -251,105 +454,42 @@ fn parseImpl(comptime allow_zero_pad: bool, bytes: []const u8, info: *Info) Pars
     if (checksum != 0) return error.InvalidChecksum;
     if (table[8] != 1 and table[8] != 2) return error.UnsupportedRevision;
     if (le64(table, 40) != 0) return error.InvalidBlock;
-    info.* = .{};
-
-    const SelectedIvhd = struct { offset: usize, kind: u8, base: u64, segment: u16, conflicting_duplicate: bool = false };
-    var selected: [max_units]SelectedIvhd = undefined;
-    var selected_count: usize = 0;
-    // Choose the highest supported IVHD revision for each IOMMU before
-    // interpreting entries. A superseded legacy block can have a different
-    // entry vocabulary and must not reject a valid newer description.
+    // Validate every block envelope before any nested/repeated scan. Publish
+    // only after all chosen vocabularies and all IVMD records are validated.
     var offset: usize = header_bytes;
     while (offset < table.len) {
         if (table.len - offset < 4) return error.InvalidBlock;
-        const kind = table[offset];
         const length: usize = le16(table, offset + 2);
         if (length < 4 or length > table.len - offset) return error.InvalidBlock;
         const block = table[offset..][0..length];
-        switch (kind) {
-            0x10, 0x11, 0x40 => {
-                const header_length: usize = if (kind == 0x10) 24 else 40;
-                if (length < header_length or (kind == 0x40 and table[8] != 2)) return error.InvalidBlock;
-                const base = le64(block, 8);
-                const segment = le16(block, 16);
-                if (base == 0 or (base & 0xfff) != 0) return error.InvalidBlock;
-                var index: usize = 0;
-                while (index < selected_count) : (index += 1) {
-                    if (selected[index].base == base and selected[index].segment == segment) break;
-                }
-                if (index == selected_count) {
-                    if (selected_count == max_units) return error.TooManyUnits;
-                    selected[index] = .{ .offset = offset, .kind = kind, .base = base, .segment = segment };
-                    selected_count += 1;
-                } else {
-                    const previous = table[selected[index].offset..];
-                    // Revision changes may supersede entry syntax, but cannot
-                    // silently retarget one MMIO unit to another PCI function.
-                    if (le16(previous, 4) != le16(block, 4) or le16(previous, 6) != le16(block, 6))
-                        return error.InvalidBlock;
-                    if (kind > selected[index].kind) {
-                        selected[index] = .{ .offset = offset, .kind = kind, .base = base, .segment = segment };
-                    } else if (kind == selected[index].kind) {
-                        const previous_length: usize = le16(previous, 2);
-                        if (previous_length != length or !std.mem.eql(u8, previous[0..previous_length], block))
-                            selected[index].conflicting_duplicate = true;
-                    }
-                }
-            },
-            0x20, 0x21, 0x22 => {
-                if (length != 32) return error.InvalidBlock;
-            },
-            else => return error.InvalidBlock,
-        }
-        offset += length;
-    }
-    if (selected_count == 0) return error.InvalidBlock;
-    info.unit_count = selected_count;
-    for (selected[0..selected_count], 0..) |choice, index| {
-        // Conflicts in obsolete revisions are ignored, but two different
-        // highest-revision descriptions of one MMIO unit are ambiguous.
-        if (choice.conflicting_duplicate) return error.InvalidBlock;
-        const block_length: usize = le16(table, choice.offset + 2);
-        const block = table[choice.offset..][0..block_length];
-        const header_length: usize = if (choice.kind == 0x10) 24 else 40;
-        info.units[index] = .{
-            .block_type = choice.kind,
-            .flags = block[1],
-            .device_id = le16(block, 4),
-            .capability_offset = le16(block, 6),
-            .mmio_base = choice.base,
-            .segment = choice.segment,
-        };
-        try parseDeviceEntries(allow_zero_pad, &info.units[index], block[header_length..]);
-        if (info.units[index].rule_count == 0 and info.units[index].default_settings == null) return error.InvalidBlock;
-    }
-
-    offset = header_bytes;
-    while (offset < table.len) {
-        const kind = table[offset];
-        const length: usize = le16(table, offset + 2);
-        if (kind == 0x20 or kind == 0x21 or kind == 0x22) {
-            const block = table[offset..][0..length];
-            if (info.memory_range_count == max_memory_ranges) return error.TooManyMemoryRanges;
+        if (isIvhd(block)) {
+            const minimum: usize = if (block[0] == 0x10) 24 else 40;
+            if (length < minimum or (block[0] == 0x40 and table[8] != 2)) return error.InvalidBlock;
+            const base = le64(block, 8);
+            if (base == 0 or base & 0xfff != 0) return error.InvalidBlock;
+        } else if (block[0] >= 0x20 and block[0] <= 0x22) {
+            if (length != 32) return error.InvalidBlock;
             const base = le64(block, 16);
             const span = le64(block, 24);
             if (span == 0 or base > std.math.maxInt(u64) - span) return error.InvalidBlock;
-            const first: u16 = if (kind == 0x20) 0 else le16(block, 4);
-            const last: u16 = if (kind == 0x20) 0xffff else if (kind == 0x21) first else le16(block, 6);
-            if (first > last) return error.InvalidBlock;
-            info.memory_ranges[info.memory_range_count] = .{
-                .flags = block[1],
-                .first_device = first,
-                .last_device = last,
-                .segment = if (kind == 0x20) 0 else le16(block, 8),
-                .all_segments = kind == 0x20,
-                .base = base,
-                .length = span,
-            };
-            info.memory_range_count += 1;
-        }
+            if (block[0] == 0x22 and le16(block, 4) > le16(block, 6)) return error.InvalidBlock;
+        } else return error.InvalidBlock;
         offset += length;
     }
+    var result = Info{ .bytes = table[header_bytes..] };
+    var units = result.units();
+    while (try units.nextBlock()) |block| {
+        var unit = definition(block);
+        const entries = unit.entry_bytes;
+        unit.entry_bytes = &.{};
+        try parseDeviceEntries(allow_zero_pad, &unit, entries);
+        if (unit.rule_count == 0 and unit.default_settings == null) return error.InvalidBlock;
+        result.unit_count += 1;
+    }
+    if (result.unit_count == 0) return error.InvalidBlock;
+    var memories = result.memories();
+    while (memories.next() != null) result.memory_range_count += 1;
+    info.* = result;
 }
 
 pub fn find(rsdp_paddr: u64) ?[]const u8 {
@@ -384,12 +524,12 @@ test "IVRS parses source aliases, inclusive ranges, and memory definitions" {
     try parseLegacy(&bytes, legacy);
     try std.testing.expect(std.meta.eql(info.*, legacy.*));
     try std.testing.expectEqual(@as(usize, 1), info.unit_count);
-    try std.testing.expectEqual(@as(?u16, 0x0100), info.units[0].ruleFor(0x0100).?.sourceFor(0x0100));
-    try std.testing.expectEqual(@as(?u16, 0x00e0), info.units[0].ruleFor(0x0101).?.sourceFor(0x0101));
-    try std.testing.expectEqual(@as(?u16, 0x02ff), info.units[0].ruleFor(0x02ff).?.sourceFor(0x02ff));
-    try std.testing.expect(info.units[0].ruleFor(0x0300) == null);
+    try std.testing.expectEqual(@as(?u16, 0x0100), info.unitAt(0).ruleFor(0x0100).?.sourceFor(0x0100));
+    try std.testing.expectEqual(@as(?u16, 0x00e0), info.unitAt(0).ruleFor(0x0101).?.sourceFor(0x0101));
+    try std.testing.expectEqual(@as(?u16, 0x02ff), info.unitAt(0).ruleFor(0x02ff).?.sourceFor(0x02ff));
+    try std.testing.expect(info.unitAt(0).ruleFor(0x0300) == null);
     try std.testing.expectEqual(@as(usize, 1), info.memory_range_count);
-    try std.testing.expectEqual(@as(u64, 0x9000_0000), info.memory_ranges[0].base);
+    try std.testing.expectEqual(@as(u64, 0x9000_0000), info.memoryAt(0).base);
 
     bytes[9] +%= 1;
     try std.testing.expectError(error.InvalidChecksum, parse(&bytes, info));
@@ -412,8 +552,8 @@ test "IVRS all-device setting is a fallback for explicit selections" {
     const info = try std.testing.allocator.create(Info);
     defer std.testing.allocator.destroy(info);
     try parse(&bytes, info);
-    try std.testing.expectEqual(@as(u8, 0x10), info.units[0].ruleFor(0x0100).?.settings);
-    try std.testing.expectEqual(@as(u8, 0x20), info.units[0].ruleFor(0x0120).?.settings);
+    try std.testing.expectEqual(@as(u8, 0x10), info.unitAt(0).ruleFor(0x0100).?.settings);
+    try std.testing.expectEqual(@as(u8, 0x20), info.unitAt(0).ruleFor(0x0120).?.settings);
 }
 
 fn setTestChecksum(bytes: []u8) void {
@@ -445,10 +585,10 @@ test "IVRS accepts only aligned zero-filled PAD4/PAD8 without adding rules" {
     try std.testing.expectError(error.InvalidDeviceEntry, parseLegacy(&bytes, info));
     try parse(&bytes, info);
     try std.testing.expectEqual(@as(usize, 1), info.unit_count);
-    try std.testing.expectEqual(@as(usize, 1), info.units[0].rule_count);
-    try std.testing.expectEqual(@as(?u16, 0x0100), info.units[0].ruleFor(0x0100).?.sourceFor(0x0100));
-    try std.testing.expect(info.units[0].ruleFor(0x0101) == null);
-    try std.testing.expectEqual(@as(usize, 0), info.units[0].special_count);
+    try std.testing.expectEqual(@as(usize, 1), info.unitAt(0).rule_count);
+    try std.testing.expectEqual(@as(?u16, 0x0100), info.unitAt(0).ruleFor(0x0100).?.sourceFor(0x0100));
+    try std.testing.expect(info.unitAt(0).ruleFor(0x0101) == null);
+    try std.testing.expectEqual(@as(usize, 0), info.unitAt(0).special_count);
 
     bytes[78] = 1;
     setTestChecksum(&bytes);
@@ -523,25 +663,25 @@ test "real IVRS overlapping alias is resolved without firmware-order dependence"
     try std.testing.expectError(error.InvalidDeviceEntry, parseLegacy(&observed_b550_ivrs, info));
     try parse(&observed_b550_ivrs, info);
     try std.testing.expectEqual(@as(usize, 1), info.unit_count);
-    const unit = &info.units[0];
+    const unit = info.unitAt(0);
     try std.testing.expectEqual(@as(u8, 0x11), unit.block_type);
     try std.testing.expectEqual(@as(u64, 0xfd50_0000), unit.mmio_base);
     try std.testing.expectEqual(@as(usize, 2), unit.rule_count);
-    try std.testing.expectEqual(@as(u16, 0x0008), unit.rules[0].first);
-    try std.testing.expectEqual(@as(u16, 0xfffe), unit.rules[0].last);
-    try std.testing.expectEqual(@as(u16, 0xff00), unit.rules[1].first);
-    try std.testing.expectEqual(@as(u16, 0xffff), unit.rules[1].last);
+    try std.testing.expectEqual(@as(u16, 0x0008), unit.ruleAt(0).first);
+    try std.testing.expectEqual(@as(u16, 0xfffe), unit.ruleAt(0).last);
+    try std.testing.expectEqual(@as(u16, 0xff00), unit.ruleAt(1).first);
+    try std.testing.expectEqual(@as(u16, 0xffff), unit.ruleAt(1).last);
     try std.testing.expectEqual(@as(?u16, 0x0008), unit.ruleFor(0x0008).?.sourceFor(0x0008));
     try std.testing.expectEqual(@as(?u16, 0xfeff), unit.ruleFor(0xfeff).?.sourceFor(0xfeff));
     try std.testing.expectEqual(@as(?u16, 0x00a5), unit.ruleFor(0xff00).?.sourceFor(0xff00));
     try std.testing.expectEqual(@as(?u16, 0x00a5), unit.ruleFor(0xfffe).?.sourceFor(0xfffe));
     try std.testing.expectEqual(@as(?u16, 0x00a5), unit.ruleFor(0xffff).?.sourceFor(0xffff));
     try std.testing.expect(unit.ruleFor(0x0007) == null);
-    try std.testing.expectEqual(unit.rules[0].settings, unit.rules[1].settings);
+    try std.testing.expectEqual(unit.ruleAt(0).settings, unit.ruleAt(1).settings);
     try std.testing.expectEqual(@as(usize, 2), unit.special_count);
-    try std.testing.expectEqual(@as(u16, 0x00a0), unit.special_sources[0].source);
-    try std.testing.expectEqual(@as(u8, 0xd7), unit.special_sources[0].settings);
-    try std.testing.expectEqual(@as(u16, 0x0001), unit.special_sources[1].source);
+    try std.testing.expectEqual(@as(u16, 0x00a0), unit.specialAt(0).source);
+    try std.testing.expectEqual(@as(u8, 0xd7), unit.specialAt(0).settings);
+    try std.testing.expectEqual(@as(u16, 0x0001), unit.specialAt(1).source);
 }
 
 test "IVHD selection ignores superseded entry vocabularies but checks unit identity" {
@@ -551,8 +691,8 @@ test "IVHD selection ignores superseded entry vocabularies but checks unit ident
     table[72] = 0x41; // unsupported entry in superseded type 0x10 block
     setTestChecksum(&table);
     try parse(&table, info);
-    try std.testing.expectEqual(@as(u8, 0x11), info.units[0].block_type);
-    try std.testing.expectEqual(@as(?u16, 0x00a5), info.units[0].ruleFor(0xff00).?.sourceFor(0xff00));
+    try std.testing.expectEqual(@as(u8, 0x11), info.unitAt(0).block_type);
+    try std.testing.expectEqual(@as(?u16, 0x00a5), info.unitAt(0).ruleFor(0xff00).?.sourceFor(0xff00));
 
     table = observed_b550_ivrs;
     table[52] = 0x03; // same MMIO and segment, different IOMMU BDF
@@ -567,7 +707,7 @@ test "IVHD selection ignores superseded entry vocabularies but checks unit ident
     std.mem.writeInt(u32, old_duplicates[4..8], old_duplicates.len, .little);
     setTestChecksum(&old_duplicates);
     try parse(&old_duplicates, info);
-    try std.testing.expectEqual(@as(u8, 0x11), info.units[0].block_type);
+    try std.testing.expectEqual(@as(u8, 0x11), info.unitAt(0).block_type);
 
     var duplicate: [296]u8 = undefined;
     @memcpy(duplicate[0..208], &observed_b550_ivrs);
@@ -587,18 +727,82 @@ test "IVHD selection ignores superseded entry vocabularies but checks unit ident
     try std.testing.expectError(error.InvalidBlock, parse(&duplicate, info));
 }
 
+/// Test-only byte builder. Tests exercise the production decoder; no synthetic
+/// rule storage is present in production Unit or Info.
+pub const TestEntries = if (@import("builtin").is_test) struct {
+    bytes: std.ArrayList(u8) = .empty,
+    unit: Unit = .{},
+    pub fn deinit(self: *@This()) void {
+        self.bytes.deinit(std.testing.allocator);
+    }
+    pub fn clear(self: *@This()) void {
+        self.bytes.clearRetainingCapacity();
+        self.unit = .{};
+    }
+    pub fn appendRule(self: *@This(), rule: Rule) !void {
+        try addRule(&self.unit, rule);
+        var bytes: [12]u8 = @splat(0);
+        bytes[0] = if (rule.alias) 0x43 else 0x03;
+        std.mem.writeInt(u16, bytes[1..3], rule.first, .little);
+        bytes[3] = rule.settings;
+        const end: usize = if (rule.alias) 8 else 4;
+        if (rule.alias) std.mem.writeInt(u16, bytes[5..7], rule.source, .little);
+        bytes[end] = 0x04;
+        std.mem.writeInt(u16, bytes[end + 1 ..][0..2], rule.last, .little);
+        try self.bytes.appendSlice(std.testing.allocator, bytes[0 .. end + 4]);
+        self.unit.entry_bytes = self.bytes.items;
+    }
+    pub fn appendSpecial(self: *@This(), source: u16, settings: u8) !void {
+        try addSpecial(&self.unit, source, settings);
+        var bytes = [_]u8{ 0x48, 0, 0, settings, 0, 0, 0, 0 };
+        std.mem.writeInt(u16, bytes[5..7], source, .little);
+        try self.bytes.appendSlice(std.testing.allocator, &bytes);
+        self.unit.entry_bytes = self.bytes.items;
+    }
+} else struct {};
+
+pub fn testTable(allocator: std.mem.Allocator, definitions: []const Unit) ![]u8 {
+    if (!@import("builtin").is_test) @compileError("test fixture only");
+    var length: usize = header_bytes;
+    for (definitions) |unit| length += 24 + unit.entry_bytes.len + (if (unit.default_settings != null) @as(usize, 4) else 0);
+    const bytes = try allocator.alloc(u8, length);
+    @memset(bytes, 0);
+    @memcpy(bytes[0..4], "IVRS");
+    std.mem.writeInt(u32, bytes[4..8], @intCast(length), .little);
+    bytes[8] = 1;
+    var offset: usize = header_bytes;
+    for (definitions, 0..) |unit, index| {
+        const size = 24 + unit.entry_bytes.len + (if (unit.default_settings != null) @as(usize, 4) else 0);
+        const block = bytes[offset..][0..size];
+        block[0] = 0x10;
+        block[1] = unit.flags;
+        std.mem.writeInt(u16, block[2..4], @intCast(size), .little);
+        std.mem.writeInt(u16, block[4..6], unit.device_id, .little);
+        std.mem.writeInt(u16, block[6..8], unit.capability_offset, .little);
+        std.mem.writeInt(u64, block[8..16], if (unit.mmio_base != 0) unit.mmio_base else 0xfed0_0000 + @as(u64, @intCast(index)) * 0x4000, .little);
+        std.mem.writeInt(u16, block[16..18], unit.segment, .little);
+        @memcpy(block[24..][0..unit.entry_bytes.len], unit.entry_bytes);
+        if (unit.default_settings) |settings| block[size - 4 ..][0..4].* = .{ 1, 0, 0, settings };
+        offset += size;
+    }
+    setTestChecksum(bytes);
+    return bytes;
+}
+
 test "overlap resolution is generic, order independent, and rejects ambiguous sources" {
-    var unit = Unit{};
+    var fixture = TestEntries{};
+    defer fixture.deinit();
+    const unit = &fixture.unit;
     const broad = Rule{ .first = 0x0008, .last = 0xfffe, .settings = 0x10 };
     const alias = Rule{ .first = 0xff00, .last = 0xffff, .source = 0x00a5, .settings = 0x10, .alias = true };
-    try addRule(&unit, broad);
-    try addRule(&unit, alias);
+    try fixture.appendRule(broad);
+    try fixture.appendRule(alias);
     try std.testing.expectEqual(@as(usize, 2), unit.rule_count);
-    try std.testing.expectEqual(@as(u16, 0xfffe), unit.rules[0].last);
+    try std.testing.expectEqual(@as(u16, 0xfffe), unit.ruleAt(0).last);
     try std.testing.expectEqual(@as(?u16, 0x00a5), unit.ruleFor(0xff00).?.sourceFor(0xff00));
     try std.testing.expectEqual(@as(u8, 0x10), unit.settingsForSource(0x00a5));
 
-    try std.testing.expectError(error.OverlappingRule, addRule(&unit, .{
+    try std.testing.expectError(error.OverlappingRule, fixture.appendRule(.{
         .first = 0xff10,
         .last = 0xffff,
         .source = 0x00a6,
@@ -607,26 +811,26 @@ test "overlap resolution is generic, order independent, and rejects ambiguous so
     }));
     try std.testing.expectEqual(@as(usize, 2), unit.rule_count);
 
-    unit = .{};
-    try addRule(&unit, broad);
+    fixture.clear();
+    try fixture.appendRule(broad);
     var different = alias;
     different.settings = 0x20;
-    try std.testing.expectError(error.OverlappingRule, addRule(&unit, different));
-    try std.testing.expectEqual(@as(u16, 0xfffe), unit.rules[0].last);
+    try std.testing.expectError(error.OverlappingRule, fixture.appendRule(different));
+    try std.testing.expectEqual(@as(u16, 0xfffe), unit.ruleAt(0).last);
 
-    unit = .{};
-    try addRule(&unit, alias);
-    try addRule(&unit, broad);
+    fixture.clear();
+    try fixture.appendRule(alias);
+    try fixture.appendRule(broad);
     try std.testing.expectEqual(@as(?u16, 0x00a5), unit.ruleFor(0xff00).?.sourceFor(0xff00));
     try std.testing.expectEqual(@as(?u16, 0xfeff), unit.ruleFor(0xfeff).?.sourceFor(0xfeff));
 
-    unit = .{};
-    try addRule(&unit, .{ .first = 0x0100, .last = 0x0300, .settings = 0x20 });
-    try addRule(&unit, .{ .first = 0x0180, .last = 0x0280, .source = 0x0050, .settings = 0x20, .alias = true });
+    fixture.clear();
+    try fixture.appendRule(.{ .first = 0x0100, .last = 0x0300, .settings = 0x20 });
+    try fixture.appendRule(.{ .first = 0x0180, .last = 0x0280, .source = 0x0050, .settings = 0x20, .alias = true });
     try std.testing.expectEqual(@as(?u16, 0x017f), unit.ruleFor(0x017f).?.sourceFor(0x017f));
     try std.testing.expectEqual(@as(?u16, 0x0050), unit.ruleFor(0x0200).?.sourceFor(0x0200));
     try std.testing.expectEqual(@as(?u16, 0x0281), unit.ruleFor(0x0281).?.sourceFor(0x0281));
-    try std.testing.expectError(error.OverlappingRule, addRule(&unit, .{
+    try std.testing.expectError(error.OverlappingRule, fixture.appendRule(.{
         .first = 0x0200,
         .last = 0x0400,
         .source = 0x0051,
@@ -634,60 +838,140 @@ test "overlap resolution is generic, order independent, and rejects ambiguous so
         .alias = true,
     }));
 
-    unit = .{};
-    try addRule(&unit, .{ .first = 0x0100, .last = 0x0300, .settings = 0x10 });
-    try addRule(&unit, .{ .first = 0x0180, .last = 0x0280, .settings = 0x20 });
+    fixture.clear();
+    try fixture.appendRule(.{ .first = 0x0100, .last = 0x0300, .settings = 0x10 });
+    try fixture.appendRule(.{ .first = 0x0180, .last = 0x0280, .settings = 0x20 });
     try std.testing.expectEqual(@as(u8, 0x10), unit.ruleFor(0x017f).?.settings);
     try std.testing.expectEqual(@as(u8, 0x20), unit.ruleFor(0x0200).?.settings);
-    try std.testing.expectError(error.OverlappingRule, addRule(&unit, .{
+    try std.testing.expectError(error.OverlappingRule, fixture.appendRule(.{
         .first = 0x0181,
         .last = 0x0281,
         .settings = 0x30,
     }));
 
-    unit = .{};
+    fixture.clear();
     unit.default_settings = 0x30;
-    try addRule(&unit, .{ .first = 0x0100, .last = 0x0110, .source = 0x0020, .settings = 0x10, .alias = true });
+    try fixture.appendRule(.{ .first = 0x0100, .last = 0x0110, .source = 0x0020, .settings = 0x10, .alias = true });
     try std.testing.expectEqual(@as(?u16, 0x0020), unit.ruleFor(0x0100).?.sourceFor(0x0100));
     try std.testing.expectEqual(@as(u8, 0x10), unit.settingsForSource(0x0020));
     try std.testing.expectEqual(@as(u8, 0x30), unit.ruleFor(0x0120).?.settings);
-    try addRule(&unit, unit.rules[0]);
+    try fixture.appendRule(unit.ruleAt(0));
     try std.testing.expectEqual(@as(usize, 1), unit.rule_count);
 
-    unit = .{};
-    try addRule(&unit, .{ .first = 0x0020, .last = 0x0020, .source = 0x0030, .settings = 0x10, .alias = true });
+    fixture.clear();
+    try fixture.appendRule(.{ .first = 0x0020, .last = 0x0020, .source = 0x0030, .settings = 0x10, .alias = true });
     try std.testing.expectEqual(@as(u8, 0), unit.settingsForSource(0x0020));
     try std.testing.expectEqual(@as(u8, 0x10), unit.settingsForSource(0x0030));
 
-    unit = .{};
-    try addRule(&unit, .{ .first = 0x0100, .last = 0x0110, .source = 0x0200, .settings = 0x10, .alias = true });
-    try addRule(&unit, .{ .first = 0x0200, .last = 0x0200, .settings = 0x20 });
-    try std.testing.expectError(error.OverlappingRule, validateAliasTargets(&unit));
-
-    unit = .{};
-    for (0..max_rules_per_unit - 1) |index| {
-        unit.rules[index] = .{ .first = @intCast(index), .last = @intCast(index) };
-    }
-    unit.rules[max_rules_per_unit - 1] = broad;
-    unit.rule_count = max_rules_per_unit;
-    try std.testing.expectError(error.TooManyRules, addRule(&unit, alias));
-    try std.testing.expectEqual(@as(u16, 0xfffe), unit.rules[max_rules_per_unit - 1].last);
+    fixture.clear();
+    try fixture.appendRule(.{ .first = 0x0100, .last = 0x0110, .source = 0x0200, .settings = 0x10, .alias = true });
+    try fixture.appendRule(.{ .first = 0x0200, .last = 0x0200, .settings = 0x20 });
+    try std.testing.expectError(error.OverlappingRule, validateAliasTargets(unit));
 }
 
 test "shared special requester keeps nonzero settings and rejects conflicts" {
-    var unit = Unit{};
-    try addSpecial(&unit, 0x00a0, 0);
-    try addSpecial(&unit, 0x00a0, 0xd7);
-    try addSpecial(&unit, 0x00a0, 0);
-    try addSpecial(&unit, 0x00a0, 0xd7);
+    var fixture = TestEntries{};
+    defer fixture.deinit();
+    const unit = &fixture.unit;
+    try fixture.appendSpecial(0x00a0, 0);
+    try fixture.appendSpecial(0x00a0, 0xd7);
+    try fixture.appendSpecial(0x00a0, 0);
+    try fixture.appendSpecial(0x00a0, 0xd7);
     try std.testing.expectEqual(@as(usize, 1), unit.special_count);
-    try std.testing.expectEqual(@as(u8, 0xd7), unit.special_sources[0].settings);
-    try std.testing.expectError(error.InvalidDeviceEntry, addSpecial(&unit, 0x00a0, 0x10));
-    try std.testing.expectEqual(@as(u8, 0xd7), unit.special_sources[0].settings);
+    try std.testing.expectEqual(@as(u8, 0xd7), unit.specialAt(0).settings);
+    try std.testing.expectError(error.InvalidDeviceEntry, fixture.appendSpecial(0x00a0, 0x10));
+    try std.testing.expectEqual(@as(u8, 0xd7), unit.specialAt(0).settings);
 
-    unit = .{};
-    try addSpecial(&unit, 0x00a0, 0xd7);
-    try addSpecial(&unit, 0x00a0, 0);
+    fixture.clear();
+    try fixture.appendSpecial(0x00a0, 0xd7);
+    try fixture.appendSpecial(0x00a0, 0);
     try std.testing.expectEqual(@as(usize, 1), unit.special_count);
-    try std.testing.expectEqual(@as(u8, 0xd7), unit.special_sources[0].settings);
+    try std.testing.expectEqual(@as(u8, 0xd7), unit.specialAt(0).settings);
+}
+
+test "IVRS selected unit rules specials and IVMD exceed former capacities" {
+    const allocator = std.testing.allocator;
+    for ([_]usize{ 7, 8, 9, 257 }) |count| {
+        const definitions = try allocator.alloc(Unit, count);
+        defer allocator.free(definitions);
+        @memset(definitions, .{ .default_settings = 0 });
+        const bytes = try testTable(allocator, definitions);
+        defer allocator.free(bytes);
+        var info: Info = .{};
+        try parse(bytes, &info);
+        try std.testing.expectEqual(count, info.unit_count);
+        var units = info.units();
+        for (0..count) |index| try std.testing.expectEqual(@as(u64, 0xfed0_0000) + index * 0x4000, units.next().?.mmio_base);
+        try std.testing.expect(units.next() == null);
+    }
+    for ([_]usize{ 511, 512, 513, 1025 }) |count| {
+        var fixture = TestEntries{};
+        defer fixture.deinit();
+        for (0..count) |index| try fixture.appendRule(.{ .first = @intCast(index), .last = @intCast(index), .settings = 0x10 });
+        const bytes = try testTable(allocator, &.{fixture.unit});
+        defer allocator.free(bytes);
+        var info: Info = .{};
+        try parse(bytes, &info);
+        const unit = info.unitAt(0);
+        try std.testing.expectEqual(count, unit.rule_count);
+        try std.testing.expectEqual(@as(u16, @intCast(count - 1)), unit.ruleAt(count - 1).first);
+        try std.testing.expectEqual(@as(u8, 0x10), unit.settingsForSource(@intCast(count - 1)));
+    }
+    for ([_]usize{ 127, 128, 129, 257 }) |count| {
+        var fixture = TestEntries{};
+        defer fixture.deinit();
+        fixture.unit.default_settings = 0;
+        for (0..count) |index| try fixture.appendSpecial(@intCast(index), 0x10);
+        const unit_bytes = try testTable(allocator, &.{fixture.unit});
+        defer allocator.free(unit_bytes);
+        const bytes = try allocator.alloc(u8, unit_bytes.len + count * 32);
+        defer allocator.free(bytes);
+        @memcpy(bytes[0..unit_bytes.len], unit_bytes);
+        @memset(bytes[unit_bytes.len..], 0);
+        std.mem.writeInt(u32, bytes[4..8], @intCast(bytes.len), .little);
+        for (0..count) |index| {
+            const block = bytes[unit_bytes.len + index * 32 ..][0..32];
+            block[0] = 0x20;
+            std.mem.writeInt(u16, block[2..4], 32, .little);
+            std.mem.writeInt(u64, block[16..24], 0x9000_0000 + index * 4096, .little);
+            std.mem.writeInt(u64, block[24..32], 4096, .little);
+        }
+        setTestChecksum(bytes);
+        var info: Info = .{};
+        try parse(bytes, &info);
+        const unit = info.unitAt(0);
+        try std.testing.expectEqual(count, unit.special_count);
+        try std.testing.expectEqual(@as(u16, @intCast(count - 1)), unit.specialAt(count - 1).source);
+        try std.testing.expectEqual(count, info.memory_range_count);
+        try std.testing.expectEqual(@as(u64, 0x9000_0000) + (count - 1) * 4096, info.memoryAt(count - 1).base);
+        const saved = info;
+        std.mem.writeInt(u64, bytes[bytes.len - 8 ..][0..8], std.math.maxInt(u64), .little);
+        setTestChecksum(bytes);
+        try std.testing.expectError(error.InvalidBlock, parse(bytes, &info));
+        // No new partial view is published. End the old borrow before mutation
+        // in production; here only its scalar extent is inspected after error.
+        try std.testing.expectEqual(saved.unit_count, info.unit_count);
+        try std.testing.expectEqual(saved.bytes.ptr, info.bytes.ptr);
+    }
+}
+
+test "IVRS malformed envelopes pending ranges alias targets and highest conflicts reject" {
+    const allocator = std.testing.allocator;
+    var fixture = TestEntries{};
+    defer fixture.deinit();
+    try fixture.appendRule(.{ .first = 0x100, .last = 0x110, .source = 0x200, .settings = 0x10, .alias = true });
+    try fixture.appendRule(.{ .first = 0x200, .last = 0x200, .settings = 0x20 });
+    const bytes = try testTable(allocator, &.{fixture.unit});
+    defer allocator.free(bytes);
+    var info: Info = .{};
+    try std.testing.expectError(error.OverlappingRule, parse(bytes, &info));
+    for ([_]u16{ 0, 3, 23, 65535 }) |length| {
+        std.mem.writeInt(u16, bytes[50..52], length, .little);
+        setTestChecksum(bytes);
+        try std.testing.expectError(error.InvalidBlock, parse(bytes, &info));
+    }
+    std.mem.writeInt(u16, bytes[50..52], @intCast(bytes.len - 48), .little);
+    bytes[80] = 0x02; // range end replaced by a selector
+    setTestChecksum(bytes);
+    try std.testing.expectError(error.InvalidDeviceEntry, parse(bytes, &info));
 }

@@ -11,7 +11,7 @@ struct unix_linux_message {
 };
 _Static_assert(sizeof(struct unix_linux_message) == 56, "Linux x86-64 msghdr");
 
-int64_t lpr_unix_socket_message(uint64_t fd, uint64_t raw, uint64_t flags, int writing)
+int64_t lpr_unix_socket_message(uint64_t fd, uint64_t raw, uint64_t flags, int writing, unsigned *wait_not_ready __attribute__((unused)))
 {
     if (!lpr_user_range_plausible(raw, sizeof(struct unix_linux_message))) return -EFAULT;
     struct unix_linux_message message;
@@ -35,7 +35,7 @@ int64_t lpr_unix_socket_message(uint64_t fd, uint64_t raw, uint64_t flags, int w
     }
     uint32_t returned_flags = 0;
     result = lpr_unix_socket_message_iov(&pin, message.vectors, message.vector_count,
-        writing, flags, &returned_flags, &ancillary);
+        writing, flags, &returned_flags, &ancillary, wait_not_ready);
     /* Include credential truncation and identify the Linux FD, even when
      * recvmsg succeeds. No logging/counters on the normal receive path. */
     if (!writing && result >= 0 && (returned_flags & 8u))
@@ -56,7 +56,7 @@ done:
 }
 
 int64_t lpr_unix_socket_address_io(uint64_t fd, uint64_t buffer, uint64_t length,
-    int writing, uint64_t flags, uint64_t address, uint64_t address_length)
+    int writing, uint64_t flags, uint64_t address, uint64_t address_length, unsigned *wait_not_ready __attribute__((unused)))
 {
     uint32_t capacity = 0;
     if (address && !writing) {
@@ -69,7 +69,7 @@ int64_t lpr_unix_socket_address_io(uint64_t fd, uint64_t buffer, uint64_t length
     const lpr_linux_iovec_t vector = { .base = buffer, .len = length };
     struct unix_linux_message message = { .name = address, .name_length = capacity,
         .vectors = (uint64_t)(uintptr_t)&vector, .vector_count = 1 };
-    int64_t result = lpr_unix_socket_message(fd, (uint64_t)(uintptr_t)&message, flags, writing);
+    int64_t result = lpr_unix_socket_message(fd, (uint64_t)(uintptr_t)&message, flags, writing, wait_not_ready);
     if (result >= 0 && !writing && address)
         lpr_memcpy((void *)(uintptr_t)address_length, &message.name_length, sizeof(capacity));
     return result;

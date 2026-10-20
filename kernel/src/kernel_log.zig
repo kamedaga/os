@@ -1,3 +1,4 @@
+const lock_diagnostics = @import("sync/lock_diagnostics.zig");
 const std = @import("std");
 const serial = @import("serial.zig");
 const root = @import("root");
@@ -32,17 +33,26 @@ pub fn Ring(comptime capacity: usize) type {
         next: u64 = 0,
         dropped: u64 = 0,
         lock_word: u8 = 0,
+        diagnostic_record: lock_diagnostics.Record = .{},
 
-        fn tryLock(self: *Self) bool {
-            return @cmpxchgStrong(u8, &self.lock_word, 0, 1, .acquire, .monotonic) == null;
+        fn tryLock(self: *Self, comptime mode: lock_diagnostics.order.Mode) bool {
+            const diagnostic_if = lock_diagnostics.maskInterrupts();
+            defer lock_diagnostics.restoreInterrupts(diagnostic_if);
+            if (mode == .blocking) lock_diagnostics.beforeAcquire(&self.diagnostic_record, .{ .class = .log_ring });
+            if (@cmpxchgStrong(u8, &self.lock_word, 0, 1, .acquire, .monotonic) != null) return false;
+            if (mode == .blocking) lock_diagnostics.acquired(&self.diagnostic_record, .{ .class = .log_ring }) else lock_diagnostics.acquiredTry(&self.diagnostic_record, .{ .class = .log_ring });
+            return true;
         }
 
         fn unlock(self: *Self) void {
+            const diagnostic_if = lock_diagnostics.maskInterrupts();
+            defer lock_diagnostics.restoreInterrupts(diagnostic_if);
+            lock_diagnostics.releasing(&self.diagnostic_record);
             @atomicStore(u8, &self.lock_word, 0, .release);
         }
 
         pub fn append(self: *Self, text: []const u8) void {
-            if (!self.tryLock()) {
+            if (!self.tryLock(.try_once)) {
                 _ = @atomicRmw(u64, &self.dropped, .Add, 1, .monotonic);
                 return;
             }
@@ -55,7 +65,8 @@ pub fn Ring(comptime capacity: usize) type {
 
         pub fn snapshot(self: *Self, cursor: u64, out: []u8, result: *log_abi.Read) bool {
             var attempts: usize = 0;
-            while (!self.tryLock()) : (attempts += 1) {
+            // Bounded retries still wait: rank-check before even the first attempt.
+            while (!self.tryLock(.blocking)) : (attempts += 1) {
                 if (attempts == 4096) return false;
                 std.atomic.spinLoopHint();
             }
@@ -241,4 +252,22 @@ pub fn writeOnlyThreadIndexLabel(thread_index: usize) void {
         9 => writeOnly("9"),
         else => writeOnly("?"),
     }
+}
+
+test "lock admission log writer try and bounded snapshot blocking use actual ring" {
+    if (!lock_diagnostics.enabled) return;
+    var ring: Ring(16) = .{};
+    ring.append("hello");
+    try std.testing.expectEqual(lock_diagnostics.order.Mode.try_once, ring.diagnostic_record.mode);
+    var out: [16]u8 = undefined;
+    var result: log_abi.Read = undefined;
+    try std.testing.expect(ring.snapshot(0, &out, &result));
+    try std.testing.expectEqual(lock_diagnostics.order.Mode.blocking, ring.diagnostic_record.mode);
+    try std.testing.expectEqualStrings("hello", out[0..5]);
+    try std.testing.expect(ring.tryLock(.try_once));
+    try std.testing.expectError(error.IpiWaitWithBlockingLock, lock_diagnostics.testCpu().assertCanWaitForIpi());
+    ring.append("dropped");
+    try std.testing.expectEqual(@as(u64, 1), ring.dropped);
+    ring.unlock();
+    lock_diagnostics.assertRootEmpty();
 }

@@ -2,6 +2,7 @@
 #ifndef PACHA_KOBOX_GPU_QUEUE_H
 #define PACHA_KOBOX_GPU_QUEUE_H
 
+#include <pacha/abi.h>
 #include "../gpud/gpu_channel.h"
 #include "gpu_event_message.h"
 #include "gpu_queue_message.h"
@@ -29,7 +30,7 @@ struct ph_gpu_queue {
     unsigned char event_message[PH_GPU_DRM_EVENT_MESSAGE_BYTES];
     unsigned int active_lane;
     unsigned int next_lane;
-    int event_fd;
+    pacha_fd_t event_fd;
     int bound, event_active, event_fences;
 };
 

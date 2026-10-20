@@ -13,7 +13,7 @@ uint64_t lpr_exec_now_ns(void) { return 0; }
 uint64_t lpr_exec_now_cycles(void) { return 0; }
 void lpr_exec_metric(const char *s, uint64_t a, uint64_t b) { (void)s; (void)a; (void)b; }
 void lpr_exec_metric_cycles(const char *s, uint64_t a, uint64_t b) { (void)s; (void)a; (void)b; }
-int pacha_vmo_create(uint64_t size, uint64_t rights, uint32_t flags)
+pacha_fd_t pacha_vmo_create(uint64_t size, uint64_t rights, uint32_t flags)
 {
     (void)rights; (void)flags;
     assert(size >= 65536 && size < 8 * 1024 * 1024);
@@ -22,7 +22,7 @@ int pacha_vmo_create(uint64_t size, uint64_t rights, uint32_t flags)
     assert(buffer);
     return 20;
 }
-void *pacha_mmap(int fd, uint64_t size, uint64_t prot, uint64_t flags, uint64_t offset)
+void *pacha_mmap(pacha_fd_t fd, uint64_t size, uint64_t prot, uint64_t flags, uint64_t offset)
 {
     (void)prot; (void)flags;
     assert(fd == 20 && size == buffer_size && offset == 0);
@@ -33,7 +33,7 @@ int pacha_munmap(void *addr, uint64_t size)
     assert(addr == buffer && size == buffer_size);
     return 0;
 }
-int pacha_fd_close(int fd) { assert(fd >= 16); ++close_calls; return 0; }
+int pacha_fd_close(pacha_fd_t fd) { assert(fd >= 16); ++close_calls; return 0; }
 long pacha_getrandom(void *out, uint64_t size, uint64_t flags)
 {
     (void)flags;
@@ -41,7 +41,7 @@ long pacha_getrandom(void *out, uint64_t size, uint64_t flags)
     memset(out, (int)(batch_calls + 1), size);
     return (long)size;
 }
-int pacha_process_map_batch(int fd, const struct pacha_process_map_batch_entry *maps, uint64_t count)
+int pacha_process_map_batch(pacha_fd_t fd, const struct pacha_process_map_batch_entry *maps, uint64_t count)
 {
     assert(fd == 19 && count == 2);
     ++batch_calls;
@@ -58,7 +58,7 @@ int pacha_process_map_batch(int fd, const struct pacha_process_map_batch_entry *
     reservation_base = maps[0].target_va;
     return 0;
 }
-int pacha_thread_create(int fd, uint64_t entry, uint64_t sp, uint64_t flags, uint64_t fs, uint64_t rights)
+pacha_fd_t pacha_thread_create(pacha_fd_t fd, uint64_t entry, uint64_t sp, uint64_t flags, uint64_t fs, uint64_t rights)
 {
     (void)entry; (void)flags; (void)fs; (void)rights;
     assert(fd == 19 && mapped_base != 0);
@@ -67,7 +67,7 @@ int pacha_thread_create(int fd, uint64_t entry, uint64_t sp, uint64_t flags, uin
     child_sp = sp;
     return 21;
 }
-int pacha_thread_start(int fd) { assert(fd == 21); return 0; }
+int pacha_thread_start(pacha_fd_t fd) { assert(fd == 21); return 0; }
 
 static void reset(void)
 {

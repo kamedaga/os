@@ -53,7 +53,7 @@ int lpr_prepare_exec_manifest(filed_exec_path_t *exec, lpr_exec_transaction_t *t
     return failure == 1 ? -LPR_LINUX_ENOMEM : 0;
 }
 int64_t lpr_filed_exec_self(filed_exec_path_t *exec,
-    const lpr_exec_transaction_t *tx, int *process, int *thread, int *bootstrap)
+    const lpr_exec_transaction_t *tx, pacha_fd_t *process, pacha_fd_t *thread, pacha_fd_t *bootstrap)
 {
     (void)tx;
     assert(!destroyed && !strcmp(exec->path, "/sbin/pacha-service-runtime"));
@@ -63,7 +63,7 @@ int64_t lpr_filed_exec_self(filed_exec_path_t *exec,
     *process = 41; *thread = 42; *bootstrap = 43;
     return 0;
 }
-int lpr_install_exec_bootstrap_fd(int fd)
+int lpr_install_exec_bootstrap_fd(pacha_fd_t fd)
 {
     assert(fd == 43 && !destroyed && !installed);
     ++installed;
@@ -76,7 +76,7 @@ int lpr_supervisor_set_comm(const char *path)
     ++published;
     return comm_failure ? -LPR_LINUX_EIO : 0;
 }
-int64_t lpr_supervisor_call_token(uint32_t op, uint64_t token, int fd, uint64_t *result)
+int64_t lpr_supervisor_call_token(uint32_t op, uint64_t token, pacha_fd_t fd, uint64_t *result)
 {
     assert(op == LPRS_OP_PROCESS_EXEC_COMMIT_BEGIN && token == 101 && fd == 41 && !result);
     assert(destroyed == 1 && published == 1);
@@ -172,4 +172,14 @@ int main(void)
     run(0, 0, 0);
 #endif
     puts("exec SET_COMM: owned copied path survives publication; every success/error path frees exactly once PASS");
+}
+
+#include "lpr_ipc_mock.h"
+int64_t lpr_ipc_message(uint64_t nr, uint64_t fd, uint64_t send, uint64_t receive,
+    uint64_t timeout, uint64_t flags, int *committed) {
+    return test_lpr_ipc_noncall(nr, fd, send, receive, timeout, flags, committed);
+}
+
+int64_t lpr_pacha_syscall4(uint64_t nr,uint64_t a,uint64_t b,uint64_t c,uint64_t d) {
+    (void)nr;(void)a;(void)b;(void)c;(void)d;abort();
 }

@@ -34,6 +34,10 @@ void *memset(void *destination, int value, size_t size)
 static uint64_t call(uint64_t nr, uint64_t a, uint64_t b, uint64_t c,
     uint64_t d, uint64_t e, uint64_t f)
 {
+    if (nr == PACHA_FD_SYSCALL_POLL || nr == PACHA_FD_SYSCALL_WAIT_MANY) {
+        last_result = (uint64_t)pacha_poll_registers(nr, a, b, c, d);
+        return last_result;
+    }
     register uint64_t r10 __asm__("r10") = d;
     register uint64_t r8 __asm__("r8") = e;
     register uint64_t r9 __asm__("r9") = f;
@@ -69,7 +73,7 @@ __attribute__((noreturn)) static void fail_at(unsigned line)
 }
 #define CHECK(condition) do { if (!(condition)) fail_at(__LINE__); } while (0)
 
-static int is_fd(uint64_t value) { return value >= 16 && value < PACHA_FD_TABLE_LIMIT; }
+static int is_fd(uint64_t value) { return value >= 16 && value < PACHA_THREAD_SELF_FD; }
 static uint64_t now(void)
 {
     uint64_t ts[2];

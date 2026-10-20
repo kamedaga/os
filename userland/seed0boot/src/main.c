@@ -26,19 +26,19 @@ static int is_nvme(const struct pacha_capsule_pci_function *device)
     return device->class_code == 0x010802;
 }
 
-static int set_inherit(int fd, int enabled)
+static int set_inherit(pacha_fd_t fd, int enabled)
 {
-    return (int)pacha_fd_fcntl(fd, PACHA_FD_FCNTL_SET_FLAGS,
+    return (pacha_fd_t)pacha_fd_fcntl(fd, PACHA_FD_FCNTL_SET_FLAGS,
         enabled ? PACHA_FD_FLAG_INHERIT : 0,
         PACHA_FD_FLAG_INHERIT);
 }
 
-static int create_handoff_vmo(const struct pacha_root_handoff *handoff)
+static pacha_fd_t create_handoff_vmo(const struct pacha_root_handoff *handoff)
 {
     const uint64_t rights = PACHA_FD_RIGHT_INSPECT | PACHA_FD_RIGHT_TRANSFER |
         PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_MAP_READ |
         PACHA_FD_RIGHT_MAP_WRITE;
-    const int fd = pacha_vmo_create(4096, rights, 0);
+    const pacha_fd_t fd = pacha_vmo_create(4096, rights, 0);
     if (fd < 16) return fd;
     void *page = pacha_mmap(fd, 4096, PACHA_PROT_READ | PACHA_PROT_WRITE,
         PACHA_MMAP_SHARED, 0);
@@ -52,10 +52,10 @@ static int create_handoff_vmo(const struct pacha_root_handoff *handoff)
     return fd;
 }
 
-static int send_root_batch(int channel_fd,
-    const struct pacha_root_handoff *handoff, const int *selected)
+static int send_root_batch(pacha_fd_t channel_fd,
+    const struct pacha_root_handoff *handoff, const pacha_fd_t *selected)
 {
-    const int metadata_fd = create_handoff_vmo(handoff);
+    const pacha_fd_t metadata_fd = create_handoff_vmo(handoff);
     if (metadata_fd < 16) return metadata_fd;
     struct pacha_ipc_fd fds[1 + PACHA_ROOT_HANDOFF_BATCH_DEVICES];
     memset(fds, 0, sizeof(fds));
@@ -101,7 +101,7 @@ static int send_root_batch(int channel_fd,
     return status;
 }
 
-static int send_root_handoff(int channel_fd, int live_mode, int installer_mode)
+static int send_root_handoff(pacha_fd_t channel_fd, int live_mode, int installer_mode)
 {
     if (channel_fd < 16 || seed0_bootstrap_descriptor() == NULL) return -22;
     const long function_count = pacha_capsule_pci_function_count();
@@ -111,7 +111,7 @@ static int send_root_handoff(int channel_fd, int live_mode, int installer_mode)
     memset(&handoff, 0, sizeof(handoff));
     handoff.magic = PACHA_ROOT_HANDOFF_MAGIC;
     handoff.size = sizeof(handoff);
-    int selected[PACHA_ROOT_HANDOFF_BATCH_DEVICES];
+    pacha_fd_t selected[PACHA_ROOT_HANDOFF_BATCH_DEVICES];
     int status = 0;
     for (uint64_t index = 0; index < (uint64_t)function_count; index++) {
         struct pacha_capsule_pci_function device;
@@ -132,7 +132,7 @@ static int send_root_handoff(int channel_fd, int live_mode, int installer_mode)
             handoff.device_count = 0;
             memset(handoff.devices, 0, sizeof(handoff.devices));
         }
-        const int fd = pacha_capsule_pci_claim(index);
+        const pacha_fd_t fd = pacha_capsule_pci_claim(index);
         if (fd < 16) {
             status = fd;
             goto fail;
@@ -161,7 +161,7 @@ fail:
     return status;
 }
 
-static int serve_power_requests(int power_fd)
+static int serve_power_requests(pacha_fd_t power_fd)
 {
     if (power_fd < 16) return -22;
     for (;;) {
@@ -178,11 +178,12 @@ static int serve_power_requests(int power_fd)
         }
         if (request.word0 != PACHA_LIVE_POWER_REQUEST_MAGIC ||
             (request.word1 != PACHA_LIVE_POWER_OFF &&
-             request.word1 != PACHA_LIVE_POWER_REBOOT) || request.fd_count != 1 ||
-            reply_fd.fd < 16) {
+             request.word1 != PACHA_LIVE_POWER_REBOOT) || request.fd_count != 0) {
             fprintf(stderr, "[seed0boot] invalid power request\n");
             if (request.fd_count == 1 && reply_fd.fd >= 16)
-                (void)pacha_fd_close((int)reply_fd.fd);
+                (void)pacha_fd_close((pacha_fd_t)reply_fd.fd);
+            const struct pacha_ipc_msg invalid = {.word1 = (uint64_t)(int64_t)-22};
+            (void)pacha_ipc_reply(PACHA_IPC_REPLY_IMPLICIT, &invalid);
             continue;
         }
         printf("[seed0boot] ACPI %s requested\n",
@@ -196,8 +197,7 @@ static int serve_power_requests(int power_fd)
             .word0 = PACHA_LIVE_POWER_REQUEST_MAGIC,
             .word1 = (uint64_t)result,
         };
-        (void)pacha_ipc_reply((int)reply_fd.fd, &response);
-        (void)pacha_fd_close((int)reply_fd.fd);
+        (void)pacha_ipc_reply(PACHA_IPC_REPLY_IMPLICIT, &response);
     }
 }
 
@@ -223,7 +223,7 @@ static int launch_live_root(void)
         pacha_ipc_channel_create(&root_handoff, channel_rights, 0) != 0 ||
         pacha_ipc_channel_create(&power, channel_rights, 0) != 0)
         return 20;
-    int endpoint_fd = -1;
+    pacha_fd_t endpoint_fd = -1;
     int status = seed0_launch_live_filed(ready.b, unix_path.a,
         &endpoint_fd);
     (void)pacha_fd_close(ready.b);

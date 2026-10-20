@@ -1,3 +1,4 @@
+const lock_diagnostics = @import("sync/lock_diagnostics.zig");
 const std = @import("std");
 const x86_platform = @import("arch/x86_64/platform.zig");
 const lapic = @import("lapic.zig");
@@ -5,7 +6,12 @@ const interrupts = @import("interrupts.zig");
 const scheduler_observer = @import("scheduler_observer.zig");
 const mtrr = @import("arch/x86_64/mtrr.zig");
 
-pub const max_cpus: usize = x86_platform.max_cpus;
+const runtime = @import("arch/x86_64/cpu_runtime.zig");
+pub const CpuSet = @import("cpu_set.zig").CpuSet;
+const topology = @import("cpu_topology.zig");
+pub fn cpuCapacity() usize {
+    return runtime.capacity();
+}
 const trampoline_page_bytes: usize = 4096;
 const cpu_state_absent: u32 = 0;
 const cpu_state_booting: u32 = 1;
@@ -21,7 +27,7 @@ pub const CpuState = enum(u32) {
 
 pub const CpuInfo = struct {
     slot: usize,
-    lapic_id: ?u8,
+    lapic_id: ?u32,
     state: CpuState,
     started: bool,
     is_bootstrap: bool,
@@ -29,35 +35,41 @@ pub const CpuInfo = struct {
 
 pub const BootInfo = struct {
     trampoline_base: u64 = 0,
-    lapic_ids: [max_cpus]u8 = [_]u8{0} ** max_cpus,
-    lapic_count: u8 = 0,
+    lapic_ids: []u32 = &.{},
+    lapic_count: usize = 0,
     // Fail closed for shorthand broadcast unless MADT described every CPU.
     broadcast_topology_complete: bool = false,
 };
 
 var observed_cpu_count: u32 = 1;
-var broadcast_online_mask: u64 = 0;
-var ap_started: [max_cpus]u32 = [_]u32{0} ** max_cpus;
-var cpu_states: [max_cpus]u32 = [_]u32{cpu_state_absent} ** max_cpus;
-pub export var runtime_lapic_ids: [max_cpus]u8 = [_]u8{0xFF} ** max_cpus;
+var broadcast_online_mask: CpuSet = .{ .words = &.{}, .capacity = 0 };
+var online_set: CpuSet = .{ .words = &.{}, .capacity = 0 };
+var matching_set: CpuSet = .{ .words = &.{}, .capacity = 0 };
+var ap_started: []u32 = &.{};
+var cpu_states: []u32 = &.{};
+pub export var runtime_lapic_ids: [*]u32 = undefined;
+var runtime_lapic_id_storage: []u32 = &.{};
 var ap_user_timer_vector: u8 = 0;
 var ap_user_timer_initial_count: u32 = 0;
-var ap_syscall_entry: usize = 0;
+// Each CPU's LSTAR names its own entry stub (see traps.syscallEntryForCpu).
+var ap_syscall_entry: ?*const fn (usize) usize = null;
 var wake_ipi_vector: u8 = 0;
 
 // Serialized by the kernel-state lock, like native IRQ lease changes.
 var irq_drain_first: u8 = 0;
 var irq_drain_count: u8 = 0;
 var irq_drain_generation: u64 = 0;
-var irq_drain_ack: [max_cpus]u64 = [_]u64{0} ** max_cpus;
+var irq_drain_ack: []u64 = &.{};
+const NotifyWake = @import("sync/notify_wake.zig").Token;
+var notify_wake: []NotifyWake = &.{};
 
 // Captured once during serial CPU startup, immutable once userspace runs.
 // No partially booted or late/unverified topology may admit UC_MINUS aliases.
 // Keep each CPU's evidence available for diagnosis without rereading MSRs or
 // changing the boot-time admission decision. Slot zero belongs to the BSP.
-var mmio_cache_snapshots: [max_cpus]mtrr.CacheSnapshot = [_]mtrr.CacheSnapshot{.{}} ** max_cpus;
-var mmio_cache_matches: [max_cpus]u32 = [_]u32{0} ** max_cpus;
-var mmio_cache_online_mask: u64 = 0;
+var mmio_cache_snapshots: []mtrr.CacheSnapshot = &.{};
+var mmio_cache_matches: []u32 = &.{};
+var mmio_cache_online_mask: CpuSet = .{ .words = &.{}, .capacity = 0 };
 
 extern fn stageUserReturnFromFramePointerForCurrentCpu(frame_addr: usize, iret_offset: usize) callconv(.winapi) void;
 
@@ -72,6 +84,9 @@ fn maxStaticEnd(a: usize, b: usize) usize {
 pub fn kernelStaticStorageEndAddr() usize {
     var end: usize = 0;
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(observed_cpu_count), &observed_cpu_count));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(online_set), &online_set));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(matching_set), &matching_set));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(runtime_lapic_id_storage), &runtime_lapic_id_storage));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(broadcast_online_mask), &broadcast_online_mask));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(ap_started), &ap_started));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(cpu_states), &cpu_states));
@@ -83,6 +98,7 @@ pub fn kernelStaticStorageEndAddr() usize {
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(irq_drain_count), &irq_drain_count));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(irq_drain_generation), &irq_drain_generation));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(irq_drain_ack), &irq_drain_ack));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(notify_wake), &notify_wake));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(mmio_cache_snapshots), &mmio_cache_snapshots));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(mmio_cache_matches), &mmio_cache_matches));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(mmio_cache_online_mask), &mmio_cache_online_mask));
@@ -94,8 +110,8 @@ pub fn configureApUserTimer(timer_vector: u8, initial_count: u32) void {
     ap_user_timer_initial_count = initial_count;
 }
 
-pub fn configureApSyscallEntry(entry: usize) void {
-    ap_syscall_entry = entry;
+pub fn configureApSyscallEntry(entry_for_cpu: *const fn (usize) usize) void {
+    ap_syscall_entry = entry_for_cpu;
 }
 
 pub fn configureWakeIpiVector(vector: u8) void {
@@ -116,30 +132,38 @@ pub fn cpuCount() usize {
 }
 
 pub fn cpuState(cpu_slot: usize) CpuState {
-    if (cpu_slot >= max_cpus) return .absent;
+    if (cpu_slot >= cpu_states.len) return .absent;
     return stateFromRaw(@atomicLoad(u32, &cpu_states[cpu_slot], .acquire));
 }
 
-pub fn onlineCpuMask() u64 {
-    var mask: u64 = 0;
-    var cpu_slot: usize = 0;
-    while (cpu_slot < max_cpus and cpu_slot < 64) : (cpu_slot += 1) {
-        if (!isStarted(cpu_slot)) continue;
-        if (runtimeLapicIdPtr(cpu_slot).* == 0xFF) continue;
-        switch (cpuState(cpu_slot)) {
-            .idle, .user => mask |= @as(u64, 1) << @intCast(cpu_slot),
-            .absent, .booting => {},
-        }
-    }
-    return mask;
+// Published only by the BSP after each serial AP startup; runtime topology
+// is immutable before user dispatch. Consumers borrow it without scratch races.
+pub fn onlineCpuSet() CpuSet {
+    return online_set;
+}
+
+pub fn initCpuStorage(count: usize) !void {
+    ap_started = try runtime.alloc(u32, count);
+    cpu_states = try runtime.alloc(u32, count);
+    runtime_lapic_id_storage = try runtime.alloc(u32, count);
+    @memset(runtime_lapic_id_storage, 0xffffffff);
+    runtime_lapic_ids = runtime_lapic_id_storage.ptr;
+    irq_drain_ack = try runtime.alloc(u64, count);
+    notify_wake = try runtime.alloc(NotifyWake, count);
+    mmio_cache_snapshots = try runtime.alloc(mtrr.CacheSnapshot, count);
+    mmio_cache_matches = try runtime.alloc(u32, count);
+    online_set = CpuSet.init(try runtime.alloc(usize, CpuSet.wordCount(count)), count);
+    matching_set = CpuSet.init(try runtime.alloc(usize, CpuSet.wordCount(count)), count);
+    broadcast_online_mask = CpuSet.init(try runtime.alloc(usize, CpuSet.wordCount(count)), count);
+    mmio_cache_online_mask = CpuSet.init(try runtime.alloc(usize, CpuSet.wordCount(count)), count);
 }
 
 pub fn cpuInfo(cpu_slot: usize) ?CpuInfo {
-    if (cpu_slot >= max_cpus) return null;
+    if (cpu_slot >= runtime_lapic_id_storage.len) return null;
     const apic_id = runtimeLapicIdPtr(cpu_slot).*;
     return .{
         .slot = cpu_slot,
-        .lapic_id = if (apic_id == 0xFF) null else apic_id,
+        .lapic_id = if (apic_id == 0xFFFFFFFF) null else apic_id,
         .state = cpuState(cpu_slot),
         .started = isStarted(cpu_slot),
         .is_bootstrap = cpu_slot == 0,
@@ -155,11 +179,21 @@ fn readStackPointer() u64 {
 }
 
 pub fn currentCpuSlot() usize {
-    return currentCpuSlotIfKnown() orelse 0;
+    // Live user XState crosses this helper on both sides of save/restore.
+    // Do not route through the aggregate optional facade: even a return-value
+    // copy may use XMM0. Preserve the historical unknown -> BSP fallback here;
+    // diagnostics use the explicit unknown result instead.
+    return x86_platform.cpuSlotForStackPointer(readStackPointer()).indexOr(0);
 }
 
 pub fn currentCpuSlotIfKnown() ?usize {
-    return x86_platform.cpuSlotForStackPointer(readStackPointer());
+    return x86_platform.cpuSlotForStackPointer(readStackPointer()).index();
+}
+
+/// Strict scalar identity for live-XState code. Unlike currentCpuSlot(), an
+/// unrecognized stack must not borrow the bootstrap CPU's context pin.
+pub fn currentCpuSlotOrInvalid() usize {
+    return x86_platform.cpuSlotForStackPointer(readStackPointer()).indexOr(cpuCapacity());
 }
 
 pub fn isBootstrapCpu() bool {
@@ -170,126 +204,31 @@ pub fn isCpuIdle(cpu_slot: usize) bool {
     return cpuState(cpu_slot) == .idle;
 }
 
-fn readU32(addr: u64) u32 {
-    const p: [*]const u8 = @ptrFromInt(addr);
-    return @as(u32, p[0]) |
-        (@as(u32, p[1]) << 8) |
-        (@as(u32, p[2]) << 16) |
-        (@as(u32, p[3]) << 24);
-}
-
-fn readU64(addr: u64) u64 {
-    return @as(u64, readU32(addr)) | (@as(u64, readU32(addr + 4)) << 32);
-}
-
-fn bytesEqual(addr: u64, expected: []const u8) bool {
-    const p: [*]const u8 = @ptrFromInt(addr);
-    var i: usize = 0;
-    while (i < expected.len) : (i += 1) {
-        if (p[i] != expected[i]) return false;
-    }
+fn appendLapicId(info: *BootInfo, id: u32) bool {
+    topology.append(info.lapic_ids, &info.lapic_count, .{ .id = id, .enabled = true, .x2 = lapic.usesX2Apic() }, lapic.usesX2Apic()) catch return false;
     return true;
 }
 
-fn checksumOk(addr: u64, len: usize) bool {
-    const p: [*]const u8 = @ptrFromInt(addr);
-    var sum: u8 = 0;
-    var i: usize = 0;
-    while (i < len) : (i += 1) sum +%= p[i];
-    return sum == 0;
-}
-
-fn tableLength(addr: u64) usize {
-    return @intCast(readU32(addr + 4));
-}
-
-fn findMadtFromRoot(root_addr: u64, xsdt: bool) ?u64 {
-    if (!bytesEqual(root_addr, if (xsdt) "XSDT" else "RSDT")) return null;
-    const len = tableLength(root_addr);
-    if (len < 36 or !checksumOk(root_addr, len)) return null;
-    const entry_size: usize = if (xsdt) 8 else 4;
-    var off: usize = 36;
-    while (off + entry_size <= len) : (off += entry_size) {
-        const table_addr = if (xsdt)
-            readU64(root_addr + off)
-        else
-            @as(u64, readU32(root_addr + off));
-        if (table_addr != 0 and bytesEqual(table_addr, "APIC")) return table_addr;
-    }
-    return null;
-}
-
-fn findMadt(rsdp: u64) ?u64 {
-    if (rsdp == 0 or !bytesEqual(rsdp, "RSD PTR ") or !checksumOk(rsdp, 20)) return null;
-    const revision = (@as([*]const u8, @ptrFromInt(rsdp)))[15];
-    if (revision >= 2) {
-        const len = readU32(rsdp + 20);
-        const xsdt_addr = readU64(rsdp + 24);
-        if (len >= 36 and xsdt_addr != 0 and checksumOk(rsdp, @intCast(len))) {
-            if (findMadtFromRoot(xsdt_addr, true)) |madt| return madt;
-        }
-    }
-    const rsdt_addr = readU32(rsdp + 16);
-    if (rsdt_addr == 0) return null;
-    return findMadtFromRoot(rsdt_addr, false);
-}
-
-fn appendLapicId(info: *BootInfo, id: u8) void {
-    var i: usize = 0;
-    while (i < info.lapic_count) : (i += 1) {
-        if (info.lapic_ids[i] == id) return;
-    }
-    if (info.lapic_count >= max_cpus or id == 0xFF) {
-        info.broadcast_topology_complete = false;
-        if (info.lapic_count >= max_cpus) return;
-    }
-    info.lapic_ids[info.lapic_count] = id;
-    info.lapic_count += 1;
-}
-
-fn collectMadtLapicIds(info: *BootInfo, rsdp: u64) bool {
-    const madt = findMadt(rsdp) orelse return false;
-    const len = tableLength(madt);
-    if (len < 44 or !checksumOk(madt, len)) return false;
-    info.broadcast_topology_complete = true;
-    var off: usize = 44;
-    while (off + 2 <= len) {
-        const entry_addr = madt + off;
-        const entry_type = (@as([*]const u8, @ptrFromInt(entry_addr)))[0];
-        const entry_len = (@as([*]const u8, @ptrFromInt(entry_addr)))[1];
-        if (entry_len < 2 or off + entry_len > len) return false;
-        switch (entry_type) {
-            0 => if (entry_len >= 8 and (readU32(entry_addr + 4) & 0x1) != 0) {
-                appendLapicId(info, (@as([*]const u8, @ptrFromInt(entry_addr)))[3]);
-            } else {
-                info.broadcast_topology_complete = false;
-            },
-            9 => {
-                // x2APIC enumeration is not sufficient to prove this xAPIC
-                // shorthand's complete destination set. Keep unicast here.
-                info.broadcast_topology_complete = false;
-                if (entry_len >= 16 and (readU32(entry_addr + 4) & 0x1) != 0) {
-                    const x2apic_id = readU32(entry_addr + 8);
-                    if (x2apic_id <= std.math.maxInt(u8)) appendLapicId(info, @intCast(x2apic_id));
-                }
-            },
-            else => {},
-        }
-        off += entry_len;
-    }
-    if (off != len) info.broadcast_topology_complete = false;
-    return info.lapic_count != 0;
-}
-
 pub fn prepareBootInfo(rsdp: u64, trampoline_base: u64) ?BootInfo {
-    const trampoline_bytes = trampoline_page_bytes;
-    if (trampoline_base == 0 or (trampoline_base & 0xFFF) != 0 or
-        trampoline_base +| trampoline_bytes > 0x100000)
-    {
-        return null;
+    if (trampoline_base == 0 or trampoline_base & 0xfff != 0 or trampoline_base +| trampoline_page_bytes > 0x100000) return null;
+    var entries = @import("acpi_tables.zig").madtEntries(rsdp) orelse return null;
+    var count: usize = 1; // BSP fallback also has owned storage.
+    while (entries.next() catch return null) |record| {
+        if ((topology.decode(record) catch return null)) |entry| {
+            if (entry.enabled) count = std.math.add(usize, count, 1) catch return null;
+        }
     }
-    var info = BootInfo{ .trampoline_base = trampoline_base };
-    if (!collectMadtLapicIds(&info, rsdp)) return null;
+    var info = BootInfo{ .trampoline_base = trampoline_base, .lapic_ids = runtime.alloc(u32, count) catch return null, .broadcast_topology_complete = true };
+    entries = @import("acpi_tables.zig").madtEntries(rsdp) orelse return null;
+    while (entries.next() catch return null) |record| {
+        if ((topology.decode(record) catch return null)) |entry| {
+            if (!entry.enabled or entry.x2) info.broadcast_topology_complete = false;
+            topology.append(info.lapic_ids, &info.lapic_count, entry, lapic.usesX2Apic()) catch return null;
+        }
+    }
+    const before = info.lapic_count;
+    if (!appendLapicId(&info, lapic.localApicId())) return null;
+    if (before != info.lapic_count) info.broadcast_topology_complete = false;
     return info;
 }
 
@@ -318,10 +257,10 @@ fn write64(page: [*]u8, off: usize, value: u64) void {
     emit64(page, &cursor, value);
 }
 
-fn buildTrampoline(base: u64, cr3: u64, stack_top: u64, cpu_slot: usize, entry: u64) ?u8 {
+fn buildTrampoline(base: u64, cr3: u64, formal_cr3: u64, stack_top: u64, cpu_slot: usize, entry: u64) ?u8 {
     if ((base & 0xFFF) != 0 or base >= 0x100000) return null;
     if ((cr3 >> 32) != 0) return null;
-    const page: [*]u8 = @ptrFromInt(base);
+    const page = trampolineWriter(.fromInt(base)) orelse unreachable;
     @memset(page[0..trampoline_page_bytes], 0);
 
     var off: usize = 0;
@@ -361,10 +300,12 @@ fn buildTrampoline(base: u64, cr3: u64, stack_top: u64, cpu_slot: usize, entry: 
     emit32(page, &off, @intCast(base + protected_off));
     emit16(page, &off, 0x18); // ljmp protected32
 
+    // The code/GDT page is RX when paging starts with WP enabled. Preset
+    // accessed bits so segment loads cannot attempt a write to that page.
     write64(page, gdt_off + 0, 0);
-    write64(page, gdt_off + 8, 0x00AF9A000000FFFF);
-    write64(page, gdt_off + 16, 0x00CF92000000FFFF);
-    write64(page, gdt_off + 24, 0x00CF9A000000FFFF);
+    write64(page, gdt_off + 8, 0x00AF9B000000FFFF);
+    write64(page, gdt_off + 16, 0x00CF93000000FFFF);
+    write64(page, gdt_off + 24, 0x00CF9B000000FFFF);
     var gdtr_cursor = gdtr_off;
     emit16(page, &gdtr_cursor, 31);
     emit32(page, &gdtr_cursor, @intCast(base + gdt_off));
@@ -405,7 +346,7 @@ fn buildTrampoline(base: u64, cr3: u64, stack_top: u64, cpu_slot: usize, entry: 
     emit8(page, &off, 0x20);
     emit8(page, &off, 0xC0); // mov eax, cr0
     emit8(page, &off, 0x0D);
-    emit32(page, &off, 0x80000000); // or eax, PG
+    emit32(page, &off, 0x80010000); // or eax, PG | WP
     emit8(page, &off, 0x0F);
     emit8(page, &off, 0x22);
     emit8(page, &off, 0xC0); // mov cr0, eax
@@ -456,6 +397,9 @@ fn buildTrampoline(base: u64, cr3: u64, stack_top: u64, cpu_slot: usize, entry: 
     emit8(page, &off, 0xB9);
     emit64(page, &off, @intCast(cpu_slot)); // mov rcx, imm64
     emit8(page, &off, 0x48);
+    emit8(page, &off, 0xBA);
+    emit64(page, &off, formal_cr3); // mov rdx, imm64: consumed only in high code
+    emit8(page, &off, 0x48);
     emit8(page, &off, 0xB8);
     emit64(page, &off, entry); // mov rax, imm64
     emit8(page, &off, 0x48);
@@ -472,7 +416,7 @@ fn buildTrampoline(base: u64, cr3: u64, stack_top: u64, cpu_slot: usize, entry: 
     return @intCast(base >> 12);
 }
 
-fn runtimeLapicIdPtr(cpu_slot: usize) *volatile u8 {
+fn runtimeLapicIdPtr(cpu_slot: usize) *volatile u32 {
     return @ptrCast(&runtime_lapic_ids[cpu_slot]);
 }
 
@@ -490,30 +434,32 @@ fn setCpuState(cpu_slot: usize, state: CpuState) void {
 
 pub fn startIdleAps(info: *BootInfo, kernel_cr3: u64) bool {
     @import("realtime_clock.zig").registerCpu(0, x86_platform.kernelPointerPaddr);
-    @atomicStore(u64, &broadcast_online_mask, 0, .release);
-    @atomicStore(u64, &mmio_cache_online_mask, 0, .release);
+    broadcast_online_mask.clear();
+    mmio_cache_online_mask.clear();
     _ = mtrr.ensureWcPatSlot4();
     @atomicStore(u32, &mmio_cache_matches[0], @intFromBool(mtrr.captureCacheSnapshot(&mmio_cache_snapshots[0])), .release);
     if (info.trampoline_base == 0) {
         return false;
     }
     if (info.lapic_count == 0) {
-        appendLapicId(info, lapic.localApicId());
+        if (!appendLapicId(info, lapic.localApicId())) return false;
     }
     const bsp_id = lapic.localApicId();
-    @atomicStore(u32, &observed_cpu_count, if (info.lapic_count == 0) 1 else info.lapic_count, .release);
+    @atomicStore(u32, &observed_cpu_count, @intCast(if (info.lapic_count == 0) 1 else info.lapic_count), .release);
     runtimeLapicIdPtr(0).* = bsp_id;
     setCpuState(0, .idle);
     markStarted(0);
+    online_set.insertAtomic(0);
 
+    const boot_cr3 = x86_platform.prepareApBootRoot(info.trampoline_base, @import("kernel_runtime.zig").global_free_list) orelse return false;
     var cpu_slot: usize = 1;
     var i: usize = 0;
-    while (i < info.lapic_count and cpu_slot < max_cpus) : (i += 1) {
+    while (i < info.lapic_count and cpu_slot < cpuCapacity()) : (i += 1) {
         const apic_id = info.lapic_ids[i];
         if (apic_id == bsp_id) continue;
         @atomicStore(u32, &ap_started[cpu_slot], 0, .release);
         @atomicStore(u32, &mmio_cache_matches[cpu_slot], 0, .release);
-        runtimeLapicIdPtr(cpu_slot).* = 0xFF;
+        runtimeLapicIdPtr(cpu_slot).* = 0xFFFFFFFF;
         setCpuState(cpu_slot, .booting);
         if (!x86_platform.mapCpuRuntimeStacks(cpu_slot)) {
             setCpuState(cpu_slot, .absent);
@@ -526,16 +472,19 @@ pub fn startIdleAps(info: *BootInfo, kernel_cr3: u64) bool {
         // APs are started serially. isStarted() is published only after the
         // AP has left this page and installed its permanent GDT and stack.
         const trampoline_base = info.trampoline_base;
+        if (!x86_platform.setApTrampolinePermissions(trampoline_base, true, false)) return false;
         const vector = buildTrampoline(
             trampoline_base,
+            boot_cr3,
             kernel_cr3,
             stack_top,
             cpu_slot,
-            @intFromPtr(&apIdleEntry),
+            @intFromPtr(&apHighEntry),
         ) orelse {
             setCpuState(cpu_slot, .absent);
             return false;
         };
+        if (!x86_platform.setApTrampolinePermissions(trampoline_base, false, true)) return false;
         if (!lapic.sendInitSipi(apic_id, vector)) {
             setCpuState(cpu_slot, .absent);
             return false;
@@ -548,50 +497,75 @@ pub fn startIdleAps(info: *BootInfo, kernel_cr3: u64) bool {
             setCpuState(cpu_slot, .absent);
             return false;
         }
+        online_set.insertAtomic(cpu_slot);
         cpu_slot += 1;
     }
+    if (!x86_platform.setApTrampolinePermissions(info.trampoline_base, false, false)) return false;
     const success = cpu_slot == info.lapic_count;
     if (success) {
-        const mask = onlineCpuMask();
-        if (@popCount(mask) == info.lapic_count) {
-            // Shorthand IPI safety depends on complete MADT topology, but
-            // PAT/MTRR agreement is an independent all-online-CPU proof.
-            // x2APIC MADT entries deliberately disable shorthand without
-            // invalidating otherwise matching cache snapshots.
-            if (info.broadcast_topology_complete)
-                @atomicStore(u64, &broadcast_online_mask, mask, .release);
-            var matching: u64 = 0;
-            for (&mmio_cache_matches, 0..) |*value, slot| {
-                if (@atomicLoad(u32, value, .acquire) != 0) matching |= @as(u64, 1) << @intCast(slot);
+        if (online_set.count() == info.lapic_count) {
+            if (info.broadcast_topology_complete) broadcast_online_mask.copyFrom(online_set);
+            for (mmio_cache_matches, 0..) |*value, slot| {
+                if (@atomicLoad(u32, value, .acquire) != 0) matching_set.insert(slot);
             }
-            @atomicStore(u64, &mmio_cache_online_mask, cacheEvidenceForOnlineCpus(success, info.lapic_count, mask, matching), .release);
+            if (cacheEvidenceForOnlineCpus(success, info.lapic_count, online_set, matching_set))
+                mmio_cache_online_mask.copyFrom(online_set);
         }
     }
+    if (success and !x86_platform.retireApBootRoot(@import("kernel_runtime.zig").global_free_list)) return false;
     return success;
+}
+
+// The boot root shares only image/stack slot 511. No direct-map access or
+// Zig prologue may precede this full-width CR3 load; RCX preserves cpu_slot.
+fn apHighEntry() callconv(.naked) noreturn {
+    asm volatile (
+        \\mov %%rdx, %%cr3
+        \\movabs %[target], %%rax
+        \\jmp *%%rax
+        :
+        : [target] "i" (&apIdleEntry),
+    );
 }
 
 fn apIdleEntry(cpu_slot: usize) callconv(.winapi) noreturn {
     asm volatile ("cli");
-    if (!x86_platform.enableNxForCurrentCpu()) {
+    if (!x86_platform.enableNxForCurrentCpu() or !x86_platform.enableWriteProtectForCurrentCpu()) {
         setCpuState(cpu_slot, .absent);
         markStarted(cpu_slot);
         while (true) asm volatile ("hlt");
     }
+    @import("kernel_log.zig").writeFmt("permissions: cpu={} WP=1 NXE=1\n", .{cpu_slot});
     if (!x86_platform.enableAvxXStateForCurrentCpu()) {
         setCpuState(cpu_slot, .absent);
         markStarted(cpu_slot);
         while (true) asm volatile ("hlt");
     }
+    x86_platform.configureXStateOptimizationForCpu(cpu_slot);
     if (!x86_platform.loadGdtAndReloadSegmentsForCpu(cpu_slot)) {
         setCpuState(cpu_slot, .absent);
         markStarted(cpu_slot);
         while (true) asm volatile ("hlt");
     }
-    x86_platform.loadInterruptTableForCurrentCpu();
-    if (ap_syscall_entry != 0) {
-        x86_platform.enableSyscallEntry(ap_syscall_entry);
+    // Entries load kernel_cr3_entry_value, which carries the PCID no-flush
+    // bit once the BSP enabled PCIDs; that bit raises #GP without CR4.PCIDE.
+    // Enable it before any vector can fire, and keep a CPU that cannot out.
+    if (!x86_platform.enablePcidIfSupported() and x86_platform.pcid_enabled != 0) {
+        setCpuState(cpu_slot, .absent);
+        markStarted(cpu_slot);
+        while (true) asm volatile ("hlt");
     }
-    _ = x86_platform.enablePcidIfSupported();
+    // Base save/install executes RDFSBASE/WRFSBASE once the BSP enabled
+    // them; without CR4.FSGSBASE here they raise #UD on the first switch.
+    if (x86_platform.fsgsbase_enabled != 0 and !x86_platform.enableFsgsbaseOnCurrentCpu()) {
+        setCpuState(cpu_slot, .absent);
+        markStarted(cpu_slot);
+        while (true) asm volatile ("hlt");
+    }
+    x86_platform.loadInterruptTableForCurrentCpu();
+    if (ap_syscall_entry) |entry_for_cpu| {
+        x86_platform.enableSyscallEntry(entry_for_cpu(cpu_slot));
+    }
     _ = x86_platform.enablePkuIfSupported();
     // Vector, divider and one-shot mode are CPU-local initialization. Leave
     // the timer stopped until this AP dispatches a user thread.
@@ -622,18 +596,18 @@ pub const UcMinusMmioStatus = enum { ready, cache_evidence_missing, unsafe_range
 
 fn ucMinusMmioStatusWithSnapshot(
     snapshot: *const mtrr.CacheSnapshot,
-    verified: u64,
-    online: u64,
+    verified: CpuSet,
+    online: CpuSet,
     paddr: u64,
     bytes: u64,
 ) UcMinusMmioStatus {
-    if (verified == 0 or verified != online) return .cache_evidence_missing;
+    if (verified.count() == 0 or !verified.eql(online)) return .cache_evidence_missing;
     return if (ucMinusMmioWithSnapshot(snapshot, paddr, bytes)) .ready else .unsafe_range;
 }
 
 pub fn ucMinusMmioStatus(paddr: u64, bytes: u64) UcMinusMmioStatus {
-    const verified = @atomicLoad(u64, &mmio_cache_online_mask, .acquire);
-    return ucMinusMmioStatusWithSnapshot(&mmio_cache_snapshots[0], verified, onlineCpuMask(), paddr, bytes);
+    const verified = mmio_cache_online_mask;
+    return ucMinusMmioStatusWithSnapshot(&mmio_cache_snapshots[0], verified, onlineCpuSet(), paddr, bytes);
 }
 
 pub fn ucMinusMmioAllowed(paddr: u64, bytes: u64) bool {
@@ -651,36 +625,34 @@ pub const RamCacheProofError = error{ CacheEvidenceMissing, InvalidRange, RamNot
 /// This is separate from BAR proof, which can legitimately admit MTRR UC/WC.
 /// Caller excludes CPU topology/PAT/MTRR changes until commit completes.
 pub fn ramCachePatProof(pages: []const u64, mode: @import("memory/ram_cache_transition.zig").Mode) RamCacheProofError!u3 {
-    return ramCachePatProofWithSnapshots(&mmio_cache_snapshots, @atomicLoad(u64, &mmio_cache_online_mask, .acquire), onlineCpuMask(), pages, mode);
+    return ramCachePatProofWithSnapshots(mmio_cache_snapshots, mmio_cache_online_mask, onlineCpuSet(), pages, mode);
 }
 
 fn ramCachePatProofWithSnapshots(
     snapshots: []const mtrr.CacheSnapshot,
-    verified: u64,
-    online: u64,
+    verified: CpuSet,
+    online: CpuSet,
     pages: []const u64,
     mode: @import("memory/ram_cache_transition.zig").Mode,
 ) RamCacheProofError!u3 {
-    if (verified == 0 or verified != online or online & 1 == 0 or snapshots.len == 0)
+    if (verified.count() == 0 or !verified.eql(online) or !online.contains(0) or snapshots.len == 0)
         return error.CacheEvidenceMissing;
     @import("memory/ram_cache_paging.zig").validatePages(pages, @as(u64, 1) << 52) catch return error.InvalidRange;
     const boot = &snapshots[0];
     if (!boot.valid()) return error.CacheEvidenceMissing;
-    var seen: u64 = 0;
+    var seen: usize = 0;
     var common_wc: u8 = 0xff;
     for (snapshots, 0..) |*snapshot, cpu| {
-        if (cpu >= 64) break;
-        const bit = @as(u64, 1) << @as(u6, @intCast(cpu));
-        if (online & bit == 0) continue;
+        if (!online.contains(cpu)) continue;
         if (!boot.matches(snapshot)) return error.CacheEvidenceMissing;
-        seen |= bit;
+        seen += 1;
         var wc: u8 = 0;
         for (0..8) |slot| {
             if (snapshot.patSlotIsWc(@intCast(slot))) wc |= @as(u8, 1) << @as(u3, @intCast(slot));
         }
         common_wc &= wc;
     }
-    if (seen != online) return error.CacheEvidenceMissing;
+    if (seen != online.count()) return error.CacheEvidenceMissing;
     // Matching snapshots prove all CPUs share the MTRR interpretation.
     // The snapshot deliberately cannot prove fixed-MTRR RAM below 1 MiB.
     for (pages) |pa| {
@@ -716,17 +688,17 @@ test "MMIO alias RAM proof requires restorable WB and common PAT on all CPUs" {
     var snapshots = [_]mtrr.CacheSnapshot{ base, base };
     const pages = [_]u64{ 0x200000, 0x203000 };
     for ([_]@import("memory/ram_cache_transition.zig").Mode{ .wb, .uc_minus, .uc, .wc }, [_]u3{ 0, 2, 3, 4 }) |mode, pat|
-        try std.testing.expectEqual(pat, try ramCachePatProofWithSnapshots(&snapshots, 3, 3, &pages, mode));
-    try std.testing.expectError(error.CacheEvidenceMissing, ramCachePatProofWithSnapshots(&snapshots, 1, 3, &pages, .wc));
+        try std.testing.expectEqual(pat, try ramCachePatProofWithSnapshots(&snapshots, testSet(3), testSet(3), &pages, mode));
+    try std.testing.expectError(error.CacheEvidenceMissing, ramCachePatProofWithSnapshots(&snapshots, testSet(1), testSet(3), &pages, .wc));
     snapshots[1].pat &= ~(@as(u64, 0xff) << 32);
-    try std.testing.expectError(error.WcPatUnavailable, ramCachePatProofWithSnapshots(&snapshots, 3, 3, &pages, .wc));
+    try std.testing.expectError(error.WcPatUnavailable, ramCachePatProofWithSnapshots(&snapshots, testSet(3), testSet(3), &pages, .wc));
     snapshots[1] = base;
-    try std.testing.expectError(error.InvalidRange, ramCachePatProofWithSnapshots(&snapshots, 3, 3, &.{0x80000}, .wb));
-    try std.testing.expectError(error.InvalidRange, ramCachePatProofWithSnapshots(&snapshots, 3, 3, &.{@as(u64, 1) << 40}, .wb));
-    try std.testing.expectError(error.InvalidRange, ramCachePatProofWithSnapshots(&snapshots, 3, 3, &.{ 0x200000, 0x200000 }, .wb));
+    try std.testing.expectError(error.InvalidRange, ramCachePatProofWithSnapshots(&snapshots, testSet(3), testSet(3), &.{0x80000}, .wb));
+    try std.testing.expectError(error.InvalidRange, ramCachePatProofWithSnapshots(&snapshots, testSet(3), testSet(3), &.{@as(u64, 1) << 40}, .wb));
+    try std.testing.expectError(error.InvalidRange, ramCachePatProofWithSnapshots(&snapshots, testSet(3), testSet(3), &.{ 0x200000, 0x200000 }, .wb));
     const mask: u64 = (((@as(u64, 1) << 40) - 1) & ~@as(u64, 4095)) | (1 << 11);
     for (&snapshots) |*snapshot| snapshot.ranges[0] = .{ .base = pages[1], .mask = mask };
-    try std.testing.expectError(error.RamNotWriteBack, ramCachePatProofWithSnapshots(&snapshots, 3, 3, &pages, .wc));
+    try std.testing.expectError(error.RamNotWriteBack, ramCachePatProofWithSnapshots(&snapshots, testSet(3), testSet(3), &pages, .wc));
 }
 
 test "MMIO alias RAM proof accepts AMD TOM2 default only with matching CPU evidence" {
@@ -740,34 +712,32 @@ test "MMIO alias RAM proof accepts AMD TOM2 default only with matching CPU evide
         .amd_top_mem2 = 0x8_0000_0000,
     };
     var snapshots = [_]mtrr.CacheSnapshot{ base, base };
-    try std.testing.expectEqual(@as(u3, 2), try ramCachePatProofWithSnapshots(&snapshots, 3, 3, &.{0x1_4000_0000}, .uc_minus));
-    try std.testing.expectError(error.RamNotWriteBack, ramCachePatProofWithSnapshots(&snapshots, 3, 3, &.{0x8_0000_0000}, .uc_minus));
+    try std.testing.expectEqual(@as(u3, 2), try ramCachePatProofWithSnapshots(&snapshots, testSet(3), testSet(3), &.{0x1_4000_0000}, .uc_minus));
+    try std.testing.expectError(error.RamNotWriteBack, ramCachePatProofWithSnapshots(&snapshots, testSet(3), testSet(3), &.{0x8_0000_0000}, .uc_minus));
     snapshots[1].amd_top_mem2 -= 0x80_0000;
-    try std.testing.expectError(error.CacheEvidenceMissing, ramCachePatProofWithSnapshots(&snapshots, 3, 3, &.{0x1_4000_0000}, .uc_minus));
+    try std.testing.expectError(error.CacheEvidenceMissing, ramCachePatProofWithSnapshots(&snapshots, testSet(3), testSet(3), &.{0x1_4000_0000}, .uc_minus));
 }
 
 pub const WcMmioProofError = error{ CacheEvidenceMissing, InvalidRange, UnsupportedCpu, WcPatUnavailable };
 
 fn wcMmioProofWithSnapshots(
     snapshots: []const mtrr.CacheSnapshot,
-    verified: u64,
-    online: u64,
+    verified: CpuSet,
+    online: CpuSet,
     paddr: u64,
     bytes: u64,
 ) WcMmioProofError!WcMmioProof {
-    if (verified == 0 or verified != online or online & 1 == 0 or snapshots.len == 0)
+    if (verified.count() == 0 or !verified.eql(online) or !online.contains(0) or snapshots.len == 0)
         return error.CacheEvidenceMissing;
     const boot = &snapshots[0];
     if (!boot.valid()) return error.CacheEvidenceMissing;
-    var seen: u64 = 0;
+    var seen: usize = 0;
     for (snapshots, 0..) |*snapshot, cpu_slot| {
-        if (cpu_slot >= 64) break;
-        const bit = @as(u64, 1) << @as(u6, @intCast(cpu_slot));
-        if (online & bit == 0) continue;
+        if (!online.contains(cpu_slot)) continue;
         if (!boot.matches(snapshot)) return error.CacheEvidenceMissing;
-        seen |= bit;
+        seen += 1;
     }
-    if (seen != online) return error.CacheEvidenceMissing;
+    if (seen != online.count()) return error.CacheEvidenceMissing;
 
     const mtrr_type = boot.uniformMtrrType(paddr, bytes) orelse return error.InvalidRange;
     // AMD APM Vol. 2, effective-type table: PAT0 WB + MTRR WC is WC.
@@ -782,9 +752,7 @@ fn wcMmioProofWithSnapshots(
     for ([_]u3{ 1, 4, 5, 6, 7 }) |pat_slot| {
         var common = true;
         for (snapshots, 0..) |*snapshot, cpu_slot| {
-            if (cpu_slot >= 64) break;
-            const bit = @as(u64, 1) << @as(u6, @intCast(cpu_slot));
-            if (online & bit != 0 and !snapshot.patSlotIsWc(pat_slot)) {
+            if (online.contains(cpu_slot) and !snapshot.patSlotIsWc(pat_slot)) {
                 common = false;
                 break;
             }
@@ -797,8 +765,8 @@ fn wcMmioProofWithSnapshots(
 /// Read-only cache proof for the actual CPU PAT/MTRR state. This does not
 /// authorize a BAR lease or modify any identity mapping.
 pub fn wcMmioProof(paddr: u64, bytes: u64) WcMmioProofError!WcMmioProof {
-    const verified = @atomicLoad(u64, &mmio_cache_online_mask, .acquire);
-    return wcMmioProofWithSnapshots(&mmio_cache_snapshots, verified, onlineCpuMask(), paddr, bytes);
+    const verified = mmio_cache_online_mask;
+    return wcMmioProofWithSnapshots(mmio_cache_snapshots, verified, onlineCpuSet(), paddr, bytes);
 }
 
 test "MMIO alias WC proof requires all online CPUs to share a usable PAT slot" {
@@ -811,22 +779,22 @@ test "MMIO alias WC proof requires all online CPUs to share a usable PAT slot" {
         .amd_pat_mtrr_semantics = true,
     };
     var snapshots = [_]mtrr.CacheSnapshot{ base, base };
-    const ready = try wcMmioProofWithSnapshots(&snapshots, 0b11, 0b11, address, 8192);
+    const ready = try wcMmioProofWithSnapshots(&snapshots, testSet(0b11), testSet(0b11), address, 8192);
     try std.testing.expectEqual(@as(u3, 1), ready.pat_slot);
     try std.testing.expectEqual(mtrr.MemoryType.uc, ready.mtrr_type);
 
     snapshots[1].pat &= ~(@as(u64, 0xff) << 8);
-    try std.testing.expectError(error.WcPatUnavailable, wcMmioProofWithSnapshots(&snapshots, 0b11, 0b11, address, 8192));
+    try std.testing.expectError(error.WcPatUnavailable, wcMmioProofWithSnapshots(&snapshots, testSet(0b11), testSet(0b11), address, 8192));
     snapshots[0].pat = 6 | (@as(u64, 7) << 16) | (@as(u64, 1) << 32);
     snapshots[1].pat |= @as(u64, 1) << 32;
-    const high_slot = try wcMmioProofWithSnapshots(&snapshots, 0b11, 0b11, address, 8192);
+    const high_slot = try wcMmioProofWithSnapshots(&snapshots, testSet(0b11), testSet(0b11), address, 8192);
     try std.testing.expectEqual(@as(u3, 4), high_slot.pat_slot);
 
-    try std.testing.expectError(error.CacheEvidenceMissing, wcMmioProofWithSnapshots(&snapshots, 0b01, 0b11, address, 8192));
-    try std.testing.expectError(error.InvalidRange, wcMmioProofWithSnapshots(&snapshots, 0b11, 0b11, address + 1, 8192));
+    try std.testing.expectError(error.CacheEvidenceMissing, wcMmioProofWithSnapshots(&snapshots, testSet(0b01), testSet(0b11), address, 8192));
+    try std.testing.expectError(error.InvalidRange, wcMmioProofWithSnapshots(&snapshots, testSet(0b11), testSet(0b11), address + 1, 8192));
     snapshots[0].amd_pat_mtrr_semantics = false;
     snapshots[1].amd_pat_mtrr_semantics = false;
-    try std.testing.expectError(error.UnsupportedCpu, wcMmioProofWithSnapshots(&snapshots, 0b11, 0b11, address, 8192));
+    try std.testing.expectError(error.UnsupportedCpu, wcMmioProofWithSnapshots(&snapshots, testSet(0b11), testSet(0b11), address, 8192));
 }
 
 test "MMIO alias WC proof admits PAT0 when every MTRR is WC" {
@@ -838,128 +806,73 @@ test "MMIO alias WC proof admits PAT0 when every MTRR is WC" {
         .physical_bits = 46,
     };
     var snapshots = [_]mtrr.CacheSnapshot{ base, base };
-    const proof = try wcMmioProofWithSnapshots(&snapshots, 0b11, 0b11, address, 8192);
+    const proof = try wcMmioProofWithSnapshots(&snapshots, testSet(0b11), testSet(0b11), address, 8192);
     try std.testing.expectEqual(@as(u3, 0), proof.pat_slot);
     try std.testing.expectEqual(mtrr.MemoryType.wc, proof.mtrr_type);
 
     snapshots[1].default_type = (1 << 11) | 6;
-    try std.testing.expectError(error.CacheEvidenceMissing, wcMmioProofWithSnapshots(&snapshots, 0b11, 0b11, address, 8192));
+    try std.testing.expectError(error.CacheEvidenceMissing, wcMmioProofWithSnapshots(&snapshots, testSet(0b11), testSet(0b11), address, 8192));
 }
 
 pub const ExplicitUcMmioStatus = enum {
     ready,
     cache_evidence_missing,
     invalid_range,
-    identity_not_uc,
+    mapping_not_uc,
 };
 
 /// The AMD IOMMU dereferences its register BAR through the low identity VA.
 /// Unlike UC_MINUS device leases, explicit PAT3 UC is safe with a WB MTRR
 /// when every actual identity leaf is UC; do not relax UC_MINUS admission.
-pub fn explicitUcIdentityMmioStatus(paddr: u64, bytes: u64) ExplicitUcMmioStatus {
-    const verified = @atomicLoad(u64, &mmio_cache_online_mask, .acquire);
-    if (verified == 0 or verified != onlineCpuMask()) return .cache_evidence_missing;
-    if (paddr >= @import("arch/x86_64/physical_layout.zig").identity_limit or
-        bytes > @import("arch/x86_64/physical_layout.zig").identity_limit - paddr or
+pub fn explicitUcMmioStatus(paddr: u64, bytes: u64) ExplicitUcMmioStatus {
+    const verified = mmio_cache_online_mask;
+    if (verified.count() == 0 or !verified.eql(onlineCpuSet())) return .cache_evidence_missing;
+    if (!x86_platform.kernelMmioRangeFits(paddr, bytes) or
         !mmio_cache_snapshots[0].rangeSupportsUncachedMapping(paddr, bytes)) return .invalid_range;
     var page = paddr;
     const end = paddr + bytes;
     while (page < end) : (page += 4096) {
-        if (!x86_platform.bootIdentityPageIsExplicitUc(page)) return .identity_not_uc;
+        if (!x86_platform.bootMmioPageIsExplicitUc(page)) return .mapping_not_uc;
     }
     return .ready;
 }
 
-pub fn mmioCacheEvidenceMasks() struct { verified: u64, matching: u64, online: u64 } {
-    var matching: u64 = 0;
-    for (&mmio_cache_matches, 0..) |*value, slot| {
-        if (@atomicLoad(u32, value, .acquire) != 0) matching |= @as(u64, 1) << @intCast(slot);
-    }
-    return .{
-        .verified = @atomicLoad(u64, &mmio_cache_online_mask, .acquire),
-        .matching = matching,
-        .online = onlineCpuMask(),
-    };
+pub fn mmioCacheEvidenceCounts() struct { verified: usize, matching: usize, online: usize } {
+    return .{ .verified = mmio_cache_online_mask.count(), .matching = matching_set.count(), .online = online_set.count() };
 }
 
-fn cacheEvidenceForOnlineCpus(success: bool, count: u8, online: u64, matching: u64) u64 {
-    if (!success or online == 0 or @popCount(online) != count or matching != online) return 0;
-    return online;
-}
-
-test "MMIO alias cache evidence does not depend on broadcast topology" {
-    try std.testing.expectEqual(@as(u64, 0), cacheEvidenceForOnlineCpus(false, 2, 3, 3));
-    try std.testing.expectEqual(@as(u64, 0), cacheEvidenceForOnlineCpus(true, 2, 3, 1));
-    try std.testing.expectEqual(@as(u64, 0), cacheEvidenceForOnlineCpus(true, 3, 3, 3));
-    try std.testing.expectEqual(@as(u64, 3), cacheEvidenceForOnlineCpus(true, 2, 3, 3));
-    try std.testing.expect(!broadcastMaskMatches(0, 3, 3, 0));
-}
-
-fn kernelIdentityRanges() [2][2]u64 {
-    return .{
-        .{ 0, @import("arch/x86_64/physical_layout.zig").identity_limit },
-        .{ x86_platform.phys_copy_window_va + (1 << 21), x86_platform.phys_copy_window_va +
-            (@as(u64, x86_platform.high_mmio_pdp_table_count) << 30) },
-    };
-}
-
-fn identityAliasesUncached(snapshot: *const mtrr.CacheSnapshot, paddr: u64, bytes: u64) bool {
-    // Caller already validated the entire aligned physical range and overflow.
-    for (kernelIdentityRanges()) |range| {
-        const start = @max(paddr, range[0]);
-        const end = @min(paddr + bytes, range[1]);
-        if (start < end and !snapshot.rangeIsUncached(start, end - start)) return false;
-    }
-    return true;
+fn cacheEvidenceForOnlineCpus(success: bool, count: usize, online: CpuSet, matching: CpuSet) bool {
+    return success and online.count() != 0 and online.count() == count and matching.eql(online);
 }
 
 fn ucMinusMmioWithSnapshot(snapshot: *const mtrr.CacheSnapshot, paddr: u64, bytes: u64) bool {
-    return snapshot.rangeIsUcMinusUncached(paddr, bytes) and
-        identityAliasesUncached(snapshot, paddr, bytes);
+    return snapshot.rangeIsUcMinusUncached(paddr, bytes);
 }
 
 /// Explicit UC for the kernel's temporary MMIO window. Existing WB-encoded
 /// identity aliases must remain effectively UC, including the high window.
 pub fn uncachedKernelMmioPageAllowed(paddr: u64) bool {
-    const verified = @atomicLoad(u64, &mmio_cache_online_mask, .acquire);
-    if (verified == 0 or verified != onlineCpuMask()) return false;
+    const verified = mmio_cache_online_mask;
+    if (verified.count() == 0 or !verified.eql(onlineCpuSet())) return false;
     return uncachedKernelMmioPageWithSnapshot(&mmio_cache_snapshots[0], paddr);
 }
 
 fn uncachedKernelMmioPageWithSnapshot(snapshot: *const mtrr.CacheSnapshot, paddr: u64) bool {
-    if (!snapshot.rangeSupportsUncachedMapping(paddr, 4096)) return false;
-    return identityAliasesUncached(snapshot, paddr, 4096);
+    return snapshot.rangeSupportsUncachedMapping(paddr, 4096);
 }
 
-test "MMIO alias cache proof includes low and high identity boundaries" {
-    var snapshot = mtrr.CacheSnapshot{
+test "MMIO alias cache proof uses physical width independently of high window VA" {
+    const snapshot = mtrr.CacheSnapshot{
         .pat = 6 | (@as(u64, 7) << 16),
         .physical_bits = 46,
         .default_type = (1 << 11) | 6,
     };
-    const low_end = @import("arch/x86_64/physical_layout.zig").identity_limit;
-    const high_start = x86_platform.phys_copy_window_va + (1 << 21);
-    const high_end = x86_platform.phys_copy_window_va +
-        (@as(u64, x86_platform.high_mmio_pdp_table_count) << 30);
-    for ([_]u64{ low_end - 4096, high_start, high_end - 4096 }) |paddr| {
-        try std.testing.expect(!uncachedKernelMmioPageWithSnapshot(&snapshot, paddr));
-        try std.testing.expect(!ucMinusMmioWithSnapshot(&snapshot, paddr, 4096));
+    for ([_]u64{ 0xfee00000, 16 << 30, 1 << 39, (1 << 46) - 4096 }) |pa| {
+        try std.testing.expect(uncachedKernelMmioPageWithSnapshot(&snapshot, pa));
+        try std.testing.expect(ucMinusMmioWithSnapshot(&snapshot, pa, 4096));
     }
-    for ([_]u64{ low_end, high_start - 4096, high_end, 0x380000000000 }) |paddr| {
-        try std.testing.expect(uncachedKernelMmioPageWithSnapshot(&snapshot, paddr));
-        try std.testing.expect(ucMinusMmioWithSnapshot(&snapshot, paddr, 4096));
-    }
-    for ([_]u64{ low_end - 4096, high_start - 4096, high_end - 4096 }) |paddr| {
-        try std.testing.expect(!ucMinusMmioWithSnapshot(&snapshot, paddr, 8192));
-    }
-    try std.testing.expect(!ucMinusMmioWithSnapshot(&snapshot, 0x380000000000, std.math.maxInt(u64)));
     try std.testing.expect(!ucMinusMmioWithSnapshot(&snapshot, (1 << 46) - 4096, 8192));
-    snapshot.default_type = 1 << 11;
-    for ([_]u64{ low_end - 4096, high_start, high_end - 4096 }) |paddr| {
-        try std.testing.expect(uncachedKernelMmioPageWithSnapshot(&snapshot, paddr));
-        try std.testing.expect(ucMinusMmioWithSnapshot(&snapshot, paddr, 8192));
-    }
-    try std.testing.expect(!uncachedKernelMmioPageWithSnapshot(&snapshot, 1 << 46));
+    try std.testing.expect(!uncachedKernelMmioPageWithSnapshot(&snapshot, x86_platform.phys_copy_window_va));
 }
 
 test "MMIO alias cache status separates missing evidence from unsafe range" {
@@ -969,10 +882,10 @@ test "MMIO alias cache status separates missing evidence from unsafe range" {
         .default_type = 1 << 11,
     };
     const paddr: u64 = 0xfce00000;
-    try std.testing.expectEqual(UcMinusMmioStatus.cache_evidence_missing, ucMinusMmioStatusWithSnapshot(&snapshot, 0, 0b11, paddr, 0x80000));
-    try std.testing.expectEqual(UcMinusMmioStatus.cache_evidence_missing, ucMinusMmioStatusWithSnapshot(&snapshot, 0b01, 0b11, paddr, 0x80000));
-    try std.testing.expectEqual(UcMinusMmioStatus.ready, ucMinusMmioStatusWithSnapshot(&snapshot, 0b11, 0b11, paddr, 0x80000));
-    try std.testing.expectEqual(UcMinusMmioStatus.unsafe_range, ucMinusMmioStatusWithSnapshot(&snapshot, 0b11, 0b11, paddr, 0));
+    try std.testing.expectEqual(UcMinusMmioStatus.cache_evidence_missing, ucMinusMmioStatusWithSnapshot(&snapshot, testSet(0), testSet(0b11), paddr, 0x80000));
+    try std.testing.expectEqual(UcMinusMmioStatus.cache_evidence_missing, ucMinusMmioStatusWithSnapshot(&snapshot, testSet(0b01), testSet(0b11), paddr, 0x80000));
+    try std.testing.expectEqual(UcMinusMmioStatus.ready, ucMinusMmioStatusWithSnapshot(&snapshot, testSet(0b11), testSet(0b11), paddr, 0x80000));
+    try std.testing.expectEqual(UcMinusMmioStatus.unsafe_range, ucMinusMmioStatusWithSnapshot(&snapshot, testSet(0b11), testSet(0b11), paddr, 0));
 }
 
 pub fn returnCurrentApToIdleFromInterrupt() noreturn {
@@ -1038,7 +951,7 @@ fn redispatchCurrentAp(timer_expired: bool) noreturn {
 
 pub fn wakeCpu(cpu_slot: usize) bool {
     if (cpu_slot == currentCpuSlot()) return true;
-    if (cpu_slot >= max_cpus) return false;
+    if (cpu_slot >= cpuCapacity()) return false;
     // A runnable publication needs its own APIC edge. Coalescing against an
     // earlier vector loses the later publication when the target consumes the
     // first vector immediately before returning to HLT.
@@ -1049,12 +962,30 @@ pub fn wakeCpu(cpu_slot: usize) bool {
     return false;
 }
 
+/// Caller holds K from runnable publication through this return. Only this
+/// path uses the token; general lifecycle/maintenance IPIs remain independent.
+pub fn wakeCpuForNotify(cpu_slot: usize) bool {
+    if (cpu_slot == currentCpuSlot()) return true;
+    if (cpu_slot >= notify_wake.len) return false;
+    if (!notify_wake[cpu_slot].request()) return true;
+    if (wakeCpu(cpu_slot)) return true;
+    notify_wake[cpu_slot].failed();
+    return false;
+}
+
+/// Before the handler's ring-0 early return. Idle resumes its queue-check loop;
+/// busy kernel work retains the ordinary user-return/timer scheduling rules.
+pub fn receiveNotifyWake() void {
+    const cpu = currentCpuSlot();
+    if (cpu < notify_wake.len) notify_wake[cpu].received();
+}
+
 /// Deliver the scheduler/wake vector to any online CPU, including the BSP.
 /// The vector also carries kernel-internal cross-CPU maintenance requests.
 pub fn interruptCpu(cpu_slot: usize) bool {
-    if (cpu_slot >= runtime_lapic_ids.len) return false;
+    if (cpu_slot >= runtime_lapic_id_storage.len) return false;
     const apic_id = runtime_lapic_ids[cpu_slot];
-    if (apic_id == 0xFF) return false;
+    if (apic_id == 0xFFFFFFFF) return false;
     if (cpuState(cpu_slot) == .absent) return false;
     if (wake_ipi_vector == 0) return false;
     return lapic.sendFixedIpi(apic_id, wake_ipi_vector);
@@ -1065,7 +996,7 @@ pub fn interruptCpu(cpu_slot: usize) bool {
 pub fn acknowledgeInterruptDrain() void {
     const generation = @atomicLoad(u64, &irq_drain_generation, .acquire);
     const cpu = currentCpuSlot();
-    if (cpu >= max_cpus or generation == 0 or
+    if (cpu >= cpuCapacity() or generation == 0 or
         @atomicLoad(u64, &irq_drain_ack[cpu], .acquire) == generation) return;
     const first = @atomicLoad(u8, &irq_drain_first, .acquire);
     const count = @atomicLoad(u8, &irq_drain_count, .acquire);
@@ -1078,8 +1009,11 @@ pub fn acknowledgeInterruptDrain() void {
 /// re-enable that source until it returns. IRQ handlers only try the held
 /// kernel-state lock, so the interrupt window cannot recursively acquire it.
 pub fn drainInterruptRange(first: u8, count: u8) bool {
-    const targets = onlineCpuMask();
-    if (targets == 0 or count == 0) return false;
+    // Publishing a request while a remote responder spins with IF=0 can
+    // deadlock before the first ACK; inspect all interrupted owners as well.
+    lock_diagnostics.assertCanWaitForIpi();
+    const targets = onlineCpuSet();
+    if (targets.count() == 0 or count == 0) return false;
     const prior = @atomicLoad(u64, &irq_drain_generation, .acquire);
     if (prior == std.math.maxInt(u64)) return false;
     const generation = prior + 1;
@@ -1088,8 +1022,8 @@ pub fn drainInterruptRange(first: u8, count: u8) bool {
     @atomicStore(u64, &irq_drain_generation, generation, .release);
     var cpu: usize = 0;
     var sent = true;
-    while (cpu < max_cpus and cpu < 64) : (cpu += 1) {
-        if ((targets & (@as(u64, 1) << @intCast(cpu))) != 0 and cpu != currentCpuSlot())
+    while (cpu < cpuCapacity()) : (cpu += 1) {
+        if (targets.contains(cpu) and cpu != currentCpuSlot())
             sent = interruptCpu(cpu) and sent;
     }
     if (!sent) return false;
@@ -1098,8 +1032,8 @@ pub fn drainInterruptRange(first: u8, count: u8) bool {
         acknowledgeInterruptDrain();
         var complete = true;
         cpu = 0;
-        while (cpu < max_cpus and cpu < 64) : (cpu += 1) {
-            if ((targets & (@as(u64, 1) << @intCast(cpu))) != 0 and
+        while (cpu < cpuCapacity()) : (cpu += 1) {
+            if (targets.contains(cpu) and
                 @atomicLoad(u64, &irq_drain_ack[cpu], .acquire) != generation) complete = false;
         }
         if (complete) return true;
@@ -1112,43 +1046,14 @@ pub fn drainInterruptRange(first: u8, count: u8) bool {
 
 /// IF must remain clear. Failure means the caller must use per-CPU sends;
 /// duplicate delivery is harmless for generation-acknowledged maintenance.
-pub fn interruptAllOtherOnlineCpus(target_mask: u64) bool {
-    const complete_mask = @atomicLoad(u64, &broadcast_online_mask, .acquire);
-    const current = currentCpuSlot();
-    if (wake_ipi_vector == 0 or !broadcastMaskMatches(complete_mask, target_mask, onlineCpuMask(), current)) return false;
-    if (@popCount(target_mask) <= 1) return true;
+pub fn interruptAllOtherOnlineCpus(target: CpuSet) bool {
+    if (wake_ipi_vector == 0 or !broadcastMaskMatches(broadcast_online_mask, target, onlineCpuSet(), currentCpuSlot())) return false;
+    if (target.count() <= 1) return true;
     return lapic.sendFixedIpiAllExcludingSelf(wake_ipi_vector);
 }
 
-fn broadcastMaskMatches(complete: u64, target: u64, online: u64, current: usize) bool {
-    if (complete == 0 or target != complete or online != complete or current >= 64) return false;
-    return (target & (@as(u64, 1) << @intCast(current))) != 0;
-}
-
-test "broadcast gate rejects incomplete topology and supports 64 CPUs" {
-    try std.testing.expect(!broadcastMaskMatches(0, 3, 3, 0));
-    try std.testing.expect(!broadcastMaskMatches(3, 1, 3, 0));
-    try std.testing.expect(!broadcastMaskMatches(3, 3, 1, 0));
-    try std.testing.expect(!broadcastMaskMatches(3, 3, 3, 2));
-    try std.testing.expect(!broadcastMaskMatches(3, 3, 3, 64));
-    try std.testing.expect(broadcastMaskMatches(1, 1, 1, 0));
-    try std.testing.expect(broadcastMaskMatches(255, 255, 255, 7));
-    const all = std.math.maxInt(u64);
-    try std.testing.expect(broadcastMaskMatches(all, all, all, 63));
-}
-
-test "broadcast enumeration fails closed on capacity and reserved APIC ID" {
-    var info: BootInfo = .{ .broadcast_topology_complete = true };
-    for (0..64) |id| appendLapicId(&info, @intCast(id));
-    try std.testing.expect(info.broadcast_topology_complete);
-    appendLapicId(&info, 0); // Duplicate records do not drop a physical CPU.
-    try std.testing.expect(info.broadcast_topology_complete);
-    appendLapicId(&info, 64);
-    try std.testing.expect(!info.broadcast_topology_complete);
-    try std.testing.expectEqual(@as(u8, 64), info.lapic_count);
-    info = .{ .broadcast_topology_complete = true };
-    appendLapicId(&info, 0xff);
-    try std.testing.expect(!info.broadcast_topology_complete);
+fn broadcastMaskMatches(complete: CpuSet, target: CpuSet, online: CpuSet, current: usize) bool {
+    return complete.count() != 0 and target.eql(complete) and online.eql(complete) and target.contains(current);
 }
 
 // Both callers enter with IF clear and the local timer already stopped.
@@ -1165,77 +1070,6 @@ fn apIdleLoop(cpu_slot: usize) noreturn {
         }
         asm volatile ("sti; hlt; cli" ::: .{ .memory = true });
     }
-}
-
-fn apIretToUser(entry: *const scheduler_observer.UserEntry) callconv(.winapi) void {
-    asm volatile (std.fmt.comptimePrint(
-            \\mov %[entry], %%rbx
-            \\mov {d}(%%rbx), %%r11
-            \\push %%r11
-            \\lea {d}(%%rbx), %%rbx
-            \\mov {d}(%%rbx), %%r10
-            \\push %%r10
-            \\mov {d}(%%rbx), %%r10
-            \\push %%r10
-            \\mov {d}(%%rbx), %%r10
-            \\push %%r10
-            \\mov {d}(%%rbx), %%r10
-            \\push %%r10
-            \\mov {d}(%%rbx), %%r10
-            \\push %%r10
-            \\mov {d}(%%rbx), %%r10
-            \\push %%r10
-            \\mov {d}(%%rbx), %%r10
-            \\push %%r10
-            \\mov {d}(%%rbx), %%r10
-            \\push %%r10
-            \\mov {d}(%%rbx), %%r10
-            \\push %%r10
-            \\mov {d}(%%rbx), %%r15
-            \\mov {d}(%%rbx), %%r14
-            \\mov {d}(%%rbx), %%r13
-            \\mov {d}(%%rbx), %%r12
-            \\mov {d}(%%rbx), %%r9
-            \\mov {d}(%%rbx), %%r8
-            \\mov {d}(%%rbx), %%rbp
-            \\mov {d}(%%rbx), %%rdi
-            \\mov {d}(%%rbx), %%rsi
-            \\mov {d}(%%rbx), %%rdx
-            \\mov {d}(%%rbx), %%rcx
-            \\mov 72(%%rsp), %%r11
-            \\mov %%r11, %%cr3
-            \\pop %%rax
-            \\pop %%r10
-            \\pop %%rbx
-            \\pop %%r11
-            \\iretq
-        , .{
-            @offsetOf(scheduler_observer.UserEntry, "cr3"),
-            @offsetOf(scheduler_observer.UserEntry, "frame"),
-            @offsetOf(interrupts.TrapFrame, "ss"),
-            @offsetOf(interrupts.TrapFrame, "rsp"),
-            @offsetOf(interrupts.TrapFrame, "rflags"),
-            @offsetOf(interrupts.TrapFrame, "cs"),
-            @offsetOf(interrupts.TrapFrame, "rip"),
-            @offsetOf(interrupts.TrapFrame, "r11"),
-            @offsetOf(interrupts.TrapFrame, "rbx"),
-            @offsetOf(interrupts.TrapFrame, "r10"),
-            @offsetOf(interrupts.TrapFrame, "rax"),
-            @offsetOf(interrupts.TrapFrame, "r15"),
-            @offsetOf(interrupts.TrapFrame, "r14"),
-            @offsetOf(interrupts.TrapFrame, "r13"),
-            @offsetOf(interrupts.TrapFrame, "r12"),
-            @offsetOf(interrupts.TrapFrame, "r9"),
-            @offsetOf(interrupts.TrapFrame, "r8"),
-            @offsetOf(interrupts.TrapFrame, "rbp"),
-            @offsetOf(interrupts.TrapFrame, "rdi"),
-            @offsetOf(interrupts.TrapFrame, "rsi"),
-            @offsetOf(interrupts.TrapFrame, "rdx"),
-            @offsetOf(interrupts.TrapFrame, "rcx"),
-        })
-        :
-        : [entry] "r" (entry),
-        : .{ .memory = true });
 }
 
 fn jumpToUserReturn() callconv(.winapi) void {
@@ -1337,4 +1171,43 @@ test "AP immediate redispatch inherits only an unconsumed busy slice" {
     Probe.count = 0;
     startApUserSlice(Probe, .fresh_slice, 0, 42);
     try std.testing.expectEqual(@as(usize, 0), Probe.count);
+}
+
+// AP reset fetches low PA, but the BSP writes through the owned RAM direct
+// mapping. The dedicated AP root is the only low virtual alias.
+fn trampolineWriter(physical: @import("memory/addresses.zig").PhysicalAddress) ?[*]u8 {
+    if (physical.toInt() == 0 or physical.toInt() & 4095 != 0 or
+        !physical.rangeFits(trampoline_page_bytes, 0x100000)) return null;
+    return (@import("arch/x86_64/physical_layout.zig").identitySlice(u8, physical, trampoline_page_bytes) orelse return null).ptr;
+}
+
+test "SMP address domains trampoline aperture rejects null misalignment and high memory" {
+    try std.testing.expect(trampolineWriter(.fromInt(0)) == null);
+    try std.testing.expect(trampolineWriter(.fromInt(4097)) == null);
+    try std.testing.expect(trampolineWriter(.fromInt(0x100000)) == null);
+    try std.testing.expect(trampolineWriter(.fromInt(std.math.maxInt(u64))) == null);
+    try std.testing.expectEqual(@as(usize, 0xff000), @intFromPtr(trampolineWriter(.fromInt(0xff000)).?));
+}
+
+fn testSet(comptime value: usize) CpuSet {
+    const Fixture = struct {
+        var word = [_]usize{value};
+    };
+    return .{ .words = &Fixture.word, .capacity = 2 };
+}
+
+test "cache evidence and shorthand require every CPU beyond one word" {
+    var a_words: [CpuSet.wordCount(72)]usize = undefined;
+    var b_words: [CpuSet.wordCount(72)]usize = undefined;
+    const a = CpuSet.init(&a_words, 72);
+    const b = CpuSet.init(&b_words, 72);
+    for (0..72) |cpu| a.insert(cpu);
+    b.copyFrom(a);
+    try std.testing.expect(cacheEvidenceForOnlineCpus(true, 72, a, b));
+    try std.testing.expect(broadcastMaskMatches(a, b, a, 71));
+    b.remove(71);
+    try std.testing.expect(!cacheEvidenceForOnlineCpus(true, 72, a, b));
+    try std.testing.expect(!broadcastMaskMatches(a, b, a, 0));
+    try std.testing.expect(!cacheEvidenceForOnlineCpus(false, 72, a, a));
+    try std.testing.expect(!cacheEvidenceForOnlineCpus(true, 71, a, a));
 }

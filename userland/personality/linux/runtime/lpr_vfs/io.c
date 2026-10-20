@@ -105,10 +105,10 @@ static int lpr_elf_read_diag_normal(uint64_t buf, int64_t result)
     return 0;
 }
 #endif
-static int64_t lpr_backend_read_impl(const lpr_fd_pin_t *pin, uint64_t buf, uint64_t count);
-int64_t lpr_backend_read(const lpr_fd_pin_t *pin, uint64_t buf, uint64_t count)
+static int64_t lpr_backend_read_impl(const lpr_fd_pin_t *pin, uint64_t buf, uint64_t count, unsigned *wait_not_ready __attribute__((unused)));
+int64_t lpr_backend_read(const lpr_fd_pin_t *pin, uint64_t buf, uint64_t count, unsigned *wait_not_ready __attribute__((unused)))
 {
-    const int64_t result = lpr_backend_read_impl(pin, buf, count);
+    const int64_t result = lpr_backend_read_impl(pin, buf, count, wait_not_ready);
     if (pin && pin->ops_id == LPR_FD_OPS_FILED && count == 960) {
 #if LPR_ELF_READ_DIAG > 1
         if (lpr_elf_read_diag_normal(buf, result)) return result;
@@ -137,9 +137,9 @@ int64_t lpr_backend_read(const lpr_fd_pin_t *pin, uint64_t buf, uint64_t count)
     }
     return result;
 }
-static int64_t lpr_backend_read_impl(const lpr_fd_pin_t *pin, uint64_t buf, uint64_t count)
+static int64_t lpr_backend_read_impl(const lpr_fd_pin_t *pin, uint64_t buf, uint64_t count, unsigned *wait_not_ready __attribute__((unused)))
 #else
-int64_t lpr_backend_read(const lpr_fd_pin_t *pin, uint64_t buf, uint64_t count)
+int64_t lpr_backend_read(const lpr_fd_pin_t *pin, uint64_t buf, uint64_t count, unsigned *wait_not_ready __attribute__((unused)))
 #endif
 {
     if (pin == 0 || pin->state == 0) {
@@ -177,21 +177,21 @@ int64_t lpr_backend_read(const lpr_fd_pin_t *pin, uint64_t buf, uint64_t count)
         return 0;
     }
     case LPR_FD_OPS_INPUT:
-        return lpr_input_read_events(fd, buf, count);
+        return lpr_input_read_events(fd, buf, count, wait_not_ready);
     case LPR_FD_OPS_DRM:
-        return lpr_drm_read_events(fd, buf, count);
+        return lpr_drm_read_events(fd, buf, count, wait_not_ready);
     case LPR_FD_OPS_TTY:
-        return lpr_tty_io(TERMD_OP_HANDLE_READ, fd, buf, count);
+        return lpr_tty_io(TERMD_OP_HANDLE_READ, fd, buf, count, wait_not_ready);
     case LPR_FD_OPS_EVENT: {
         lpr_event_backend_t *event = pin->state;
         if (event->subtype == LPR_EVENT_BACKEND_INOTIFY) {
-            return lpr_linux_inotify_read(fd, buf, count);
+            return lpr_linux_inotify_read(fd, buf, count, wait_not_ready);
         }
         if (event->subtype == LPR_EVENT_BACKEND_SIGNALFD) {
-            return lpr_linux_signalfd_read(fd, buf, count);
+            return lpr_linux_signalfd_read(fd, buf, count, wait_not_ready);
         }
         if (event->subtype == LPR_EVENT_BACKEND_TIMERFD) {
-            return lpr_linux_timerfd_read(fd, buf, count);
+            return lpr_linux_timerfd_read(fd, buf, count, wait_not_ready);
         }
         if (event->subtype != LPR_EVENT_BACKEND_EVENTFD) {
             return -LPR_LINUX_EBADF;
@@ -224,7 +224,7 @@ int64_t lpr_backend_read(const lpr_fd_pin_t *pin, uint64_t buf, uint64_t count)
                 if (wait_status == 0)
                     wait_status = lpr_wait_deadline_init(&deadline, -1);
                 if (wait_status == 0)
-                    wait_status = lpr_wait_graph_block(&graph, &deadline);
+                    wait_status = lpr_wait_graph_block(&graph, &deadline, wait_not_ready);
                 if (wait_status != 0) return wait_status;
                 counter = __atomic_load_n(
                     &event->counter, __ATOMIC_ACQUIRE);
@@ -272,7 +272,7 @@ int64_t lpr_backend_read(const lpr_fd_pin_t *pin, uint64_t buf, uint64_t count)
         for (;;) {
             const int64_t n = lpr_pacha_syscall3(
                 PACHAOS_SYSCALL_FD_READ,
-                (uint64_t)(uint32_t)pipe->native.raw,
+                (uint64_t)pipe->native.raw,
                 buf,
                 count);
             if (n >= 0) return n;
@@ -282,7 +282,7 @@ int64_t lpr_backend_read(const lpr_fd_pin_t *pin, uint64_t buf, uint64_t count)
             {
                 return err;
             }
-            const int64_t wait_status = lpr_pipe_wait(fd, 0x0001u, 0);
+            const int64_t wait_status = lpr_pipe_wait(fd, 0x0001u, 0, wait_not_ready);
             if (wait_status != 0) {
                 return wait_status;
             }
@@ -305,7 +305,7 @@ int64_t lpr_backend_read(const lpr_fd_pin_t *pin, uint64_t buf, uint64_t count)
 int64_t lpr_backend_readv(
     const lpr_fd_pin_t *pin,
     uint64_t iov_raw,
-    uint64_t iov_count)
+    uint64_t iov_count, unsigned *wait_not_ready __attribute__((unused)))
 {
     if (pin == 0 || pin->state == 0) {
         return -LPR_LINUX_EBADF;
@@ -316,9 +316,9 @@ int64_t lpr_backend_readv(
     const uint64_t fd = pin->fd;
     switch (pin->ops_id) {
     case LPR_FD_OPS_INSTALL_DISK:
-        return lpr_iov_scalar_io(fd, iov_raw, iov_count, 0);
+        return lpr_iov_scalar_io(fd, iov_raw, iov_count, 0, wait_not_ready);
     case LPR_FD_OPS_DEVICE:
-        return lpr_iov_scalar_io(fd, iov_raw, iov_count, 0);
+        return lpr_iov_scalar_io(fd, iov_raw, iov_count, 0, wait_not_ready);
     case LPR_FD_OPS_PIPE: {
         lpr_pipe_backend_t *pipe = (lpr_pipe_backend_t *)pin->state;
         if (!pipe->readable || pipe->native.raw < 0) {
@@ -327,7 +327,7 @@ int64_t lpr_backend_readv(
         for (;;) {
             const int64_t n = lpr_pacha_syscall3(
                 PACHAOS_SYSCALL_FD_READV,
-                (uint64_t)(uint32_t)pipe->native.raw,
+                (uint64_t)pipe->native.raw,
                 iov_raw,
                 iov_count);
             if (n >= 0) {
@@ -339,18 +339,18 @@ int64_t lpr_backend_readv(
             {
                 return err;
             }
-            const int64_t wait_status = lpr_pipe_wait(fd, 0x0001u, 0);
+            const int64_t wait_status = lpr_pipe_wait(fd, 0x0001u, 0, wait_not_ready);
             if (wait_status != 0) {
                 return wait_status;
             }
         }
     }
     case LPR_FD_OPS_TTY:
-        return lpr_iov_scalar_io(fd, iov_raw, iov_count, 0);
+        return lpr_iov_scalar_io(fd, iov_raw, iov_count, 0, wait_not_ready);
     case LPR_FD_OPS_DRM:
-        return lpr_iov_scalar_io(fd, iov_raw, iov_count, 0);
+        return lpr_iov_scalar_io(fd, iov_raw, iov_count, 0, wait_not_ready);
     case LPR_FD_OPS_INPUT:
-        return lpr_iov_scalar_io(fd, iov_raw, iov_count, 0);
+        return lpr_iov_scalar_io(fd, iov_raw, iov_count, 0, wait_not_ready);
     case LPR_FD_OPS_EVENT: {
         const lpr_event_backend_t *event =
             (const lpr_event_backend_t *)pin->state;
@@ -364,7 +364,7 @@ int64_t lpr_backend_readv(
         int64_t total = 0;
         const lpr_linux_iovec_t *iov = (const lpr_linux_iovec_t *)(uintptr_t)iov_raw;
         for (uint64_t i = 0; i < iov_count; i += 1) {
-            const int64_t n = lpr_backend_read(pin, iov[i].base, iov[i].len);
+            const int64_t n = lpr_backend_read(pin, iov[i].base, iov[i].len, wait_not_ready);
             if (n < 0) {
                 return total != 0 ? total : n;
             }

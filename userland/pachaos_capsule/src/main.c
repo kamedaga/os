@@ -116,7 +116,7 @@ static int run_nvme_smoke(void)
 static void log_pci_command(uint64_t device_fd, const char *label)
 {
     uint32_t command = 0;
-    int status = pacha_capsule_pci_config_read((int)device_fd, 0x04, 2, &command);
+    int status = pacha_capsule_pci_config_read((pacha_fd_t)device_fd, 0x04, 2, &command);
     printf("[pachaos_capsule] pci command %s status=%d value=0x%04x\n",
         label,
         status,
@@ -159,7 +159,7 @@ int main(int argc, char **argv)
 
     for (unsigned bar_index = 0; bar_index < 2; bar_index++) {
         struct pacha_capsule_bar_info bar = {0};
-        int bar_status = pacha_capsule_pci_bar_info((int)cfg->device_fd, bar_index, &bar);
+        int bar_status = pacha_capsule_pci_bar_info((pacha_fd_t)cfg->device_fd, bar_index, &bar);
         printf("[pachaos_capsule] pci bar%u status=%d start=0x%llx end=0x%llx size=0x%llx flags=0x%llx\n",
             bar_index,
             bar_status,
@@ -170,7 +170,7 @@ int main(int argc, char **argv)
     }
     for (uint16_t offset = 0x10; offset <= 0x14; offset += 4) {
         uint32_t value = 0;
-        int config_status = pacha_capsule_pci_config_read((int)cfg->device_fd, offset, 4, &value);
+        int config_status = pacha_capsule_pci_config_read((pacha_fd_t)cfg->device_fd, offset, 4, &value);
         printf("[pachaos_capsule] pci config[0x%02x] status=%d value=0x%08x\n",
             offset,
             config_status,

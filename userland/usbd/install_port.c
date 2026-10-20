@@ -17,7 +17,7 @@ static int same_disk(const kb2_block_disk_t *left,
 }
 
 static int find_disk(struct ph_block_client *block, struct ph_ipc *ipc,
-    int process_fd, const kb2_block_disk_t *requested,
+    pacha_fd_t process_fd, const kb2_block_disk_t *requested,
     kb2_block_disk_t *fresh) {
     uint64_t next = 0;
     do {
@@ -39,7 +39,7 @@ static int attach(struct usbd_install_port *port,
     const struct pacha_ipc_msg *request) {
     if (port->shared || request->fd_count != 1 ||
         request->fds[0].fd < 16) return -EPROTO;
-    const int fd = (int)request->fds[0].fd;
+    const pacha_fd_t fd = (pacha_fd_t)request->fds[0].fd;
     struct pacha_fd_info info = {0};
     if (pacha_fd_get_info(fd, &info) ||
         info.kind != PACHA_FD_KIND_VMO ||
@@ -57,7 +57,7 @@ static int attach(struct usbd_install_port *port,
 }
 
 static int dispatch(struct usbd_install_port *port,
-    struct ph_block_client *block, struct ph_ipc *ipc, int process_fd,
+    struct ph_block_client *block, struct ph_ipc *ipc, pacha_fd_t process_fd,
     uint64_t resource_id, kb2_block_disk_t *write_disk,
     int *restart_requested) {
     struct installer_block_page *page = port->shared;
@@ -123,7 +123,7 @@ static int dispatch(struct usbd_install_port *port,
 }
 
 int usbd_install_port_pump(struct usbd_install_port *port,
-    struct ph_block_client *block, struct ph_ipc *ipc, int process_fd,
+    struct ph_block_client *block, struct ph_ipc *ipc, pacha_fd_t process_fd,
     uint64_t resource_id, kb2_block_disk_t *write_disk,
     int *restart_requested) {
     if (!port || port->fd < 16 || !block || !ipc || process_fd < 16 ||
@@ -152,9 +152,9 @@ int usbd_install_port_pump(struct usbd_install_port *port,
         status = dispatch(port, block, ipc, process_fd, resource_id,
             write_disk, restart_requested);
     if (operation != INSTALLER_BLOCK_ATTACH && request.fd_count)
-        (void)pacha_fd_close((int)request.fds[0].fd);
+        (void)pacha_fd_close((pacha_fd_t)request.fds[0].fd);
     if (operation == INSTALLER_BLOCK_ATTACH && status && request.fd_count)
-        (void)pacha_fd_close((int)request.fds[0].fd);
+        (void)pacha_fd_close((pacha_fd_t)request.fds[0].fd);
     port->sequence = sequence > port->sequence ? sequence : port->sequence;
     if (port->shared) port->shared->status = status;
     const struct pacha_ipc_msg reply = {

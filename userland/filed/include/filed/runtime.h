@@ -1,3 +1,4 @@
+#include <pacha/abi.h>
 #pragma once
 #include <stddef.h>
 #include <stdint.h>
@@ -12,8 +13,8 @@ struct filed_unix_hold;
 typedef struct filed_runtime {
     storage_filed_bootstrap_t bootstrap;
     struct filed_storage_owner *storage;
-    int bootstrap_fd, client_endpoint_fd, unix_path_fd;
-    int live_bootfs_fd, live_ready_fd;
+    pacha_fd_t bootstrap_fd, client_endpoint_fd, unix_path_fd;
+    pacha_fd_t live_bootfs_fd, live_ready_fd;
     uint64_t live_bootfs_size;
     uint8_t live_root;
     struct filed_client *clients, *actor;
@@ -22,8 +23,8 @@ typedef struct filed_runtime {
     struct filed_unix_hold *unix_holds;
     uint64_t unix_hold_sequence;
     uint64_t client_sequence, request_sequence, storage_generation;
-    int netd_socket_endpoint_fd, termd_tty_endpoint_fd;
-    int gpud_drm_endpoint_fd, inputd_input_endpoint_fd;
+    pacha_fd_t netd_socket_endpoint_fd, termd_tty_endpoint_fd;
+    pacha_fd_t gpud_drm_endpoint_fd, inputd_input_endpoint_fd;
 } filed_runtime_t;
 void filed_runtime_init(filed_runtime_t *);
 int filed_runtime_bootstrap(filed_runtime_t *, char **);

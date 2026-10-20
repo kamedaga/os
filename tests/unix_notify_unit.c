@@ -13,7 +13,7 @@
 
 struct channels { int fd[3]; int cached; struct unix_notify_cache cache; };
 
-static int channel_resolve(void *raw, uint64_t socket, uint32_t id, int *fd)
+static int channel_resolve(void *raw, uint64_t socket, uint32_t id, pacha_fd_t *fd)
 {
     (void)raw;
     assert(socket == 1 && (id == 1 || id == 2));
@@ -21,7 +21,7 @@ static int channel_resolve(void *raw, uint64_t socket, uint32_t id, int *fd)
     return 0;
 }
 
-static int channel_send(void *raw, int fd, uint64_t token)
+static int channel_send(void *raw, pacha_fd_t fd, uint64_t token)
 {
     struct channels *channels = raw;
     assert(fd == (int)(uint32_t)token + 16);
@@ -34,7 +34,7 @@ static int channel_relay(void *raw, uint64_t socket, uint32_t id)
     assert(0); return -EIO;
 }
 
-static void channel_close(void *raw, int fd) { (void)raw; (void)fd; }
+static void channel_close(void *raw, pacha_fd_t fd) { (void)raw; (void)fd; }
 
 static void signal_channel(void *context, uint64_t token)
 {
@@ -76,7 +76,7 @@ struct cache_fixture {
     int allocation_error, send_error, relay_error;
 };
 
-static int cache_resolve(void *raw, uint64_t socket, uint32_t id, int *fd)
+static int cache_resolve(void *raw, uint64_t socket, uint32_t id, pacha_fd_t *fd)
 {
     struct cache_fixture *fixture = raw;
     assert(socket == 71);
@@ -87,7 +87,7 @@ static int cache_resolve(void *raw, uint64_t socket, uint32_t id, int *fd)
     return 0;
 }
 
-static int cache_send(void *raw, int fd, uint64_t token)
+static int cache_send(void *raw, pacha_fd_t fd, uint64_t token)
 {
     struct cache_fixture *fixture = raw;
     assert(fd == (int)(uint32_t)token + 16);
@@ -103,7 +103,7 @@ static int cache_relay(void *raw, uint64_t socket, uint32_t id)
     return fixture->relay_error;
 }
 
-static void cache_close(void *raw, int fd)
+static void cache_close(void *raw, pacha_fd_t fd)
 {
     assert(fd >= 16);
     ((struct cache_fixture *)raw)->closes++;

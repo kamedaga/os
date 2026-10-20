@@ -1,7 +1,10 @@
+/// Internal waits finish before signal delivery; teardown is never deferred.
+pub const wait_uninterruptible: u64 = 1 << 1;
+
 pub const fd_table_entries: u32 = 256;
-pub const fd_table_limit: u32 = 4096;
 // FD_TABLE(minimum_capacity): zero queries, otherwise grow without shrinking.
-// Returns capacity, maximum, and free slots from first_dynamic_fd as three u64s.
+// Returns capacity, FD-number capacity (excluding reserved top u32 values),
+// and free slots from first_dynamic_fd as three u64s.
 pub const fd_table_info_size: u64 = 24;
 pub const first_dynamic_fd: u32 = 16;
 // FD_DUP only: mint an observation/notification capability for the calling thread's
@@ -200,9 +203,14 @@ pub const event_known_mask: u64 =
 
 pub const pollfd_fd_offset: u64 = 0;
 pub const pollfd_events_offset: u64 = 8;
-pub const pollfd_revents_offset: u64 = 16;
-pub const pollfd_size: u64 = 24;
-pub const max_pollfds: u64 = fd_table_entries;
+pub const pollfd_min_write_bytes_offset: u64 = 16;
+pub const pollfd_revents_offset: u64 = 24;
+pub const pollfd_size: u64 = 32;
+// POLL/WAIT_MANY: R10=index, R8=revents when RAX=1; no copyout.
+// R8=0 on failure/non-singleton (INVALID also has numeric value 1).
+// Otherwise only ready entries are copied out. User wrappers clear revents.
+// One FD_POLL request snapshot, independent of descriptor table capacity.
+pub const max_pollfds: u64 = 256;
 pub const wait_forever: u64 = ~@as(u64, 0);
 
 pub const iovec_base_offset: u64 = 0;

@@ -37,7 +37,7 @@ static void controller_deallocate(void *context, void *pointer, size_t size) {
     free(pointer);
 }
 
-static int wait_readable(int fd, int process_fd) {
+static int wait_readable(pacha_fd_t fd, pacha_fd_t process_fd) {
     struct pacha_pollfd events[2] = {
         {.fd = fd, .events = PACHA_FD_EVENT_READABLE | PACHA_FD_EVENT_HANGUP},
         {.fd = process_fd, .events = PACHA_FD_EVENT_READABLE | PACHA_FD_EVENT_HANGUP},
@@ -48,7 +48,7 @@ static int wait_readable(int fd, int process_fd) {
     return result > 0 && events[0].revents == PACHA_FD_EVENT_READABLE ? 0 : -EIO;
 }
 
-static int wait_process(int process_fd) {
+static int wait_process(pacha_fd_t process_fd) {
     struct pacha_pollfd event = {.fd = process_fd,
         .events = PACHA_FD_EVENT_READABLE | PACHA_FD_EVENT_HANGUP};
     long result = pacha_fd_wait_many(&event, 1, PACHA_FD_WAIT_FOREVER);
@@ -57,8 +57,8 @@ static int wait_process(int process_fd) {
 
 /* Independent capabilities keep storage maintenance out of input cadence.
  * Leave lower-priority ready FDs undrained: the next wait sees them again. */
-static int wait_process_or_tick(int process_fd, int timer_fd,
-    int installer_fd, int input_fd) {
+static int wait_process_or_tick(pacha_fd_t process_fd, pacha_fd_t timer_fd,
+    pacha_fd_t installer_fd, pacha_fd_t input_fd) {
     struct pacha_pollfd events[4] = {
         {.fd = process_fd, .events = PACHA_FD_EVENT_READABLE | PACHA_FD_EVENT_HANGUP},
         {.fd = timer_fd, .events = PACHA_FD_EVENT_READABLE},
@@ -91,7 +91,7 @@ static int wait_process_or_tick(int process_fd, int timer_fd,
 static int send_ready(const struct usbd_boot_config *config, int status) {
     const struct pacha_ipc_msg message = {.word0 = USBD_BOOT_READY_MAGIC,
         .word1 = (uint64_t)(int64_t)status, .word2 = status ? 0 : 1};
-    return pacha_ipc_send((int)config->ready_channel_fd, &message);
+    return pacha_ipc_send((pacha_fd_t)config->ready_channel_fd, &message);
 }
 
 static int complete_action(kb2_controller_t *controller,
@@ -174,7 +174,7 @@ static int start_generation(kb2_controller_t *controller, struct usbd_package *p
                     current->launch.process.fd, generation);
                 if (!connected)
                     connected = usbd_source_open(&current->source,
-                        (int)config->input_source_endpoint_fd, config->resource_id,
+                        (pacha_fd_t)config->input_source_endpoint_fd, config->resource_id,
                         generation, config->pci_segment, config->pci_bus,
                         config->pci_device, config->pci_function);
                 if (!connected)
@@ -265,7 +265,7 @@ static int restart_generation(kb2_controller_t *controller,
 static int run(const struct usbd_boot_config *config) {
     struct usbd_package package = {0};
     int error = usbd_package_open(&package,
-        (int)config->filed_endpoint_fd, (int)config->device_fd, config->kind);
+        (pacha_fd_t)config->filed_endpoint_fd, (pacha_fd_t)config->device_fd, config->kind);
     if (error) {
         printf("[usbd] stage=package-open status=%d\n", error);
         return error;
@@ -278,7 +278,7 @@ static int run(const struct usbd_boot_config *config) {
         return error ? error : -EIO;
     struct usbd_install_port install_port = {
         .fd = config->installer_channel_fd >= 16 ?
-            (int)config->installer_channel_fd : -1,
+            (pacha_fd_t)config->installer_channel_fd : -1,
         .shared_fd = -1};
     kb2_block_disk_t write_disk = {0};
     for (;;) {
@@ -297,7 +297,7 @@ static int run(const struct usbd_boot_config *config) {
         fflush(stdout);
         const uint64_t timer_rights = PACHA_FD_RIGHT_READ | PACHA_FD_RIGHT_WAIT |
             PACHA_FD_RIGHT_POLL | PACHA_FD_RIGHT_CLOSE;
-        int timer_fd = pacha_timerfd_create(UINT64_C(1000000000),
+        pacha_fd_t timer_fd = pacha_timerfd_create(UINT64_C(1000000000),
             UINT64_C(1000000000), timer_rights, 0);
         if (timer_fd < 16) return timer_fd < 0 ? timer_fd : -EIO;
         if (config->kind == USBD_KIND_USB_XHCI) {
@@ -372,7 +372,7 @@ static int run(const struct usbd_boot_config *config) {
 int main(int argc, char **argv) {
     (void)argc;
     struct usbd_boot_config config = {0};
-    int bootstrap_fd = pacha_bootstrap_fd_from_argv(argv);
+    pacha_fd_t bootstrap_fd = pacha_bootstrap_fd_from_argv(argv);
     if (bootstrap_fd < 16 ||
         pacha_fd_read(bootstrap_fd, &config, sizeof(config)) != (long)sizeof(config) ||
         config.magic != USBD_BOOT_CONFIG_MAGIC ||

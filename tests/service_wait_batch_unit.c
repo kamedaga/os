@@ -12,7 +12,7 @@ long pacha_syscall4(uint64_t op, uint64_t address, uint64_t count, uint64_t tick
     if (count > 256 || fail_wait) return PACHA_SYSCALL_ERR_INVALID;
     struct pacha_pollfd *fds = (void *)(uintptr_t)address;
     for (uint64_t i = 0; i < count; ++i) {
-        fds[i].revents = fds[i].fd == ready_fd ? PACHA_FD_EVENT_READABLE : 0;
+        fds[i].revents = fds[i].fd == (uint64_t)ready_fd ? PACHA_FD_EVENT_READABLE : 0;
         if (fds[i].revents) return 1;
     }
     if (ticks) { ++sleeps; if (late_fd) ready_fd = late_fd; }

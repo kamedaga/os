@@ -2,6 +2,7 @@
 #ifndef PACHA_KOBOX_HOST_H
 #define PACHA_KOBOX_HOST_H
 
+#include <pacha/abi.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdatomic.h>
@@ -42,7 +43,7 @@ struct ph_image {
     void *direct;            /* Direct-map view of the entire RAM VMO. */
     size_t size;
     size_t ram_size;         /* Immutable actual allocation after image_open. */
-    int ram_fd;
+    pacha_fd_t ram_fd;
     unsigned char *ram_cache_modes; /* One byte per physical RAM page. */
     struct ph_dma *device_dma; /* Borrowed attached-domain list, quiesced at detach. */
     bool cache_drain_completed;
@@ -81,7 +82,7 @@ struct ph_task {
     /* The fiber running on this native thread, NULL on helper threads. Read
      * only through ph_current_fiber(): see the single-instruction rule below. */
     struct ph_fiber *fiber;
-    int fd;
+    pacha_fd_t fd;
     /* Borrowed boot thread; not joinable by the adapter. */
     bool bound;
     /* Protect host operations from notification-driven Linux entry.
@@ -124,7 +125,7 @@ static inline struct ph_task *ph_current_task(void) {
 struct ph_task *ph_test_current_task(void);
 #endif
 #ifndef PH_TLS_TEST_HOOKS
-#define PH_TLS_LOAD(type, field) ({ type ph_tls_value_; \
+#define PH_TLS_LOAD(type, field) __extension__ ({ type ph_tls_value_; \
     __asm__ volatile("mov %%fs:%c1, %0" : "=r"(ph_tls_value_) \
         : "i"(offsetof(struct ph_task, field)) : "memory"); ph_tls_value_; })
 #define PH_TLS_STORE(field, value) __asm__ volatile("mov %0, %%fs:%c1" \

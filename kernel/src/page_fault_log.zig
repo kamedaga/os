@@ -1,3 +1,4 @@
+const platform = @import("arch/x86_64/platform.zig");
 const kernel = @import("kernel.zig");
 const interrupts = @import("interrupts.zig");
 const scheduler = @import("scheduler.zig").connection;
@@ -49,7 +50,7 @@ pub fn dumpPageWalkForVa(cr3: u64, va: u64) void {
     const pd_index: usize = @intCast((va >> 21) & 0x1FF);
     const pt_index: usize = @intCast((va >> 12) & 0x1FF);
 
-    const pml4_ptr: *const [512]u64 = @ptrFromInt(cr3 & h.page_addr_mask);
+    const pml4_ptr = platform.borrowIdentityTable(.fromInt(cr3 & h.page_addr_mask)) orelse return;
     const pml4e = pml4_ptr[pml4_index];
     h.write("  WALK.CR3=");
     h.write_hex_raw(cr3);
@@ -59,7 +60,7 @@ pub fn dumpPageWalkForVa(cr3: u64, va: u64) void {
     h.write("\n");
     if ((pml4e & h.page_present) == 0) return;
 
-    const pdpt_ptr: *const [512]u64 = @ptrFromInt(pml4e & h.page_addr_mask);
+    const pdpt_ptr = platform.borrowIdentityTable(.fromInt(pml4e & h.page_addr_mask)) orelse return;
     const pdpte = pdpt_ptr[pdpt_index];
     h.write("  WALK.PDPTE=");
     h.write_hex_raw(pdpte);
@@ -67,7 +68,7 @@ pub fn dumpPageWalkForVa(cr3: u64, va: u64) void {
     if ((pdpte & h.page_present) == 0) return;
     if ((pdpte & h.page_ps) != 0) return;
 
-    const pd_ptr: *const [512]u64 = @ptrFromInt(pdpte & h.page_addr_mask);
+    const pd_ptr = platform.borrowIdentityTable(.fromInt(pdpte & h.page_addr_mask)) orelse return;
     const pde = pd_ptr[pd_index];
     h.write("  WALK.PDE=");
     h.write_hex_raw(pde);
@@ -75,7 +76,7 @@ pub fn dumpPageWalkForVa(cr3: u64, va: u64) void {
     if ((pde & h.page_present) == 0) return;
     if ((pde & h.page_ps) != 0) return;
 
-    const pt_ptr: *const [512]u64 = @ptrFromInt(pde & h.page_addr_mask);
+    const pt_ptr = platform.borrowIdentityTable(.fromInt(pde & h.page_addr_mask)) orelse return;
     const pte = pt_ptr[pt_index];
     h.write("  WALK.PTE=");
     h.write_hex_raw(pte);
@@ -291,4 +292,37 @@ pub fn logStep2(cr2: u64, frame: *const ExceptionTrapFrame) void {
     h.write("  MAPPED_PADDR=");
     h.write_hex_raw(mapped_paddr);
     h.write("\n");
+}
+
+test "MMIO overlay physical access page walk stops at the first failed table borrow" {
+    const std = @import("std");
+    const Fixture = struct {
+        var tables: [3][512]u64 align(4096) = undefined;
+        var words: usize = 0;
+        fn write(_: []const u8) void {}
+        fn hex(_: u64) void {
+            words += 1;
+        }
+        fn boolean(_: bool) void {}
+    };
+    const saved_hooks = if (page_fault_log_hooks_ready) page_fault_log_hooks_storage else null;
+    const saved_ready = page_fault_log_hooks_ready;
+    defer {
+        if (saved_hooks) |hooks| page_fault_log_hooks_storage = hooks;
+        page_fault_log_hooks_ready = saved_ready;
+    }
+    init(.{ .page_entries = 512, .page_addr_mask = 0x000f_ffff_ffff_f000, .page_present = 1, .page_ps = 128, .kernel_state_ready = &page_fault_log_hooks_ready, .state = undefined, .write = Fixture.write, .write_hex_raw = Fixture.hex, .write_bool01 = Fixture.boolean });
+    Fixture.words = 0;
+    dumpPageWalkForVa((@as(u64, 1) << 52), 0);
+    try std.testing.expectEqual(@as(usize, 0), Fixture.words);
+    for (&Fixture.tables) |*table| @memset(table, 0);
+    const root = @intFromPtr(&Fixture.tables[0]);
+    try std.testing.expect(root + @sizeOf(@TypeOf(Fixture.tables)) < (@as(u64, 1) << 52));
+    for (0..3) |depth| {
+        Fixture.tables[depth][0] = (@as(u64, 1) << 52) | 1;
+        Fixture.words = 0;
+        dumpPageWalkForVa(root, 0);
+        try std.testing.expectEqual(depth + 2, Fixture.words);
+        if (depth + 1 < 3) Fixture.tables[depth][0] = @intFromPtr(&Fixture.tables[depth + 1]) | 1;
+    }
 }

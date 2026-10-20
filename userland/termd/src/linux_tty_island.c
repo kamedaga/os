@@ -143,7 +143,7 @@ typedef struct termd_linux_tty_handle {
     uint32_t process_id;
     uint32_t pgrp_id;
     uint32_t reserved_owner;
-    int notify_fd;
+    pacha_fd_t notify_fd;
     uint32_t notify_events;
     uint8_t notify_pending;
     uint8_t reserved_notify[3];
@@ -167,7 +167,7 @@ typedef struct termd_linux_tty_handle {
 typedef struct termd_linux_transfer_lease {
     uint8_t active;
     uint8_t reserved0[3];
-    int lease_fd;
+    pacha_fd_t lease_fd;
     uint64_t handle;
 } termd_linux_transfer_lease_t;
 
@@ -659,7 +659,7 @@ static int wait_hvc0_cdev_ready(struct termd_linux_tty_island *island)
     const uint64_t timer_rights = PACHA_FD_RIGHT_INSPECT |
         PACHA_FD_RIGHT_WAIT | PACHA_FD_RIGHT_POLL |
         PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_READ;
-    const int deadline_fd = pacha_timerfd_create(
+    const pacha_fd_t deadline_fd = pacha_timerfd_create(
         256000000ull, 0, timer_rights, PACHA_FD_FLAG_CLOEXEC);
     if (deadline_fd < 16)
         return -5;
@@ -844,7 +844,7 @@ static int termd_linux_tty_find_pts_index(
 int termd_linux_tty_island_open_ptmx(
     struct termd_linux_tty_island *island,
     uint64_t flags,
-    int notify_fd,
+    pacha_fd_t notify_fd,
     uint64_t *out_handle)
 {
     if (island == NULL || out_handle == NULL || notify_fd < 16) {
@@ -926,7 +926,7 @@ int termd_linux_tty_island_open_ptmx(
 int termd_linux_tty_island_open_pts(
     struct termd_linux_tty_island *island,
     const termd_open_request_t *request,
-    int notify_fd,
+    pacha_fd_t notify_fd,
     uint64_t *out_handle)
 {
     if (island == NULL || request == NULL || out_handle == NULL || notify_fd < 16) {
@@ -1023,7 +1023,7 @@ int termd_linux_tty_island_open_pts(
 int termd_linux_tty_island_open_hvc(
     struct termd_linux_tty_island *island,
     const termd_open_request_t *request,
-    int notify_fd,
+    pacha_fd_t notify_fd,
     uint64_t *out_handle)
 {
     if (island == NULL || request == NULL || out_handle == NULL || notify_fd < 16) {
@@ -1104,7 +1104,7 @@ int termd_linux_tty_island_open_hvc(
 int termd_linux_tty_island_open_ctty(
     struct termd_linux_tty_island *island,
     const termd_open_request_t *request,
-    int notify_fd,
+    pacha_fd_t notify_fd,
     uint64_t *out_handle)
 {
     if (request == NULL) {
@@ -1224,7 +1224,7 @@ int termd_linux_tty_island_close(
     return termd_linux_tty_island_close_reason(island, handle_id, "request");
 }
 
-size_t termd_linux_tty_island_collect_wait_sources(int *out_fds, size_t capacity)
+size_t termd_linux_tty_island_collect_wait_sources(pacha_fd_t *out_fds, size_t capacity)
 {
     size_t count = 0;
     if (out_fds == NULL) return 0;
@@ -1262,7 +1262,7 @@ size_t termd_linux_tty_island_reap_hangups(struct termd_linux_tty_island *island
         if (pacha_fd_poll(&pollfd, 1) <= 0 ||
             (pollfd.revents & PACHA_FD_EVENT_HANGUP) == 0) continue;
         const uint64_t handle_id = handle->handle;
-        const int notify_fd = handle->notify_fd;
+        const pacha_fd_t notify_fd = handle->notify_fd;
         handle->notify_fd = -1;
         (void)pacha_fd_close(notify_fd);
         handle->ref_count = termd_linux_transfer_lease_count(handle_id) + 1u;
@@ -1327,7 +1327,7 @@ int termd_linux_tty_island_dup(
 int termd_linux_tty_island_transfer_dup(
     struct termd_linux_tty_island *island,
     uint64_t handle_id,
-    int lease_fd,
+    pacha_fd_t lease_fd,
     uint64_t *out_handle)
 {
     if (island == NULL || out_handle == NULL || lease_fd < 16) {
@@ -1462,7 +1462,7 @@ int termd_linux_tty_island_ioctl(
 int termd_linux_tty_island_open_peer(
     struct termd_linux_tty_island *island,
     const termd_ioctl_request_t *request,
-    int notify_fd,
+    pacha_fd_t notify_fd,
     uint64_t *out_handle)
 {
     if (island == NULL || request == NULL || out_handle == NULL || notify_fd < 16) {
@@ -1932,7 +1932,7 @@ int termd_linux_tty_island_init(
         struct pacha_capsule_irq wake_irq;
         memset(&wake_irq, 0, sizeof(wake_irq));
         const int irq_status = pacha_capsule_device_derive_irq(
-            (int)cfg->device_fd,
+            (pacha_fd_t)cfg->device_fd,
             PACHA_CAPSULE_IRQ_AUTO,
             0,
             0,

@@ -33,7 +33,7 @@ int lpr_unix_address_copy(const struct unix_address *name, uint64_t address, uin
 { (void)name; (void)address; (void)length; assert(0); return -EINVAL; }
 int64_t lpr_unix_socket_message_iov(const lpr_fd_pin_t *pin, uint64_t vectors,
     uint64_t count, int writing, uint64_t flags, uint32_t *returned,
-    struct lpr_unix_ancillary *ancillary)
+    struct lpr_unix_ancillary *ancillary, unsigned *wait_not_ready __attribute__((unused)))
 {
     (void)vectors; (void)count; (void)writing; (void)flags;
     assert(pin->state == &socket_state);
@@ -57,7 +57,7 @@ static void receive(int writing)
         .control = (uint64_t)(uintptr_t)control, .control_length = sizeof(control),
         .flags = 0x1234,
     };
-    assert(lpr_unix_socket_message(35, (uint64_t)(uintptr_t)&message, 0, writing) == next_result);
+    assert(lpr_unix_socket_message(35, (uint64_t)(uintptr_t)&message, 0, writing, 0) == next_result);
     if (!writing && next_result >= 0) {
         assert(message.flags == next_flags && message.control_length == 24);
     } else assert(message.flags == 0x1234 && message.control_length == sizeof(control));
@@ -85,4 +85,14 @@ int main(void)
     assert(logs == LPR_UNIX_DIAG_MAX_RECORDS);
     puts("unix recvmsg truncation diagnostic: quiet normal path, unchanged result/flags and bounded errors PASS");
     return 0;
+}
+
+#include "lpr_ipc_mock.h"
+int64_t lpr_ipc_message(uint64_t nr, uint64_t fd, uint64_t send, uint64_t receive,
+    uint64_t timeout, uint64_t flags, int *committed) {
+    return test_lpr_ipc_noncall(nr, fd, send, receive, timeout, flags, committed);
+}
+
+int64_t lpr_pacha_syscall4(uint64_t nr,uint64_t a,uint64_t b,uint64_t c,uint64_t d) {
+    (void)nr;(void)a;(void)b;(void)c;(void)d;abort();
 }

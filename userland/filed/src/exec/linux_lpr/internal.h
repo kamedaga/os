@@ -1,3 +1,4 @@
+#include <pacha/abi.h>
 #pragma once
 
 #include <stdint.h>
@@ -77,13 +78,13 @@ typedef struct lpr_exec_loaded {
 
 typedef struct lpr_exec_pending_map_batch {
     struct pacha_process_map_batch_entry *entries;
-    int *close_fds;
+    pacha_fd_t *close_fds;
     uint64_t count, capacity;
 } lpr_exec_pending_map_batch_t;
 
 typedef struct lpr_exec_plan {
-    int process_fd;
-    int thread_fd;
+    pacha_fd_t process_fd;
+    pacha_fd_t thread_fd;
     uint64_t main_entry;
     uint64_t runtime_entry;
     uint64_t interpreter_base;
@@ -190,15 +191,15 @@ int lpr_exec_patch_syscalls(
     uint64_t *out_patched);
 void lpr_exec_map_dump_metrics(void);
 
-int lpr_exec_install_low_layout(int process_fd, uint64_t syscall_entry_va);
+int lpr_exec_install_low_layout(pacha_fd_t process_fd, uint64_t syscall_entry_va);
 int lpr_exec_load_image_into_process(
-    int process_fd,
+    pacha_fd_t process_fd,
     const lpr_exec_image_t *image,
     uint64_t dyn_base,
     int patch_text,
     lpr_exec_loaded_t *loaded);
 int lpr_exec_load_image_with_low_layout_into_process(
-    int process_fd,
+    pacha_fd_t process_fd,
     const lpr_exec_image_t *image,
     uint64_t dyn_base,
     int patch_text,
@@ -206,7 +207,7 @@ int lpr_exec_load_image_with_low_layout_into_process(
     lpr_exec_loaded_t *loaded);
 int lpr_exec_load_file_into_process(
     filed_runtime_t *runtime,
-    int process_fd,
+    pacha_fd_t process_fd,
     const lpr_exec_file_t *file,
     const lpr_exec_meta_t *meta,
     uint64_t dyn_base,
@@ -214,7 +215,7 @@ int lpr_exec_load_file_into_process(
     lpr_exec_loaded_t *loaded);
 void lpr_exec_pending_map_batch_init(lpr_exec_pending_map_batch_t *batch);
 void lpr_exec_pending_map_batch_discard(lpr_exec_pending_map_batch_t *batch);
-int lpr_exec_pending_map_batch_commit(int process_fd, lpr_exec_pending_map_batch_t *batch);
+int lpr_exec_pending_map_batch_commit(pacha_fd_t process_fd, lpr_exec_pending_map_batch_t *batch);
 int lpr_exec_prepare_file_into_map_batch(
     filed_runtime_t *runtime,
     const lpr_exec_file_t *file,
@@ -224,5 +225,5 @@ int lpr_exec_prepare_file_into_map_batch(
     lpr_exec_pending_map_batch_t *batch,
     lpr_exec_loaded_t *loaded);
 
-int lpr_exec_start_plan(lpr_exec_plan_t *plan, const filed_exec_path_t *request, int bootstrap_fd, int start_thread);
-void lpr_exec_discard_process_fd(int process_fd);
+int lpr_exec_start_plan(lpr_exec_plan_t *plan, const filed_exec_path_t *request, pacha_fd_t bootstrap_fd, int start_thread);
+void lpr_exec_discard_process_fd(pacha_fd_t process_fd);

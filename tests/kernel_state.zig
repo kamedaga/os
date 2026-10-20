@@ -1,3 +1,15 @@
+// Historical pool sizes used only to exercise growth beyond the removed limits.
+const former_max_fd_objects: usize = 8192;
+const former_max_pipes: usize = 256;
+const former_max_ipc_endpoints: usize = 1024;
+const former_max_ipc_channels: usize = 1024;
+const former_max_ipc_replies: usize = 1024;
+const former_max_native_vmos: usize = 32768;
+const former_max_vmas_per_process: usize = 8192;
+const former_max_fd_wait_groups: usize = 256;
+const former_max_fd_wait_group_links: usize = 512;
+const former_max_task_fd_waiters: usize = 256;
+
 const std = @import("std");
 const kernel = @import("kernel");
 const fd_abi = @import("kernel_abi_root").fd_abi;
@@ -7,36 +19,122 @@ const KernelState = kernel.KernelState;
 const KernelError = kernel.KernelError;
 const FreePageList = kernel.FreePageList;
 const PrincipalId = kernel.PrincipalId;
+const DmaHold = kernel.DmaRetentionTestHold;
 
 const p0: PrincipalId = kernel.processPrincipalFromIndex(0) orelse unreachable;
 const p1: PrincipalId = kernel.processPrincipalFromIndex(1) orelse unreachable;
 const p2: PrincipalId = kernel.processPrincipalFromIndex(2) orelse unreachable;
 
+var invocation_allocator = kernel.InvocationStorageTestAllocator{};
+
 var fd_capacity_backing: [64 * 1024 * 1024]u8 align(4096) = undefined;
 var runtime_storage: [kernel.runtimeStorageBytes()]u8 align(4096) = undefined;
 var backing_growth_memory: [128 * 4096]u8 align(4096) = undefined;
 
-fn initFdState() !KernelState {
+var physical_host_grants: [3]kernel.PhysicalAccessTest.Mapping = undefined;
+fn physicalFixture() !kernel.PhysicalAccessTest.BackingSet {
+    // Explicit host grants take priority even when a linker places them inside
+    // a logical fixture PA window. Their data and PMM descriptor share backing.
+    physical_host_grants = .{
+        .{ .physical = @intFromPtr(&fd_capacity_backing), .bytes = &fd_capacity_backing },
+        .{ .physical = @intFromPtr(&runtime_storage), .bytes = &runtime_storage },
+        .{ .physical = @intFromPtr(&backing_growth_memory), .bytes = &backing_growth_memory },
+    };
+    kernel.PhysicalAccessTest.host_mappings = &physical_host_grants;
+    return kernel.PhysicalAccessTest.BackingSet.initMixed(&.{
+        .{ .first = 4096, .pages = 4095 },
+        .{ .first = 64 << 20, .pages = 768 },
+        .{ .first = 0x08000000, .pages = 16 },
+        .{ .first = 0x09000000, .pages = 16 },
+        .{ .first = 0x0a000000, .pages = 16 },
+        .{ .first = 0x0b000000, .pages = 16 },
+        .{ .first = 0x80000000, .pages = 0x11000 },
+        .{ .first = (1 << 32) - (2 << 20), .pages = 1536 },
+        .{ .first = 20 << 30, .pages = 131072 },
+        .{ .first = 16 << 30, .pages = 16 },
+        .{ .first = 254 * (@as(u64, 1) << 39), .pages = 1024 },
+    });
+}
+
+fn initFdState(state: *KernelState) !void {
+    kernel.resetDmaRetentionForTest();
     try std.testing.expect(kernel.initRuntimeStorage(runtime_storage[0..]));
-    // Avoid stacking two by-value initialization helpers for this large state.
-    var state: KernelState = undefined;
+    // Stable timer owners bind during process admission; initialize at final address.
+    try state.initFromDetectedRegionsInPlace(300);
+    state.invocation_test_allocator = invocation_allocator.interface();
+}
+
+fn reconstructUnbackedFixtureInPlace(state: *KernelState) !void {
+    // Only these serial logical waiter fixtures use this teardown. No PMM
+    // backing or borrower survives; do not make production live reset legal.
+    try std.testing.expect(state.fd_tables_extra.directory_owner.bound_address == null);
+    try std.testing.expect(state.fd_tables_extra.directory_owner.published == null and state.fd_tables_extra.directory_owner.retired == null and state.fd_tables_extra.directory_owner.pending == null);
+    try std.testing.expect(state.vma_directory_storage.bound_address == null);
+    try std.testing.expect(state.vma_body_storage.bound_address == null);
+    try std.testing.expect(state.descriptor_storage.bound_address == null);
+    state.deinitPools();
+    state.* = undefined;
     try state.initFromDetectedRegionsInPlace(1);
-    return state;
 }
 
 fn createTestFdObject(s: *KernelState, id: u64) !kernel.KernelObjectRef {
     return s.createKernelObject(.event, .{ .event = id });
 }
 
-fn expectVmoSlotEqual(expected: kernel.NativeVmoSlot, actual: kernel.NativeVmoSlot) !void {
+fn releaseFixtureOwner(owner: anytype) void {
+    // Test-only teardown after all borrowers and workers finish. Save original
+    // issuer/grant/link before release, which invalidates the record itself.
+    inline for (.{ owner.published, owner.retired, owner.pending }) |head| {
+        var cursor = head;
+        while (cursor) |record| {
+            const next = record.next;
+            const allocator = record.allocator;
+            const allocation = record.allocation;
+            std.debug.assert(allocator.release(allocator.context, allocation));
+            cursor = next;
+        }
+    }
+    owner.published = null;
+    owner.retired = null;
+    owner.pending = null;
+}
+
+// Compare resource semantics without recursively traversing reverse links.
+// ReferenceCheck verifies reverse links; expectVmaAddressIndex verifies the
+// address index and its owner. Neither graph is a recursively comparable value.
+fn expectResourceEqualDeep(expected: anytype, actual: @TypeOf(expected)) !void {
+    const T = @TypeOf(expected);
+    if (T == kernel.VmaEntry or T == kernel.FdEntry) {
+        inline for (std.meta.fields(T)) |field| {
+            if (comptime T == kernel.FdEntry and std.mem.eql(u8, field.name, "authority")) {
+                if (expected.object.kind == .endpoint or expected.object.kind == .channel)
+                    try std.testing.expectEqual(expected.authority.ipc_generation, actual.authority.ipc_generation);
+            } else if (comptime T == kernel.FdEntry and std.mem.eql(u8, field.name, "cursor")) {
+                if (expected.object.kind == .endpoint or expected.object.kind == .channel)
+                    try std.testing.expectEqual(expected.cursor.ipc_queue, actual.cursor.ipc_queue)
+                else
+                    try std.testing.expectEqual(expected.cursor.offset, actual.cursor.offset);
+            } else if (comptime !std.mem.eql(u8, field.name, "references")) {
+                try std.testing.expectEqualDeep(@field(expected, field.name), @field(actual, field.name));
+            }
+        }
+    } else try std.testing.expectEqualDeep(expected, actual);
+}
+
+fn expectVmoSlotEqual(expected: kernel.NativeVmoSlot, observed: kernel.NativeVmoSlot) !void {
+    var actual = observed;
+    // Instrumentation is not published VMO state. Still compare roots, owners,
+    // PFN counts and the actual lock byte below.
+    actual.page_store.lock.takes = expected.page_store.lock.takes;
+    actual.page_store.visits = expected.page_store.visits;
     inline for (std.meta.fields(kernel.NativeVmoSlot)) |field| {
-        if (comptime !std.mem.eql(u8, field.name, "backing"))
-            try std.testing.expectEqualDeep(@field(expected, field.name), @field(actual, field.name));
+        if (comptime !std.mem.eql(u8, field.name, "backing") and !std.mem.eql(u8, field.name, "references") and !std.mem.eql(u8, field.name, "parent_edge"))
+            try expectResourceEqualDeep(@field(expected, field.name), @field(actual, field.name));
     }
     if (expected.kind == .device_memory)
-        try std.testing.expectEqualDeep(expected.backing.device, actual.backing.device)
+        try expectResourceEqualDeep(expected.backing.device, actual.backing.device)
     else
-        try std.testing.expectEqualDeep(expected.backing.parent, actual.backing.parent);
+        try expectResourceEqualDeep(expected.backing.parent, actual.backing.parent);
 }
 
 fn fdRights(comptime fields: anytype) kernel.FdRights {
@@ -139,6 +237,9 @@ fn finishAcpiChecksum(bytes: []u8) void {
 }
 
 test "DMAR RMRR clips continuous DMA window and rejects malformed reservations" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
     var fixture: [48 + 16 + 32]u8 = undefined;
     initDmarFixture(&fixture, 47, 0);
     writeDrhd(&fixture, 48, 1, 0, 0xfed90000);
@@ -162,6 +263,9 @@ test "DMAR RMRR clips continuous DMA window and rejects malformed reservations" 
 }
 
 test "DMAR parser accepts one DRHD" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
     var fixture = [_]u8{0} ** 64;
     initDmarFixture(fixture[0..], 47, 0x1);
     writeDrhd(fixture[0..], 48, 0x1, 3, 0xfed9_0000);
@@ -172,12 +276,15 @@ test "DMAR parser accepts one DRHD" {
     try std.testing.expectEqual(@as(u16, 48), parsed.hostAddressWidthBits());
     try std.testing.expectEqual(@as(u8, 0x1), parsed.flags);
     try std.testing.expectEqual(@as(usize, 1), parsed.drhd_count);
-    try std.testing.expectEqual(@as(u64, 0xfed9_0000), parsed.drhds[0].register_base);
-    try std.testing.expectEqual(@as(u16, 3), parsed.drhds[0].segment);
-    try std.testing.expect(parsed.drhds[0].include_pci_all);
+    try std.testing.expectEqual(@as(u64, 0xfed9_0000), parsed.drhdAt(0).register_base);
+    try std.testing.expectEqual(@as(u16, 3), parsed.drhdAt(0).segment);
+    try std.testing.expect(parsed.drhdAt(0).include_pci_all);
 }
 
 test "DMAR parser retains multiple DRHD structures" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
     var fixture = [_]u8{0} ** 80;
     initDmarFixture(fixture[0..], 38, 0);
     writeDrhd(fixture[0..], 48, 0, 0, 0xfed9_0000);
@@ -186,13 +293,16 @@ test "DMAR parser retains multiple DRHD structures" {
 
     const parsed = try kernel.acpi_dmar.parseDmar(fixture[0..]);
     try std.testing.expectEqual(@as(usize, 2), parsed.drhd_count);
-    try std.testing.expect(!parsed.drhds[0].include_pci_all);
-    try std.testing.expectEqual(@as(u16, 2), parsed.drhds[1].segment);
-    try std.testing.expectEqual(@as(u64, 0xfeda_0000), parsed.drhds[1].register_base);
-    try std.testing.expect(parsed.drhds[1].include_pci_all);
+    try std.testing.expect(!parsed.drhdAt(0).include_pci_all);
+    try std.testing.expectEqual(@as(u16, 2), parsed.drhdAt(1).segment);
+    try std.testing.expectEqual(@as(u64, 0xfeda_0000), parsed.drhdAt(1).register_base);
+    try std.testing.expect(parsed.drhdAt(1).include_pci_all);
 }
 
 test "DMAR parser retains DRHD device scopes and paths" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
     var fixture = [_]u8{0} ** 74;
     initDmarFixture(fixture[0..], 47, 0);
     writeDrhdWithLength(fixture[0..], 48, 26, 0, 0, 0xfed9_0000);
@@ -204,9 +314,9 @@ test "DMAR parser retains DRHD device scopes and paths" {
     finishAcpiChecksum(fixture[0..]);
 
     const parsed = try kernel.acpi_dmar.parseDmar(fixture[0..]);
-    try std.testing.expectEqual(@as(u16, 26), parsed.drhds[0].length);
-    try std.testing.expectEqual(@as(usize, 1), parsed.drhds[0].scope_count);
-    const scope = parsed.drhds[0].scopes[0];
+    try std.testing.expectEqual(@as(u16, 26), parsed.drhdAt(0).length);
+    try std.testing.expectEqual(@as(usize, 1), parsed.drhdAt(0).scope_count);
+    const scope = parsed.drhdAt(0).scopeAt(0);
     try std.testing.expectEqual(@as(u8, 1), scope.scope_type);
     try std.testing.expectEqual(@as(u8, 7), scope.enumeration_id);
     try std.testing.expectEqual(@as(usize, 2), scope.path_count);
@@ -215,6 +325,9 @@ test "DMAR parser retains DRHD device scopes and paths" {
 }
 
 test "DMAR parser rejects malformed DRHD device scope" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
     var fixture = [_]u8{0} ** 72;
     initDmarFixture(fixture[0..], 47, 0);
     writeDrhdWithLength(fixture[0..], 48, 24, 0, 0, 0xfed9_0000);
@@ -228,6 +341,9 @@ test "DMAR parser rejects malformed DRHD device scope" {
 }
 
 test "DMAR parser skips unknown remapping structure types" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
     var fixture = [_]u8{0} ** 72;
     initDmarFixture(fixture[0..], 38, 0);
     writeDmarStructureHeader(fixture[0..], 48, 0x7fff, 8);
@@ -237,10 +353,13 @@ test "DMAR parser skips unknown remapping structure types" {
 
     const parsed = try kernel.acpi_dmar.parseDmar(fixture[0..]);
     try std.testing.expectEqual(@as(usize, 1), parsed.drhd_count);
-    try std.testing.expectEqual(@as(u64, 0xfed9_0000), parsed.drhds[0].register_base);
+    try std.testing.expectEqual(@as(u64, 0xfed9_0000), parsed.drhdAt(0).register_base);
 }
 
 test "DMAR parser rejects invalid and out-of-bounds structure lengths" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
     var zero_length = [_]u8{0} ** 52;
     initDmarFixture(zero_length[0..], 38, 0);
     writeDmarStructureHeader(zero_length[0..], 48, 0, 0);
@@ -261,6 +380,9 @@ test "DMAR parser rejects invalid and out-of-bounds structure lengths" {
 }
 
 test "DMAR parser rejects checksum mismatch" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
     var fixture = [_]u8{0} ** 64;
     initDmarFixture(fixture[0..], 38, 0);
     writeDrhd(fixture[0..], 48, 1, 0, 0xfed9_0000);
@@ -274,6 +396,9 @@ test "DMAR parser rejects checksum mismatch" {
 }
 
 test "VT-d table builders encode legacy root context and second-level entries" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
     var root = [_]u64{0xffff_ffff_ffff_ffff} ** 512;
     kernel.vtd_tables.clear(&root);
     try std.testing.expect(kernel.vtd_tables.setRootEntry(&root, 0x2a, 0x1234_5000));
@@ -293,6 +418,9 @@ test "VT-d table builders encode legacy root context and second-level entries" {
 }
 
 test "VT-d table builders reject unaligned and out-of-range inputs" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
     var page = [_]u64{0} ** 512;
     try std.testing.expect(!kernel.vtd_tables.setRootEntry(&page, 0, 0x1234_5001));
     try std.testing.expect(!kernel.vtd_tables.setContextEntry(&page, 0, 0x0010_0000_0000_0000, 1));
@@ -302,6 +430,9 @@ test "VT-d table builders reject unaligned and out-of-range inputs" {
 }
 
 test "VT-d IOVA allocator allocates frees exhausts and wraps its cursor" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
     const t = kernel.vtd_tables;
     var storage = t.IovaTestStorage{};
     const page_count = 65536;
@@ -330,6 +461,9 @@ test "VT-d IOVA allocator allocates frees exhausts and wraps its cursor" {
 }
 
 test "VT-d device domains isolate mappings and reuse teardown IOVA" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
     const t = kernel.vtd_tables;
     var context = [_]u64{0} ** t.entries_per_page;
     var domain_roots: [2]t.TablePage align(4096) = undefined;
@@ -359,9 +493,14 @@ test "VT-d device domains isolate mappings and reuse teardown IOVA" {
 }
 
 test "process descriptor capacity limit does not exceed address-space storage" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     var free_list = FreePageList{};
-    try free_list.appendContiguousRange(0, 0x20_0000, 16);
+    try free_list.installRegions(&.{.{ .id = 0, .start = 0x20_0000, .end = (0x20_0000) + (16) * 4096 }});
+    try free_list.seedContiguousRange(0x20_0000, 16);
     const limit = kernel.initial_process_count + 2;
 
     const first = s.createProcessDescriptorWithCapacityLimit("limited-0", &free_list, limit) orelse unreachable;
@@ -378,7 +517,11 @@ const NoopUnmapper = struct {
 };
 
 test "fd install allocates lowest slots and close releases object" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     const obj0 = try createTestFdObject(&s, 1);
     const obj1 = try createTestFdObject(&s, 2);
 
@@ -396,7 +539,11 @@ test "fd install allocates lowest slots and close releases object" {
 }
 
 test "fd dup requires dup right and rejects rights escalation" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     const obj = try createTestFdObject(&s, 10);
     const no_dup = fdRights(.{ .transfer = true });
     const fd0 = try s.installFd(p0, obj, no_dup, .{}, 0);
@@ -417,7 +564,11 @@ test "fd dup requires dup right and rejects rights escalation" {
 }
 
 test "fd transfer copy and move enforce transfer right and refcounts" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     const obj = try createTestFdObject(&s, 20);
     const no_transfer = fdRights(.{ .dup = true });
     const fd0 = try s.installFd(p0, obj, no_transfer, .{}, 0);
@@ -439,7 +590,11 @@ test "fd transfer copy and move enforce transfer right and refcounts" {
 }
 
 test "capsule device authority is a native fd object" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     const rights = fdRights(.{
         .inspect = true,
         .dup = true,
@@ -468,9 +623,13 @@ test "capsule device authority is a native fd object" {
 }
 
 test "pinned overlap exception is exact and other pins still reject" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     const base: u64 = 0x4000_0000;
-    s.next_fd_object_scan = kernel.max_fd_objects - 1;
+    s.next_fd_object_scan = former_max_fd_objects - 1;
     const source_fd = try s.createDmaBufferFd(p0, .{
         .device = 1,
         .user_va = base + 0x80,
@@ -497,18 +656,18 @@ test "pinned overlap exception is exact and other pins still reject" {
 
     const alias = try s.dupFd(p0, source_fd, 16, fdRights(.{ .close = true }), .{});
     try s.closeFd(p0, source_fd);
-    try std.testing.expect(s.pinned_object_slots.isSet(source_ref.index));
+    try std.testing.expect(s.fd_objects.isMarked(@intCast(source_ref.index), 1));
     var free_list = FreePageList{};
     try s.closeFdWithFreeList(p0, alias, &free_list);
-    try std.testing.expect(!s.pinned_object_slots.isSet(source_ref.index));
+    try std.testing.expect(!s.fd_objects.isMarked(@intCast(source_ref.index), 1));
     try std.testing.expect(s.rangeOverlapsPinnedUserObject(p0, base, 4096));
     s.next_fd_object_scan = source_ref.index;
     const reused = try createTestFdObject(&s, 22);
     try std.testing.expectEqual(source_ref.index, reused.index);
     try std.testing.expect(reused.generation != source_ref.generation);
-    try std.testing.expect(!s.pinned_object_slots.isSet(reused.index));
+    try std.testing.expect(!s.fd_objects.isMarked(@intCast(reused.index), 1));
     s.resetKernelObjectTable();
-    try std.testing.expectEqual(@as(usize, 0), s.pinned_object_slots.count());
+    try std.testing.expectEqual(@as(usize, 0), markedCount(&s.fd_objects, 1));
     try std.testing.expect(!s.rangeOverlapsPinnedUserObject(p0, base, 4096));
     // An unpublished object is indexed, but ref_count=0 is not a live pin.
     const pending = try s.createKernelObject(.dma_mapping, .{ .dma_mapping = .{
@@ -516,14 +675,18 @@ test "pinned overlap exception is exact and other pins still reject" {
         .user_va = base,
         .size = 64,
     } });
-    try std.testing.expect(s.pinned_object_slots.isSet(pending.index));
+    try std.testing.expect(s.fd_objects.isMarked(@intCast(pending.index), 1));
     try std.testing.expect(!s.rangeOverlapsPinnedUserObject(p0, base, 4096));
     s.clearKernelObjectSlot(s.kernelObjectSlot(pending).?);
-    try std.testing.expectEqual(@as(usize, 0), s.pinned_object_slots.count());
+    try std.testing.expectEqual(@as(usize, 0), markedCount(&s.fd_objects, 1));
 }
 
 test "DMA derivation aliases DMA pins only when explicitly allowed" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     const base: u64 = 0x4080_0000;
     const source_fd = try s.createDmaBufferFd(p0, .{
         .device = 1,
@@ -554,14 +717,14 @@ test "DMA derivation aliases DMA pins only when explicitly allowed" {
 
     const scatter_base: u64 = base + 0xc_0000;
     var scatter_free_list = FreePageList{};
-    const scatter_fd = try s.createDmaMappingFd(p0, .{
+    const scatter_fd = try s.createDmaMappingFdWithBacking(p0, .{
         .device = 1,
         .user_va = scatter_base + 0x80,
         .iova = 0x908c_0080,
         .size = 64,
         .page_count = 1,
         .direction = .from_device,
-    }, fdRights(.{ .close = true }), .{}, 16);
+    }, fdRights(.{ .close = true }), .{}, 16, &.{0x908c0000});
     try std.testing.expect(s.rangeConflictsWithDmaDerivation(p0, scatter_base, 4096, null, true, false));
 
     const second_mapping_fd = try s.createDmaMappingFd(p0, .{
@@ -596,16 +759,20 @@ test "DMA derivation aliases DMA pins only when explicitly allowed" {
 }
 
 test "VT-d scatter DMA aliases do not relax other pinned objects or pass-through" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     const scatter_base: u64 = 0x4098_0000;
-    _ = try s.createDmaMappingFd(p0, .{
+    _ = try s.createDmaMappingFdWithBacking(p0, .{
         .device = 1,
         .user_va = scatter_base + 0x180,
         .iova = 0x9098_0180,
         .size = 64,
         .page_count = 1,
         .direction = .from_device,
-    }, fdRights(.{ .close = true }), .{}, 16);
+    }, fdRights(.{ .close = true }), .{}, 16, &.{0x90980000});
 
     try std.testing.expect(!s.rangeConflictsWithDmaDerivation(
         p0,
@@ -659,7 +826,11 @@ test "VT-d scatter DMA aliases do not relax other pinned objects or pass-through
 }
 
 test "process-create grants reject pinned objects and never inherit ambient fds" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     var free_list = FreePageList{};
     const pin_fd = try s.createDmaBufferFd(p0, .{
         .device = 1,
@@ -700,7 +871,11 @@ test "process-create grants reject pinned objects and never inherit ambient fds"
 }
 
 test "process-create grants require transfer and attenuate private sources without parent mutation" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     var free_list = FreePageList{};
     const ref = try createTestFdObject(&s, 42);
     const source = try s.installFd(p0, ref, fdRights(.{ .transfer = true, .close = true, .inspect = true }), fdFlags(.{ .private = true, .inherit = true }), 16);
@@ -711,7 +886,7 @@ test "process-create grants require transfer and attenuate private sources witho
     try std.testing.expectEqual(ref, child.object);
     try std.testing.expectEqual(fd_abi.right_inspect, kernel.fdRightsToBits(child.rights));
     try std.testing.expectEqual(@as(u32, 0), kernel.fdFlagsToBits(child.flags));
-    try std.testing.expectEqualDeep(before, (s.fdEntryConst(p0, source) orelse unreachable).*);
+    try expectResourceEqualDeep(before, (s.fdEntryConst(p0, source) orelse unreachable).*);
     const no_transfer = try s.installFd(p0, ref, fdRights(.{ .close = true }), .{}, 16);
     const invalid = [_]ProcessFdGrant{.{ .source_fd = no_transfer, .target_fd = 8, .rights = fd_abi.right_close, .flags = 0 }};
     try std.testing.expectError(KernelError.InvalidState, s.grantFdsForProcessCreate(p0, p1, &invalid, &free_list));
@@ -719,14 +894,18 @@ test "process-create grants require transfer and attenuate private sources witho
 }
 
 test "process-create rejects invalid grant batches before copying any reference" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     var free_list = FreePageList{};
     const ref = try createTestFdObject(&s, 43);
     const source = try s.installFd(p0, ref, fdRights(.{ .transfer = true, .close = true }), .{}, 16);
     const first = ProcessFdGrant{ .source_fd = source, .target_fd = 4, .rights = fd_abi.right_close, .flags = 0 };
     const invalid = [_]ProcessFdGrant{
         first, // duplicate destination
-        .{ .source_fd = source, .target_fd = 4096, .rights = 0, .flags = 0 },
+        .{ .source_fd = source, .target_fd = fd_abi.thread_self_fd, .rights = 0, .flags = 0 },
         .{ .source_fd = source, .target_fd = 5, .rights = fd_abi.right_dup, .flags = 0 },
         .{ .source_fd = source, .target_fd = 5, .rights = 1 << 63, .flags = 0 },
         .{ .source_fd = source, .target_fd = 5, .rights = 0, .flags = 1 << 63 },
@@ -741,7 +920,8 @@ test "process-create rejects invalid grant batches before copying any reference"
     try std.testing.expectError(KernelError.OutOfFreePages, s.grantFdsForProcessCreate(p0, p1, &high, &free_list));
     try std.testing.expect(s.fdEntryConst(p1, 4) == null);
     try std.testing.expectEqual(@as(?u32, 1), s.kernelObjectRefCount(ref));
-    try free_list.appendContiguousRange(0, @intFromPtr(&fd_capacity_backing), 64);
+    try free_list.installRegions(&.{.{ .id = 0, .start = @intFromPtr(&fd_capacity_backing), .end = (@intFromPtr(&fd_capacity_backing)) + (256) * 4096 }});
+    try free_list.seedContiguousRange(@intFromPtr(&fd_capacity_backing), 256);
     const free_before = free_list.pageCount();
     try s.grantFdsForProcessCreate(p0, p1, &high, &free_list);
     try std.testing.expectEqual(ref, (s.fdEntryConst(p1, 4095) orelse unreachable).object);
@@ -751,7 +931,11 @@ test "process-create rejects invalid grant batches before copying any reference"
 }
 
 test "process-create rolls back partial retains including non-closeable grants" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     var free_list = FreePageList{};
     const first = try createTestFdObject(&s, 44);
     const second = try createTestFdObject(&s, 45);
@@ -771,9 +955,14 @@ test "process-create rolls back partial retains including non-closeable grants" 
 }
 
 test "process-create handle failure cleanup returns high grant pages and references" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     var free_list = FreePageList{};
-    try free_list.appendContiguousRange(0, @intFromPtr(&fd_capacity_backing), 64);
+    try free_list.installRegions(&.{.{ .id = 0, .start = @intFromPtr(&fd_capacity_backing), .end = (@intFromPtr(&fd_capacity_backing)) + (256) * 4096 }});
+    try free_list.seedContiguousRange(@intFromPtr(&fd_capacity_backing), 256);
     const pages = free_list.pageCount();
     const ref = try createTestFdObject(&s, 46);
     const source = try s.installFd(p0, ref, fdRights(.{ .transfer = true }), .{}, 16);
@@ -797,7 +986,11 @@ test "process-create handle failure cleanup returns high grant pages and referen
 }
 
 test "owner teardown revokes exact pinned aliases only" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     var free_list = FreePageList{};
     const owner_fd = try s.createDmaBufferFd(p0, .{
         .device = 1,
@@ -821,23 +1014,27 @@ test "owner teardown revokes exact pinned aliases only" {
     try std.testing.expect(s.fdEntryConst(p0, owner_fd) == null);
     try std.testing.expect(s.fdEntryConst(p1, alias_fd) == null);
     try std.testing.expectEqual(@as(?u32, null), s.kernelObjectRefCount(owner_ref));
-    try std.testing.expect(!s.pinned_object_slots.isSet(owner_ref.index));
-    try std.testing.expect(s.pinned_object_slots.isSet(unrelated_ref.index));
+    try std.testing.expect(!s.fd_objects.isMarked(@intCast(owner_ref.index), 1));
+    try std.testing.expect(s.fd_objects.isMarked(@intCast(unrelated_ref.index), 1));
     try std.testing.expectEqual(unrelated_ref, (s.fdEntryConst(p1, unrelated_fd) orelse unreachable).object);
     try std.testing.expectEqual(@as(?u32, 1), s.kernelObjectRefCount(unrelated_ref));
 }
 
-test "scatter DMA mapping keeps ABI page count without side storage" {
-    var s = try initFdState();
+test "scatter DMA mapping keeps ABI page count with retained PFN backing" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
 
-    const fd = try s.createDmaMappingFd(p0, .{
+    const fd = try s.createDmaMappingFdWithBacking(p0, .{
         .device = 1,
         .user_va = 0x4400_0080,
         .iova = 0x8200_0080,
         .size = 3 * 4096 - 0x80,
         .page_count = 3,
         .direction = .bidirectional,
-    }, fdRights(.{ .close = true }), .{}, 16);
+    }, fdRights(.{ .close = true }), .{}, 16, &.{ 0x82000000, 0x82001000, 0x82002000 });
 
     const object_ref = (s.fdEntryConst(p0, fd) orelse unreachable).object;
     const slot = s.kernelObjectSlotConst(object_ref) orelse unreachable;
@@ -852,35 +1049,43 @@ test "scatter DMA mapping keeps ABI page count without side storage" {
     try std.testing.expectEqual(@as(?u32, null), s.kernelObjectRefCount(object_ref));
 }
 
-test "scatter DMA mapping validates fd capacity without allocator side storage" {
-    var s = try initFdState();
-    try std.testing.expectError(KernelError.TableFull, s.createDmaMappingFd(p0, .{
+test "scatter DMA mapping validates fd capacity and rolls back retained PFN backing" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
+    try std.testing.expectError(KernelError.TableFull, s.createDmaMappingFdWithBacking(p0, .{
         .device = 1,
         .user_va = 0x4500_0000,
         .iova = 0x8200_0000,
         .size = 4096,
         .page_count = 1,
-    }, fdRights(.{ .close = true }), .{}, @intCast(kernel.fd_table_entries)));
-    try std.testing.expectEqual(@as(usize, 0), s.pinned_object_slots.count());
+    }, fdRights(.{ .close = true }), .{}, @intCast(kernel.fd_table_entries), &.{0x82000000}));
+    try std.testing.expectEqual(@as(usize, 0), markedCount(&s.fd_objects, 1));
     try std.testing.expectError(KernelError.TableFull, s.createDmaBufferFd(p0, .{
         .device = 1,
         .user_va = 0x4500_0000,
         .iova = 0x8200_0000,
         .size = 4096,
     }, fdRights(.{ .close = true }), .{}, @intCast(kernel.fd_table_entries)));
-    try std.testing.expectEqual(@as(usize, 0), s.pinned_object_slots.count());
+    try std.testing.expectEqual(@as(usize, 0), markedCount(&s.fd_objects, 1));
 }
 
-test "owner revoke tears down scatter DMA without side storage" {
-    var s = try initFdState();
+test "owner revoke retains scatter DMA backing after reference teardown" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     var free_list = FreePageList{};
-    const owner_fd = try s.createDmaMappingFd(p0, .{
+    const owner_fd = try s.createDmaMappingFdWithBacking(p0, .{
         .device = 1,
         .user_va = 0x4600_0080,
         .iova = 0x8200_0080,
         .size = 8192 - 0x80,
         .page_count = 2,
-    }, fdRights(.{ .close = true }), .{}, 16);
+    }, fdRights(.{ .close = true }), .{}, 16, &.{ 0x82000000, 0x82001000 });
     const object_ref = (s.fdEntryConst(p0, owner_fd) orelse unreachable).object;
     const alias_fd = try s.installFd(p1, object_ref, fdRights(.{ .close = true }), .{}, 16);
     s.releasePrincipalNativeMemory(p0, &free_list);
@@ -890,7 +1095,11 @@ test "owner revoke tears down scatter DMA without side storage" {
 }
 
 test "process fd exposes process object kind and lifecycle state" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     const rights = fdRights(.{
         .inspect = true,
         .dup = true,
@@ -924,7 +1133,11 @@ test "process fd exposes process object kind and lifecycle state" {
 }
 
 test "process signal pending hint is process-scoped and cleared by lifecycle" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     try std.testing.expectEqual(@as(u64, 0), s.processSignalPendingHintVa(p1));
     try std.testing.expect(s.setProcessSignalPendingHintVa(p1, 0x1234));
     try std.testing.expectEqual(@as(u64, 0x1234), s.processSignalPendingHintVa(p1));
@@ -949,7 +1162,11 @@ test "process signal pending hint is process-scoped and cleared by lifecycle" {
 }
 
 test "stale active process fd cannot retarget a reused principal generation" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     const rights = fdRights(.{ .kill = true, .wait = true, .close = true });
     const stale_fd = try s.createProcessFd(p0, .{
         .principal_raw = @intFromEnum(p1),
@@ -964,7 +1181,11 @@ test "stale active process fd cannot retarget a reused principal generation" {
 }
 
 test "terminal process fd remains waitable after principal reuse" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     const rights = fdRights(.{ .wait = true, .close = true });
     const fd = try s.createProcessFd(p0, .{
         .principal_raw = @intFromEnum(p1),
@@ -980,7 +1201,11 @@ test "terminal process fd remains waitable after principal reuse" {
 }
 
 test "one thread can wait on multiple process fds" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     const rights = fdRights(.{ .wait = true, .poll = true, .close = true });
     const fd1 = try s.createProcessFd(p0, .{
         .principal_raw = @intFromEnum(p1),
@@ -1009,13 +1234,17 @@ test "one thread can wait on multiple process fds" {
 }
 
 test "fork excludes private capabilities without changing parent references" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     const private_object = try createTestFdObject(&s, 501);
     const ordinary_object = try createTestFdObject(&s, 502);
     const private_fd = try s.installFd(p0, private_object, fdRights(.{ .inspect = true, .close = true }), .{ .private = true, .inherit = true }, 16);
     const ordinary_fd = try s.installFd(p0, ordinary_object, fdRights(.{ .inspect = true, .close = true, .dup = true }), .{ .cloexec = true, .nonblock = true }, 16);
-    (s.getFdTable(p0) orelse unreachable).entries[ordinary_fd].offset = 12345;
-    const original = (s.getFdTable(p0) orelse unreachable).entries[ordinary_fd];
+    (s.getFdTable(p0) orelse unreachable).at(ordinary_fd).*.cursor.offset = 12345;
+    const original = (s.getFdTable(p0) orelse unreachable).at(ordinary_fd).*;
     try s.cloneFdTableForFork(p0, p1);
     try std.testing.expect(s.fdEntryConst(p1, private_fd) == null);
     try std.testing.expectEqual(@as(?u32, 1), s.kernelObjectRefCount(private_object));
@@ -1024,14 +1253,18 @@ test "fork excludes private capabilities without changing parent references" {
     try std.testing.expectEqual(original.object, copied.object);
     try std.testing.expectEqual(kernel.fdRightsToBits(original.rights), kernel.fdRightsToBits(copied.rights));
     try std.testing.expectEqual(kernel.fdFlagsToBits(original.flags), kernel.fdFlagsToBits(copied.flags));
-    try std.testing.expectEqual(original.offset, copied.offset);
+    try std.testing.expectEqual(original.cursor.offset, copied.cursor.offset);
     try s.closeFd(p1, ordinary_fd);
     try std.testing.expectEqual(@as(?u32, 1), s.kernelObjectRefCount(ordinary_object));
     try std.testing.expect(s.fdEntryConst(p0, private_fd) != null);
 }
 
 test "thread observation wakes only terminal generation across objects and owners" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     const rights = fdRights(.{ .inspect = true, .wait = true, .poll = true, .transfer = true, .close = true });
     var fds: [3]kernel.Fd = undefined;
     for ([_]u32{ 3, 3, 4 }, 0..) |slot, i| {
@@ -1083,7 +1316,11 @@ test "thread observation wakes only terminal generation across objects and owner
 }
 
 test "thread fd stores owner slot generation and lifecycle state" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     const rights = fdRights(.{
         .inspect = true,
         .dup = true,
@@ -1126,7 +1363,11 @@ test "thread fd stores owner slot generation and lifecycle state" {
 }
 
 test "fd replace releases destination exactly once" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     const obj_a = try createTestFdObject(&s, 30);
     const obj_b = try createTestFdObject(&s, 31);
     const rights = fdRights(.{ .dup = true, .transfer = true });
@@ -1143,7 +1384,11 @@ test "fd replace releases destination exactly once" {
 }
 
 test "fd set flags requires set_flags right" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     const obj = try createTestFdObject(&s, 40);
     const fd0 = try s.installFd(p0, obj, fdRights(.{}), .{}, 0);
     try std.testing.expectError(KernelError.InvalidState, s.setFdFlags(p0, fd0, fdFlags(.{ .nonblock = true }), fdFlags(.{ .nonblock = true })));
@@ -1156,7 +1401,11 @@ test "fd set flags requires set_flags right" {
 }
 
 test "fd process runtime reset releases fd table" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     const obj = try createTestFdObject(&s, 50);
     _ = try s.installFd(p0, obj, fdRights(.{ .dup = true }), .{}, 0);
     try std.testing.expectEqual(@as(?u32, 1), s.kernelObjectRefCount(obj));
@@ -1167,7 +1416,11 @@ test "fd process runtime reset releases fd table" {
 }
 
 test "fd process exit and remove release fd table" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     const exit_obj = try createTestFdObject(&s, 55);
     _ = try s.installFd(p1, exit_obj, fdRights(.{}), .{}, 0);
     try std.testing.expect(s.markProcessExited(p1));
@@ -1181,19 +1434,24 @@ test "fd process exit and remove release fd table" {
 }
 
 test "dynamic fd table preserves capabilities through growth fork and teardown" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     var free_list = FreePageList{};
-    try free_list.appendContiguousRange(0, @intFromPtr(&fd_capacity_backing), fd_capacity_backing.len / 4096);
+    try free_list.installRegions(&.{.{ .id = 0, .start = @intFromPtr(&fd_capacity_backing), .end = (@intFromPtr(&fd_capacity_backing)) + (fd_capacity_backing.len / 4096) * 4096 }});
+    try free_list.seedContiguousRange(@intFromPtr(&fd_capacity_backing), fd_capacity_backing.len / 4096);
     const initial_pages = free_list.pageCount();
     const object = try createTestFdObject(&s, 71);
     const low = try s.installFd(p0, object, fdRights(.{ .dup = true, .close = true }), .{}, 16);
     try s.ensureFdTableCapacity(p0, 512, &free_list);
-    try std.testing.expectEqual(@as(usize, 512), s.getFdTableConst(p0).?.slots().len);
+    try std.testing.expectEqual(@as(usize, 512), s.getFdTableConst(p0).?.capacity);
     const high = try s.dupFd(p0, low, 300, fdRights(.{ .dup = true, .close = true }), .{ .cloexec = true });
     try std.testing.expectEqual(@as(kernel.Fd, 300), high);
     try s.ensureFdTableCapacity(p0, 1024, &free_list);
     try std.testing.expectEqual(@as(?u32, 2), s.kernelObjectRefCount(object));
-    try std.testing.expect(s.getFdTableConst(p0).?.entries[low].isEmpty());
+    try std.testing.expect(!s.getFdTableConst(p0).?.at(low).isEmpty());
     try std.testing.expect(s.fdEntryConst(p0, 4096) == null);
     try std.testing.expect(s.fdEntryConst(p1, high) == null);
     try s.ensureFdTableCapacity(p1, 1024, &free_list);
@@ -1208,30 +1466,44 @@ test "dynamic fd table preserves capabilities through growth fork and teardown" 
     s.releasePrincipalNativeMemory(p1, &free_list);
     try std.testing.expectEqual(initial_pages, free_list.pageCount());
     try std.testing.expectEqual(@as(?u32, null), s.kernelObjectRefCount(object));
-    try std.testing.expectEqual(@as(usize, 256), s.getFdTableConst(p0).?.slots().len);
+    try std.testing.expectEqual(@as(usize, 0), s.getFdTableConst(p0).?.capacity);
 }
 
-test "dynamic fd metadata survives full free range list and descriptor reuse" {
-    var s = try initFdState();
+test "dynamic fd metadata survives DMA return refusal and descriptor reuse" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     var free_list = FreePageList{};
-    try free_list.appendContiguousRange(0, @intFromPtr(&fd_capacity_backing), fd_capacity_backing.len / 4096);
+    try free_list.installRegions(&.{ .{ .id = 73, .start = @intFromPtr(&fd_capacity_backing), .end = (@intFromPtr(&fd_capacity_backing)) + (fd_capacity_backing.len / 4096) * 4096 }, .{ .id = 1, .start = 1 << 40, .end = (1 << 40) + (1 << 29) } });
+    try free_list.seedContiguousRange(@intFromPtr(&fd_capacity_backing), fd_capacity_backing.len / 4096);
     const initial_pages = free_list.pageCount();
     try s.ensureFdTableCapacity(p1, 512, &free_list);
     const allocated_pages = initial_pages - free_list.pageCount();
-    var full = FreePageList{};
-    // Synthetic occupied PMM range records, never dereferenced as memory.
-    for (&full.ranges, 0..) |*range, i| {
-        range.* = .{ .region_id = 1, .physical_start = @as(u64, @intCast(i)) * 8192, .len = 1 };
+    // Keep the unrelated remainder allocated while testing issuer retention.
+    var remainders: std.ArrayList(struct { physical: u64, pages: usize }) = .empty;
+    defer remainders.deinit(std.testing.allocator);
+    while (free_list.pageCount() != 0) {
+        const remainder = try free_list.popContiguousOwnedInRange(free_list.rangeAt(0).len, 4096, std.math.maxInt(u64));
+        try remainders.append(std.testing.allocator, .{ .physical = remainder.physical.toInt(), .pages = remainder.pages });
     }
-    full.range_len = full.ranges.len;
-    full.len = full.ranges.len;
-    s.releasePrincipalNativeMemory(p1, &full);
-    try std.testing.expect(s.getFdTable(p1).?.retired_storage != null);
+    var other = FreePageList{};
+    try other.installRegions(&.{.{ .id = 0, .start = 4096, .end = (1 << 40) + (1 << 29) }});
+    var hold = try DmaHold.init(@intFromPtr(&fd_capacity_backing), allocated_pages);
+    defer hold.end();
+    s.releasePrincipalNativeMemory(p1, &other);
+    try std.testing.expect(s.fd_retired.head != null);
     try std.testing.expect(s.removeProcessDescriptor(p1));
     try std.testing.expect(s.ensureProcessDescriptor(p1, "reused-retired-fds"));
-    try std.testing.expect(s.getFdTable(p1).?.retired_storage != null);
-    s.releasePrincipalNativeMemory(p1, &free_list);
-    try std.testing.expect(s.getFdTable(p1).?.retired_storage == null);
+    try std.testing.expect(s.fd_retired.head != null);
+    hold.end();
+    s.releasePrincipalNativeMemory(p1, &other);
+    try std.testing.expect(s.getFdTable(p1).?.entries.body_owner.retired == null);
+    try std.testing.expectEqual(allocated_pages, free_list.pageCount());
+    try std.testing.expectEqual(@as(u64, 73), free_list.rangeAt(0).region_id);
+    try std.testing.expectEqual(@as(usize, 0), other.pageCount());
+    for (remainders.items) |remainder| try free_list.appendContiguousRange(remainder.physical, remainder.pages);
     try std.testing.expectEqual(initial_pages, free_list.pageCount());
     try std.testing.expect(allocated_pages > 0);
     s.releasePrincipalNativeMemory(p1, &free_list);
@@ -1239,29 +1511,460 @@ test "dynamic fd metadata survives full free range list and descriptor reuse" {
 }
 
 test "fd process capacity growth preserves extra fd tables" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     var free_list = FreePageList{};
-    try free_list.appendContiguousRange(
-        0,
-        @intFromPtr(&fd_capacity_backing),
-        fd_capacity_backing.len / 4096,
-    );
+    try free_list.installRegions(&.{.{ .id = 0, .start = @intFromPtr(&fd_capacity_backing), .end = (@intFromPtr(&fd_capacity_backing)) + (fd_capacity_backing.len / 4096) * 4096 }});
+    try free_list.seedContiguousRange(@intFromPtr(&fd_capacity_backing), fd_capacity_backing.len / 4096);
 
     try std.testing.expect(s.ensureProcessCapacity(kernel.process_count + 1, &free_list));
     const extra_principal = kernel.processPrincipalFromIndex(kernel.process_count).?;
     try std.testing.expect(s.ensureProcessDescriptor(extra_principal, "extra"));
+    const table = s.getFdTable(extra_principal).?;
+    try s.ensureFdTableCapacity(extra_principal, 512, &free_list);
+    const owner_address = table.entries.body_owner.bound_address;
+    const entry_root = table.at(300);
     const obj = try createTestFdObject(&s, 60);
-    const fd = try s.installFd(extra_principal, obj, fdRights(.{ .dup = true }), fdFlags(.{ .cloexec = true }), 0);
+    const fd = try s.installFd(extra_principal, obj, fdRights(.{ .dup = true }), fdFlags(.{ .cloexec = true }), 300);
 
     try std.testing.expect(s.ensureProcessCapacity(kernel.process_count * 2 + 1, &free_list));
+    try std.testing.expectEqual(table, s.getFdTable(extra_principal).?);
+    try std.testing.expectEqual(owner_address, table.entries.body_owner.bound_address);
+    try std.testing.expectEqual(entry_root, table.at(300));
+    try std.testing.expect(s.fd_tables_extra.directory_owner.retired == null);
     const entry = s.fdEntryConst(extra_principal, fd) orelse unreachable;
     try std.testing.expect(entry.flags.cloexec);
     try std.testing.expect(entry.rights.dup);
     try std.testing.expectEqual(@as(?u32, 1), s.kernelObjectRefCount(obj));
+    // A bound entry Owner survives another growth and slot reuse, while all
+    // capability references and dynamic entry grants are actually returned.
+    try s.ensureFdTableCapacity(extra_principal, 1024, &free_list);
+    s.releasePrincipalNativeMemory(extra_principal, &free_list);
+    try std.testing.expect(s.removeProcessDescriptor(extra_principal));
+    try std.testing.expect(s.ensureProcessDescriptor(extra_principal, "reused"));
+    try std.testing.expectEqual(table, s.getFdTable(extra_principal).?);
+    try std.testing.expectEqual(owner_address, table.entries.body_owner.bound_address);
+    try std.testing.expect(table.entries.body_owner.published == null and table.entries.body_owner.retired == null);
+    try std.testing.expectEqual(@as(?u32, null), s.kernelObjectRefCount(obj));
+    releaseFixtureOwner(&s.fd_tables_extra.directory_owner);
+    releaseFixtureOwner(&s.fd_tables_extra.body_owner);
+    releaseFixtureOwner(&s.fd_tables_extra.metadata_owner);
+    releaseFixtureOwner(&s.descriptor_storage);
+    releaseFixtureOwner(&s.vma_directory_storage);
+    releaseFixtureOwner(&s.vma_body_storage);
+    try std.testing.expectEqual(fd_capacity_backing.len / 4096, free_list.pageCount());
+}
+
+test "process growth preserves writes through an outstanding stable VMA borrow" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
+    var free_list: FreePageList = .{};
+    const pages = fd_capacity_backing.len / 4096;
+    try free_list.installRegions(&.{.{ .id = 97, .start = @intFromPtr(&fd_capacity_backing), .end = (@intFromPtr(&fd_capacity_backing)) + (pages) * 4096 }});
+    try free_list.seedContiguousRange(@intFromPtr(&fd_capacity_backing), pages);
+    const Fixture = struct {
+        fn releaseAll(owner: anytype) void {
+            // Test teardown only: all borrowed pointers are dead here. Save
+            // links and the original issuer/grant before returning each header.
+            inline for (.{ owner.published, owner.retired, owner.pending }) |head| {
+                var cursor = head;
+                while (cursor) |record| {
+                    const next = record.next;
+                    const allocator = record.allocator;
+                    const allocation = record.allocation;
+                    std.debug.assert(allocator.release(allocator.context, allocation));
+                    cursor = next;
+                }
+            }
+            owner.published = null;
+            owner.retired = null;
+            owner.pending = null;
+        }
+    };
+    var released = false;
+    defer if (!released) Fixture.releaseAll(&s.fd_tables_extra.directory_owner);
+    defer if (!released) Fixture.releaseAll(&s.fd_tables_extra.body_owner);
+    defer if (!released) Fixture.releaseAll(&s.fd_tables_extra.metadata_owner);
+    defer if (!released) Fixture.releaseAll(&s.descriptor_storage);
+    defer if (!released) Fixture.releaseAll(&s.vma_directory_storage);
+    defer if (!released) Fixture.releaseAll(&s.vma_body_storage);
+    try std.testing.expect(s.ensureProcessCapacity(kernel.process_count + 1, &free_list));
+    const principal = kernel.processPrincipalFromIndex(kernel.process_count).?;
+    try std.testing.expect(s.ensureProcessDescriptor(principal, "growth-borrow"));
+    {
+        const borrowed = s.getVmaTable(principal).?;
+        try borrowed.reference_slots.prepareIndex(0, try s.poolAllocator());
+        try borrowed.entries.prepareIndex(0, try s.poolAllocator());
+        try borrowed.active_indices.prepareIndex(0, try s.poolAllocator());
+        s.installVmaEntry(borrowed, 0, .{
+            .active = true,
+            .start_va = 0x400000,
+            .size_bytes = 4096,
+            .prot = .{ .read = true },
+        });
+        // Fault readers own AS/shared locks, while growth owns KernelState.
+        // The same body must survive publication: retaining an old copied
+        // body prevented UAF but stranded this later write in the old table.
+        try std.testing.expect(s.ensureProcessCapacity(kernel.process_count * 2 + 1, &free_list));
+        borrowed.entries.get(@intCast(0)).?.*.prot.write = true;
+        const published = s.getVmaTable(principal).?;
+        try std.testing.expectEqual(borrowed, published);
+        const view: *const KernelState = &s;
+        try std.testing.expectEqual(@as(*const kernel.VmaTable, borrowed), view.getVmaTableConst(principal).?);
+        try std.testing.expect(borrowed.entries.get(@intCast(0)).?.*.prot.write);
+        try std.testing.expect(published.entries.get(@intCast(0)).?.*.prot.write);
+        try std.testing.expect(s.vma_directory_storage.retired == null);
+        try std.testing.expect(s.fd_tables_extra.directory_owner.retired == null);
+        try std.testing.expect(s.vma_body_storage.retired == null);
+    }
+    Fixture.releaseAll(&s.fd_tables_extra.directory_owner);
+    Fixture.releaseAll(&s.fd_tables_extra.body_owner);
+    Fixture.releaseAll(&s.fd_tables_extra.metadata_owner);
+    Fixture.releaseAll(&s.descriptor_storage);
+    Fixture.releaseAll(&s.vma_directory_storage);
+    Fixture.releaseAll(&s.vma_body_storage);
+    released = true;
+    try std.testing.expectEqual(pages, free_list.pageCount());
+    for (0..free_list.rangeCount()) |range_index| {
+        const range = free_list.rangeAt(range_index);
+        try std.testing.expectEqual(@as(u64, 97), range.region_id);
+    }
+}
+
+test "descriptor snapshots survive growth and diagnostics never wait on interrupted writer" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
+    var list: FreePageList = .{};
+    const pages = fd_capacity_backing.len / 4096;
+    try list.installRegions(&.{.{ .id = 100, .start = @intFromPtr(&fd_capacity_backing), .end = (@intFromPtr(&fd_capacity_backing)) + (pages) * 4096 }});
+    try list.seedContiguousRange(@intFromPtr(&fd_capacity_backing), pages);
+    defer releaseFixtureOwner(&s.fd_tables_extra.directory_owner);
+    defer releaseFixtureOwner(&s.fd_tables_extra.body_owner);
+    defer releaseFixtureOwner(&s.fd_tables_extra.metadata_owner);
+    defer releaseFixtureOwner(&s.descriptor_storage);
+    defer releaseFixtureOwner(&s.vma_directory_storage);
+    defer releaseFixtureOwner(&s.vma_body_storage);
+    try std.testing.expect(s.ensureProcessCapacity(kernel.process_count + 1, &list));
+    const principal = kernel.processPrincipalFromIndex(kernel.process_count).?;
+    try std.testing.expect(s.ensureProcessDescriptor(principal, "stable-label"));
+    try std.testing.expect(s.setProcessSignalPendingHintVa(principal, 0x12340000));
+    const snapshot = s.processDescriptor(principal).?;
+    const old_grant = s.descriptor_storage.published.?.allocation;
+    try std.testing.expect(s.ensureProcessCapacity(kernel.process_count * 2 + 1, &list));
+    try expectResourceEqualDeep(snapshot, s.processDescriptor(principal).?);
+    try std.testing.expect(s.descriptor_storage.retired == null);
+    var returned = false;
+    for (0..list.rangeCount()) |range_index| {
+        const range = list.rangeAt(range_index);
+        if (range.region_id == old_grant.region_id and
+            range.physical_start <= old_grant.physical.toInt() and
+            range.physical_start + range.len * 4096 >= old_grant.physical.toInt() + old_grant.pages * 4096)
+            returned = true;
+    }
+    try std.testing.expect(returned);
+    @atomicStore(u8, &s.descriptor_lock.value, 1, .release);
+    const busy = s.tryProcessLabel(principal);
+    @atomicStore(u8, &s.descriptor_lock.value, 0, .release);
+    try std.testing.expect(busy == null);
+    try std.testing.expectEqualStrings("stable-label", s.tryProcessLabel(principal).?);
+    try std.testing.expect(s.processDescriptorSlotConst(std.math.maxInt(usize)) == null);
+    try std.testing.expect(s.removeProcessDescriptor(principal));
+    try std.testing.expect(s.tryProcessLabel(principal) == null);
+    try std.testing.expect(s.ensureProcessDescriptor(principal, "new-label"));
+    try std.testing.expect(snapshot.generation != s.processDescriptor(principal).?.generation);
+    try std.testing.expectEqualStrings("stable-label", snapshot.label);
+    try std.testing.expectEqual(@as(u64, 0x12340000), snapshot.signal_pending_hint_va);
+    const Hook = struct {
+        fn run(state: *const KernelState, target: PrincipalId, _: kernel.DebugProcessLifecycleReason) void {
+            std.debug.assert(@atomicLoad(u8, &state.descriptor_lock.value, .acquire) == 0);
+            _ = state.processDescriptor(target);
+        }
+    };
+    s.debug_process_lifecycle_hook = Hook.run;
+    try std.testing.expect(s.markProcessExited(principal));
+    try std.testing.expect(s.ensureProcessDescriptor(principal, "hook"));
+    try std.testing.expect(s.markProcessFaulted(principal, 14));
+}
+
+test "descriptor held reader excludes old root retirement and final capacity publication" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
+    var list: FreePageList = .{};
+    try list.installRegions(&.{.{ .id = 101, .start = @intFromPtr(&fd_capacity_backing), .end = (@intFromPtr(&fd_capacity_backing)) + (fd_capacity_backing.len / 4096) * 4096 }});
+    try list.seedContiguousRange(@intFromPtr(&fd_capacity_backing), fd_capacity_backing.len / 4096);
+    defer releaseFixtureOwner(&s.fd_tables_extra.directory_owner);
+    defer releaseFixtureOwner(&s.fd_tables_extra.body_owner);
+    defer releaseFixtureOwner(&s.fd_tables_extra.metadata_owner);
+    defer releaseFixtureOwner(&s.descriptor_storage);
+    defer releaseFixtureOwner(&s.vma_directory_storage);
+    defer releaseFixtureOwner(&s.vma_body_storage);
+    try std.testing.expect(s.ensureProcessCapacity(kernel.process_count + 1, &list));
+    const principal = kernel.processPrincipalFromIndex(kernel.process_count).?;
+    try std.testing.expect(s.ensureProcessDescriptor(principal, "held-reader"));
+    const old_root = s.process_descriptors_extra;
+    const old_record = s.descriptor_storage.published.?;
+    const old_capacity = s.process_capacity;
+    var contended: u8 = 0;
+    s.descriptor_test_probe = &contended;
+    defer s.descriptor_test_probe = null;
+    @atomicStore(u8, &s.descriptor_lock.value, 1, .release);
+    var held = true;
+    defer if (held) @atomicStore(u8, &s.descriptor_lock.value, 0, .release);
+    const Writer = struct {
+        state: *KernelState,
+        pmm: *FreePageList,
+        done: u8 = 0,
+        ok: bool = false,
+        fn run(self: *@This()) void {
+            self.ok = self.state.ensureProcessCapacity(kernel.process_count * 2 + 1, self.pmm);
+            @atomicStore(u8, &self.done, 1, .release);
+        }
+    };
+    var writer = Writer{ .state = &s, .pmm = &list };
+    const worker = try std.Thread.spawn(.{}, Writer.run, .{&writer});
+    defer worker.join();
+    defer {
+        if (held) @atomicStore(u8, &s.descriptor_lock.value, 0, .release);
+        held = false;
+    }
+    while (@atomicLoad(u8, &contended, .acquire) == 0 and @atomicLoad(u8, &writer.done, .acquire) == 0)
+        std.atomic.spinLoopHint();
+    try std.testing.expectEqual(@as(u8, 1), @atomicLoad(u8, &contended, .acquire));
+    try std.testing.expectEqual(@as(u8, 0), @atomicLoad(u8, &writer.done, .acquire));
+    try std.testing.expectEqual(old_root.ptr, s.process_descriptors_extra.ptr);
+    try std.testing.expectEqual(old_record, s.descriptor_storage.published.?);
+    try std.testing.expectEqual(old_capacity, s.process_capacity);
+    try std.testing.expectEqualStrings("held-reader", old_root[0].label);
+    // Other roots are already installed, but final public capacity still
+    // describes the old set until this last short borrow ends.
+    try std.testing.expect(s.vma_tables_extra.len > old_root.len);
+    @atomicStore(u8, &s.descriptor_lock.value, 0, .release);
+    held = false;
+    while (@atomicLoad(u8, &writer.done, .acquire) == 0) std.atomic.spinLoopHint();
+    try std.testing.expect(writer.ok);
+    try std.testing.expect(s.descriptor_storage.retired == null);
+    try std.testing.expect(s.processCapacitySnapshot() > old_capacity);
+    try std.testing.expectEqualStrings("held-reader", s.processDescriptor(principal).?.label);
+}
+
+test "VMA directory held reader excludes publication and old directory return" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
+    var list: FreePageList = .{};
+    try list.installRegions(&.{.{ .id = 98, .start = @intFromPtr(&fd_capacity_backing), .end = (@intFromPtr(&fd_capacity_backing)) + (fd_capacity_backing.len / 4096) * 4096 }});
+    try list.seedContiguousRange(@intFromPtr(&fd_capacity_backing), fd_capacity_backing.len / 4096);
+    defer releaseFixtureOwner(&s.fd_tables_extra.directory_owner);
+    defer releaseFixtureOwner(&s.fd_tables_extra.body_owner);
+    defer releaseFixtureOwner(&s.fd_tables_extra.metadata_owner);
+    defer releaseFixtureOwner(&s.descriptor_storage);
+    defer releaseFixtureOwner(&s.vma_directory_storage);
+    defer releaseFixtureOwner(&s.vma_body_storage);
+    try std.testing.expect(s.ensureProcessCapacity(kernel.process_count + 1, &list));
+    const old_root = s.vma_tables_extra;
+    const old_record = s.vma_directory_storage.published.?;
+    const body = old_root[0];
+    var contended: u8 = 0;
+    s.vma_directory_test_probe = &contended;
+    defer s.vma_directory_test_probe = null;
+    // Deliberately emulate a real directory reader inside the same leaf. The
+    // atomic probe proves the writer reached publication, not merely reserve.
+    @atomicStore(u8, &s.vma_directory_lock.value, 1, .release);
+    var held = true;
+    defer if (held) @atomicStore(u8, &s.vma_directory_lock.value, 0, .release);
+    const Writer = struct {
+        state: *KernelState,
+        pmm: *FreePageList,
+        done: u8 = 0,
+        ok: bool = false,
+        fn run(self: *@This()) void {
+            self.ok = self.state.ensureProcessCapacity(kernel.process_count * 2 + 1, self.pmm);
+            @atomicStore(u8, &self.done, 1, .release);
+        }
+    };
+    var writer = Writer{ .state = &s, .pmm = &list };
+    const worker = try std.Thread.spawn(.{}, Writer.run, .{&writer});
+    defer worker.join();
+    // On failed assertions unlock before join, including error unwinding.
+    defer {
+        if (held) @atomicStore(u8, &s.vma_directory_lock.value, 0, .release);
+        held = false;
+    }
+    while (@atomicLoad(u8, &contended, .acquire) == 0 and @atomicLoad(u8, &writer.done, .acquire) == 0)
+        std.atomic.spinLoopHint();
+    try std.testing.expectEqual(@as(u8, 1), @atomicLoad(u8, &contended, .acquire));
+    try std.testing.expectEqual(@as(u8, 0), @atomicLoad(u8, &writer.done, .acquire));
+    try std.testing.expectEqual(old_root.ptr, s.vma_tables_extra.ptr);
+    try std.testing.expectEqual(old_record, s.vma_directory_storage.published.?);
+    try std.testing.expectEqual(body, old_root[0]);
+    @atomicStore(u8, &s.vma_directory_lock.value, 0, .release);
+    held = false;
+    while (@atomicLoad(u8, &writer.done, .acquire) == 0) std.atomic.spinLoopHint();
+    try std.testing.expect(writer.ok);
+    try std.testing.expect(s.vma_tables_extra.ptr != old_root.ptr);
+    try std.testing.expectEqual(body, s.vma_tables_extra[0]);
+    try std.testing.expect(s.vma_directory_storage.retired == null);
+    try std.testing.expect(s.fd_tables_extra.directory_owner.retired == null);
+    try std.testing.expect(s.vma_body_storage.retired == null);
+    try std.testing.expect(s.vmaTableForProcessIndex(s.process_capacity) == null);
+    try std.testing.expect(s.vmaTableForProcessIndex(std.math.maxInt(usize)) == null);
+}
+
+test "VMA directory retries PMM return rejection using original issuer without growth" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
+    var list: FreePageList = .{};
+    try list.installRegions(&.{ .{ .id = 99, .start = @intFromPtr(&fd_capacity_backing), .end = (@intFromPtr(&fd_capacity_backing)) + (fd_capacity_backing.len / 4096) * 4096 }, .{ .id = 900, .start = 1 << 40, .end = (1 << 40) + (1 << 29) } });
+    try list.seedContiguousRange(@intFromPtr(&fd_capacity_backing), fd_capacity_backing.len / 4096);
+    defer {
+        releaseFixtureOwner(&s.fd_tables_extra.directory_owner);
+        releaseFixtureOwner(&s.fd_tables_extra.body_owner);
+        releaseFixtureOwner(&s.fd_tables_extra.metadata_owner);
+        releaseFixtureOwner(&s.descriptor_storage);
+        releaseFixtureOwner(&s.vma_directory_storage);
+        releaseFixtureOwner(&s.vma_body_storage);
+    }
+    try std.testing.expect(s.ensureProcessCapacity(kernel.process_count + 1, &list));
+    const old_grant = s.vma_directory_storage.published.?.allocation;
+    const old_descriptor_grant = s.descriptor_storage.published.?.allocation;
+    const body = s.vmaTableForProcessIndex(kernel.process_count).?;
+    // Radix path returns can split the free list; every piece must retain
+    // its original region even though the former single-array layout is gone.
+    try std.testing.expect(list.rangeCount() != 0);
+    for (0..list.rangeCount()) |i| try std.testing.expectEqual(@as(u64, 99), list.rangeAt(i).region_id);
+    var directory_hold = try DmaHold.init(old_grant.physical.toInt(), old_grant.pages);
+    defer directory_hold.end();
+    var descriptor_hold = try DmaHold.init(old_descriptor_grant.physical.toInt(), old_descriptor_grant.pages);
+    defer descriptor_hold.end();
+    try std.testing.expect(s.ensureProcessCapacity(kernel.process_count * 2 + 1, &list));
+    try std.testing.expect(s.vma_directory_storage.retired != null);
+    const after_failure = list.pageCount();
+    const root = s.vma_tables_extra.ptr;
+    const capacity = s.process_capacity;
+    var other: FreePageList = .{};
+    try other.installRegions(&.{.{ .id = 0, .start = 4096, .end = (1 << 40) + (1 << 29) }});
+    try std.testing.expect(s.ensureProcessCapacity(capacity, &other));
+    try std.testing.expect(s.vma_directory_storage.retired != null);
+    directory_hold.end();
+    try std.testing.expect(s.ensureProcessCapacity(capacity, &other));
+    try std.testing.expect(s.vma_directory_storage.retired == null);
+    try std.testing.expectEqual(after_failure + old_grant.pages, list.pageCount());
+    try std.testing.expect(s.descriptor_storage.retired != null);
+    descriptor_hold.end();
+    try std.testing.expect(s.ensureProcessCapacity(capacity, &other));
+    try std.testing.expect(s.descriptor_storage.retired == null);
+    // Descriptor and VMA returns preserve their original issuer independently
+    // of the canonical FD radix paths.
+    try std.testing.expect(s.fd_tables_extra.directory_owner.retired == null);
+    try std.testing.expectEqual(after_failure + old_grant.pages + old_descriptor_grant.pages, list.pageCount());
+    try std.testing.expect(s.ensureProcessCapacity(capacity, &other));
+    try std.testing.expectEqual(after_failure + old_grant.pages + old_descriptor_grant.pages, list.pageCount());
+    try std.testing.expectEqual(@as(usize, 0), other.pageCount());
+    try std.testing.expectEqual(root, s.vma_tables_extra.ptr);
+    try std.testing.expectEqual(capacity, s.process_capacity);
+    try std.testing.expectEqual(body, s.vmaTableForProcessIndex(kernel.process_count).?);
+    var returned = false;
+    for (0..list.rangeCount()) |range_index| {
+        const range = list.rangeAt(range_index);
+        // The original returned grant may coalesce with a radix-path return.
+        if (range.physical_start <= old_grant.physical.toInt() and
+            range.physical_start + range.len * 4096 >= old_grant.physical.toInt() + old_grant.pages * 4096)
+        {
+            try std.testing.expectEqual(@as(u64, 99), range.region_id);
+            returned = true;
+        }
+    }
+    try std.testing.expect(returned);
+    try std.testing.expect(s.ensureProcessCapacity(capacity, &other));
+    try std.testing.expectEqual(after_failure + old_grant.pages + old_descriptor_grant.pages, list.pageCount());
+}
+
+test "process storage growth rolls back every partial allocation preserving PMM region" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    const Owner = @TypeOf(@as(KernelState, undefined).fd_tables_extra.directory_owner);
+    const sizes = [_]usize{
+        try Owner.allocationPages(kernel.ProcessDescriptor, kernel.process_count),
+        try Owner.allocationPages(*kernel.FdTable, kernel.process_count),
+        try Owner.allocationPages(kernel.FdTable, kernel.process_count),
+        try Owner.allocationPages(*kernel.VmaTable, kernel.process_count),
+        try Owner.allocationPages(kernel.VmaTable, kernel.process_count),
+    };
+    var available: usize = 0;
+    for (sizes) |size| {
+        var s: KernelState = undefined;
+        try initFdState(&s);
+        var list: FreePageList = .{};
+        try list.installRegions(&.{.{ .id = 53, .start = @intFromPtr(&fd_capacity_backing), .end = (@intFromPtr(&fd_capacity_backing)) + (fd_capacity_backing.len / 4096) * 4096 }});
+        if (available != 0) try list.seedContiguousRange(@intFromPtr(&fd_capacity_backing), available);
+        const old_desc = s.process_descriptors_extra.ptr;
+        const old_vma = s.vma_tables_extra.ptr;
+        try std.testing.expect(!s.ensureProcessCapacity(kernel.process_count + 1, &list));
+        try std.testing.expectEqual(kernel.process_count, s.process_capacity);
+        try std.testing.expectEqual(old_desc, s.process_descriptors_extra.ptr);
+        try std.testing.expectEqual(kernel.process_count, s.fd_process_capacity);
+        // Return any private prepared FD chunks before comparing all PMM pages.
+        s.fd_tables_extra.deinit();
+        try std.testing.expectEqual(old_vma, s.vma_tables_extra.ptr);
+        try std.testing.expectEqual(@as(usize, 0), s.vma_tables_extra.len);
+        try std.testing.expectEqual(available, list.pageCount());
+        for (0..list.rangeCount()) |range_index| {
+            const range = list.rangeAt(range_index);
+            try std.testing.expectEqual(@as(u64, 53), range.region_id);
+        }
+        try std.testing.expect(s.fd_tables_extra.directory_owner.pending == null and s.fd_tables_extra.directory_owner.published == null);
+        try std.testing.expect(s.descriptor_storage.pending == null and s.descriptor_storage.published == null);
+        try std.testing.expect(s.vma_directory_storage.pending == null and s.vma_directory_storage.published == null);
+        try std.testing.expect(s.vma_body_storage.pending == null and s.vma_body_storage.published == null);
+        available += size;
+    }
+}
+
+test "PMM owned grant preserves nonzero region across removal swap split and return" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var list: FreePageList = .{};
+    try list.installRegions(&.{ .{ .id = 17, .start = 0x100000, .end = 0x104000 }, .{ .id = 29, .start = 0x200000, .end = 0x208000 } });
+    try list.seedContiguousRange(0x100000, 4);
+    try list.seedContiguousRange(0x200000, 8);
+    const first = try list.popContiguousOwnedInRange(4, 0x100000, 0x104000);
+    try std.testing.expectEqual(@as(u64, 17), first.region_id);
+    try std.testing.expectEqual(@as(u64, 0x100000), first.physical.toInt());
+    try std.testing.expectEqual(@as(u64, 29), list.rangeAt(0).region_id);
+    const middle = try list.popContiguousOwnedInRange(2, 0x202000, 0x204000);
+    try std.testing.expectEqual(@as(u64, 29), middle.region_id);
+    try std.testing.expectEqual(@as(usize, 6), list.pageCount());
+    try list.appendContiguousRange(middle.physical.toInt(), middle.pages);
+    try list.appendContiguousRange(first.physical.toInt(), first.pages);
+    try std.testing.expectEqual(@as(usize, 12), list.pageCount());
+    try expectFreeRangeInvariants(&list);
 }
 
 test "ipc endpoint fd sends and receives inline words" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     var free_list = FreePageList{};
     const rights = fdRights(.{ .send = true, .recv = true, .close = true });
     const endpoint = try s.createIpcEndpointFd(p0, rights, .{}, 16);
@@ -1277,7 +1980,11 @@ test "ipc endpoint fd sends and receives inline words" {
 }
 
 test "ipc fd passing moves attenuated vmo fd through endpoint" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     var free_list = FreePageList{};
     const endpoint_rights = fdRights(.{ .send = true, .recv = true, .transfer = true, .close = true });
     const endpoint = try s.createIpcEndpointFd(p0, endpoint_rights, .{}, 16);
@@ -1310,7 +2017,11 @@ test "ipc fd passing moves attenuated vmo fd through endpoint" {
 }
 
 test "ipc channel pair sends to peer receive queue" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     var free_list = FreePageList{};
     const pair = try s.createIpcChannelPairFds(p0, fdRights(.{ .send = true, .recv = true, .close = true }), .{}, 16);
 
@@ -1322,7 +2033,11 @@ test "ipc channel pair sends to peer receive queue" {
 }
 
 test "ipc writable waiter wakes when receive frees a full channel queue" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     var free_list = FreePageList{};
     const rights = fdRights(.{
         .send = true,
@@ -1385,7 +2100,11 @@ test "ipc writable waiter wakes when receive frees a full channel queue" {
 }
 
 test "starting a new fd wait clears stale channel waiters for the thread" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     const rights = fdRights(.{
         .send = true,
         .recv = true,
@@ -1408,7 +2127,11 @@ test "starting a new fd wait clears stale channel waiters for the thread" {
 }
 
 test "ipc channel hangup waiter wakes only after the peer's final fd closes" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     var free_list = FreePageList{};
     const rights = fdRights(.{
         .send = true,
@@ -1442,7 +2165,11 @@ test "ipc channel hangup waiter wakes only after the peer's final fd closes" {
 }
 
 test "fd waiter cleanup removes a channel hangup-only waiter" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     var free_list = FreePageList{};
     const rights = fdRights(.{
         .send = true,
@@ -1469,9 +2196,12 @@ test "fd waiter cleanup removes a channel hangup-only waiter" {
 }
 
 test "shared broker channel supports 24 hangup waiters and bounded reuse" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
     const s = try std.testing.allocator.create(KernelState);
     defer std.testing.allocator.destroy(s);
-    s.* = try initFdState();
+    try initFdState(s);
     var free_list = FreePageList{};
     const rights = fdRights(.{ .send = true, .recv = true, .wait = true, .poll = true, .close = true });
     const pair = try s.createIpcChannelPairFds(p0, rights, .{}, 16);
@@ -1483,7 +2213,7 @@ test "shared broker channel supports 24 hangup waiters and bounded reuse" {
         try s.armFdWaitGroup(group.*);
     }
     const extra = try s.beginFdWaitGroup(p0, 32, 1, 33);
-    try std.testing.expectError(KernelError.TableFull, s.registerIpcPollWaitersForFd(p0, pair.a, fd_abi.event_hangup, 0x2000, 32, 1, 33, extra));
+    try std.testing.expect(try s.registerIpcPollWaitersForFd(p0, pair.a, fd_abi.event_hangup, 0x2000, 32, 1, 33, extra));
     s.cancelFdWaitGroup(groups[0], 1);
     try std.testing.expect(try s.registerIpcPollWaitersForFd(p0, pair.a, fd_abi.event_hangup, 0x2000, 32, 1, 33, extra));
     try s.armFdWaitGroup(extra);
@@ -1504,12 +2234,15 @@ test "shared broker channel supports 24 hangup waiters and bounded reuse" {
     }
     try std.testing.expect(seen[32] and !seen[0]);
     try std.testing.expectEqual(@as(usize, 0), s.takeIpcChannelPeerCloseWaiters(peer, &targets));
-    for (s.fd_wait_group_thread_counts) |count|
-        try std.testing.expectEqual(@as(u16, 0), count);
+    try std.testing.expectEqual(@as(usize, 0), s.fd_wait_group_thread_counts.live);
 }
 
 test "signal wake cancellation clears ipc recv completion waiter" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     const rights = fdRights(.{
         .send = true,
         .recv = true,
@@ -1518,7 +2251,7 @@ test "signal wake cancellation clears ipc recv completion waiter" {
     });
     const pair = try s.createIpcChannelPairFds(p0, rights, .{}, 16);
     const group = try s.beginFdWaitGroup(p0, 7, 11, 1);
-    _ = try s.registerIpcRecvCompletionWaiterForFd(p0, pair.a, 0x2000, 2, 7, 11, 1, group);
+    _ = try s.registerIpcRecvCompletionWaiterForFd(p0, pair.a, .{ .active = true, .array = 0x2000 }, 2, 7, 11, 1, group);
     try s.armFdWaitGroup(group);
 
     s.unregisterFdWaitersForThread(p0, 7, 11);
@@ -1528,7 +2261,11 @@ test "signal wake cancellation clears ipc recv completion waiter" {
 }
 
 test "fd wait group cancellation survives a destroyed object in the registration map" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     var free_list = FreePageList{};
     const rights = fdRights(.{
         .send = true,
@@ -1574,64 +2311,82 @@ test "fd wait group cancellation survives a destroyed object in the registration
 }
 
 test "fd wait group counts preserve colliding threads and exact cancellation" {
-    var s = try initFdState();
-    const collision = 7 + kernel.max_fd_wait_groups;
-    try std.testing.expectEqual(@as(u16, 0), s.fd_wait_group_thread_counts[7]);
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
+    const collision = 7 + former_max_fd_wait_groups;
+    try std.testing.expectEqual(@as(u64, 0), groupCount(&s, 7));
     s.cancelFdWaitGroupsForThread(p0, 7, 11);
     const first = try s.beginFdWaitGroup(p0, 7, 11, 1);
     _ = try s.beginFdWaitGroup(p0, 7, 11, 2);
     const other_thread = try s.beginFdWaitGroup(p1, collision, 11, 3);
     const other_generation = try s.beginFdWaitGroup(p0, 7, 12, 4);
-    try std.testing.expectEqual(@as(u16, 4), s.fd_wait_group_thread_counts[7]);
+    try std.testing.expectEqual(@as(u64, 3), groupCount(&s, 7));
     s.cancelFdWaitGroup(first, 99);
     s.cancelFdWaitGroupsForThread(p1, 7, 11);
-    try std.testing.expectEqual(@as(u16, 4), s.fd_wait_group_thread_counts[7]);
+    try std.testing.expectEqual(@as(u64, 3), groupCount(&s, 7));
     s.cancelFdWaitGroupsForThread(p0, 7, 11);
-    try std.testing.expectEqual(@as(u16, 2), s.fd_wait_group_thread_counts[7]);
-    try std.testing.expect(s.fd_wait_groups[other_thread.index].state == .building);
-    try std.testing.expect(s.fd_wait_groups[other_generation.index].state == .building);
+    try std.testing.expectEqual(@as(u64, 1), groupCount(&s, 7));
+    try std.testing.expect(s.fd_wait_groups.get(@intCast(other_thread.index)).?.*.state == .building);
+    try std.testing.expect(s.fd_wait_groups.get(@intCast(other_generation.index)).?.*.state == .building);
     s.cancelFdWaitGroup(first, 1);
-    try std.testing.expectEqual(@as(u16, 2), s.fd_wait_group_thread_counts[7]);
+    try std.testing.expectEqual(@as(u64, 1), groupCount(&s, 7));
     s.cancelFdWaitGroupsForOwner(p1);
-    try std.testing.expectEqual(@as(u16, 1), s.fd_wait_group_thread_counts[7]);
+    try std.testing.expectEqual(@as(u64, 1), groupCount(&s, 7));
     s.cancelFdWaitGroupsForThread(p0, 7, 12);
-    try std.testing.expectEqual(@as(u16, 0), s.fd_wait_group_thread_counts[7]);
+    try std.testing.expectEqual(@as(u64, 0), groupCount(&s, 7));
 }
 
 test "fd wait group counts survive failed setup full capacity and reset" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     try std.testing.expectError(KernelError.InvalidState, s.beginFdWaitGroup(p0, 7, 11, 0));
     const failed_setup = try s.beginFdWaitGroup(p0, 7, 11, 1);
     try std.testing.expectError(KernelError.InvalidState, s.linkFdWaitRegistration(failed_setup, .{}));
     try s.armFdWaitGroup(failed_setup);
     try std.testing.expectError(KernelError.InvalidState, s.armFdWaitGroup(failed_setup));
     s.cancelFdWaitGroup(failed_setup, 1);
-    try std.testing.expectEqual(@as(u16, 0), s.fd_wait_group_thread_counts[7]);
-    for (0..kernel.max_fd_wait_groups) |i|
+    try std.testing.expectEqual(@as(u64, 0), groupCount(&s, 7));
+    for (0..former_max_fd_wait_groups) |i|
         _ = try s.beginFdWaitGroup(p0, 7, 11, i + 1);
-    try std.testing.expectError(KernelError.TableFull, s.beginFdWaitGroup(p0, 7, 11, 999));
-    try std.testing.expectEqual(@as(u16, kernel.max_fd_wait_groups), s.fd_wait_group_thread_counts[7]);
+    _ = try s.beginFdWaitGroup(p0, 7, 11, 999);
+    try std.testing.expectEqual(@as(u64, former_max_fd_wait_groups + 1), groupCount(&s, 7));
     s.cancelFdWaitGroupsForOwner(p0);
-    try std.testing.expectEqual(@as(u16, 0), s.fd_wait_group_thread_counts[7]);
+    try std.testing.expectEqual(@as(u64, 0), groupCount(&s, 7));
     _ = try s.beginFdWaitGroup(p0, 7, 11, 1000);
-    try s.initFromDetectedRegionsInPlace(1);
-    for (s.fd_wait_group_thread_counts) |count|
-        try std.testing.expectEqual(@as(u16, 0), count);
+    // Serial fixture teardown: no allocated backing or surviving borrower.
+    // Construct a fresh state, rather than claiming a live-reset contract.
+    try reconstructUnbackedFixtureInPlace(&s);
+    try std.testing.expectEqual(@as(usize, 0), s.fd_wait_group_thread_counts.live);
 }
 
 fn expectTimerWaiterCount(s: *const KernelState, expected: usize) !void {
     var actual: usize = 0;
-    for (s.task_fd_waiters, 0..) |waiter, slot_index| {
-        const is_timer = waiter.active and waiter.object.kind == .timer;
-        if (is_timer) actual += 1;
-        try std.testing.expectEqual(is_timer, s.task_timer_waiter_slots.isSet(slot_index));
+    {
+        var pool_iter_39 = s.task_fd_waiters.iterator();
+        while (pool_iter_39.next()) |pool_entry_39| {
+            const waiter = pool_entry_39.value.*;
+            const slot_index: usize = pool_entry_39.ref.index;
+            const is_timer = waiter.active and waiter.object.kind == .timer;
+            if (is_timer) actual += 1;
+            try std.testing.expectEqual(is_timer, s.task_fd_waiters.isMarked(@intCast(slot_index), 1));
+        }
     }
     try std.testing.expectEqual(expected, actual);
-    try std.testing.expectEqual(actual, s.task_timer_waiter_slots.count());
+    try std.testing.expectEqual(actual, markedCount(&s.task_fd_waiters, 1));
 }
 
 test "timer waiter count preserves duplicates mixed fds deadlines and exact cleanup" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     const rights = fdRights(.{ .wait = true, .poll = true, .write = true, .close = true });
     const timer = try s.createTimerFd(p0, 100, 0, .{}, rights, 16);
     const event = try s.createEventFd(p0, 0, .{}, rights, 16);
@@ -1677,7 +2432,11 @@ test "timer waiter count preserves duplicates mixed fds deadlines and exact clea
 }
 
 test "timer waiter count retains pending completion until exact group retirement" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     const timer = try s.createTimerFd(p0, 100, 0, .{}, fdRights(.{ .wait = true, .poll = true }), 16);
     const group = try s.beginFdWaitGroup(p0, 7, 11, 1);
     _ = try s.registerTaskReadableWaiterForFd(p0, timer, fd_abi.event_readable, 0x1000, 7, 11, 1, group);
@@ -1699,7 +2458,11 @@ test "timer waiter count retains pending completion until exact group retirement
 }
 
 test "timer waiter count survives close reuse and object table reset" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     var free_list = FreePageList{};
     const rights = fdRights(.{ .wait = true, .poll = true, .close = true });
     const timer = try s.createTimerFd(p0, 100, 0, .{}, rights, 16);
@@ -1730,63 +2493,79 @@ test "timer waiter count survives close reuse and object table reset" {
 }
 
 test "timer waiter count rolls back failed links and full capacity and resets" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     const rights = fdRights(.{ .wait = true, .poll = true });
     const timer = try s.createTimerFd(p0, 100, 0, .{}, rights, 16);
     const event = try s.createEventFd(p0, 0, .{}, rights, 16);
     const failed = try s.beginFdWaitGroup(p0, 7, 11, 1);
     try s.armFdWaitGroup(failed);
-    try std.testing.expectError(KernelError.TableFull, s.registerTaskReadableWaiterForFd(p0, timer, fd_abi.event_readable, 0x1000, 7, 11, 1, failed));
+    try std.testing.expectError(KernelError.InvalidState, s.registerTaskReadableWaiterForFd(p0, timer, fd_abi.event_readable, 0x1000, 7, 11, 1, failed));
     try expectTimerWaiterCount(&s, 0);
-    for (s.task_fd_waiters) |waiter| try std.testing.expect(!waiter.active);
+    {
+        var pool_iter_40 = s.task_fd_waiters.iterator();
+        while (pool_iter_40.next()) |pool_entry_40| {
+            const waiter = pool_entry_40.value.*;
+            try std.testing.expect(!waiter.active);
+        }
+    }
     s.cancelFdWaitGroup(failed, 1);
-    for (0..kernel.max_task_fd_waiters) |i| {
+    for (0..former_max_task_fd_waiters) |i| {
         const group = try s.beginFdWaitGroup(p0, i, 11, i + 2);
         _ = try s.registerTaskReadableWaiterForFd(p0, if (i % 2 == 0) timer else event, fd_abi.event_readable, 0x1000 + 24 * i, i, 11, i + 2, group);
         try s.armFdWaitGroup(group);
     }
-    try expectTimerWaiterCount(&s, kernel.max_task_fd_waiters / 2);
+    try expectTimerWaiterCount(&s, former_max_task_fd_waiters / 2);
     var targets: [1]kernel.ThreadWakeTarget = undefined;
     try std.testing.expectEqual(@as(usize, 0), s.takeReadyTimerWaiters(100, targets[0..0]));
-    for (0..kernel.max_task_fd_waiters / 2) |i| {
+    for (0..former_max_task_fd_waiters / 2) |i| {
         try std.testing.expectEqual(@as(usize, 1), s.takeReadyTimerWaiters(100, &targets));
         try std.testing.expectEqual(@as(u16, @intCast(2 * i)), targets[0].registration.slot);
-        try expectTimerWaiterCount(&s, kernel.max_task_fd_waiters / 2);
+        try expectTimerWaiterCount(&s, former_max_task_fd_waiters / 2);
     }
     try std.testing.expectEqual(@as(usize, 0), s.takeReadyTimerWaiters(100, &targets));
     try std.testing.expectEqual(@as(?u64, null), s.nextTimerWaiterDeadline());
-    const first = s.task_fd_waiters[0].binding.group;
-    try std.testing.expectError(KernelError.TableFull, s.registerTaskReadableWaiterForFd(p0, timer, fd_abi.event_readable, 0x5000, 0, 11, 2, first));
-    try expectTimerWaiterCount(&s, kernel.max_task_fd_waiters / 2);
+    const first = s.task_fd_waiters.get(@intCast(0)).?.*.binding.group;
+    try std.testing.expectError(KernelError.InvalidState, s.registerTaskReadableWaiterForFd(p0, timer, fd_abi.event_readable, 0x5000, 0, 11, 2, first));
+    try expectTimerWaiterCount(&s, former_max_task_fd_waiters / 2);
     s.cancelFdWaitGroupsForOwner(p0);
     try expectTimerWaiterCount(&s, 0);
     const next = try s.beginFdWaitGroup(p0, 7, 11, 1000);
     _ = try s.registerTaskReadableWaiterForFd(p0, timer, fd_abi.event_readable, 0x1000, 7, 11, 1000, next);
     try expectTimerWaiterCount(&s, 1);
-    try s.initFromDetectedRegionsInPlace(1);
+    // This fixture owns no PMM extents; discard its logical timer objects and
+    // construct fresh storage. Production live owners cannot use constructors.
+    try reconstructUnbackedFixtureInPlace(&s);
     try expectTimerWaiterCount(&s, 0);
 }
 
 test "timer waiter index preserves sparse last slot and minimum deadline order" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     const rights = fdRights(.{ .wait = true, .poll = true, .write = true });
     const later = try s.createTimerFd(p0, 300, 0, .{}, rights, 16);
     const earlier = try s.createTimerFd(p0, 100, 0, .{}, rights, 16);
     const event = try s.createEventFd(p0, 0, .{}, rights, 16);
-    for (0..kernel.max_task_fd_waiters) |i| {
+    for (0..former_max_task_fd_waiters) |i| {
         const group = try s.beginFdWaitGroup(p0, i, 11, i + 1);
-        const fd = if (i == 63) later else if (i == kernel.max_task_fd_waiters - 1) earlier else event;
+        const fd = if (i == 63) later else if (i == former_max_task_fd_waiters - 1) earlier else event;
         _ = try s.registerTaskReadableWaiterForFd(p0, fd, fd_abi.event_readable, 0x1000 + 24 * i, i, 11, i + 1, group);
         try s.armFdWaitGroup(group);
     }
     try expectTimerWaiterCount(&s, 2);
-    try std.testing.expect(s.task_timer_waiter_slots.isSet(kernel.max_task_fd_waiters - 1));
+    try std.testing.expect(s.task_fd_waiters.isMarked(@intCast(former_max_task_fd_waiters - 1), 1));
     try std.testing.expectEqual(@as(?u64, 100), s.nextTimerWaiterDeadline());
     var targets: [1]kernel.ThreadWakeTarget = undefined;
     try std.testing.expectEqual(@as(usize, 0), s.takeReadyTimerWaiters(100, targets[0..0]));
     try std.testing.expectEqual(@as(?u64, 100), s.nextTimerWaiterDeadline());
     try std.testing.expectEqual(@as(usize, 1), s.takeReadyTimerWaiters(100, &targets));
-    try std.testing.expectEqual(@as(u16, kernel.max_task_fd_waiters - 1), targets[0].registration.slot);
+    try std.testing.expectEqual(@as(u16, former_max_task_fd_waiters - 1), targets[0].registration.slot);
     try expectTimerWaiterCount(&s, 2);
     try std.testing.expectEqual(@as(?u64, 300), s.nextTimerWaiterDeadline());
     try std.testing.expectEqual(@as(usize, 0), s.takeReadyTimerWaiters(100, &targets));
@@ -1803,7 +2582,11 @@ test "timer waiter index preserves sparse last slot and minimum deadline order" 
 }
 
 test "delayed target cannot cancel a reused fd wait group slot" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     const rights = fdRights(.{
         .send = true,
         .recv = true,
@@ -1833,7 +2616,7 @@ test "delayed target cannot cancel a reused fd wait group slot" {
     s.cancelFdWaitGroup(old_group, 51);
 
     var i: usize = 0;
-    while (i < kernel.max_fd_wait_groups - 1) : (i += 1) {
+    while (i < former_max_fd_wait_groups - 1) : (i += 1) {
         const transient = try s.beginFdWaitGroup(p0, 8, @intCast(100 + i), @intCast(1000 + i));
         s.cancelFdWaitGroup(transient, @intCast(1000 + i));
     }
@@ -1853,7 +2636,7 @@ test "delayed target cannot cancel a reused fd wait group slot" {
     try s.armFdWaitGroup(new_group);
 
     s.cancelFdWaitGroup(delayed[0].group, delayed[0].wait_token);
-    try std.testing.expectEqual(@as(u16, 1), s.fd_wait_group_thread_counts[7]);
+    try std.testing.expectEqual(@as(u64, 1), groupCount(&s, 7));
     var current: [1]kernel.ThreadWakeTarget = undefined;
     try std.testing.expectEqual(
         @as(usize, 1),
@@ -1863,7 +2646,11 @@ test "delayed target cannot cancel a reused fd wait group slot" {
 }
 
 test "duplicate poll entries stay grouped until completion" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     const rights = fdRights(.{
         .send = true,
         .recv = true,
@@ -1906,30 +2693,37 @@ test "duplicate poll entries stay grouped until completion" {
     try std.testing.expectEqual(@as(u64, 0x1018), targets[1].pollfd_va);
 }
 
-test "ipc call attaches one-shot reply fd" {
-    var s = try initFdState();
+test "ipc call has no automatic fd and extraction owns reply authority" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     var free_list = FreePageList{};
     const endpoint = try s.createIpcEndpointFd(p0, fdRights(.{ .recv = true, .call = true, .transfer = true, .close = true }), .{}, 16);
     const client_endpoint = try s.transferFd(p0, p1, endpoint, 16, fdRights(.{ .call = true, .close = true }), .{}, .copy);
 
-    const client_reply = try s.ipcCall(p1, client_endpoint, .{ .words = .{ 99, 0, 0, 0 } }, 16, &free_list);
-    const request = try s.ipcRecv(p0, endpoint, 1, 16, &free_list);
+    const before = try s.fdFreeCountFrom(p1, 16);
+    const call = try s.ipcCall(p1, client_endpoint, .{ .words = .{ 99, 0, 0, 0 } }, .{ .owner = p1 }, &free_list);
+    try std.testing.expectEqual(before, try s.fdFreeCountFrom(p1, 16));
+    const request = try s.ipcRecv(p0, endpoint, 0, 16, &free_list);
     try std.testing.expectEqual(@as(u64, 99), request.words[0]);
-    try std.testing.expectEqual(@as(usize, 1), request.fd_count);
-    const server_reply = request.fds[0].fd;
-    const server_reply_entry = s.fdEntryConst(p0, server_reply) orelse unreachable;
-    try std.testing.expect(server_reply_entry.rights.send);
-    try std.testing.expect(!server_reply_entry.rights.recv);
-
-    try s.ipcReply(p0, server_reply, .{ .words = .{ 1234, 0, 0, 0 } }, &free_list);
-    try std.testing.expectError(KernelError.InvalidState, s.ipcReply(p0, server_reply, .{ .words = .{ 1, 0, 0, 0 } }, &free_list));
-
-    const reply = try s.ipcRecv(p1, client_reply, 0, 16, &free_list);
-    try std.testing.expectEqual(@as(u64, 1234), reply.words[0]);
+    try std.testing.expectEqual(@as(usize, 0), request.fd_count);
+    try std.testing.expectEqual(call, request.call);
+    const extracted = try s.ipcExtractReply(p0, request.call, 16);
+    const entry = s.fdEntryConst(p0, extracted).?;
+    try std.testing.expect(entry.rights.send and entry.rights.transfer and !entry.rights.recv);
+    try s.closeFdWithFreeList(p0, extracted, &free_list);
+    s.releaseIpcCallReference(call);
+    try std.testing.expect(s.ipcReplySlot(call) == null);
 }
 
-test "ipc receiver handoff hints follow endpoint receiver and reply creator" {
-    var s = try initFdState();
+test "ipc receiver handoff hints and call caller identity are independent" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     var free_list = FreePageList{};
     const endpoint = try s.createIpcEndpointFd(
         p0,
@@ -1954,24 +2748,22 @@ test "ipc receiver handoff hints follow endpoint receiver and reply creator" {
     try std.testing.expectEqual(@as(u32, 11), endpoint_hint.thread_generation);
     try std.testing.expectEqual(p0, endpoint_hint.owner);
 
-    const client_reply = try s.ipcCall(
-        p1,
-        client_endpoint,
-        .{ .words = .{ 99, 0, 0, 0 } },
-        16,
-        &free_list,
-    );
-    try std.testing.expect(s.noteIpcReceiverForFd(p1, client_reply, 9, 13));
-    const request = try s.ipcRecv(p0, endpoint, 1, 16, &free_list);
-    const server_reply = request.fds[0].fd;
-    const reply_hint = s.ipcReceiverHandoffHintForSendFd(p0, server_reply) orelse unreachable;
-    try std.testing.expectEqual(@as(usize, 9), reply_hint.thread_index);
-    try std.testing.expectEqual(@as(u32, 13), reply_hint.thread_generation);
-    try std.testing.expectEqual(p1, reply_hint.owner);
+    const call = try s.ipcCall(p1, client_endpoint, .{}, .{ .owner = p1, .thread_index = 9, .thread_generation = 13, .wait_token = 7 }, &free_list);
+    const request = try s.ipcRecv(p0, endpoint, 0, 16, &free_list);
+    const caller = s.ipcReplySlot(call).?.caller;
+    try std.testing.expectEqual(@as(usize, 9), caller.thread_index);
+    try std.testing.expectEqual(@as(u32, 13), caller.thread_generation);
+    try std.testing.expectEqual(p1, caller.owner);
+    s.releaseIpcCallAuthority(request.call);
+    s.releaseIpcCallReference(call);
 }
 
 test "ipc channel receiver hints isolate sides permissions and recycled objects" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     const rights = fdRights(.{ .send = true, .recv = true, .transfer = true, .close = true });
     const pair = try s.createIpcChannelPairFds(p0, rights, .{}, 16);
     try std.testing.expect(s.noteIpcReceiverForFd(p0, pair.a, 7, 11));
@@ -2006,7 +2798,11 @@ test "ipc channel receiver hints isolate sides permissions and recycled objects"
 }
 
 test "irq fd records only matching device and MSI-X entry" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     const irq_fd = try s.createIrqFd(p0, .{
         .device = 0x1001,
         .kind = .msix,
@@ -2046,7 +2842,11 @@ test "irq fd records only matching device and MSI-X entry" {
 }
 
 test "retired irq aliases report hangup and cannot consume a replacement event" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     const rights = fdRights(.{ .irq_wait = true, .poll = true, .read = true, .close = true, .dup = true });
     const fd = try s.createIrqFd(p0, .{ .device = 0x1001, .kind = .msix, .vector = 1 }, rights, .{}, 16);
     const alias = try s.dupFd(p0, fd, 16, rights, .{});
@@ -2077,7 +2877,11 @@ test "retired irq aliases report hangup and cannot consume a replacement event" 
 }
 
 test "irq publication retirement drains racing writer before slot reuse" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     const fd = try s.createIrqFd(p0, .{
         .device = 0x1001,
         .kind = .msix,
@@ -2100,100 +2904,89 @@ test "irq publication retirement drains racing writer before slot reuse" {
         thread.join();
     }
     while (s.irqPublishedEventCount(original).? == 0) std.atomic.spinLoopHint();
-    s.unpublishIrqObject(original);
-    var generation = original.generation;
+    var current_fd = fd;
+    var current_ref = original;
     for (0..256) |_| {
-        const retiring = kernel.KernelObjectRef{ .kind = .irq, .index = original.index, .generation = generation };
-        s.publishIrqObject(retiring, .{
-            .owner_principal_raw = @intFromEnum(p0),
-            .device = 0x1001,
-            .kind = .msix,
-            .vector = 1,
-        });
-        while (s.irqPublishedEventCount(retiring).? == 0) std.atomic.spinLoopHint();
-        s.unpublishIrqObject(retiring);
-        generation = KernelState.nextObjectGeneration(generation);
-        const replacement = kernel.KernelObjectRef{ .kind = .irq, .index = original.index, .generation = generation };
-        s.publishIrqObject(replacement, .{
-            .owner_principal_raw = @intFromEnum(p1),
+        try s.closeFd(p0, current_fd);
+        try std.testing.expect(s.kernelObjectSlot(current_ref) == null);
+        const replacement = try s.createIrqFd(p0, .{
             .device = 0x1002,
             .kind = .msix,
             .vector = 1,
-        });
+        }, fdRights(.{ .irq_wait = true, .close = true }), .{}, 16);
+        const replacement_ref = s.fdEntryConst(p0, replacement).?.object;
+        try std.testing.expectEqual(current_ref.index, replacement_ref.index);
+        try std.testing.expect(current_ref.generation != replacement_ref.generation);
         for (0..128) |_| std.atomic.spinLoopHint();
-        try std.testing.expectEqual(@as(?u64, 0), s.irqPublishedEventCount(replacement));
-        s.unpublishIrqObject(replacement);
-        generation = KernelState.nextObjectGeneration(generation);
-    }
-}
-
-test "irq candidate words preserve boundary slots retirement and reuse" {
-    var s = try initFdState();
-    var owners: [4]PrincipalId = undefined;
-    try std.testing.expectEqual(@as(usize, 0), s.recordDeviceInterruptEvent(0x1001, 1, &owners));
-    const indices = [_]u32{ 0, 63, 64, kernel.max_fd_objects - 1 };
-    for (indices) |index| {
-        const ref = kernel.KernelObjectRef{ .kind = .irq, .index = index, .generation = 7 };
-        s.publishIrqObject(ref, .{
-            .owner_principal_raw = @intFromEnum(p0),
+        try std.testing.expectEqual(@as(?u64, 0), s.irqPublishedEventCount(replacement_ref));
+        try s.closeFd(p0, replacement);
+        current_fd = try s.createIrqFd(p0, .{
             .device = 0x1001,
             .kind = .msix,
             .vector = 1,
-        });
-        try std.testing.expect((s.irq_publish_candidates[index / 64] &
-            (@as(u64, 1) << @as(u6, @intCast(index % 64)))) != 0);
+        }, fdRights(.{ .irq_wait = true, .close = true }), .{}, 16);
+        current_ref = s.fdEntryConst(p0, current_fd).?.object;
+        while (s.irqPublishedEventCount(current_ref).? == 0) std.atomic.spinLoopHint();
     }
-    // Multiple matching slots still deduplicate the owner; mismatches are not
-    // events even when their candidate bits are set.
+    try s.closeFd(p0, current_fd);
+}
+
+test "concurrent IRQ producers add each event exactly once" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
+    defer s.deinitPools();
+    const fd = try s.createIrqFd(p0, .{ .device = 0x1001, .kind = .msix, .vector = 1 }, fdRights(.{ .irq_wait = true, .close = true }), .{}, 16);
+    const ref = s.fdEntryConst(p0, fd).?.object;
+    const Producer = struct {
+        fn run(state: *KernelState) void {
+            var owners: [1]PrincipalId = undefined;
+            for (0..10000) |_| _ = state.recordDeviceInterruptEvent(0x1001, 1, &owners);
+        }
+    };
+    var threads: [4]std.Thread = undefined;
+    for (&threads) |*thread| thread.* = try std.Thread.spawn(.{}, Producer.run, .{&s});
+    for (threads) |thread| thread.join();
+    try std.testing.expectEqual(@as(?u64, 40000), s.irqPublishedEventCount(ref));
+    try s.closeFd(p0, fd);
+}
+
+test "irq directory filters live candidates and preserves generation on reuse" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
+    defer s.deinitPools();
+    var refs: [65]kernel.KernelObjectRef = undefined;
+    for (&refs) |*ref| {
+        ref.* = try s.createKernelObject(.irq, .{ .irq = .{ .owner_principal_raw = @intFromEnum(p0), .device = 0x1001, .kind = .msix, .vector = 1 } });
+        s.publishIrqObject(ref.*, s.kernelObjectSlot(ref.*).?.payload.irq);
+    }
+    var owners: [4]PrincipalId = undefined;
     try std.testing.expectEqual(@as(usize, 0), s.recordDeviceInterruptEvent(0x1002, 1, &owners));
     try std.testing.expectEqual(@as(usize, 0), s.recordDeviceInterruptEvent(0x1001, 2, &owners));
     try std.testing.expectEqual(@as(usize, 1), s.recordDeviceInterruptEvent(0x1001, 1, &owners));
-    try std.testing.expectEqual(p0, owners[0]);
-    for (indices) |index| {
-        const ref = kernel.KernelObjectRef{ .kind = .irq, .index = index, .generation = 7 };
+    for (refs) |ref| {
         try std.testing.expectEqual(@as(?u64, 1), s.irqPublishedEventCount(ref));
-        s.unpublishIrqObject(.{ .kind = .irq, .index = index, .generation = 6 });
+        s.unpublishIrqObject(.{ .kind = .irq, .index = ref.index, .generation = ref.generation + 1 });
         try std.testing.expectEqual(@as(?u64, 1), s.irqPublishedEventCount(ref));
         s.unpublishIrqObject(ref);
-        try std.testing.expect((s.irq_publish_candidates[index / 64] &
-            (@as(u64, 1) << @as(u6, @intCast(index % 64)))) != 0);
-        s.next_fd_object_scan = index;
-        const event = try s.createKernelObject(.event, .{ .event = 42 });
-        try std.testing.expectEqual(index, event.index);
-        try std.testing.expectEqual(@as(usize, 0), s.recordDeviceInterruptEvent(0x1002, 1, &owners));
-        try std.testing.expectEqual(@as(u64, 42), s.kernelObjectSlot(event).?.payload.event);
     }
     try std.testing.expectEqual(@as(usize, 0), s.recordDeviceInterruptEvent(0x1001, 1, &owners));
-    const replacement = kernel.KernelObjectRef{ .kind = .irq, .index = 64, .generation = 8 };
-    s.publishIrqObject(replacement, .{
-        .owner_principal_raw = @intFromEnum(p1),
-        .device = 0x1002,
-        .kind = .msix,
-        .vector = 2,
-    });
-    // A fully saturated conservative bitmap must preserve exact filtering.
-    @memset(&s.irq_publish_candidates, std.math.maxInt(u64));
-    try std.testing.expectEqual(@as(usize, 0), s.recordDeviceInterruptEvent(0x1001, 1, &owners));
-    try std.testing.expectEqual(@as(usize, 1), s.recordDeviceInterruptEvent(0x1002, 2, &owners));
-    try std.testing.expectEqual(p1, owners[0]);
-    try std.testing.expectEqual(@as(?u64, 1), s.irqPublishedEventCount(replacement));
-    // The global reset is quiescent here, just like the existing table reset.
-    s.resetKernelObjectTable();
-    for (s.irq_publish_candidates) |word| try std.testing.expectEqual(@as(u64, 0), word);
-    try std.testing.expectEqual(@as(usize, 0), s.recordDeviceInterruptEvent(0x1002, 2, &owners));
-    s.publishIrqObject(replacement, .{
-        .owner_principal_raw = @intFromEnum(p1),
-        .device = 0x1002,
-        .kind = .msix,
-        .vector = 2,
-    });
-    try std.testing.expectEqual(@as(usize, 1), s.recordDeviceInterruptEvent(0x1002, 2, &owners));
 }
 
 test "physical page allocation returns a page handle" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     var free_list = FreePageList{};
-    try free_list.appendContiguousRange(0, 0x1_0000_0000, 2);
+    try free_list.installRegions(&.{.{ .id = 0, .start = 0x1_0000_0000, .end = (0x1_0000_0000) + (2) * 4096 }});
+    try free_list.seedContiguousRange(0x1_0000_0000, 2);
 
     const page = try s.allocPhysicalPage(&free_list);
     try std.testing.expectEqual(@as(u64, 0x1_0000_0000), page.paddr);
@@ -2201,12 +2994,14 @@ test "physical page allocation returns a page handle" {
 
 fn expectFreeRangeInvariants(list: *const FreePageList) !void {
     var pages: usize = 0;
-    for (list.ranges[0..list.range_len], 0..) |range, i| {
+    for (0..list.rangeCount()) |i| {
+        const range = list.rangeAt(i);
         try std.testing.expect(range.len != 0);
         try std.testing.expectEqual(@as(u64, 0), range.physical_start % 4096);
         pages += range.len;
         const end = range.physical_start + range.len * 4096;
-        for (list.ranges[i + 1 .. list.range_len]) |other| {
+        for (i + 1..list.rangeCount()) |j| {
+            const other = list.rangeAt(j);
             try std.testing.expect(end <= other.physical_start or
                 other.physical_start + other.len * 4096 <= range.physical_start);
         }
@@ -2215,6 +3010,9 @@ fn expectFreeRangeInvariants(list: *const FreePageList) !void {
 }
 
 test "free range removal preserves constrained allocation and surviving ranges" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
     const boundary: u64 = 4 << 30;
     for (0..6) |operation| {
         for (0..3) |removed| {
@@ -2223,12 +3021,23 @@ test "free range removal preserves constrained allocation and surviving ranges" 
             var list = FreePageList{};
             const above = operation == 3 or operation == 5;
             const pages: usize = if (operation >= 4) 2 else 1;
-            const target: u64 = if (above) boundary else boundary - pages * 4096;
+            const target: u64 = if (operation == 1) boundary + 0x200000 else if (above) boundary else boundary - pages * 4096;
+            var boundaries: [3]std.meta.Child(@typeInfo(@TypeOf(FreePageList.installRegions)).@"fn".params[1].type.?) = undefined;
+            for (&boundaries, 0..) |*region, i| {
+                const start = if (i == removed) target else (if (above) @as(u64, 0x100000) else boundary + 0x100000) + i * 0x10000;
+                region.* = .{ .id = i, .start = start, .end = start + (if (i == removed) pages else @as(usize, 3)) * 4096 };
+            }
+            std.mem.sort(@TypeOf(boundaries[0]), &boundaries, {}, struct {
+                fn less(_: void, a: @TypeOf(boundaries[0]), b: @TypeOf(boundaries[0])) bool {
+                    return a.start < b.start;
+                }
+            }.less);
+            try list.installRegions(&boundaries);
             for (0..3) |i| {
                 const start = if (i == removed) target else (if (above) @as(u64, 0x100000) else boundary + 0x100000) + i * 0x10000;
-                try list.appendContiguousRange(@intCast(i), start, if (i == removed) pages else 3);
+                try list.seedContiguousRange(start, if (i == removed) pages else 3);
             }
-            const original = list.ranges[0..3].*;
+            const original = [_]kernel.RegionFreeRange{ list.rangeAt(0), list.rangeAt(1), list.rangeAt(2) };
             const allocated = switch (operation) {
                 0 => try list.popFront(),
                 1 => try list.popBack(),
@@ -2241,12 +3050,13 @@ test "free range removal preserves constrained allocation and surviving ranges" 
             try std.testing.expectEqual(target, allocated);
             try std.testing.expectEqual(@as(usize, 2), list.rangeCount());
             try std.testing.expectEqual(@as(usize, 6), list.pageCount());
-            for (original, 0..) |range, i| {
-                if (i == removed) continue;
+            for (original) |range| {
+                if (range.region_id == removed) continue;
                 var found: usize = 0;
-                for (list.ranges[0..list.range_len]) |survivor| {
+                for (0..list.rangeCount()) |range_index| {
+                    const survivor = list.rangeAt(range_index);
                     if (survivor.region_id == range.region_id) {
-                        try std.testing.expectEqualDeep(range, survivor);
+                        try expectResourceEqualDeep(range, survivor);
                         found += 1;
                     }
                 }
@@ -2258,6 +3068,9 @@ test "free range removal preserves constrained allocation and surviving ranges" 
 }
 
 test "free range unordered bridge merge preserves relocated survivor" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
     const permutations = [_][3]usize{
         .{ 0, 1, 2 }, .{ 0, 2, 1 }, .{ 1, 0, 2 },
         .{ 1, 2, 0 }, .{ 2, 0, 1 }, .{ 2, 1, 0 },
@@ -2268,11 +3081,12 @@ test "free range unordered bridge merge preserves relocated survivor" {
             const base: u64 = 0x100000;
             const upper = base + (gap_pages + 1) * 4096;
             const starts = [_]u64{ base, upper, 0x300000 };
-            for (order) |index| try list.appendPage(7, starts[index]);
+            try list.installRegions(&.{.{ .id = 7, .start = base, .end = 0x301000 }});
+            for (order) |index| try list.seedContiguousRange(starts[index], 1);
             if (gap_pages == 1) {
-                try list.appendPage(7, base + 4096);
+                try list.seedContiguousRange(base + 4096, 1);
             } else {
-                try list.appendContiguousRange(7, base + 4096, gap_pages);
+                try list.seedContiguousRange(base + 4096, gap_pages);
             }
             try std.testing.expectEqual(@as(usize, 2), list.rangeCount());
             try expectFreeRangeInvariants(&list);
@@ -2286,19 +3100,24 @@ test "free range unordered bridge merge preserves relocated survivor" {
     }
     // Physical adjacency alone must not merge distinct region owners.
     var separate = FreePageList{};
-    try separate.appendPage(1, 0x100000);
-    try separate.appendPage(2, 0x102000);
-    try separate.appendPage(1, 0x101000);
+    try separate.installRegions(&.{ .{ .id = 1, .start = 0x100000, .end = 0x102000 }, .{ .id = 2, .start = 0x102000, .end = 0x103000 } });
+    try separate.seedContiguousRange(0x100000, 1);
+    try separate.seedContiguousRange(0x102000, 1);
+    try separate.seedContiguousRange(0x101000, 1);
     try std.testing.expectEqual(@as(usize, 2), separate.rangeCount());
     try std.testing.expectError(KernelError.OutOfFreePages, separate.popContiguousBelow(3, 0x200000));
     try expectFreeRangeInvariants(&separate);
 }
 
 test "free range fragmented drain returns every page once after repeated removals" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
     var list = FreePageList{};
     var seen = [_]bool{false} ** 257;
     const base: u64 = 0x100000;
-    for (0..seen.len) |i| try list.appendPage(0, base + i * 8192);
+    try list.installRegions(&.{.{ .id = 0, .start = base, .end = base + seen.len * 8192 }});
+    for (0..seen.len) |i| try list.seedContiguousRange(base + i * 8192, 1);
     for (0..seen.len) |i| {
         const page = if (i % 2 == 0) try list.popFront() else try list.popBack();
         try std.testing.expect(page >= base and (page - base) % 8192 == 0);
@@ -2314,40 +3133,41 @@ test "free range fragmented drain returns every page once after repeated removal
 }
 
 test "free range allocation split failure preserves all physical pages" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
     for ([_]bool{ false, true }) |contiguous| {
         var free_list = FreePageList{};
+        try free_list.installRegions(&.{.{ .id = 0, .start = 4096, .end = (1 << 40) + (1 << 29) }});
         const boundary: u64 = 4 << 30;
-        free_list.range_len = FreePageList.max_ranges;
-        free_list.len = FreePageList.max_ranges + 3;
-        free_list.ranges[0] = .{ .region_id = 0, .physical_start = boundary - 4096, .len = 4 };
-        for (free_list.ranges[1..], 1..) |*range, index| {
-            range.* = .{ .region_id = 0, .physical_start = (20 << 30) + index * 8192, .len = 1 };
-        }
+        var backing = try kernel.PhysicalAccessTest.BackingSet.init(&.{.{ .first = boundary - 4096, .pages = 1 }});
+        defer backing.deinit();
+        try free_list.seedContiguousRange(boundary - 4096, 4);
         if (contiguous) {
-            try std.testing.expectError(KernelError.TooManyFreeRanges, free_list.popContiguousAtOrAbove(2, boundary));
+            try std.testing.expectError(KernelError.InvalidState, free_list.popContiguousAtOrAbove(2, boundary));
         } else {
-            try std.testing.expectError(KernelError.TooManyFreeRanges, free_list.popFrontAtOrAbove(boundary));
+            try std.testing.expectError(KernelError.InvalidState, free_list.popFrontAtOrAbove(boundary));
         }
-        try std.testing.expectEqual(@as(usize, FreePageList.max_ranges), free_list.rangeCount());
-        try std.testing.expectEqual(@as(usize, FreePageList.max_ranges + 3), free_list.pageCount());
-        try std.testing.expectEqual(boundary - 4096, free_list.ranges[0].physical_start);
-        try std.testing.expectEqual(@as(usize, 4), free_list.ranges[0].len);
-        for (free_list.ranges[1..], 1..) |range, index| {
-            try std.testing.expectEqual(@as(u64, (20 << 30) + index * 8192), range.physical_start);
-            try std.testing.expectEqual(@as(usize, 1), range.len);
-        }
-        // A full descriptor table must still allow consuming the entire tail.
+        try std.testing.expectEqual(@as(usize, 1), free_list.rangeCount());
+        try std.testing.expectEqual(@as(usize, 4), free_list.pageCount());
+        try std.testing.expectEqual(boundary - 4096, free_list.rangeAt(0).physical_start);
+        try std.testing.expectEqual(@as(usize, 4), free_list.rangeAt(0).len);
+        // Consuming the whole tail needs no new descriptor at an inaccessible PA.
         const tail = try free_list.popContiguousAtOrAbove(3, boundary);
         try std.testing.expectEqual(boundary, tail);
-        try std.testing.expectEqual(@as(usize, 1), free_list.ranges[0].len);
-        try std.testing.expectEqual(@as(usize, FreePageList.max_ranges), free_list.pageCount());
+        try std.testing.expectEqual(@as(usize, 1), free_list.rangeAt(0).len);
+        try std.testing.expectEqual(@as(usize, 1), free_list.pageCount());
     }
 }
 
 test "bounded contiguous allocation clips both ends and preserves excluded pages" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
     var list = FreePageList{};
     const boundary: u64 = 1 << 32;
-    try list.appendContiguousRange(0, boundary - 8192, 8);
+    try list.installRegions(&.{.{ .id = 0, .start = boundary - 8192, .end = (boundary - 8192) + (8) * 4096 }});
+    try list.seedContiguousRange(boundary - 8192, 8);
     try std.testing.expectEqual(boundary + 4096, try list.popContiguousInRange(2, boundary + 1, boundary + 3 * 4096));
     try std.testing.expectEqual(@as(usize, 6), list.pageCount());
     try std.testing.expectError(KernelError.OutOfFreePages, list.popContiguousInRange(1, boundary + 1, boundary + 4095));
@@ -2359,31 +3179,56 @@ test "bounded contiguous allocation clips both ends and preserves excluded pages
     try std.testing.expectEqual(@as(usize, 0), list.pageCount());
 }
 
-test "large bootfs preserves low contiguous RAM for IOMMU and respects identity limit" {
+test "large bootfs above 16 GiB preserves DMA32 RAM and respects direct aperture" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
     var list = FreePageList{};
     const low: u64 = 64 << 20;
-    const high: u64 = 1 << 32;
-    const identity_end: u64 = 16 << 30;
+    const high: u64 = 20 << 30;
+    const identity_end: u64 = 254 * (@as(u64, 1) << 39);
     const staging_pages = 107 * 256;
     // Keep an ineligible range first: free ranges are intentionally unordered.
-    try list.appendContiguousRange(0, identity_end, 100);
-    try list.appendContiguousRange(1, low, 768);
-    try list.appendContiguousRange(2, high, staging_pages);
-    for (0..staging_pages) |_| {
-        const page = try kernel.boot_resource_pages.allocate(&list);
-        try std.testing.expect(page >= high and page < identity_end);
+    try list.installRegions(&.{ .{ .id = 1, .start = low, .end = low + 768 * 4096 }, .{ .id = 2, .start = high, .end = high + staging_pages * 4096 }, .{ .id = 0, .start = identity_end, .end = identity_end + 100 * 4096 } });
+    try list.seedContiguousRange(identity_end, 100);
+    try list.seedContiguousRange(low, 768);
+    try list.seedContiguousRange(high, staging_pages);
+    const records = try std.testing.allocator.alloc(kernel.boot_resource_pages.StagedPage, staging_pages);
+    defer std.testing.allocator.free(records);
+    for (records) |*record| record.* = .{};
+    for (records) |*record| {
+        try record.acquire(&list);
+        var loan: kernel.boot_resource_pages.Loan = .{};
+        try record.borrowInto(&loan);
+        const physical = (try loan.physical()).toInt();
+        try std.testing.expect(physical >= high and physical < identity_end);
+        try loan.end();
     }
     try std.testing.expectEqual(@as(usize, 768), list.availableBelow(high).total);
     try std.testing.expectEqual(low, try list.popContiguousBelow(512, high));
     // A small-memory machine retains the existing low-RAM fallback.
-    try std.testing.expectEqual(low + 512 * 4096, try kernel.boot_resource_pages.allocate(&list));
+    var fallback: kernel.boot_resource_pages.StagedPage = .{};
+    try fallback.acquire(&list);
+    var fallback_loan: kernel.boot_resource_pages.Loan = .{};
+    try fallback.borrowInto(&fallback_loan);
+    try std.testing.expectEqual(low + 512 * 4096, (try fallback_loan.physical()).toInt());
+    try fallback_loan.end();
     _ = try list.popContiguousBelow(255, high);
-    try std.testing.expectError(KernelError.OutOfFreePages, kernel.boot_resource_pages.allocate(&list));
+    var exhausted: kernel.boot_resource_pages.StagedPage = .{};
+    try std.testing.expectError(KernelError.OutOfFreePages, exhausted.acquire(&list));
     try std.testing.expectEqual(@as(usize, 100), list.pageCount());
+    // These real ownership records outlive their grants, unlike the old test
+    // loop's raw paddr values. Return each original region before metadata.
+    for (records) |*record| try record.release();
+    try fallback.release();
 }
 
 test "zero-on-demand VMO holes read as zero without physical allocation" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     var free_list = FreePageList{};
     const rights = fdRights(.{ .read = true, .close = true, .resize = true, .map_read = true, .map_write = true });
     const fd = try s.createZeroOnDemandVmoFd(p0, 8192, rights, .{}, 16);
@@ -2406,9 +3251,14 @@ test "zero-on-demand VMO holes read as zero without physical allocation" {
 }
 
 test "zero-on-demand shared faults converge and grow retains aliases" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     var free_list = FreePageList{};
-    try free_list.appendContiguousRange(0, 20 << 30, 8);
+    try free_list.installRegions(&.{.{ .id = 0, .start = 20 << 30, .end = (20 << 30) + (8) * 4096 }});
+    try free_list.seedContiguousRange(20 << 30, 8);
     const rights = fdRights(.{ .close = true, .resize = true, .map_read = true, .map_write = true });
     const fd = try s.createZeroOnDemandVmoFd(p0, 8192, rights, .{}, 16);
     const ref = s.nativeVmoRefForFd(p0, fd).?;
@@ -2424,11 +3274,11 @@ test "zero-on-demand shared faults converge and grow retains aliases" {
     const spare = (try s.allocPhysicalPage(&free_list)).paddr;
     try std.testing.expectEqual(page, s.commitNativeVmaFaultMapping(p0, a, page, null).?.paddr);
     try std.testing.expectEqual(page, s.commitNativeVmaFaultMapping(p1, b, spare, null).?.paddr);
-    try free_list.appendPage(0, spare);
+    try free_list.appendPage(spare);
     const old = s.vmaEntryForVaConst(p0, va).?.*;
     try s.growVmoFdWithPages(p0, fd, 16384, &free_list);
     try std.testing.expectEqual(@as(usize, 7), free_list.pageCount());
-    try std.testing.expectEqualDeep(old, s.vmaEntryForVaConst(p0, va).?.*);
+    try expectResourceEqualDeep(old, s.vmaEntryForVaConst(p0, va).?.*);
     try std.testing.expectEqual(@as(?u64, page), s.nativeVmoResolvedPagePaddr(ref, 0));
     try std.testing.expectEqual(@as(?u64, 0), s.nativeVmoResolvedPagePaddrOrZero(ref, 3));
     var fixed = try s.prepareFixedFdMmap(p0, fd, va + 0x10000, 16384, .{ .read = true, .write = true }, .{ .shared = true }, 0, &free_list);
@@ -2442,9 +3292,14 @@ test "zero-on-demand shared faults converge and grow retains aliases" {
 }
 
 test "zero-on-demand private COW retries changed source and separates fork writes" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     var free_list = FreePageList{};
-    try free_list.appendContiguousRange(0, 20 << 30, 16);
+    try free_list.installRegions(&.{.{ .id = 0, .start = 20 << 30, .end = (20 << 30) + (16) * 4096 }});
+    try free_list.seedContiguousRange(20 << 30, 16);
     const fd = try s.createZeroOnDemandVmoFd(p0, 8192, fdRights(.{ .close = true, .map_read = true, .map_write = true }), .{}, 16);
     const ref = s.nativeVmoRefForFd(p0, fd).?;
     const va: u64 = 0x4900_0000;
@@ -2457,7 +3312,7 @@ test "zero-on-demand private COW retries changed source and separates fork write
     _ = s.commitNativeVmaFaultMapping(p0, shared_plan, shared_page, null).?;
     const candidate = (try s.allocPhysicalPage(&free_list)).paddr;
     try std.testing.expect(s.commitNativeVmaCowMapping(p0, stale, candidate, &free_list) == null);
-    try free_list.appendPage(0, candidate);
+    try free_list.appendPage(candidate);
     try std.testing.expectEqual(.allocate_copy, s.prepareNativeVmaCowMapping(p0, va, true, false).kind);
     const untouched = s.prepareNativeVmaCowMapping(p0, va + 4096, true, false);
     try std.testing.expectEqual(.allocate_zero, untouched.kind);
@@ -2477,7 +3332,11 @@ test "zero-on-demand private COW retries changed source and separates fork write
 }
 
 test "zero-on-demand does not accept stale out-of-bounds or malformed backing" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     var free_list = FreePageList{};
     const fd = try s.createZeroOnDemandVmoFd(p0, 4096, fdRights(.{ .close = true, .map_read = true, .map_write = true }), .{}, 16);
     const ref = s.nativeVmoRefForFd(p0, fd).?;
@@ -2487,7 +3346,7 @@ test "zero-on-demand does not accept stale out-of-bounds or malformed backing" {
     try std.testing.expect(s.nativeVmoResolvedPagePaddrOrZero(ref, 1) == null);
     const slot = s.nativeVmoSlot(ref).?;
     const saved = slot.*;
-    slot.page_store_start +%= 1;
+    slot.page_store_start.owner +%= 1;
     try std.testing.expectEqual(.denied, s.prepareNativeVmaFaultMapping(p0, va, true, false).kind);
     try std.testing.expect(s.commitNativeVmaFaultMapping(p0, plan, 0x90000000, null) == null);
     slot.* = saved;
@@ -2509,10 +3368,15 @@ test "zero-on-demand does not accept stale out-of-bounds or malformed backing" {
 }
 
 test "zero-on-demand VMO holes read as zero and shared fault candidates converge across growth" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     var free_list = FreePageList{};
     const base: u64 = 20 << 30;
-    try free_list.appendContiguousRange(0, base, 8);
+    try free_list.installRegions(&.{.{ .id = 0, .start = base, .end = (base) + (8) * 4096 }});
+    try free_list.seedContiguousRange(base, 8);
     const rights = fdRights(.{ .resize = true, .read = true, .inspect = true, .close = true, .dup = true, .map_read = true, .map_write = true });
     const fd = try s.createZeroOnDemandVmoFd(p0, 8192, rights, .{}, 16);
     const ref = s.nativeVmoRefForFd(p0, fd).?;
@@ -2534,10 +3398,10 @@ test "zero-on-demand VMO holes read as zero and shared fault candidates converge
     const spare = (try s.allocPhysicalPage(&free_list)).paddr;
     try std.testing.expectEqual(first, s.commitNativeVmaFaultMapping(p0, a, first, null).?.paddr);
     try std.testing.expectEqual(first, s.commitNativeVmaFaultMapping(p1, b, spare, null).?.paddr);
-    try free_list.appendPage(0, spare);
+    try free_list.appendPage(spare);
     const original = s.vmaEntryForVaConst(p0, 0x4900_0000).?.*;
     try s.growVmoFdWithPages(p0, fd, 16384, &free_list);
-    try std.testing.expectEqualDeep(original, s.vmaEntryForVaConst(p0, 0x4900_0000).?.*);
+    try expectResourceEqualDeep(original, s.vmaEntryForVaConst(p0, 0x4900_0000).?.*);
     try std.testing.expectEqual(@as(?u64, first), s.nativeVmoResolvedPagePaddr(ref, 0));
     try std.testing.expectEqual(@as(?u64, 0), s.nativeVmoResolvedPagePaddrOrZero(ref, 3));
     try std.testing.expectEqual(@as(usize, 7), free_list.pageCount());
@@ -2550,9 +3414,14 @@ test "zero-on-demand VMO holes read as zero and shared fault candidates converge
 }
 
 test "zero-on-demand private COW stays separate and retries after shared publication" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     var free_list = FreePageList{};
-    try free_list.appendContiguousRange(0, 20 << 30, 16);
+    try free_list.installRegions(&.{.{ .id = 0, .start = 20 << 30, .end = (20 << 30) + (16) * 4096 }});
+    try free_list.seedContiguousRange(20 << 30, 16);
     const fd = try s.createZeroOnDemandVmoFd(p0, 8192, fdRights(.{ .close = true, .map_read = true, .map_write = true }), .{}, 16);
     const ref = s.nativeVmoRefForFd(p0, fd).?;
     _ = try s.mmapFd(p0, fd, 0x4900_0000, 8192, vmaProt(.{ .read = true, .write = true }), mmapFlags(.{ .private = true }), 0);
@@ -2583,7 +3452,11 @@ test "zero-on-demand private COW stays separate and retries after shared publica
 }
 
 test "zero-on-demand rejects invalid references and resets policy on slot reuse" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     var free_list = FreePageList{};
     const fd = try s.createZeroOnDemandVmoFd(p0, 8192, fdRights(.{ .close = true, .resize = true, .map_read = true }), .{}, 16);
     const ref = s.nativeVmoRefForFd(p0, fd).?;
@@ -2595,12 +3468,12 @@ test "zero-on-demand rejects invalid references and resets policy on slot reuse"
     slot.backing.parent.ref = stale;
     try std.testing.expect(s.nativeVmoResolvedPagePaddrOrZero(ref, 0) == null);
     slot.backing.parent.ref = .{};
-    slot.page_store_start ^= 1;
+    slot.page_store_start.owner ^= 1;
     try std.testing.expect(s.nativeVmoResolvedPagePaddrOrZero(ref, 0) == null);
     const before = slot.*;
     try std.testing.expectError(KernelError.InvalidState, s.growVmoFdWithPages(p0, fd, 16384, &free_list));
     try expectVmoSlotEqual(before, slot.*);
-    slot.page_store_start ^= 1;
+    slot.page_store_start.owner ^= 1;
     try s.closeFdWithFreeList(p0, fd, &free_list);
     s.next_native_vmo_scan = ref.index;
     const reused = try s.createNativeVmo(.anonymous, 4096);
@@ -2612,10 +3485,15 @@ test "zero-on-demand rejects invalid references and resets policy on slot reuse"
 }
 
 test "VMO grow preserves shared aliases page views and final ownership" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     var free_list = FreePageList{};
     const base: u64 = 20 << 30;
-    try free_list.appendContiguousRange(0, base, 8);
+    try free_list.installRegions(&.{.{ .id = 0, .start = base, .end = (base) + (8) * 4096 }});
+    try free_list.seedContiguousRange(base, 8);
     const rights = fdRights(.{ .resize = true, .inspect = true, .close = true, .dup = true, .map_read = true, .map_write = true });
     const fd = try s.createAnonymousVmoFdWithPages(p0, 8192, rights, .{}, 16, &free_list);
     const ref = s.nativeVmoRefForFd(p0, fd).?;
@@ -2628,8 +3506,8 @@ test "VMO grow preserves shared aliases page views and final ownership" {
     const original_entry = s.vmaEntryForVaConst(p0, 0x4900_0000).?.*;
     try s.growVmoFdWithPages(p0, fd, 16384, &free_list);
     try std.testing.expectEqual(refs_before, s.nativeVmoRefCount(ref));
-    try std.testing.expectEqualDeep(original_entry, s.vmaEntryForVaConst(p0, 0x4900_0000).?.*);
-    try std.testing.expectEqualDeep(original_entry, s.vmaEntryForVaConst(p1, 0x4900_0000).?.*);
+    try expectResourceEqualDeep(original_entry, s.vmaEntryForVaConst(p0, 0x4900_0000).?.*);
+    try expectResourceEqualDeep(original_entry, s.vmaEntryForVaConst(p1, 0x4900_0000).?.*);
     try std.testing.expectEqual(@as(u64, 16384), s.fdInfo(p1, fd).?.size_bytes);
     for (0..4) |page| try std.testing.expectEqual(@as(?u64, base + page * 4096), s.nativeVmoPagePaddr(ref, page));
     try std.testing.expectEqual(@as(?u64, base + 4096), s.nativeVmoResolvedPagePaddr(view, 0));
@@ -2646,14 +3524,19 @@ test "VMO grow preserves shared aliases page views and final ownership" {
 }
 
 test "VMO grow rejects authority bad bounds and non-root objects without mutation" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     var free_list = FreePageList{};
-    try free_list.appendContiguousRange(0, 0x8200_0000, 4);
+    try free_list.installRegions(&.{.{ .id = 0, .start = 0x8200_0000, .end = (0x8200_0000) + (4) * 4096 }});
+    try free_list.seedContiguousRange(0x8200_0000, 4);
     const rights = fdRights(.{ .resize = true, .close = true, .dup = true, .map_read = true });
     const fd = try s.createAnonymousVmoFdWithPages(p0, 8192, rights, .{}, 16, &free_list);
     const ref = s.nativeVmoRefForFd(p0, fd).?;
     const original = s.nativeVmoSlot(ref).?.*;
-    for ([_]u64{ 0, 4096, 8191, 8193, std.math.maxInt(u64), (@as(u64, kernel.max_vmo_backing_pages) + 1) * 4096 }) |capacity| {
+    for ([_]u64{ 0, 4096, 8191, 8193, std.math.maxInt(u64), (@as(u64, kernel.max_vmo_logical_pages) + 1) * 4096 }) |capacity| {
         try std.testing.expectError(KernelError.InvalidState, s.growVmoFdWithPages(p0, fd, capacity, &free_list));
         try expectVmoSlotEqual(original, s.nativeVmoSlot(ref).?.*);
     }
@@ -2677,17 +3560,18 @@ test "VMO grow rejects authority bad bounds and non-root objects without mutatio
     try std.testing.expectError(KernelError.InvalidState, s.growVmoFdWithPages(p0, fd, 16384, &free_list));
 }
 
-test "zero-on-demand faults preserve backing through physical and sparse-store exhaustion" {
-    for ([_]bool{ false, true }) |store_full| {
-        var s = try initFdState();
-        var paddrs: [2]u64 = undefined;
-        var owners: [2]u64 = undefined;
-        var indices: [2]u32 = undefined;
-        if (store_full) try std.testing.expect(kernel.initVmoBackingPageStoreForTest(&paddrs, &owners, &indices));
+test "zero-on-demand faults preserve backing through physical exhaustion" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    {
+        var s: KernelState = undefined;
+        try initFdState(&s);
         defer if (!kernel.initRuntimeStorage(runtime_storage[0..])) unreachable;
         var free_list = FreePageList{};
-        const physical_count: usize = if (store_full) 3 else 1;
-        try free_list.appendContiguousRange(0, 20 << 30, physical_count);
+        const physical_count: usize = 1;
+        try free_list.installRegions(&.{.{ .id = 0, .start = 254 * (@as(u64, 1) << 39), .end = (254 * (@as(u64, 1) << 39)) + (physical_count) * 4096 }});
+        try free_list.seedContiguousRange(254 * (@as(u64, 1) << 39), physical_count);
         const fd = try s.createZeroOnDemandVmoFd(p0, 8192, fdRights(.{ .close = true, .map_read = true, .map_write = true }), .{}, 16);
         const ref = s.nativeVmoRefForFd(p0, fd).?;
         _ = try s.mmapFd(p0, fd, 0x4900_0000, 8192, vmaProt(.{ .read = true, .write = true }), mmapFlags(.{ .shared = true }), 0);
@@ -2701,16 +3585,8 @@ test "zero-on-demand faults preserve backing through physical and sparse-store e
         const private = s.prepareNativeVmaCowMapping(p0, 0x4a00_1000, true, false);
         try std.testing.expectEqual(.allocate_zero, shared.kind);
         try std.testing.expectEqual(.allocate_zero, private.kind);
-        if (store_full) {
-            const candidate = (try s.allocPhysicalPage(&free_list)).paddr;
-            try std.testing.expect(s.commitNativeVmaFaultMapping(p0, shared, candidate, null) == null);
-            try std.testing.expect(s.commitNativeVmaCowMapping(p0, private, candidate, &free_list) == null);
-            // The fault caller retains ownership of an unpublished candidate.
-            try free_list.appendPage(0, candidate);
-        } else {
-            try std.testing.expectError(KernelError.OutOfFreePages, s.allocPhysicalPage(&free_list));
-            try std.testing.expect(s.ensureNativeVmaCowMappingLockedSlow(p0, 0x4a00_1000, true, false, &free_list) == null);
-        }
+        try std.testing.expectError(KernelError.OutOfFreePages, s.allocPhysicalPage(&free_list));
+        try std.testing.expect(s.ensureNativeVmaCowMappingLockedSlow(p0, 0x4a00_1000, true, false, &free_list) == null);
         try expectVmoSlotEqual(before, s.nativeVmoSlot(ref).?.*);
         try std.testing.expectEqual(@as(?u64, first), s.nativeVmoResolvedPagePaddr(ref, 0));
         try std.testing.expectEqual(@as(?u64, 0), s.nativeVmoResolvedPagePaddrOrZero(ref, 1));
@@ -2723,19 +3599,18 @@ test "zero-on-demand faults preserve backing through physical and sparse-store e
     }
 }
 
-test "VMO grow rolls back physical and sparse-store exhaustion" {
-    for ([_]bool{ false, true }) |store_full| {
-        var s = try initFdState();
-        var paddr_slots: [3]u64 = undefined;
-        var owner_slots: [3]u64 = undefined;
-        var index_slots: [3]u32 = undefined;
-        if (store_full) try std.testing.expect(kernel.initVmoBackingPageStoreForTest(&paddr_slots, &owner_slots, &index_slots));
+test "VMO grow rolls back physical exhaustion" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    {
+        var s: KernelState = undefined;
+        try initFdState(&s);
         defer if (!kernel.initRuntimeStorage(runtime_storage[0..])) unreachable;
         var free_list = FreePageList{};
-        // Backing can live above the identity window, but table metadata
-        // cannot. Exhaust metadata allocation without dereferencing fake RAM.
-        const physical_base: u64 = if (store_full) 20 << 30 else 0x9000_0000;
-        try free_list.appendContiguousRange(0, physical_base, if (store_full) 4 else 2);
+        const physical_base: u64 = 0x9000_0000;
+        try free_list.installRegions(&.{.{ .id = 0, .start = physical_base, .end = (physical_base) + @as(u64, 2) * 4096 }});
+        try free_list.seedContiguousRange(physical_base, 2);
         const fd = try s.createAnonymousVmoFdWithPages(p0, 4096, fdRights(.{ .resize = true, .close = true }), .{}, 16, &free_list);
         const ref = s.nativeVmoRefForFd(p0, fd).?;
         const old = s.nativeVmoSlot(ref).?.*;
@@ -2754,11 +3629,16 @@ test "VMO grow rolls back physical and sparse-store exhaustion" {
 }
 
 test "ordinary VMO pages use high RAM while contiguous DMA keeps low RAM" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     var free_list = FreePageList{};
     const high: u64 = (16 << 30) + 4096;
-    try free_list.appendContiguousRange(0, 0x200000, 2);
-    try free_list.appendContiguousRange(0, high, 2);
+    try free_list.installRegions(&.{.{ .id = 0, .start = 0x200000, .end = high + 8192 }});
+    try free_list.seedContiguousRange(0x200000, 2);
+    try free_list.seedContiguousRange(high, 2);
     const rights = fdRights(.{ .map_read = true, .map_write = true, .close = true });
     const fd = try s.createAnonymousVmoFdWithPages(p0, 8192, rights, .{}, 16, &free_list);
     const vmo = s.nativeVmoRefForFd(p0, fd).?;
@@ -2775,10 +3655,15 @@ test "ordinary VMO pages use high RAM while contiguous DMA keeps low RAM" {
 }
 
 test "ordinary VMO allocation succeeds without low RAM and rolls back shortage" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     var free_list = FreePageList{};
     const high: u64 = 20 << 30;
-    try free_list.appendContiguousRange(0, high, 1);
+    try free_list.installRegions(&.{.{ .id = 0, .start = high, .end = (high) + (1) * 4096 }});
+    try free_list.seedContiguousRange(high, 1);
     const rights = fdRights(.{ .map_read = true, .map_write = true, .close = true });
     try std.testing.expectError(KernelError.OutOfFreePages, s.createAnonymousVmoFdWithPages(p0, 8192, rights, .{}, 16, &free_list));
     try std.testing.expectEqual(@as(usize, 1), free_list.pageCount());
@@ -2792,9 +3677,14 @@ test "ordinary VMO allocation succeeds without low RAM and rolls back shortage" 
 }
 
 test "page-backed vmo fd uses dynamic fd range and reports fd info" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     var free_list = FreePageList{};
-    try free_list.appendContiguousRange(0, 0x20_0000, 2);
+    try free_list.installRegions(&.{.{ .id = 0, .start = 0x20_0000, .end = (0x20_0000) + (2) * 4096 }});
+    try free_list.seedContiguousRange(0x20_0000, 2);
     const original_free = free_list.len;
 
     const rights = fdRights(.{
@@ -2828,8 +3718,13 @@ test "page-backed vmo fd uses dynamic fd range and reports fd info" {
 }
 
 test "128 GiB anonymous reservation keeps sparse backing across splits and release" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     var free_list = FreePageList{};
+    try free_list.installRegions(&.{.{ .id = 0, .start = 4096, .end = (1 << 40) + (1 << 29) }});
     const base: u64 = 0x200_0000_0000;
     const size: u64 = 128 << 30;
     const flags = mmapFlags(.{ .anonymous = true, .private = true, .noreserve = true });
@@ -2852,45 +3747,38 @@ test "128 GiB anonymous reservation keeps sparse backing across splits and relea
     s.releasePrincipalNativeMemory(p0, &free_list);
     try std.testing.expectEqual(@as(u64, 0), kernel.vmObjectBackingStoreStats().used_entries);
     try std.testing.expectEqual(@as(usize, 3), free_list.pageCount());
-    try std.testing.expectError(KernelError.InvalidState, s.createAnonymousVmaWithPages(p0, base, size, prot, prot, mmapFlags(.{ .anonymous = true, .private = true }), &free_list));
-    try std.testing.expectError(KernelError.InvalidState, s.createAnonymousVmaWithPages(p0, base, size, prot, prot, mmapFlags(.{ .anonymous = true, .shared = true, .noreserve = true }), &free_list));
-    try std.testing.expectError(KernelError.InvalidState, s.createAnonymousVmoFdWithPages(p0, size, fdRights(.{ .map_read = true }), .{}, 0, &free_list));
+    for ([_]kernel.MmapFlags{ mmapFlags(.{ .anonymous = true, .private = true }), mmapFlags(.{ .anonymous = true, .shared = true, .noreserve = true }) }) |map_flags| {
+        _ = try s.createAnonymousVmaWithPages(p0, base, size, prot, prot, map_flags, &free_list);
+        s.releasePrincipalNativeMemory(p0, &free_list);
+    }
+    try std.testing.expectError(KernelError.OutOfFreePages, s.createAnonymousVmoFdWithPages(p0, 131073 * 4096, fdRights(.{ .map_read = true }), .{}, 0, &free_list));
 }
 
-test "large backing snapshots survive wrapped rehash between batches" {
-    var paddrs: [8]u64 = undefined;
-    var owners: [8]u64 = undefined;
-    var indices: [8]u32 = undefined;
-    try std.testing.expect(kernel.initVmoBackingPageStoreForTest(&paddrs, &owners, &indices));
-    defer if (!kernel.initRuntimeStorage(runtime_storage[0..])) unreachable;
+test "large backing snapshots survive empty branch removal between batches" {
+    try std.testing.expect(kernel.initRuntimeStorage(runtime_storage[0..]));
+    var store = kernel.BackingStore{};
     const owner = kernel.vmoBackingStoreOwner(.native_vmo, 1, 9);
     const count: u32 = 128 << 18;
-    var colliding: [3]u32 = undefined;
-    var found: usize = 0;
-    var page: u32 = 0;
-    while (found < colliding.len) : (page += 1) {
-        if (kernel.vmoBackingPageStoreBucketForTest(owner, page) != 7) continue;
-        colliding[found] = page;
-        found += 1;
-    }
-    for (colliding, 0..) |index, i|
-        try kernel.setVmoBackingPageStorePaddr(owner, count, index, owner, (i + 1) * 4096, null);
+    const ref = kernel.allocEmptyVmoBackingPageStore(&store, count, owner).?;
+    const indices = [_]u32{ 0, 131072, count - 1 };
+    for (indices, 0..) |index, i| try kernel.setVmoBackingPageStorePaddr(ref, count, index, owner, (i + 1) * 4096, null);
     var batch: [1]kernel.BackedPage = undefined;
-    try std.testing.expectEqual(@as(usize, 0), kernel.snapshotVmoBackingPages(owner, count, owner + 1, 0, count, &batch));
-    try std.testing.expectEqual(@as(usize, 1), kernel.snapshotVmoBackingPages(owner, count, owner, 0, count, &batch));
-    try std.testing.expectEqual(colliding[0], batch[0].index);
-    try kernel.setVmoBackingPageStorePaddr(owner, count, colliding[0], owner, 0, null);
-    try std.testing.expectEqual(@as(usize, 1), kernel.snapshotVmoBackingPages(owner, count, owner, colliding[0] + 1, count, &batch));
-    try std.testing.expectEqual(colliding[1], batch[0].index);
-    try std.testing.expectEqual(@as(u64, 8192), batch[0].paddr);
-    try std.testing.expect(kernel.freeVmoBackingPageStore(owner, count, owner));
+    try std.testing.expectEqual(@as(usize, 1), kernel.snapshotVmoBackingPages(ref, count, owner, 0, count, &batch));
+    try kernel.setVmoBackingPageStorePaddr(ref, count, 0, owner, 0, null);
+    try std.testing.expectEqual(@as(usize, 1), kernel.snapshotVmoBackingPages(ref, count, owner, 1, count, &batch));
+    try std.testing.expectEqual(indices[1], batch[0].index);
+    try std.testing.expect(kernel.freeVmoBackingPageStore(ref, count, owner));
     try std.testing.expectEqual(@as(u64, 0), kernel.vmObjectBackingStoreStats().used_entries);
-    try std.testing.expectEqual(@as(usize, 0), kernel.snapshotVmoBackingPages(owner, count, owner, 0, count, &batch));
 }
 
 test "large sparse release rejects a mismatched owner before returning RAM" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     var free_list = FreePageList{};
+    try free_list.installRegions(&.{.{ .id = 0, .start = 4096, .end = (1 << 40) + (1 << 29) }});
     const vmo = try s.createNativeVmo(.anonymous, 128 << 30);
     try s.retainNativeVmo(vmo);
     const slot = s.nativeVmoSlot(vmo).?;
@@ -2905,9 +3793,369 @@ test "large sparse release rejects a mismatched owner before returning RAM" {
     try std.testing.expectEqual(@as(usize, 1), free_list.pageCount());
 }
 
-test "large sparse COW detach copies only backed pages of its logical slice" {
-    var s = try initFdState();
+test "VMO final drop preserves data ownership when PMM return is refused" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
+    // Synthetic PFNs are never dereferenced or merged into a real allocator.
+    // Restore the global backing fixture even when the regression fails.
+    defer if (!kernel.initRuntimeStorage(runtime_storage[0..])) unreachable;
+    var full = FreePageList{};
+    try full.installRegions(&.{.{ .id = 0, .start = 4096, .end = (1 << 40) + (1 << 29) }});
+    const physical: u64 = 0x1000;
+    var hold = try DmaHold.init(physical, 1);
+    defer hold.end();
+    try std.testing.expectError(KernelError.PageQuarantined, full.appendPage(physical));
+    try std.testing.expectEqual(@as(u64, 0), kernel.vmObjectBackingStoreStats().used_entries);
+    const ref = try s.createNativeVmo(.anonymous, 4096);
+    try s.retainNativeVmo(ref);
+    const slot = s.nativeVmoSlot(ref).?;
+    const owner = slot.page_store_owner;
+    const start = slot.page_store_start;
+    try kernel.setVmoBackingPageStorePaddr(start, 1, 0, owner, physical, null);
+    try std.testing.expectEqual(@as(u32, 1), slot.ref_count);
+    try std.testing.expectEqual(@as(u64, 1), kernel.vmObjectBackingStoreStats().used_entries);
+    s.releaseNativeVmoWithFreeList(ref, &full);
+    try std.testing.expectEqual(@as(usize, 0), full.pageCount());
+    var remaining: [1]kernel.BackedPage = undefined;
+    try std.testing.expectEqual(@as(usize, 1), kernel.snapshotVmoBackingPages(start, 1, owner, 0, 1, &remaining));
+    try std.testing.expectEqual(@as(u32, 0), remaining[0].index);
+    try std.testing.expectEqual(physical, remaining[0].paddr);
+    try std.testing.expectEqual(@as(u64, 1), kernel.vmObjectBackingStoreStats().used_entries);
+    try std.testing.expect(s.hasPendingDataReturns());
+    try std.testing.expect(s.nativeVmoSlot(ref) == null);
+    try std.testing.expectEqual(@as(u64, 0), kernel.vmObjectBackingStoreBreakdown(&s.native_vmos, &s.vmo_directory_leaf).invalid_native_entries);
+    try std.testing.expectError(KernelError.InvalidState, s.retainNativeVmo(ref));
+    try std.testing.expectError(KernelError.InvalidState, s.installNativeVmoPages(ref, 0, &.{0x5000}, null));
+    var wrong_destination = FreePageList{};
+    try wrong_destination.installRegions(&.{.{ .id = 0, .start = 4096, .end = (1 << 40) + (1 << 29) }});
+    s.releaseNativeVmoWithFreeList(ref, &wrong_destination);
+    s.releaseNativeVmo(ref);
+    for (0..3) |_| s.drainPendingDataReturns();
+    try std.testing.expectEqual(@as(usize, 1), s.pending_data_returns);
+    try std.testing.expectEqual(@as(usize, 0), wrong_destination.pageCount());
+    s.next_native_vmo_scan = ref.index;
+    const other = try s.createNativeVmo(.anonymous, 4096);
+    try std.testing.expect(other.index != ref.index);
+    hold.end();
+    s.drainPendingDataReturns();
+    try std.testing.expectEqual(@as(usize, 1), full.pageCount());
+    try std.testing.expect(!s.hasPendingDataReturns());
+    try std.testing.expectEqual(@as(u64, 0), kernel.vmObjectBackingStoreStats().used_entries);
+    s.drainPendingDataReturns();
+    try std.testing.expectEqual(@as(usize, 1), full.pageCount());
+    s.next_native_vmo_scan = ref.index;
+    const reused = try s.createNativeVmo(.anonymous, 4096);
+    try std.testing.expectEqual(ref.index, reused.index);
+    try std.testing.expect(reused.generation != ref.generation);
+    try kernel.ReferenceCheck.check(&s);
+}
+
+test "COW final drop preserves data ownership when PMM return is refused" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
+    defer if (!kernel.initRuntimeStorage(runtime_storage[0..])) unreachable;
+    var full = FreePageList{};
+    try full.installRegions(&.{.{ .id = 0, .start = 4096, .end = (1 << 40) + (1 << 29) }});
+    const physical: u64 = 0x3000;
+    var hold = try DmaHold.init(physical, 1);
+    defer hold.end();
+    try std.testing.expectError(KernelError.PageQuarantined, full.appendPage(physical));
+    try std.testing.expectEqual(@as(u64, 0), kernel.vmObjectBackingStoreStats().used_entries);
+    const ref = try s.createNativeCowTable(1, &full);
+    try s.retainNativeCowTable(ref);
+    const slot = s.nativeCowTableSlot(ref).?;
+    const owner = kernel.vmoBackingStoreOwner(.native_cow, ref.index, ref.generation);
+    const start = slot.page_store_start;
+    try s.setNativeCowPagePaddr(ref, 0, physical, null);
+    try std.testing.expectEqual(@as(u32, 1), slot.ref_count);
+    try std.testing.expectEqual(@as(u64, 1), kernel.vmObjectBackingStoreStats().used_entries);
+    s.releaseNativeCowTable(ref, &full);
+    try std.testing.expectEqual(@as(usize, 0), full.pageCount());
+    var remaining: [1]kernel.BackedPage = undefined;
+    try std.testing.expectEqual(@as(usize, 1), kernel.snapshotVmoBackingPages(start, 1, owner, 0, 1, &remaining));
+    try std.testing.expectEqual(@as(u32, 0), remaining[0].index);
+    try std.testing.expectEqual(physical, remaining[0].paddr);
+    try std.testing.expectEqual(@as(u64, 1), kernel.vmObjectBackingStoreStats().used_entries);
+    try std.testing.expect(s.hasPendingDataReturns());
+    try std.testing.expect(s.nativeCowTableSlot(ref) == null);
+    try std.testing.expectError(KernelError.InvalidState, s.retainNativeCowTable(ref));
+    try std.testing.expectError(KernelError.InvalidState, s.setNativeCowPagePaddr(ref, 0, 0x5000, null));
+    var wrong_destination = FreePageList{};
+    try wrong_destination.installRegions(&.{.{ .id = 0, .start = 4096, .end = (1 << 40) + (1 << 29) }});
+    s.releaseNativeCowTable(ref, &wrong_destination);
+    s.releaseNativeCowTable(ref, null);
+    for (0..3) |_| s.drainPendingDataReturns();
+    try std.testing.expectEqual(@as(usize, 1), s.pending_data_returns);
+    try std.testing.expectEqual(@as(usize, 0), wrong_destination.pageCount());
+    const other = try s.createNativeCowTable(1, &full);
+    try std.testing.expect(other.index != ref.index);
+    hold.end();
+    s.drainPendingDataReturns();
+    try std.testing.expectEqual(@as(usize, 1), full.pageCount());
+    try std.testing.expect(!s.hasPendingDataReturns());
+    try std.testing.expectEqual(@as(u64, 0), kernel.vmObjectBackingStoreStats().used_entries);
+    s.drainPendingDataReturns();
+    try std.testing.expectEqual(@as(usize, 1), full.pageCount());
+    const reused = try s.createNativeCowTable(1, &full);
+    try std.testing.expectEqual(ref.index, reused.index);
+    try std.testing.expect(reused.generation != ref.generation);
+    try kernel.ReferenceCheck.check(&s);
+}
+
+test "pending child keeps its parent until recovery and releases that edge exactly once" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
+    defer if (!kernel.initRuntimeStorage(runtime_storage[0..])) unreachable;
+    var full = FreePageList{};
+    try full.installRegions(&.{.{ .id = 0, .start = 4096, .end = (1 << 40) + (1 << 29) }});
+    var child_hold = try DmaHold.init(0x1000, 1);
+    defer child_hold.end();
+    var parent_hold = try DmaHold.init(0x7000, 1);
+    defer parent_hold.end();
+    const parent = try s.createNativeVmo(.anonymous, 4096);
+    try s.retainNativeVmo(parent);
+    try s.installNativeVmoPages(parent, 0, &.{0x7000}, null);
+    const child = try s.createNativeVmo(.anonymous, 4096);
+    try s.retainNativeVmo(child);
+    try s.installNativeVmoPages(child, 0, &.{0x1000}, null);
+    // Build the same retained parent edge as an anonymous shadow. The fixture
+    // is unpublished and serial; no production borrower is bypassed here.
+    try s.retainNativeVmo(parent);
+    try s.publishNativeVmoParent(child, parent, 0);
+    s.releaseNativeVmoWithFreeList(parent, &full);
+    s.releaseNativeVmoWithFreeList(child, &full);
+    for (0..3) |_| s.drainPendingDataReturns();
+    try std.testing.expectEqual(@as(?u32, 1), s.nativeVmoRefCount(parent));
+    try std.testing.expectEqual(@as(usize, 1), s.pending_data_returns);
+    try std.testing.expectEqual(@as(u64, 2), kernel.vmObjectBackingStoreStats().used_entries);
+
+    // The child is drained first; the parent still has DMA reachability.
+    child_hold.end();
+    s.drainPendingDataReturns();
+    try std.testing.expect(s.native_vmos.get(child.index) == null);
+    try std.testing.expect(s.native_vmos.generation(child.index).? != child.generation);
+    try std.testing.expect(s.nativeVmoSlot(parent) == null);
+    try std.testing.expectEqual(@as(u32, 0), s.native_vmos.get(@intCast(parent.index)).?.*.ref_count);
+    try std.testing.expectEqual(@as(usize, 1), s.pending_data_returns);
+    try std.testing.expectEqual(@as(u64, 1), kernel.vmObjectBackingStoreStats().used_entries);
+    try std.testing.expectEqual(@as(usize, 1), full.pageCount());
+    s.releaseNativeVmo(child);
+    s.releaseNativeVmoWithFreeList(parent, &full);
+    for (0..3) |_| s.drainPendingDataReturns();
+    try std.testing.expectEqual(@as(usize, 1), full.pageCount());
+
+    // Drain the parent while preserving the already returned child in PMM.
+    parent_hold.end();
+    const before = full.pageCount();
+    s.drainPendingDataReturns();
+    try std.testing.expectEqual(before + 1, full.pageCount());
+    try std.testing.expectEqual(@as(usize, 0), s.pending_data_returns);
+    try std.testing.expectEqual(@as(u64, 0), kernel.vmObjectBackingStoreStats().used_entries);
+    s.drainPendingDataReturns();
+    s.releaseNativeVmoWithFreeList(child, &full);
+    s.releaseNativeVmoWithFreeList(parent, &full);
+    try std.testing.expectEqual(before + 1, full.pageCount());
+    try kernel.ReferenceCheck.check(&s);
+}
+
+test "disjoint VMO and COW finalizers count both pending destinations and retry only remaining pages" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
+    defer if (!kernel.initRuntimeStorage(runtime_storage[0..])) unreachable;
+    var vmo_destination = FreePageList{};
+    try vmo_destination.installRegions(&.{.{ .id = 0, .start = 4096, .end = (1 << 40) + (1 << 29) }});
+    var cow_destination = FreePageList{};
+    try cow_destination.installRegions(&.{.{ .id = 0, .start = 4096, .end = (1 << 40) + (1 << 29) }});
+    var vmo_hold = try DmaHold.init(0x7000, 1);
+    defer vmo_hold.end();
+    var cow_hold = try DmaHold.init(0xb000, 1);
+    defer cow_hold.end();
+    const vmo = try s.createNativeVmo(.anonymous, 8192);
+    try s.retainNativeVmo(vmo);
+    try s.installNativeVmoPages(vmo, 0, &.{ 0x1000, 0x7000 }, null);
+    const vmo_slot = s.nativeVmoSlot(vmo).?;
+    const owner = vmo_slot.page_store_owner;
+    const start = vmo_slot.page_store_start;
+    const cow = try s.createNativeCowTable(1, &cow_destination);
+    try s.retainNativeCowTable(cow);
+    try s.setNativeCowPagePaddr(cow, 0, 0xb000, null);
+    var start_gate: u32 = 0;
+    const Finalizer = struct {
+        state: *KernelState,
+        destination: *FreePageList,
+        gate: *u32,
+        vmo: kernel.NativeVmoRef = .{},
+        cow: kernel.NativeCowTableRef = .{},
+
+        fn run(ctx: *const @This()) void {
+            while (@atomicLoad(u32, ctx.gate, .acquire) == 0) std.atomic.spinLoopHint();
+            if (!ctx.vmo.isNull())
+                ctx.state.releaseNativeVmoWithFreeList(ctx.vmo, ctx.destination)
+            else
+                ctx.state.releaseNativeCowTable(ctx.cow, ctx.destination);
+        }
+    };
+    // Each worker owns a separate slot family and destination. This checks
+    // the cross-domain atomic hint, not the production VM-lock protocol.
+    const vmo_ctx = Finalizer{ .state = &s, .destination = &vmo_destination, .gate = &start_gate, .vmo = vmo };
+    const cow_ctx = Finalizer{ .state = &s, .destination = &cow_destination, .gate = &start_gate, .cow = cow };
+    const vmo_worker = try std.Thread.spawn(.{}, Finalizer.run, .{&vmo_ctx});
+    const cow_worker = std.Thread.spawn(.{}, Finalizer.run, .{&cow_ctx}) catch |err| {
+        @atomicStore(u32, &start_gate, 1, .release);
+        vmo_worker.join();
+        return err;
+    };
+    @atomicStore(u32, &start_gate, 1, .release);
+    vmo_worker.join();
+    cow_worker.join();
+    try std.testing.expectEqual(@as(usize, 2), s.pending_data_returns);
+    try std.testing.expectEqual(@as(usize, 1), vmo_destination.pageCount());
+    try std.testing.expectEqual(@as(usize, 0), cow_destination.pageCount());
+    var remaining: [2]kernel.BackedPage = undefined;
+    try std.testing.expectEqual(@as(usize, 1), kernel.snapshotVmoBackingPages(start, 2, owner, 0, 2, &remaining));
+    try std.testing.expectEqual(@as(u32, 1), remaining[0].index);
+    try std.testing.expectEqual(@as(u64, 0x7000), remaining[0].paddr);
+
+    vmo_hold.end();
+    const before = vmo_destination.pageCount();
+    s.drainPendingDataReturns();
+    try std.testing.expectEqual(before + 1, vmo_destination.pageCount());
+    try std.testing.expectEqual(@as(usize, 1), s.pending_data_returns);
+    try std.testing.expectEqual(@as(usize, 0), cow_destination.pageCount());
+    try std.testing.expectEqual(@as(u64, 1), kernel.vmObjectBackingStoreStats().used_entries);
+    cow_hold.end();
+    s.drainPendingDataReturns();
+    try std.testing.expect(!s.hasPendingDataReturns());
+    try std.testing.expectEqual(@as(usize, 1), cow_destination.pageCount());
+    try std.testing.expectEqual(@as(u64, 0), kernel.vmObjectBackingStoreStats().used_entries);
+    s.drainPendingDataReturns();
+    try std.testing.expectEqual(before + 1, vmo_destination.pageCount());
+    try std.testing.expectEqual(@as(usize, 1), cow_destination.pageCount());
+}
+
+test "COW storage grows repeatedly reclaims bodies and preserves stale generations" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
+    defer s.native_cow_tables.deinit();
+    defer if (!kernel.initRuntimeStorage(runtime_storage[0..])) unreachable;
     var free_list = FreePageList{};
+    var refs: [513]kernel.NativeCowTableRef = undefined;
+    for (0..3) |_| {
+        for (&refs, 0..) |*ref, index| {
+            ref.* = try s.createNativeCowTable(1, &free_list);
+            try s.retainNativeCowTable(ref.*);
+            try s.setNativeCowPagePaddr(ref.*, 0, (index + 1) * 4096, null);
+        }
+        for (refs, 0..) |ref, index| {
+            try std.testing.expectEqual(@as(?u64, (index + 1) * 4096), s.nativeCowPagePaddr(ref, 0));
+            s.releaseNativeCowTable(ref, null);
+            try std.testing.expect(s.nativeCowTableSlot(ref) == null);
+        }
+        try std.testing.expectEqual(@as(u64, 0), s.native_cow_tables.live);
+        try std.testing.expect(s.native_cow_tables.body_owner.published == null);
+        try std.testing.expectEqual(@as(u64, 0), kernel.vmObjectBackingStoreStats().used_entries);
+    }
+}
+
+test "final VMO drop rejects invalid and foreign owner tokens before returning any page" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
+    defer if (!kernel.initRuntimeStorage(runtime_storage[0..])) unreachable;
+    var free_list = FreePageList{};
+    try free_list.installRegions(&.{.{ .id = 0, .start = 4096, .end = (1 << 40) + (1 << 29) }});
+    const victim = try s.createNativeVmo(.anonymous, 4096);
+    try s.retainNativeVmo(victim);
+    try s.installNativeVmoPages(victim, 0, &.{0x9000}, null);
+    const foreign = s.nativeVmoSlot(victim).?.page_store_owner;
+    for (0..3) |mode| {
+        const ref = try s.createNativeVmo(.anonymous, 4096);
+        try s.retainNativeVmo(ref);
+        try s.installNativeVmoPages(ref, 0, &.{(mode + 1) * 4096}, null);
+        const slot = s.nativeVmoSlot(ref).?;
+        const start = slot.page_store_start;
+        const owner = slot.page_store_owner;
+        if (mode != 0) slot.page_store_start.owner = foreign;
+        if (mode != 1) slot.page_store_owner = foreign;
+        const before = free_list.pageCount();
+        const faults = kernel.vmoBackingStoreOwnershipFault().count;
+        s.releaseNativeVmoWithFreeList(ref, &free_list);
+        for (0..3) |_| s.drainPendingDataReturns();
+        try std.testing.expectEqual(before, free_list.pageCount());
+        try std.testing.expect(kernel.vmoBackingStoreOwnershipFault().count > faults);
+        try std.testing.expectEqual(@as(usize, 1), s.pending_data_returns);
+        try std.testing.expectEqual(ref.generation, slot.generation);
+        try std.testing.expectEqual(@as(?u32, 1), s.nativeVmoRefCount(victim));
+        try std.testing.expectEqual(@as(?u64, 0x9000), s.nativeVmoPagePaddr(victim, 0));
+        try std.testing.expectEqual(@as(u64, 2), kernel.vmObjectBackingStoreStats().used_entries);
+        // Fault injection repair is test-only. Production leaves the failed
+        // owner visible for diagnosis rather than guessing another token.
+        slot.page_store_start = start;
+        slot.page_store_owner = owner;
+        s.drainPendingDataReturns();
+        try std.testing.expectEqual(before + 1, free_list.pageCount());
+        try std.testing.expect(!s.hasPendingDataReturns());
+        try std.testing.expectEqual(@as(u64, 1), kernel.vmObjectBackingStoreStats().used_entries);
+    }
+    s.releaseNativeVmoWithFreeList(victim, &free_list);
+    try std.testing.expectEqual(@as(usize, 4), free_list.pageCount());
+}
+
+test "final COW drop retains an invalid owner token until metadata is repaired" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
+    defer if (!kernel.initRuntimeStorage(runtime_storage[0..])) unreachable;
+    var free_list = FreePageList{};
+    try free_list.installRegions(&.{.{ .id = 0, .start = 4096, .end = (1 << 40) + (1 << 29) }});
+    const ref = try s.createNativeCowTable(1, &free_list);
+    try s.retainNativeCowTable(ref);
+    try s.setNativeCowPagePaddr(ref, 0, 0x1000, null);
+    const slot = s.nativeCowTableSlot(ref).?;
+    const start = slot.page_store_start;
+    slot.page_store_start = .{};
+    const faults = kernel.vmoBackingStoreOwnershipFault().count;
+    s.releaseNativeCowTable(ref, &free_list);
+    for (0..3) |_| s.drainPendingDataReturns();
+    try std.testing.expectEqual(@as(usize, 0), free_list.pageCount());
+    try std.testing.expect(kernel.vmoBackingStoreOwnershipFault().count > faults);
+    try std.testing.expectEqual(@as(usize, 1), s.pending_data_returns);
+    try std.testing.expectEqual(@as(u64, 1), kernel.vmObjectBackingStoreStats().used_entries);
+    try std.testing.expectEqual(ref.generation, slot.generation);
+    slot.page_store_start = start;
+    s.drainPendingDataReturns();
+    try std.testing.expectEqual(@as(usize, 1), free_list.pageCount());
+    try std.testing.expect(!s.hasPendingDataReturns());
+    try std.testing.expectEqual(@as(u64, 0), kernel.vmObjectBackingStoreStats().used_entries);
+}
+
+test "large sparse COW detach copies only backed pages of its logical slice" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
+    var free_list = FreePageList{};
+    try free_list.installRegions(&.{.{ .id = 0, .start = 4096, .end = (1 << 40) + (1 << 29) }});
     const pages: u32 = 128 << 18;
     const original = try s.createNativeCowTable(pages, &free_list);
     try s.retainNativeCowTable(original);
@@ -2923,7 +4171,8 @@ test "large sparse COW detach copies only backed pages of its logical slice" {
         .cow_page_offset = pages / 2,
     };
     var copies = FreePageList{};
-    try copies.appendContiguousRange(0, 0x9000000, 2);
+    try copies.installRegions(&.{.{ .id = 0, .start = 0x9000000, .end = (0x9000000) + (2) * 4096 }});
+    try copies.seedContiguousRange(0x9000000, 2);
     try s.detachSharedEntryCowTable(&slice, &copies);
     try std.testing.expectEqual(@as(usize, 0), copies.pageCount());
     try std.testing.expectEqual(@as(?u64, 0x9000000), s.nativeCowPagePaddr(slice.cow_table, 0));
@@ -2937,13 +4186,18 @@ test "large sparse COW detach copies only backed pages of its logical slice" {
 }
 
 test "sparse vmo backing store charges only instantiated pages" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     var free_list = FreePageList{};
-    const max_bytes = @as(u64, kernel.max_vmo_backing_pages) * kernel.native_page_size;
+    try free_list.installRegions(&.{.{ .id = 0, .start = 4096, .end = (1 << 40) + (1 << 29) }});
+    const max_bytes = @as(u64, 131072) * kernel.native_page_size;
 
     const large_vmo = try s.createNativeVmo(.anonymous, max_bytes);
     try s.retainNativeVmo(large_vmo);
-    const large_cow = try s.createNativeCowTable(kernel.max_vmo_backing_pages, &free_list);
+    const large_cow = try s.createNativeCowTable(131072, &free_list);
     try s.retainNativeCowTable(large_cow);
     var stats = kernel.vmObjectBackingStoreStats();
     try std.testing.expectEqual(@as(u64, 0), stats.used_entries);
@@ -2960,7 +4214,7 @@ test "sparse vmo backing store charges only instantiated pages" {
     try kernel.setVmoBackingPageStorePaddr(
         vmo_slot.page_store_start,
         vmo_slot.page_count,
-        kernel.max_vmo_backing_pages - 1,
+        131072 - 1,
         vmo_slot.page_store_owner,
         0x5678_9000,
         null,
@@ -2969,14 +4223,14 @@ test "sparse vmo backing store charges only instantiated pages" {
     try std.testing.expectEqual(@as(?u64, 0x1234_5000), s.nativeVmoPagePaddr(large_vmo, 1));
     try std.testing.expectEqual(
         @as(?u64, 0x5678_9000),
-        s.nativeVmoPagePaddr(large_vmo, kernel.max_vmo_backing_pages - 1),
+        s.nativeVmoPagePaddr(large_vmo, 131072 - 1),
     );
     try std.testing.expectEqual(@as(?u64, 0x9abc_d000), s.nativeCowPagePaddr(large_cow, 77));
     stats = kernel.vmObjectBackingStoreStats();
     try std.testing.expectEqual(@as(u64, 3), stats.used_entries);
     try std.testing.expectEqual(stats.capacity - 3, stats.free_entries);
 
-    const census = kernel.vmObjectBackingStoreBreakdown(&s.native_vmos);
+    const census = kernel.vmObjectBackingStoreBreakdown(&s.native_vmos, &s.vmo_directory_leaf);
     try std.testing.expectEqual(@as(u64, 2), census.native_entries);
     try std.testing.expectEqual(@as(u64, 1), census.cow_entries);
     try std.testing.expectEqual(@as(u64, 0), census.invalid_native_entries);
@@ -2985,7 +4239,7 @@ test "sparse vmo backing store charges only instantiated pages" {
     try std.testing.expectEqual(vmo_slot.page_store_owner, census.largest[0].owner);
     const saved_refs = vmo_slot.ref_count;
     vmo_slot.ref_count = 0;
-    try std.testing.expectEqual(@as(u64, 2), kernel.vmObjectBackingStoreBreakdown(&s.native_vmos).invalid_native_entries);
+    try std.testing.expectEqual(@as(u64, 2), kernel.vmObjectBackingStoreBreakdown(&s.native_vmos, &s.vmo_directory_leaf).invalid_native_entries);
     vmo_slot.ref_count = saved_refs;
     try std.testing.expectEqual(@as(u64, 3), kernel.vmObjectBackingStoreStats().used_entries);
 
@@ -3001,55 +4255,15 @@ test "sparse vmo backing store charges only instantiated pages" {
     try std.testing.expectEqual(@as(u64, 0), kernel.vmObjectBackingStoreStats().used_entries);
 }
 
-test "vmo backing store operations wait for the dedicated inner lock" {
-    try std.testing.expect(kernel.initRuntimeStorage(runtime_storage[0..]));
-
-    const Context = struct {
-        started: *u8,
-        finished: *u8,
-        result: *?u64,
-        owner: u64,
-    };
-    const Worker = struct {
-        fn run(context: *Context) void {
-            @atomicStore(u8, context.started, 1, .release);
-            context.result.* = kernel.allocEmptyVmoBackingPageStore(1, context.owner);
-            @atomicStore(u8, context.finished, 1, .release);
-        }
-    };
-
-    var started: u8 = 0;
-    var finished: u8 = 0;
-    var result: ?u64 = null;
-    var lock_held = kernel.lockVmoBackingPageStoreForTest();
-    try std.testing.expect(lock_held);
-    defer if (lock_held) kernel.unlockVmoBackingPageStoreForTest();
-
-    var context = Context{
-        .started = &started,
-        .finished = &finished,
-        .result = &result,
-        .owner = kernel.vmoBackingStoreOwner(.native_vmo, 2, 1),
-    };
-    const worker = try std.Thread.spawn(.{}, Worker.run, .{&context});
-    while (@atomicLoad(u8, &started, .acquire) == 0) std.Thread.yield() catch {};
-    for (0..1024) |_| std.Thread.yield() catch {};
-    const finished_while_locked = @atomicLoad(u8, &finished, .acquire) != 0;
-
-    kernel.unlockVmoBackingPageStoreForTest();
-    lock_held = false;
-    worker.join();
-
-    try std.testing.expect(!finished_while_locked);
-    try std.testing.expectEqual(@as(?u64, context.owner), result);
-    try std.testing.expectEqual(@as(u8, 1), @atomicLoad(u8, &finished, .acquire));
-}
-
 test "vmo backing store owner ledger rejects cross-object writes and frees" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
     try std.testing.expect(kernel.initRuntimeStorage(runtime_storage[0..]));
     const owner = kernel.vmoBackingStoreOwner(.native_vmo, 3, 1);
     const intruder = kernel.vmoBackingStoreOwner(.native_cow, 4, 1);
-    const start = kernel.allocEmptyVmoBackingPageStore(1, owner) orelse unreachable;
+    var store = kernel.BackingStore{};
+    const start = kernel.allocEmptyVmoBackingPageStore(&store, 1, owner) orelse unreachable;
 
     try std.testing.expectError(
         KernelError.InvalidState,
@@ -3069,6 +4283,9 @@ test "vmo backing store owner ledger rejects cross-object writes and frees" {
 }
 
 test "sparse vmo backing store keeps full generation and owner identity" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
     try std.testing.expect(kernel.initRuntimeStorage(runtime_storage[0..]));
     const current = kernel.vmoBackingStoreOwner(.native_vmo, 9, 0x8000_0001);
     const stale = kernel.vmoBackingStoreOwner(.native_vmo, 9, 1);
@@ -3076,7 +4293,8 @@ test "sparse vmo backing store keeps full generation and owner identity" {
     try std.testing.expect(current != stale);
     try std.testing.expect(current != cow);
 
-    const start = kernel.allocEmptyVmoBackingPageStore(8, current) orelse unreachable;
+    var store = kernel.BackingStore{};
+    const start = kernel.allocEmptyVmoBackingPageStore(&store, 8, current) orelse unreachable;
     try kernel.setVmoBackingPageStorePaddr(start, 8, 3, current, 0x1111_1000, null);
     try std.testing.expectError(
         KernelError.InvalidState,
@@ -3084,220 +4302,19 @@ test "sparse vmo backing store keeps full generation and owner identity" {
     );
     try std.testing.expectEqual(@as(?u64, 0x1111_1000), kernel.vmoBackingPageStorePaddr(start, 8, 3));
 
-    const cow_start = kernel.allocEmptyVmoBackingPageStore(8, cow) orelse unreachable;
+    var cow_store = kernel.BackingStore{};
+    const cow_start = kernel.allocEmptyVmoBackingPageStore(&cow_store, 8, cow) orelse unreachable;
     try kernel.setVmoBackingPageStorePaddr(cow_start, 8, 3, cow, 0x3333_3000, null);
     try std.testing.expectEqual(@as(?u64, 0x3333_3000), kernel.vmoBackingPageStorePaddr(cow_start, 8, 3));
     try std.testing.expectEqual(@as(u64, 2), kernel.vmObjectBackingStoreStats().used_entries);
 }
 
-test "sparse vmo backing store repairs wrapped collision chains" {
-    var paddrs: [8]u64 = undefined;
-    var owners: [8]u64 = undefined;
-    var page_indices: [8]u32 = undefined;
-    try std.testing.expect(kernel.initVmoBackingPageStoreForTest(&paddrs, &owners, &page_indices));
-    defer if (!kernel.initRuntimeStorage(runtime_storage[0..])) unreachable;
-
-    var colliding: [3]u64 = undefined;
-    var found: usize = 0;
-    var candidate_index: u32 = 1;
-    while (found < colliding.len and candidate_index < 10000) : (candidate_index += 1) {
-        const candidate = kernel.vmoBackingStoreOwner(.native_vmo, candidate_index, 1);
-        if (kernel.vmoBackingPageStoreBucketForTest(candidate, 0) == 7) {
-            colliding[found] = candidate;
-            found += 1;
-        }
-    }
-    try std.testing.expectEqual(colliding.len, found);
-    for (colliding, 0..) |owner, index| {
-        const start = kernel.allocEmptyVmoBackingPageStore(1, owner) orelse unreachable;
-        try kernel.setVmoBackingPageStorePaddr(start, 1, 0, owner, (@as(u64, index) + 1) * 0x1000, null);
-    }
-
-    try std.testing.expect(kernel.freeVmoBackingPageStore(colliding[1], 1, colliding[1]));
-    try std.testing.expectEqual(@as(?u64, 0x1000), kernel.vmoBackingPageStorePaddr(colliding[0], 1, 0));
-    try std.testing.expectEqual(@as(?u64, 0x3000), kernel.vmoBackingPageStorePaddr(colliding[2], 1, 0));
-    try std.testing.expectEqual(@as(u64, 2), kernel.vmObjectBackingStoreStats().used_entries);
-    try std.testing.expect(kernel.freeVmoBackingPageStore(colliding[0], 1, colliding[0]));
-    try std.testing.expectEqual(@as(?u64, 0x3000), kernel.vmoBackingPageStorePaddr(colliding[2], 1, 0));
-    try std.testing.expect(kernel.freeVmoBackingPageStore(colliding[2], 1, colliding[2]));
-    try std.testing.expectEqual(@as(u64, 0), kernel.vmObjectBackingStoreStats().used_entries);
-}
-
-test "sparse vmo backing batch is atomic at capacity" {
-    var paddr_slots: [5]u64 = undefined;
-    var owner_slots: [5]u64 = undefined;
-    var index_slots: [5]u32 = undefined;
-    try std.testing.expect(kernel.initVmoBackingPageStoreForTest(
-        &paddr_slots,
-        &owner_slots,
-        &index_slots,
-    ));
-    defer if (!kernel.initRuntimeStorage(runtime_storage[0..])) unreachable;
-    const owner = kernel.vmoBackingStoreOwner(.native_vmo, 5, 1);
-    const start = kernel.allocEmptyVmoBackingPageStore(16, owner) orelse unreachable;
-    try kernel.setVmoBackingPageStorePaddrs(
-        start,
-        16,
-        0,
-        owner,
-        &[_]u64{ 0x1000, 0x2000, 0x3000 },
-        null,
-    );
-    try std.testing.expectError(
-        KernelError.TableFull,
-        kernel.setVmoBackingPageStorePaddrs(
-            start,
-            16,
-            3,
-            owner,
-            &[_]u64{ 0x4000, 0x5000 },
-            null,
-        ),
-    );
-    try std.testing.expectEqual(@as(?u64, 0), kernel.vmoBackingPageStorePaddr(start, 16, 3));
-    try std.testing.expectEqual(@as(?u64, 0), kernel.vmoBackingPageStorePaddr(start, 16, 4));
-    try kernel.setVmoBackingPageStorePaddr(start, 16, 3, owner, 0x4000, null);
-    try std.testing.expectError(
-        KernelError.TableFull,
-        kernel.setVmoBackingPageStorePaddr(start, 16, 4, owner, 0x5000, null),
-    );
-    try std.testing.expectEqual(@as(?u64, 0), kernel.vmoBackingPageStorePaddr(start, 16, 15));
-}
-
-test "sparse vmo growth preserves keys and returns replaced dynamic metadata" {
-    var paddrs: [5]u64 = undefined;
-    var owners: [5]u64 = undefined;
-    var indices: [5]u32 = undefined;
-    var free_list = FreePageList{};
-    try free_list.appendContiguousRange(0, @intFromPtr(&backing_growth_memory), 128);
-    try std.testing.expect(kernel.initVmoBackingPageStoreForTest(&paddrs, &owners, &indices));
-    defer if (!kernel.initRuntimeStorage(runtime_storage[0..])) unreachable;
-    const native = kernel.vmoBackingStoreOwner(.native_vmo, 3, 0x8000_0001);
-    const cow = kernel.vmoBackingStoreOwner(.native_cow, 3, 0x8000_0001);
-    try kernel.setVmoBackingPageStorePaddrs(native, 100, 0, native, &.{ 0x1000, 0x2000, 0x3000 }, null);
-    try kernel.setVmoBackingPageStorePaddrs(cow, 100, 0, cow, &.{ 0x4000, 0x5000 }, &free_list);
-    try std.testing.expectEqual(@as(u64, 1), kernel.vmObjectBackingStoreStats().growth_count);
-    try std.testing.expectEqual(@as(usize, 127), free_list.pageCount());
-    try kernel.setVmoBackingPageStorePaddrs(native, 100, 3, native, &.{ 0x6000, 0x7000, 0x8000, 0x9000, 0xa000 }, &free_list);
-    const grown = kernel.vmObjectBackingStoreStats();
-    try std.testing.expectEqual(@as(u64, 2), grown.growth_count);
-    try std.testing.expectEqual(@as(u64, 10), grown.used_entries);
-    try std.testing.expectEqual(@as(usize, 0), grown.retired_pages);
-    // Both small replacements occupy one page: the first must be back in PMM.
-    try std.testing.expectEqual(@as(usize, 127), free_list.pageCount());
-    try std.testing.expectEqual(@as(?u64, 0x2000), kernel.vmoBackingPageStorePaddr(native, 100, 1));
-    try std.testing.expectEqual(@as(?u64, 0x5000), kernel.vmoBackingPageStorePaddr(cow, 100, 1));
-    try kernel.setVmoBackingPageStorePaddr(native, 100, 1, native, 0, &free_list);
-    try std.testing.expectEqual(@as(?u64, 0), kernel.vmoBackingPageStorePaddr(native, 100, 1));
-    try std.testing.expectEqual(@as(?u64, 0x3000), kernel.vmoBackingPageStorePaddr(native, 100, 2));
-    try std.testing.expect(kernel.freeVmoBackingPageStore(native, 100, native));
-    try std.testing.expectEqual(@as(?u64, 0x4000), kernel.vmoBackingPageStorePaddr(cow, 100, 0));
-    try std.testing.expect(kernel.freeVmoBackingPageStore(cow, 100, cow));
-    try std.testing.expectEqual(@as(u64, 0), kernel.vmObjectBackingStoreStats().used_entries);
-    try std.testing.expect(kernel.initRuntimeStorage(runtime_storage[0..]));
-    try std.testing.expectEqual(@as(usize, 128), free_list.pageCount());
-}
-
-test "sparse vmo growth OOM leaves batch and existing store unchanged" {
-    var paddrs: [3]u64 = undefined;
-    var owners: [3]u64 = undefined;
-    var indices: [3]u32 = undefined;
-    var free_list = FreePageList{};
-    try std.testing.expect(kernel.initVmoBackingPageStoreForTest(&paddrs, &owners, &indices));
-    defer if (!kernel.initRuntimeStorage(runtime_storage[0..])) unreachable;
-    const owner = kernel.vmoBackingStoreOwner(.native_vmo, 19, 1);
-    try kernel.setVmoBackingPageStorePaddr(owner, 8, 0, owner, 0x1000, null);
-    try std.testing.expectError(KernelError.OutOfFreePages, kernel.setVmoBackingPageStorePaddrs(owner, 8, 1, owner, &.{ 0x2000, 0x3000 }, &free_list));
-    try std.testing.expectEqual(@as(u64, 1), kernel.vmObjectBackingStoreStats().used_entries);
-    try std.testing.expectEqual(@as(u64, 0), kernel.vmObjectBackingStoreStats().growth_count);
-    try std.testing.expectEqual(@as(?u64, 0x1000), kernel.vmoBackingPageStorePaddr(owner, 8, 0));
-    try std.testing.expectEqual(@as(?u64, 0), kernel.vmoBackingPageStorePaddr(owner, 8, 1));
-    try std.testing.expectEqual(@as(?u64, 0), kernel.vmoBackingPageStorePaddr(owner, 8, 2));
-    try free_list.appendContiguousRange(0, @intFromPtr(&backing_growth_memory), 1);
-    try std.testing.expectError(KernelError.InvalidState, kernel.setVmoBackingPageStorePaddrs(owner, 8, 1, owner, &.{ 0x2000, 0x3001 }, &free_list));
-    try std.testing.expectEqual(@as(usize, 1), free_list.pageCount());
-    try kernel.setVmoBackingPageStorePaddrs(owner, 8, 1, owner, &.{ 0x2000, 0x3000 }, &free_list);
-    try std.testing.expectEqual(@as(u64, 3), kernel.vmObjectBackingStoreStats().used_entries);
-    try std.testing.expectEqual(@as(?u64, 0x3000), kernel.vmoBackingPageStorePaddr(owner, 8, 2));
-    try std.testing.expect(kernel.initRuntimeStorage(runtime_storage[0..]));
-    try std.testing.expectEqual(@as(usize, 1), free_list.pageCount());
-}
-
-test "sparse vmo concurrent growth retains every key and no obsolete storage" {
-    var paddrs: [5]u64 = undefined;
-    var owners: [5]u64 = undefined;
-    var indices: [5]u32 = undefined;
-    var free_list = FreePageList{};
-    try free_list.appendContiguousRange(0, @intFromPtr(&backing_growth_memory), 128);
-    try std.testing.expect(kernel.initVmoBackingPageStoreForTest(&paddrs, &owners, &indices));
-    defer if (!kernel.initRuntimeStorage(runtime_storage[0..])) unreachable;
-    const Worker = struct {
-        fn run(list: *FreePageList, ready: *u32, id: usize, failure: *?KernelError) void {
-            _ = @atomicRmw(u32, ready, .Add, 1, .acq_rel);
-            while (@atomicLoad(u32, ready, .acquire) != 4) std.atomic.spinLoopHint();
-            const owner = kernel.vmoBackingStoreOwner(.native_vmo, @intCast(id), @intCast(id + 1));
-            for (0..256) |page| {
-                kernel.setVmoBackingPageStorePaddr(owner, 256, page, owner, (id * 256 + page + 1) * 4096, list) catch |err| {
-                    failure.* = err;
-                    return;
-                };
-            }
-        }
-    };
-    var ready: u32 = 0;
-    var failures = [_]?KernelError{null} ** 4;
-    var threads: [4]std.Thread = undefined;
-    for (&threads, 0..) |*thread, id| thread.* = try std.Thread.spawn(.{}, Worker.run, .{ &free_list, &ready, id, &failures[id] });
-    for (threads) |thread| thread.join();
-    for (failures) |failure| try std.testing.expect(failure == null);
-    const stats = kernel.vmObjectBackingStoreStats();
-    try std.testing.expectEqual(@as(u64, 1024), stats.used_entries);
-    try std.testing.expect(stats.growth_count > 1);
-    try std.testing.expectEqual(@as(usize, 0), stats.retired_pages);
-    try std.testing.expect(stats.used_entries * 10 < (stats.capacity + 1) * 7);
-    for (0..4) |id| {
-        const owner = kernel.vmoBackingStoreOwner(.native_vmo, @intCast(id), @intCast(id + 1));
-        for (0..256) |page| try std.testing.expectEqual(@as(?u64, (id * 256 + page + 1) * 4096), kernel.vmoBackingPageStorePaddr(owner, 256, page));
-        try std.testing.expect(kernel.freeVmoBackingPageStore(owner, 256, owner));
-    }
-    try std.testing.expectEqual(@as(u64, 0), kernel.vmObjectBackingStoreStats().used_entries);
-    try std.testing.expect(kernel.initRuntimeStorage(runtime_storage[0..]));
-    try std.testing.expectEqual(@as(usize, 128), free_list.pageCount());
-}
-
-test "sparse vmo growth retains a rejected PMM return until reclaim succeeds" {
-    var paddrs: [3]u64 = undefined;
-    var owners: [3]u64 = undefined;
-    var indices: [3]u32 = undefined;
-    var free_list = FreePageList{};
-    try free_list.appendContiguousRange(0, @intFromPtr(&backing_growth_memory), 1);
-    try std.testing.expect(kernel.initVmoBackingPageStoreForTest(&paddrs, &owners, &indices));
-    defer if (!kernel.initRuntimeStorage(runtime_storage[0..])) unreachable;
-    const owner = kernel.vmoBackingStoreOwner(.native_vmo, 8, 1);
-    try kernel.setVmoBackingPageStorePaddrs(owner, 3, 0, owner, &.{ 0x1000, 0x2000, 0x3000 }, &free_list);
-    try std.testing.expectEqual(@as(usize, 0), free_list.pageCount());
-    // A full PMM range ledger must not erase ownership of the old table.
-    for (&free_list.ranges, 0..) |*range, index| range.* = .{
-        .region_id = 1,
-        .len = 1,
-        .physical_start = 0x1_0000_0000 + index * 8192,
-    };
-    free_list.range_len = free_list.ranges.len;
-    free_list.len = free_list.ranges.len;
-    try std.testing.expect(kernel.initRuntimeStorage(runtime_storage[0..]));
-    try std.testing.expectEqual(@as(usize, 1), kernel.vmObjectBackingStoreStats().retired_pages);
-    kernel.reclaimVmoBackingStorage();
-    try std.testing.expectEqual(@as(usize, 1), kernel.vmObjectBackingStoreStats().retired_pages);
-    // Remove the fixture's synthetic free ranges; the retained table is real.
-    free_list = .{};
-    kernel.reclaimVmoBackingStorage();
-    try std.testing.expectEqual(@as(usize, 0), kernel.vmObjectBackingStoreStats().retired_pages);
-    try std.testing.expectEqual(@as(usize, 1), free_list.pageCount());
-    try std.testing.expectEqual(@intFromPtr(&backing_growth_memory), try free_list.popFront());
-}
-
 test "native vmo page install rejects a bad batch without a partial write" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     const vmo = try s.createNativeVmo(.anonymous, 2 * kernel.native_page_size);
     try s.retainNativeVmo(vmo);
     try std.testing.expectError(
@@ -3309,7 +4326,11 @@ test "native vmo page install rejects a bad batch without a partial write" {
 }
 
 test "RAM cache preflight resolves only populated canonical RAM owners" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     const parent = try s.createNativeVmo(.anonymous, 3 * kernel.native_page_size);
     try s.retainNativeVmo(parent);
     try s.installNativeVmoPages(parent, 0, &.{ 0x8400_0000, 0x8400_7000 }, null);
@@ -3329,12 +4350,22 @@ test "RAM cache preflight resolves only populated canonical RAM owners" {
     try std.testing.expectError(KernelError.InvalidState, s.nativeRamCachePages(view, 0, pages[0..1]));
 }
 
-test "native VMO slot including device backing stays within one cache line" {
-    try std.testing.expect(@sizeOf(kernel.NativeVmoSlot) <= 64);
+test "native VMO slot explicitly budgets its failed-return destination" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    // Ownership survives PMM rejection; do not overload the parent/device
+    // union merely to preserve the old single-cache-line storage target.
+    // The internal WC token now encodes every u32 slot plus reserved zero.
+    try std.testing.expect(@sizeOf(kernel.NativeVmoSlot) <= 64 + @sizeOf(*FreePageList) + 8 + @sizeOf(u64) + @sizeOf(kernel.BackingStore) + @sizeOf(*kernel.BackingStore) + @sizeOf(@TypeOf(@as(kernel.NativeVmoSlot, .{}).references)) + @sizeOf(@TypeOf(@as(kernel.NativeVmoSlot, .{}).parent_edge)));
 }
 
 test "RAM lifetime ticket prevalidates canonical owner before infallible publication update" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     const root = try s.createNativeVmo(.anonymous, 4096);
     try s.retainNativeVmo(root);
     try s.installNativeVmoPages(root, 0, &.{0x8400_0000}, null);
@@ -3362,7 +4393,11 @@ test "RAM lifetime ticket prevalidates canonical owner before infallible publica
 }
 
 test "RAM cache mapping validation distinguishes target pages from unrelated code and DMA" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     const root = try s.createNativeVmo(.anonymous, 4 * 4096);
     try s.retainNativeVmo(root);
     try s.installNativeVmoPages(root, 0, &.{ 0x8400_0000, 0x8400_1000, 0x8400_2000, 0x8400_3000 }, null);
@@ -3431,14 +4466,18 @@ test "RAM cache mapping validation distinguishes target pages from unrelated cod
 }
 
 test "RAM cache mapping validation rejects inherited shadow overlap only" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     const root = try s.createNativeVmo(.anonymous, 8192);
     try s.retainNativeVmo(root);
     try s.installNativeVmoPages(root, 0, &.{ 0x8400_0000, 0x8400_1000 }, null);
     const shadow = try s.createNativeVmo(.anonymous, 4096);
     try s.retainNativeVmo(shadow);
     try s.retainNativeVmo(root);
-    s.nativeVmoSlot(shadow).?.backing.parent = .{ .ref = root, .offset = 4096 };
+    try s.publishNativeVmoParent(shadow, root, 4096);
     const rw = vmaProt(.{ .read = true, .write = true });
     try s.createVmaWithRetainedVmo(p1, 0x4400_0000, 4096, rw, rw, mmapFlags(.{ .shared = true }), shadow, 0);
     try s.validateRamCacheMappings(root, 0, &.{0x8400_0000});
@@ -3446,7 +4485,11 @@ test "RAM cache mapping validation rejects inherited shadow overlap only" {
 }
 
 test "2 MiB page view can borrow pages after parent RAM becomes WC" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     const page_count = 512;
     var pages: [page_count]u64 = undefined;
     for (&pages, 0..) |*page, index| page.* = 0x8400_0000 + @as(u64, @intCast(index)) * 4096;
@@ -3474,8 +4517,13 @@ test "2 MiB page view can borrow pages after parent RAM becomes WC" {
 }
 
 test "cached RAM final release waits for WB restoration including view and pending policy" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     var free_list = FreePageList{};
+    try free_list.installRegions(&.{.{ .id = 0, .start = 4096, .end = (1 << 40) + (1 << 29) }});
     const parent = try s.createNativeVmo(.anonymous, 8192);
     try s.retainNativeVmo(parent);
     try s.installNativeVmoPages(parent, 0, &.{ 0x8400_0000, 0x8400_1000 }, null);
@@ -3527,9 +4575,14 @@ test "cached RAM final release waits for WB restoration including view and pendi
 }
 
 test "cached RAM explicit WB restoration resumes ordinary release and no-freelist drop defers" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
     for ([_]bool{ false, true }) |restore_before_release| {
-        var s = try initFdState();
+        var s: KernelState = undefined;
+        try initFdState(&s);
         var free_list = FreePageList{};
+        try free_list.installRegions(&.{.{ .id = 0, .start = 4096, .end = (1 << 40) + (1 << 29) }});
         const ref = try s.createNativeVmo(.anonymous, 4096);
         try s.retainNativeVmo(ref);
         try s.installNativeVmoPages(ref, 0, &.{0x8400_0000}, null);
@@ -3556,13 +4609,18 @@ test "cached RAM explicit WB restoration resumes ordinary release and no-freelis
     }
 }
 
-test "RAM retirement preserves owned backing when WB pages cannot return to full PMM" {
-    var s = try initFdState();
+test "RAM retirement preserves owned backing when WB pages cannot return to DMA-held PMM" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     var free_list = FreePageList{};
-    for (&free_list.ranges, 0..) |*range, i|
-        range.* = .{ .region_id = 0, .len = 1, .physical_start = 0x100_0000 + @as(u64, @intCast(i)) * 8192 };
-    free_list.range_len = FreePageList.max_ranges;
-    free_list.len = FreePageList.max_ranges;
+    try free_list.installRegions(&.{.{ .id = 0, .start = 4096, .end = (1 << 40) + (1 << 29) }});
+    var first_hold = try DmaHold.init(0x8400_0000, 1);
+    defer first_hold.end();
+    var second_hold = try DmaHold.init(0x8400_2000, 1);
+    defer second_hold.end();
     const ref = try s.createNativeVmo(.anonymous, 8192);
     try s.retainNativeVmo(ref);
     try s.installNativeVmoPages(ref, 0, &.{ 0x8400_0000, 0x8400_2000 }, null);
@@ -3581,28 +4639,33 @@ test "RAM retirement preserves owned backing when WB pages cannot return to full
     try std.testing.expectEqual(owner, try s.validateRetiredRamCachePages(ref, &.{0x8400_0000}, &seen));
     try std.testing.expectError(KernelError.InvalidState, s.validateRetiredRamCachePages(ref, &.{0x8400_1000}, &seen));
     const wb: kernel.RamCacheSnapshot = .{};
-    try std.testing.expectError(KernelError.TooManyFreeRanges, s.finishRamCacheRetirement(ref, &wb, &free_list));
+    try std.testing.expectError(KernelError.PageQuarantined, s.finishRamCacheRetirement(ref, &wb, &free_list));
     try std.testing.expectEqual(@as(usize, 1), s.pending_ram_cache_retirements);
     try std.testing.expectEqual(ref, s.nextRamCacheRetirement().?);
     try std.testing.expectEqual(@as(?u64, 0x8400_0000), s.nativeVmoPagePaddr(ref, 0));
     try std.testing.expectEqual(@as(?u64, 0x8400_2000), s.nativeVmoPagePaddr(ref, 1));
     // Only the first PFN can join an existing PMM range; the second remains
     // owned. A later retry must not return the first page for a second time.
-    free_list.ranges[FreePageList.max_ranges - 1].physical_start = 0x83ff_f000;
-    try std.testing.expectError(KernelError.TooManyFreeRanges, s.finishRamCacheRetirement(ref, &wb, &free_list));
+    first_hold.end();
+    try std.testing.expectError(KernelError.PageQuarantined, s.finishRamCacheRetirement(ref, &wb, &free_list));
     try std.testing.expectEqual(@as(?u64, null), s.nativeVmoPagePaddr(ref, 0));
     try std.testing.expectEqual(@as(?u64, 0x8400_2000), s.nativeVmoPagePaddr(ref, 1));
     // Empty fixture PMM models newly available range descriptors.
-    free_list = .{};
+    second_hold.end();
     try s.finishRamCacheRetirement(ref, &wb, &free_list);
-    try std.testing.expectEqual(@as(usize, 1), free_list.pageCount());
+    try std.testing.expectEqual(@as(usize, 2), free_list.pageCount());
     try std.testing.expectEqual(@as(usize, 0), s.pending_ram_cache_retirements);
     try std.testing.expect(s.nativeVmoSlotConst(ref) == null);
 }
 
 test "page view lifetime survives failure multiple closes and generation reuse" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     var free_list = FreePageList{};
+    try free_list.installRegions(&.{.{ .id = 0, .start = 4096, .end = (1 << 40) + (1 << 29) }});
     const parent = try s.createNativeVmo(.anonymous, 8192);
     try s.retainNativeVmo(parent);
     try s.installNativeVmoPages(parent, 0, &.{ 0x8400_0000, 0x8400_1000 }, null);
@@ -3611,9 +4674,9 @@ test "page view lifetime survives failure multiple closes and generation reuse" 
 
     // Failure to retain the parent must unwind the unlinked child.
     slot.ref_count = std.math.maxInt(u32);
-    const failed_index = s.next_native_vmo_scan;
+    const live_before_failure = s.native_vmos.live;
     try std.testing.expectError(KernelError.TableFull, s.createNativePageView(parent, 1));
-    try std.testing.expectEqual(kernel.NativeVmoKind.none, s.native_vmos[failed_index].kind);
+    try std.testing.expectEqual(live_before_failure, s.native_vmos.live);
     slot.ref_count = 1;
 
     const first = try s.createNativePageView(parent, 1);
@@ -3629,7 +4692,7 @@ test "page view lifetime survives failure multiple closes and generation reuse" 
     try std.testing.expectEqual(@as(usize, 0), free_list.pageCount());
     s.releaseNativeVmoWithFreeList(second, &free_list);
     s.releaseUnmappedAnonymousVmoPageRange(p0, parent, 0, 1, &free_list);
-    try std.testing.expectEqual(@as(usize, 1), free_list.pageCount());
+    try std.testing.expectEqual(@as(usize, 0), free_list.pageCount()); // explicit temporary owner still pins backing
     s.releaseNativeVmoWithFreeList(parent, &free_list);
     try std.testing.expectEqual(@as(usize, 2), free_list.pageCount());
     s.next_native_vmo_scan = parent.index;
@@ -3641,8 +4704,13 @@ test "page view lifetime survives failure multiple closes and generation reuse" 
 }
 
 test "device memory backing validates BAR scatter and never frees device pages" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     var free_list = FreePageList{};
+    try free_list.installRegions(&.{.{ .id = 0, .start = 4096, .end = (1 << 40) + (1 << 29) }});
     const backing = try s.createNativeDeviceMemoryBacking(.{ .device = 1, .bar_index = 0, .cache = .wc }, 0xd000_0000, 0x10000, &.{ 0x9000, 0, 0x3000 }, null);
     try std.testing.expectEqual(@as(?u64, 0xd000_9000), s.nativeVmoResolvedPagePaddr(backing, 0));
     try std.testing.expectEqual(@as(?u64, 0xd000_0000), s.nativeVmoResolvedPagePaddr(backing, 1));
@@ -3663,7 +4731,11 @@ test "device memory backing validates BAR scatter and never frees device pages" 
 }
 
 test "device memory cache lease survives references and pending retirement" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     var free_list = FreePageList{};
     const ref = try s.createNativeDeviceMemoryBacking(.{ .device = 1, .bar_index = 0, .cache = .wc }, 0xd000_0000, 0x10000, &.{ 0x9000, 0, 0x3000 }, null);
     try std.testing.expectError(KernelError.InvalidState, s.activateNativeDeviceMemory(ref, 1, 0));
@@ -3688,7 +4760,11 @@ test "device memory cache lease survives references and pending retirement" {
 }
 
 test "device memory transferred mappings keep cache type through fork and revoke" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     var free_list = FreePageList{};
     const ref = try s.createNativeDeviceMemoryBacking(.{ .device = 1, .bar_index = 0, .cache = .wc }, 0xd000_0000, 0x10000, &.{ 0x9000, 0, 0x3000 }, null);
     try s.activateNativeDeviceMemory(ref, 1, 7);
@@ -3716,8 +4792,13 @@ test "device memory transferred mappings keep cache type through fork and revoke
 }
 
 test "kernel clock page is shared read-only only and never freed" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     var free_list = FreePageList{};
+    try free_list.installRegions(&.{.{ .id = 0, .start = 4096, .end = (1 << 40) + (1 << 29) }});
     const paddr: u64 = 0x8500_0000;
     const fd = try s.openKernelClockPageFd(p0, paddr, .{}, 16, null);
     const ref = s.kernel_clock_page_vmo;
@@ -3771,13 +4852,20 @@ test "kernel clock page is shared read-only only and never freed" {
     try s.closeFdWithFreeList(p0, fd, &free_list);
     try s.closeFdWithFreeList(p0, fd2, &free_list);
     try std.testing.expectEqual(@as(?u32, 1), s.nativeVmoRefCount(ref));
+    @TypeOf(s.nativeVmoSlot(ref).?.references).disconnect(&s.clock_reference, true);
+    s.kernel_clock_page_vmo = .{};
     s.releaseNativeVmoWithFreeList(ref, &free_list);
     try std.testing.expectEqual(@as(usize, 0), free_list.pageCount());
 }
 
 test "page view borrows scatter pages until its last reference closes" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     var free_list = FreePageList{};
+    try free_list.installRegions(&.{.{ .id = 0, .start = 4096, .end = (1 << 40) + (1 << 29) }});
     const parent = try s.createNativeVmo(.anonymous, 3 * kernel.native_page_size);
     try s.retainNativeVmo(parent);
     try s.installNativeVmoPages(parent, 0, &.{ 0x8100_0000, 0x8200_0000, 0x8300_0000 }, null);
@@ -3802,8 +4890,13 @@ test "page view borrows scatter pages until its last reference closes" {
 }
 
 test "page view mappings are shared non-executable in every map path" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     var free_list = FreePageList{};
+    try free_list.installRegions(&.{.{ .id = 0, .start = 4096, .end = (1 << 40) + (1 << 29) }});
     const parent = try s.createNativeVmo(.anonymous, kernel.native_page_size);
     try s.retainNativeVmo(parent);
     try s.installNativeVmoPages(parent, 0, &.{0x8400_0000}, null);
@@ -3857,9 +4950,14 @@ test "page view mappings are shared non-executable in every map path" {
 }
 
 test "parent revoke removes page view fds and mappings before freeing pages" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     var free_list = FreePageList{};
-    try free_list.appendContiguousRange(0, 0x8500_0000, 2);
+    try free_list.installRegions(&.{.{ .id = 0, .start = 0x8500_0000, .end = (0x8500_0000) + (2) * 4096 }});
+    try free_list.seedContiguousRange(0x8500_0000, 2);
     const original_free = free_list.pageCount();
     const parent_fd = try s.createAnonymousVmoFdWithPages(
         p0,
@@ -3907,13 +5005,18 @@ test "parent revoke removes page view fds and mappings before freeing pages" {
 }
 
 fn expectVmoLifetime(s: *KernelState, fd: kernel.Fd, object_refs: u32, native_refs: u32) !void {
+    try kernel.ReferenceCheck.check(s);
     const expected = @as(u64, object_refs) |
         (@as(u64, native_refs) << fd_abi.vmo_info_native_refs_shift);
     try std.testing.expectEqual(@as(?u64, expected), s.fdVmoLifetimeInfo(p0, fd));
 }
 
 test "VMO lifetime snapshot covers dup mapping fork split and derived views" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     var free_list = FreePageList{};
     const rights = fdRights(.{ .inspect = true, .dup = true, .transfer = true, .close = true, .map_read = true, .map_write = true });
     const fd = try s.createAnonymousVmoFd(p0, 12288, rights, .{}, 16);
@@ -3950,7 +5053,11 @@ test "VMO lifetime snapshot covers dup mapping fork split and derived views" {
 }
 
 test "VMO lifetime snapshot includes queued IPC and requires INSPECT" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     var free_list = FreePageList{};
     const rights = fdRights(.{ .inspect = true, .transfer = true, .dup = true, .close = true, .map_read = true });
     const fd = try s.createAnonymousVmoFd(p0, 4096, rights, .{}, 16);
@@ -3973,7 +5080,11 @@ test "VMO lifetime snapshot includes queued IPC and requires INSPECT" {
 }
 
 test "anonymous vmo fd maps through vma ledger without page capability install" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     const rights = fdRights(.{
         .dup = true,
         .map_read = true,
@@ -4004,7 +5115,11 @@ test "anonymous vmo fd maps through vma ledger without page capability install" 
 }
 
 test "mmap fd rejects rights escalation and overlapping vma" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     const fd = try s.createAnonymousVmoFd(p0, 12288, fdRights(.{ .map_read = true }), .{}, 0);
 
     try std.testing.expectError(KernelError.InvalidState, s.mmapFd(
@@ -4030,7 +5145,11 @@ test "mmap fd rejects rights escalation and overlapping vma" {
 }
 
 test "MMIO reservation admission covers whole ranges without mutating VMAs" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     var free_list = FreePageList{};
     const base: u64 = 0x4100_0000;
     const flags = mmapFlags(.{ .private = true, .anonymous = true, .noreserve = true, .fixed = true });
@@ -4057,7 +5176,11 @@ test "MMIO reservation admission covers whole ranges without mutating VMAs" {
 }
 
 test "MMIO reservation admission accepts a split 256 MiB hosted vmalloc window" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     var free_list = FreePageList{};
     const window_base: u64 = 0x7000_0000;
     const window_size: u64 = 256 << 20;
@@ -4076,8 +5199,13 @@ test "MMIO reservation admission accepts a split 256 MiB hosted vmalloc window" 
 }
 
 test "MMIO reservation admission rejects used NONE RAM and COW" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     var free_list = FreePageList{};
+    try free_list.installRegions(&.{.{ .id = 0, .start = 4096, .end = (1 << 40) + (1 << 29) }});
     const base: u64 = 0x4100_0000;
     const flags = mmapFlags(.{ .private = true, .anonymous = true, .noreserve = true });
     const ceiling = vmaProt(.{ .read = true, .write = true });
@@ -4137,7 +5265,11 @@ test "MMIO reservation admission rejects used NONE RAM and COW" {
 }
 
 test "MMIO reservation admission rejects address-bound MMIO and DMA" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     var free_list = FreePageList{};
     const base: u64 = 0x4100_0000;
     _ = try s.createAnonymousVmaWithPages(p0, base, 4 * 4096, .{}, vmaProt(.{ .read = true, .write = true }), mmapFlags(.{ .private = true, .anonymous = true, .noreserve = true }), &free_list);
@@ -4153,14 +5285,14 @@ test "MMIO reservation admission rejects address-bound MMIO and DMA" {
         .iova = 0x8001_0000,
         .size = 4096,
     }, fdRights(.{ .close = true }), .{}, 16);
-    _ = try s.createDmaMappingFd(p0, .{
+    _ = try s.createDmaMappingFdWithBacking(p0, .{
         .device = 1,
         .user_va = base + 8192,
         .iova = 0x8002_0000,
         .size = 4096,
         .page_count = 1,
         .direction = .to_device,
-    }, fdRights(.{ .close = true }), .{}, 16);
+    }, fdRights(.{ .close = true }), .{}, 16, &.{0x80020000});
     for (0..3) |page|
         try std.testing.expect(!s.userRangeIsUnbackedMmioReservation(p0, base + page * 4096, 4096));
     try std.testing.expect(!s.userRangeIsUnbackedMmioReservation(p0, base, 4 * 4096));
@@ -4168,7 +5300,11 @@ test "MMIO reservation admission rejects address-bound MMIO and DMA" {
 }
 
 test "MMIO cache leases compare overlapping physical pages rather than whole BARs" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     const cache_abi = @import("kernel_abi_root").capsule_abi;
     _ = try s.createMmioRegionFd(p0, .{
         .device = 1,
@@ -4196,7 +5332,11 @@ test "MMIO cache leases compare overlapping physical pages rather than whole BAR
 }
 
 test "mmap and mprotect preserve combined write execute permissions" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     const fd = try s.createAnonymousVmoFd(
         p0,
         4096,
@@ -4232,7 +5372,11 @@ test "mmap and mprotect preserve combined write execute permissions" {
 }
 
 test "mprotect cannot exceed the mapping authority or change its pkey" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     const read_fd = try s.createAnonymousVmoFd(
         p0,
         4096,
@@ -4346,7 +5490,11 @@ test "mprotect cannot exceed the mapping authority or change its pkey" {
 }
 
 test "fd close and munmap release native vmo lifetimes independently" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     const fd = try s.createAnonymousVmoFd(p0, 4096, fdRights(.{ .map_read = true }), .{}, 0);
     const vmo = s.nativeVmoRefForFd(p0, fd) orelse unreachable;
     _ = try s.mmapFd(p0, fd, 0x4200_0000, 4096, vmaProt(.{ .read = true }), .{}, 0);
@@ -4363,7 +5511,11 @@ test "fd close and munmap release native vmo lifetimes independently" {
 }
 
 test "munmap visits unsorted active slots despite removal swaps" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     var free_list = FreePageList{};
     const base: u64 = 0x4210_0000;
     var refs: [3]kernel.NativeVmoRef = undefined;
@@ -4372,7 +5524,7 @@ test "munmap visits unsorted active slots despite removal swaps" {
     }
     try s.munmapRangeWithFreeList(p0, base, 4096, &free_list);
     const table = s.getVmaTable(p0) orelse unreachable;
-    try std.testing.expect(table.active_indices[0] > table.active_indices[1]);
+    try std.testing.expect(table.active_indices.get(@intCast(0)).?.* > table.active_indices.get(@intCast(1)).?.*);
     var prepared = try s.prepareMunmapRangeWithFreeList(p0, base + 8192, 12288, &free_list);
     s.commitMunmapPrepared(&prepared, &free_list);
     try std.testing.expectEqual(@as(usize, 0), table.active_count);
@@ -4380,9 +5532,13 @@ test "munmap visits unsorted active slots despite removal swaps" {
 }
 
 test "munmap snapshot preserves middle split before and after source slot" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
     for ([_]bool{ false, true }) |prepared_path| {
         for ([_]bool{ false, true }) |earlier_suffix| {
-            var s = try initFdState();
+            var s: KernelState = undefined;
+            try initFdState(&s);
             var free_list = FreePageList{};
             const base: u64 = 0x4220_0000;
             if (earlier_suffix) {
@@ -4410,21 +5566,35 @@ test "munmap snapshot preserves middle split before and after source slot" {
 }
 
 test "munmap full table middle split failures preserve original range" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     var free_list = FreePageList{};
     const base: u64 = 0x4230_0000;
     const ref = try s.createAnonymousVmaWithPages(p0, base, 12288, vmaProt(.{ .read = true }), vmaProt(.{ .read = true }), mmapFlags(.{ .private = true, .anonymous = true }), &free_list);
     const table = s.getVmaTable(p0) orelse unreachable;
-    fillVmaTableExcept(table, &.{});
+    fillVmaTableExcept(&s, table, &.{});
+    var failure = kernel.InvocationStorageTestAllocator{ .fail_at = 1 };
+    defer failure.deinit();
+    const saved_allocator = table.allocator;
+    table.allocator = failure.interface();
+    defer table.allocator = saved_allocator;
     try std.testing.expectError(KernelError.TableFull, s.prepareMunmapRangeWithFreeList(p0, base + 4096, 4096, &free_list));
+    failure.fail_at = failure.calls + 1;
     try std.testing.expectError(KernelError.TableFull, s.munmapRangeWithFreeList(p0, base + 4096, 4096, &free_list));
-    try std.testing.expectEqual(kernel.max_vmas_per_process, table.active_count);
+    try std.testing.expectEqual(former_max_vmas_per_process, table.active_count);
     try std.testing.expectEqual(@as(u64, 12288), (s.vmaEntryConst(p0, base) orelse unreachable).size_bytes);
     try std.testing.expectEqual(@as(?u32, 1), s.nativeVmoRefCount(ref));
 }
 
 test "process reset releases vma table and native vmo after fd close" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     const fd = try s.createAnonymousVmoFd(p0, 4096, fdRights(.{ .map_read = true }), .{}, 0);
     const vmo = s.nativeVmoRefForFd(p0, fd) orelse unreachable;
     _ = try s.mmapFd(p0, fd, 0x4300_0000, 4096, vmaProt(.{ .read = true }), .{}, 0);
@@ -4437,9 +5607,14 @@ test "process reset releases vma table and native vmo after fd close" {
 }
 
 test "native vmo pages return to free list after vma and fd release" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     var free_list = FreePageList{};
-    try free_list.appendContiguousRange(0, 0x1_0000_0000, 4);
+    try free_list.installRegions(&.{.{ .id = 0, .start = 0x1_0000_0000, .end = (0x1_0000_0000) + (4) * 4096 }});
+    try free_list.seedContiguousRange(0x1_0000_0000, 4);
     const original_free = free_list.len;
 
     var pages: [2]u64 = undefined;
@@ -4462,9 +5637,14 @@ test "native vmo pages return to free list after vma and fd release" {
 }
 
 test "mprotect split and mremap keep vmo refs until final munmap" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     var free_list = FreePageList{};
-    try free_list.appendContiguousRange(0, 0x30_0000, 8);
+    try free_list.installRegions(&.{.{ .id = 0, .start = 0x30_0000, .end = (0x30_0000) + (8) * 4096 }});
+    try free_list.seedContiguousRange(0x30_0000, 8);
     const original_free = free_list.len;
 
     const fd = try s.createAnonymousVmoFdWithPages(
@@ -4522,10 +5702,14 @@ test "mprotect split and mremap keep vmo refs until final munmap" {
 }
 
 test "adjacent private anonymous mappings grow one unique vma past the fixed table capacity" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     var free_list = FreePageList{};
     const base_va: u64 = 0x4828_0000;
-    const mapping_count = kernel.max_vmas_per_process + 32;
+    const mapping_count = former_max_vmas_per_process + 32;
     var first_vmo: ?kernel.NativeVmoRef = null;
 
     var index: usize = 0;
@@ -4565,9 +5749,14 @@ test "adjacent private anonymous mappings grow one unique vma past the fixed tab
 }
 
 test "anonymous vma metadata relocation preserves populated pages" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     var free_list = FreePageList{};
-    try free_list.appendContiguousRange(0, 0x38_0000, 4);
+    try free_list.installRegions(&.{.{ .id = 0, .start = 0x38_0000, .end = (0x38_0000) + (4) * 4096 }});
+    try free_list.seedContiguousRange(0x38_0000, 4);
     const original_free = free_list.len;
     const base_va: u64 = 0x4829_0000;
     const blocker_va: u64 = 0x4929_0000;
@@ -4611,7 +5800,11 @@ test "anonymous vma metadata relocation preserves populated pages" {
 }
 
 test "anonymous vma growth rejects fork aliases and incompatible protection" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     var free_list = FreePageList{};
     const base_va: u64 = 0x482a_0000;
     const first_vmo = try s.createAnonymousVmaWithPages(
@@ -4652,9 +5845,14 @@ test "anonymous vma growth rejects fork aliases and incompatible protection" {
 }
 
 test "fork keeps PROT_NONE private mappings COW when mprotect enables writes" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     var free_list = FreePageList{};
-    try free_list.appendContiguousRange(0, 0x35_0000, 16);
+    try free_list.installRegions(&.{.{ .id = 0, .start = 0x35_0000, .end = (0x35_0000) + (16) * 4096 }});
+    try free_list.seedContiguousRange(0x35_0000, 16);
     const original_free = free_list.len;
     const arena_va: u64 = 0x4830_0000;
 
@@ -4684,7 +5882,7 @@ test "fork keeps PROT_NONE private mappings COW when mprotect enables writes" {
     const vmo_refs = s.nativeVmoRefCount(child_before.vmo);
     const cow_refs: ?u32 = if (s.nativeCowTableSlotConst(child_before.cow_table)) |cow| cow.ref_count else null;
     try s.setVmaProtRange(p1, arena_va + 4096, 4096, vmaProt(.{}));
-    try std.testing.expectEqualDeep(child_before, child_after_fork.*);
+    try expectResourceEqualDeep(child_before, child_after_fork.*);
     try std.testing.expectEqual(child_count, s.getVmaTable(p1).?.active_count);
     try std.testing.expectEqual(vmo_refs, s.nativeVmoRefCount(child_before.vmo));
     try std.testing.expectEqual(cow_refs, if (s.nativeCowTableSlotConst(child_before.cow_table)) |cow| @as(?u32, cow.ref_count) else null);
@@ -4706,7 +5904,7 @@ test "fork keeps PROT_NONE private mappings COW when mprotect enables writes" {
     const child_dirty = (s.vmaEntryConst(p1, arena_va) orelse unreachable).*;
     const dirty_refs = s.nativeCowTableSlotConst(child_dirty.cow_table).?.ref_count;
     try s.setVmaProtRange(p1, arena_va, 4096, child_dirty.prot);
-    try std.testing.expectEqualDeep(child_dirty, (s.vmaEntryConst(p1, arena_va) orelse unreachable).*);
+    try expectResourceEqualDeep(child_dirty, (s.vmaEntryConst(p1, arena_va) orelse unreachable).*);
     try std.testing.expectEqual(dirty_refs, s.nativeCowTableSlotConst(child_dirty.cow_table).?.ref_count);
     try std.testing.expectEqual(
         @as(?u64, child_write.paddr),
@@ -4733,7 +5931,11 @@ test "fork keeps PROT_NONE private mappings COW when mprotect enables writes" {
 }
 
 test "mprotect middle split fails atomically when only one VMA slot is free" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     var free_list = FreePageList{};
     const mapping_va: u64 = 0x4840_0000;
     const vmo = try s.createAnonymousVmaWithPages(
@@ -4746,31 +5948,37 @@ test "mprotect middle split fails atomically when only one VMA slot is free" {
         &free_list,
     );
     const table = s.getVmaTable(p0) orelse unreachable;
-    const source_index: usize = @intCast(table.active_indices[0]);
+    const source_index: usize = @intCast(table.active_indices.get(@intCast(0)).?.*);
     const free_index: usize = if (source_index == 0) 1 else 0;
 
     var index: usize = 0;
-    while (index < table.entries.len) : (index += 1) {
+    while (index < former_max_vmas_per_process) : (index += 1) {
         if (index == source_index or index == free_index) continue;
-        table.entries[index] = .{
+        try table.reference_slots.prepareIndex(@intCast(index), table.allocator.?);
+        try table.entries.prepareIndex(@intCast(index), table.allocator.?);
+        try table.active_indices.prepareIndex(@intCast(table.active_count), table.allocator.?);
+        s.installVmaEntry(table, index, .{
             .active = true,
             .start_va = 0x7000_0000 + @as(u64, @intCast(index)) * 0x1000,
             .size_bytes = 4096,
-        };
-        table.active_indices[table.active_count] = @intCast(index);
-        table.active_count += 1;
+        });
     }
-    try std.testing.expectEqual(kernel.max_vmas_per_process - 1, table.active_count);
-    const original = table.entries[source_index];
+    try std.testing.expectEqual(former_max_vmas_per_process - 1, table.active_count);
+    const original = table.entries.get(@intCast(source_index)).?.*;
     const original_refs = s.nativeVmoRefCount(vmo);
 
     try s.setVmaProtRange(p0, mapping_va + 4096, 4096, original.prot);
-    try std.testing.expectEqual(original, table.entries[source_index]);
-    try std.testing.expectEqual(kernel.max_vmas_per_process - 1, table.active_count);
+    try std.testing.expectEqual(original, table.entries.get(@intCast(source_index)).?.*);
+    try std.testing.expectEqual(former_max_vmas_per_process - 1, table.active_count);
     try std.testing.expectEqual(original_refs, s.nativeVmoRefCount(vmo));
 
+    var failure = kernel.InvocationStorageTestAllocator{ .fail_at = 1 };
+    defer failure.deinit();
+    const saved_allocator = table.allocator;
+    table.allocator = failure.interface();
+    defer table.allocator = saved_allocator;
     try std.testing.expectError(
-        KernelError.TableFull,
+        KernelError.OutOfFreePages,
         s.setVmaProtRange(
             p0,
             mapping_va + 4096,
@@ -4778,16 +5986,21 @@ test "mprotect middle split fails atomically when only one VMA slot is free" {
             vmaProt(.{ .read = true }),
         ),
     );
-    try std.testing.expectEqual(original, table.entries[source_index]);
-    try std.testing.expect(!table.entries[free_index].active);
-    try std.testing.expectEqual(kernel.max_vmas_per_process - 1, table.active_count);
+    try std.testing.expectEqual(original, table.entries.get(@intCast(source_index)).?.*);
+    try std.testing.expect(table.entries.get(@intCast(free_index)) == null);
+    try std.testing.expectEqual(former_max_vmas_per_process - 1, table.active_count);
     try std.testing.expectEqual(original_refs, s.nativeVmoRefCount(vmo));
 }
 
 test "fork fd and vma clones release vmo pages only after child cleanup" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     var free_list = FreePageList{};
-    try free_list.appendContiguousRange(0, 0x40_0000, 4);
+    try free_list.installRegions(&.{.{ .id = 0, .start = 0x40_0000, .end = (0x40_0000) + (4) * 4096 }});
+    try free_list.seedContiguousRange(0x40_0000, 4);
     const original_free = free_list.len;
 
     const rights = fdRights(.{ .close = true, .map_read = true, .map_write = true });
@@ -4809,9 +6022,14 @@ test "fork fd and vma clones release vmo pages only after child cleanup" {
 }
 
 test "exec vma replacement releases old mappings and moves staged mappings" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     var free_list = FreePageList{};
-    try free_list.appendContiguousRange(0, 0x60_0000, 4);
+    try free_list.installRegions(&.{.{ .id = 0, .start = 0x60_0000, .end = (0x60_0000) + (4) * 4096 }});
+    try free_list.seedContiguousRange(0x60_0000, 4);
     const original_free = free_list.len;
 
     const old_fd = try s.createAnonymousVmoFdWithPages(
@@ -4849,12 +6067,18 @@ test "exec vma replacement releases old mappings and moves staged mappings" {
     try s.munmapRangeWithFreeList(p0, 0x4d00_0000, 4096, &free_list);
     try std.testing.expectEqual(@as(?u32, null), s.nativeVmoRefCount(staged_vmo));
     try std.testing.expectEqual(original_free, free_list.len);
+    try kernel.ReferenceCheck.check(&s);
 }
 
 test "vmo revoke removes all fd vma and pending ipc references" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     var free_list = FreePageList{};
-    try free_list.appendContiguousRange(0, 0x50_0000, 6);
+    try free_list.installRegions(&.{.{ .id = 0, .start = 0x50_0000, .end = (0x50_0000) + (6) * 4096 }});
+    try free_list.seedContiguousRange(0x50_0000, 6);
     const original_free = free_list.len;
 
     const owner_rights = fdRights(.{
@@ -4907,20 +6131,35 @@ test "vmo revoke removes all fd vma and pending ipc references" {
     try std.testing.expectEqual(@as(u64, 7), received.words[0]);
 }
 
+fn returnRangeForTest(s: *KernelState, vmo: kernel.NativeVmoRef, count: usize, free_list: *FreePageList) void {
+    // Exercise range return with a real surviving VMA, not a temporary owner:
+    // C deliberately treats every temporary retain as a reclamation barrier.
+    const slot = s.nativeVmoSlot(vmo).?;
+    const offset = slot.size_bytes - 4096;
+    s.createVmaWithRetainedVmo(p0, 0x7000_0000, 4096, vmaProt(.{ .read = true }), vmaProt(.{ .read = true }), mmapFlags(.{ .shared = true }), vmo, offset) catch unreachable;
+    s.releaseNativeVmo(vmo);
+    s.releaseUnmappedAnonymousVmoPageRange(p0, vmo, 0, count, free_list);
+    s.retainNativeVmo(vmo) catch unreachable;
+    s.munmapRangeWithFreeList(p0, 0x7000_0000, 4096, free_list) catch unreachable;
+}
 fn returnVmoPagesForTest(s: *KernelState, vmo: kernel.NativeVmoRef, free_list: *FreePageList, partial: bool) void {
     if (partial) {
-        s.releaseUnmappedAnonymousVmoPageRange(p0, vmo, 0, 2, free_list);
+        returnRangeForTest(s, vmo, 2, free_list);
     } else {
-        // Inspect the owned-page helper before final release clears the slot.
         KernelState.releaseNativeVmoOwnedPages(s.nativeVmoSlot(vmo).?, free_list);
     }
 }
 
 test "VMO page return clears only successfully returned pages" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
     for ([_]bool{ false, true }) |partial| {
-        var s = try initFdState();
+        var s: KernelState = undefined;
+        try initFdState(&s);
         var free_list = FreePageList{};
-        const vmo = try s.createNativeVmo(.anonymous, 8192);
+        try free_list.installRegions(&.{.{ .id = 0, .start = 4096, .end = (1 << 40) + (1 << 29) }});
+        const vmo = try s.createNativeVmo(.anonymous, 12288);
         try s.retainNativeVmo(vmo);
         const pages = [_]u64{ 0x8000_0000, 0x8000_1000 };
         try s.installNativeVmoPages(vmo, 0, &pages, null);
@@ -4936,56 +6175,67 @@ test "VMO page return clears only successfully returned pages" {
     }
 }
 
-test "VMO page return preserves failed page and continues with full-list merge" {
+test "VMO page return preserves failed page and continues with neighbor merge" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
     for ([_]bool{ false, true }) |partial| {
-        var s = try initFdState();
+        var s: KernelState = undefined;
+        try initFdState(&s);
         var free_list = FreePageList{};
-        // Construct a valid maximally fragmented fixture directly, avoiding
-        // quadratic append work merely to fill the test's range table.
-        for (&free_list.ranges, 0..) |*range, index| {
-            range.* = .{ .region_id = 0, .len = 1, .physical_start = 0x100_0000 + @as(u64, @intCast(index)) * 8192 };
-        }
-        free_list.range_len = FreePageList.max_ranges;
-        free_list.len = FreePageList.max_ranges;
-        const last = FreePageList.max_ranges - 1;
-        const pages = [_]u64{ 0x1_0000_0000, free_list.ranges[last].physical_start + 4096 };
-        const vmo = try s.createNativeVmo(.anonymous, 8192);
+        try free_list.installRegions(&.{.{ .id = 0, .start = 4096, .end = (1 << 40) + (1 << 29) }});
+        try free_list.seedContiguousRange(0x100000, 1);
+        const pages = [_]u64{ 0x1_0000_0000, 0x101000 };
+        var hold = try DmaHold.init(pages[0], 1);
+        defer hold.end();
+        const vmo = try s.createNativeVmo(.anonymous, 12288);
         try s.retainNativeVmo(vmo);
         try s.installNativeVmoPages(vmo, 0, &pages, null);
-        try std.testing.expectError(KernelError.TooManyFreeRanges, free_list.appendPage(0, pages[0]));
-        try std.testing.expectEqual(@as(usize, FreePageList.max_ranges), free_list.pageCount());
+        try std.testing.expectError(KernelError.PageQuarantined, free_list.appendPage(pages[0]));
+        try std.testing.expectEqual(@as(usize, 1), free_list.pageCount());
 
         returnVmoPagesForTest(&s, vmo, &free_list, partial);
         try std.testing.expectEqual(@as(?u64, pages[0]), s.nativeVmoPagePaddrOrHole(vmo, 0));
         try std.testing.expectEqual(@as(?u64, 0), s.nativeVmoPagePaddrOrHole(vmo, 1));
-        try std.testing.expectEqual(@as(usize, FreePageList.max_ranges + 1), free_list.pageCount());
-        try std.testing.expectEqual(@as(usize, FreePageList.max_ranges), free_list.rangeCount());
-        try std.testing.expectEqual(@as(usize, 2), free_list.ranges[last].len);
+        try std.testing.expectEqual(@as(usize, 2), free_list.pageCount());
+        try std.testing.expectEqual(@as(usize, 1), free_list.rangeCount());
+        try std.testing.expectEqual(@as(usize, 2), free_list.rangeAt(0).len);
         try std.testing.expectEqual(@as(?u32, 1), s.nativeVmoRefCount(vmo));
 
-        // Capacity becomes available later: retry must return the held page
+        // DMA drains later: retry must return the held page
         // exactly once and must not return the already-cleared second page.
-        _ = try free_list.popFront();
+        hold.end();
         returnVmoPagesForTest(&s, vmo, &free_list, partial);
         try std.testing.expectEqual(@as(?u64, 0), s.nativeVmoPagePaddrOrHole(vmo, 0));
-        try std.testing.expectEqual(@as(usize, FreePageList.max_ranges + 1), free_list.pageCount());
+        try std.testing.expectEqual(@as(usize, 3), free_list.pageCount());
         s.releaseNativeVmoWithFreeList(vmo, &free_list);
     }
 }
 
-test "VMO page return rejects duplicate without clearing its backing pointer" {
+test "PMM rejects a duplicate VMO page before any backing pointer is cleared" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
     for ([_]bool{ false, true }) |partial| {
-        var s = try initFdState();
+        var s: KernelState = undefined;
+        try initFdState(&s);
         var free_list = FreePageList{};
+        try free_list.installRegions(&.{.{ .id = 0, .start = 4096, .end = (1 << 40) + (1 << 29) }});
         const pages = [_]u64{ 0x8100_0000, 0x8100_1000 };
-        const vmo = try s.createNativeVmo(.anonymous, 8192);
+        const vmo = try s.createNativeVmo(.anonymous, 12288);
         try s.retainNativeVmo(vmo);
         try s.installNativeVmoPages(vmo, 0, &pages, null);
         // Deliberately inconsistent ownership tests the defensive failure;
         // production callers must never return an already-free physical page.
-        try free_list.appendPage(0, pages[0]);
+        try free_list.appendPage(pages[0]);
+        try std.testing.expectError(error.FreeRangeOverlap, free_list.appendContiguousRange(pages[0], pages.len));
+        try std.testing.expectEqual(@as(?u64, pages[1]), s.nativeVmoPagePaddrOrHole(vmo, 1));
+        try std.testing.expectEqual(@as(usize, 1), free_list.pageCount());
+        // Repair the deliberately inconsistent free copy before exercising
+        // the production return path, whose invariant failures are fatal.
+        _ = try free_list.popFront();
         returnVmoPagesForTest(&s, vmo, &free_list, partial);
-        try std.testing.expectEqual(@as(?u64, pages[0]), s.nativeVmoPagePaddrOrHole(vmo, 0));
+        try std.testing.expectEqual(@as(?u64, 0), s.nativeVmoPagePaddrOrHole(vmo, 0));
         try std.testing.expectEqual(@as(?u64, 0), s.nativeVmoPagePaddrOrHole(vmo, 1));
         try std.testing.expectEqual(@as(usize, 2), free_list.pageCount());
         try std.testing.expectEqual(@as(usize, 1), free_list.rangeCount());
@@ -4994,81 +6244,89 @@ test "VMO page return rejects duplicate without clearing its backing pointer" {
 }
 
 test "VMO return batches bounded physical runs across snapshot boundaries" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
     for ([_]bool{ false, true }) |partial| {
-        var s = try initFdState();
+        var s: KernelState = undefined;
+        try initFdState(&s);
         var free_list = FreePageList{};
+        try free_list.installRegions(&.{.{ .id = 0, .start = 4096, .end = (1 << 40) + (1 << 29) }});
         var pages: [130]u64 = undefined;
         for (&pages, 0..) |*page, i| {
             // Two ascending runs, then descending/noncontiguous singletons.
             page.* = if (i < 65) 0x8200_0000 + i * 4096 else if (i < 128) 0x8300_0000 + (i - 65) * 4096 else 0x8400_0000 - (i - 128) * 8192;
         }
-        const vmo = try s.createNativeVmo(.anonymous, pages.len * 4096);
+        const vmo = try s.createNativeVmo(.anonymous, (pages.len + 1) * 4096);
         try s.retainNativeVmo(vmo);
         try s.installNativeVmoPages(vmo, 0, &pages, null);
         if (partial) {
-            s.releaseUnmappedAnonymousVmoPageRange(p0, vmo, 0, 129, &free_list);
+            returnRangeForTest(&s, vmo, 129, &free_list);
             try std.testing.expectEqual(@as(usize, 129), free_list.pageCount());
             try std.testing.expectEqual(@as(?u64, pages[129]), s.nativeVmoPagePaddrOrHole(vmo, 129));
         }
         s.releaseNativeVmoWithFreeList(vmo, &free_list);
         try std.testing.expectEqual(@as(usize, pages.len), free_list.pageCount());
         try std.testing.expectEqual(@as(usize, 4), free_list.rangeCount());
-        for (pages) |paddr| try std.testing.expectError(KernelError.InvalidState, free_list.appendPage(0, paddr));
+        for (pages) |paddr| try std.testing.expectError(KernelError.FreeRangeOverlap, free_list.appendPage(paddr));
         try std.testing.expectEqual(@as(?u32, null), s.nativeVmoRefCount(vmo));
     }
 }
 
-test "VMO run return joins upper neighbor even with full range table" {
-    var s = try initFdState();
+test "VMO run return joins upper neighbor without metadata allocation" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     var free_list = FreePageList{};
-    for (&free_list.ranges, 0..) |*range, i| {
-        range.* = .{ .region_id = 0, .len = 1, .physical_start = 0x100_0000 + @as(u64, @intCast(i)) * 8192 };
-    }
-    free_list.range_len = FreePageList.max_ranges;
-    free_list.len = FreePageList.max_ranges;
-    const last = FreePageList.max_ranges - 1;
-    free_list.ranges[last].physical_start = 0x8500_2000;
+    try free_list.installRegions(&.{.{ .id = 0, .start = 4096, .end = (1 << 40) + (1 << 29) }});
+    try free_list.seedContiguousRange(0x8500_2000, 1);
     const pages = [_]u64{ 0x8500_0000, 0x8500_1000 };
-    const vmo = try s.createNativeVmo(.anonymous, 8192);
+    const vmo = try s.createNativeVmo(.anonymous, 12288);
     try s.retainNativeVmo(vmo);
     try s.installNativeVmoPages(vmo, 0, &pages, null);
-    // Unlike the old sequential path, the complete run can join the upper
-    // neighbor without first needing another free-range slot.
-    try std.testing.expectError(KernelError.TooManyFreeRanges, free_list.appendPage(0, pages[0]));
     returnVmoPagesForTest(&s, vmo, &free_list, true);
-    try std.testing.expectEqual(@as(usize, FreePageList.max_ranges + 2), free_list.pageCount());
-    try std.testing.expectEqual(@as(usize, FreePageList.max_ranges), free_list.rangeCount());
-    try std.testing.expectEqual(@as(usize, 3), free_list.ranges[last].len);
+    try std.testing.expectEqual(@as(usize, 3), free_list.pageCount());
+    try std.testing.expectEqual(@as(usize, 1), free_list.rangeCount());
+    try std.testing.expectEqual(@as(usize, 3), free_list.rangeAt(0).len);
     for (0..2) |i| try std.testing.expectEqual(@as(?u64, 0), s.nativeVmoPagePaddrOrHole(vmo, @intCast(i)));
     s.releaseNativeVmoWithFreeList(vmo, &free_list);
 }
 
-test "VMO run return preserves full-table failure and supports retry" {
-    var s = try initFdState();
+test "VMO run return preserves DMA refusal and supports retry" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     var free_list = FreePageList{};
-    for (&free_list.ranges, 0..) |*range, i| {
-        range.* = .{ .region_id = 0, .len = 1, .physical_start = 0x100_0000 + @as(u64, @intCast(i)) * 8192 };
-    }
-    free_list.range_len = FreePageList.max_ranges;
-    free_list.len = FreePageList.max_ranges;
+    try free_list.installRegions(&.{.{ .id = 0, .start = 4096, .end = (1 << 40) + (1 << 29) }});
     const pages = [_]u64{ 0x8600_0000, 0x8600_1000 };
-    const vmo = try s.createNativeVmo(.anonymous, 8192);
+    var hold = try DmaHold.init(pages[0], pages.len);
+    defer hold.end();
+    const vmo = try s.createNativeVmo(.anonymous, 12288);
     try s.retainNativeVmo(vmo);
     try s.installNativeVmoPages(vmo, 0, &pages, null);
     returnVmoPagesForTest(&s, vmo, &free_list, true);
     for (pages, 0..) |page, i| try std.testing.expectEqual(@as(?u64, page), s.nativeVmoPagePaddrOrHole(vmo, @intCast(i)));
-    try std.testing.expectEqual(@as(usize, FreePageList.max_ranges), free_list.pageCount());
-    _ = try free_list.popFront();
+    try std.testing.expectEqual(@as(usize, 0), free_list.pageCount());
+    hold.end();
     returnVmoPagesForTest(&s, vmo, &free_list, true);
     for (0..2) |i| try std.testing.expectEqual(@as(?u64, 0), s.nativeVmoPagePaddrOrHole(vmo, @intCast(i)));
-    try std.testing.expectEqual(@as(usize, FreePageList.max_ranges + 1), free_list.pageCount());
+    try std.testing.expectEqual(@as(usize, 2), free_list.pageCount());
     s.releaseNativeVmoWithFreeList(vmo, &free_list);
 }
 
 test "COW bounded run return preserves outer pages and null-list behavior" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
     for ([_]bool{ false, true }) |use_free_list| {
-        var s = try initFdState();
+        var s: KernelState = undefined;
+        try initFdState(&s);
         var free_list = FreePageList{};
+        try free_list.installRegions(&.{.{ .id = 0, .start = 4096, .end = (1 << 40) + (1 << 29) }});
         const cow = try s.createNativeCowTable(68, &free_list);
         try s.retainNativeCowTable(cow);
         for (0..68) |i| try s.setNativeCowPagePaddr(cow, @intCast(i), 0x8700_0000 + i * 4096, null);
@@ -5085,10 +6343,15 @@ test "COW bounded run return preserves outer pages and null-list behavior" {
 }
 
 test "sole VMA page release validates owner range and head tail trims" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
     for ([_]u64{ 0, 4096 }) |offset| {
         for ([_]bool{ false, true }) |head| {
-            var s = try initFdState();
+            var s: KernelState = undefined;
+            try initFdState(&s);
             var free_list = FreePageList{};
+            try free_list.installRegions(&.{.{ .id = 0, .start = 4096, .end = (1 << 40) + (1 << 29) }});
             const base: u64 = 0x4680_0000;
             const pages = [_]u64{ 0x8500_0000, 0x8500_1000, 0x8500_2000, 0x8500_3000 };
             const fd = try s.createAnonymousVmoFd(p0, 16384, fdRights(.{ .map_read = true, .close = true }), .{}, 0);
@@ -5128,10 +6391,15 @@ test "sole VMA page release validates owner range and head tail trims" {
 }
 
 test "sole VMA optimization preserves FD foreign VMA and page view aliases" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
     const Mode = enum { fd_only, fd_and_vma, foreign_vma, local_vma, page_view, page_view_only };
     for (std.meta.tags(Mode)) |mode| {
-        var s = try initFdState();
+        var s: KernelState = undefined;
+        try initFdState(&s);
         var free_list = FreePageList{};
+        try free_list.installRegions(&.{.{ .id = 0, .start = 4096, .end = (1 << 40) + (1 << 29) }});
         const base: u64 = 0x4690_0000;
         const pages = [_]u64{ 0x8600_0000, 0x8600_1000, 0x8600_2000 };
         const fd = try s.createAnonymousVmoFd(p0, 12288, fdRights(.{ .map_read = true, .close = true, .transfer = true }), .{}, 0);
@@ -5169,10 +6437,15 @@ test "sole VMA optimization preserves FD foreign VMA and page view aliases" {
 }
 
 test "owned VMA page release handles middle cuts and protection splits" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
     for ([_]u64{ 0, 4096 }) |offset| {
         for ([_]bool{ false, true }) |protect_split| {
-            var s = try initFdState();
+            var s: KernelState = undefined;
+            try initFdState(&s);
             var free_list = FreePageList{};
+            try free_list.installRegions(&.{.{ .id = 0, .start = 4096, .end = (1 << 40) + (1 << 29) }});
             const base: u64 = 0x46a0_0000;
             const pages = [_]u64{ 0x8700_0000, 0x8700_1000, 0x8700_2000, 0x8700_3000, 0x8700_4000, 0x8700_5000, 0x8700_6000 };
             const fd = try s.createAnonymousVmoFd(p0, 7 * 4096, fdRights(.{ .map_read = true, .map_write = true, .close = true }), .{}, 0);
@@ -5211,10 +6484,15 @@ test "owned VMA page release handles middle cuts and protection splits" {
 }
 
 test "multiple owned VMAs do not hide FD view or foreign mapping retains" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
     const Mode = enum { fd, view, foreign };
     for (std.meta.tags(Mode)) |mode| {
-        var s = try initFdState();
+        var s: KernelState = undefined;
+        try initFdState(&s);
         var free_list = FreePageList{};
+        try free_list.installRegions(&.{.{ .id = 0, .start = 4096, .end = (1 << 40) + (1 << 29) }});
         const base: u64 = 0x46b0_0000;
         const pages = [_]u64{ 0x8800_0000, 0x8800_1000, 0x8800_2000 };
         const rights = fdRights(.{ .map_read = true, .close = true, .transfer = true });
@@ -5254,10 +6532,15 @@ test "multiple owned VMAs do not hide FD view or foreign mapping retains" {
 }
 
 test "whole VMA cuts account only for the removed mapping retain" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
     const Mode = enum { owned, fd, view, foreign, overlap, temporary };
     for (std.meta.tags(Mode)) |mode| {
-        var s = try initFdState();
+        var s: KernelState = undefined;
+        try initFdState(&s);
         var free_list = FreePageList{};
+        try free_list.installRegions(&.{.{ .id = 0, .start = 4096, .end = (1 << 40) + (1 << 29) }});
         const base: u64 = 0x46c0_0000;
         const pages = [_]u64{ 0x8900_0000, 0x8900_1000, 0x8900_2000 };
         const rights = fdRights(.{ .map_read = true, .close = true, .transfer = true });
@@ -5290,7 +6573,7 @@ test "whole VMA cuts account only for the removed mapping retain" {
         }
         try s.closeFdWithFreeList(p0, unrelated_fd, &free_list);
         try s.munmapRangeWithFreeList(p0, base + 4096, 4096, &free_list);
-        const releasable = mode == .owned or mode == .temporary;
+        const releasable = mode == .owned;
         try std.testing.expectEqual(@as(usize, if (releasable) 1 else 0), free_list.pageCount());
         try std.testing.expectEqual(@as(?u64, if (releasable) 0 else pages[1]), s.nativeVmoPagePaddrOrHole(ref, 1));
         try std.testing.expectEqual(@as(?u32, if (mode == .owned) 2 else 3), s.nativeVmoRefCount(ref));
@@ -5311,9 +6594,14 @@ test "whole VMA cuts account only for the removed mapping retain" {
 }
 
 test "shared vmo fd pages survive munmap while fd remains open" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     var free_list = FreePageList{};
-    try free_list.appendContiguousRange(0, 0x20_0000, 2);
+    try free_list.installRegions(&.{.{ .id = 0, .start = 0x20_0000, .end = (0x20_0000) + (2) * 4096 }});
+    try free_list.seedContiguousRange(0x20_0000, 2);
     const original_free = free_list.len;
 
     const fd = try s.createAnonymousVmoFdWithPages(
@@ -5346,9 +6634,14 @@ test "shared vmo fd pages survive munmap while fd remains open" {
 }
 
 test "contiguous DMA pool VMO installs consecutive low pages" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     var free_list = FreePageList{};
-    try free_list.appendContiguousRange(0, 0x80_0000, 8);
+    try free_list.installRegions(&.{.{ .id = 0, .start = 0x80_0000, .end = (0x80_0000) + (8) * 4096 }});
+    try free_list.seedContiguousRange(0x80_0000, 8);
 
     const fd = try s.createContiguousVmoFdWithPages(
         p0,
@@ -5371,10 +6664,15 @@ test "contiguous DMA pool VMO installs consecutive low pages" {
 }
 
 test "contiguous DMA pool VMO rejects fragmented free pages without consuming them" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     var free_list = FreePageList{};
-    try free_list.appendContiguousRange(0, 0x90_0000, 2);
-    try free_list.appendContiguousRange(0, 0xa0_0000, 2);
+    try free_list.installRegions(&.{.{ .id = 0, .start = 0x90_0000, .end = 0xa0_2000 }});
+    try free_list.seedContiguousRange(0x90_0000, 2);
+    try free_list.seedContiguousRange(0xa0_0000, 2);
     const original_free = free_list.pageCount();
     const original_ranges = free_list.rangeCount();
 
@@ -5394,9 +6692,14 @@ test "contiguous DMA pool VMO rejects fragmented free pages without consuming th
 }
 
 test "contiguous DMA pool VMO close restores and merges its extent" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     var free_list = FreePageList{};
-    try free_list.appendContiguousRange(0, 0xb0_0000, 8);
+    try free_list.installRegions(&.{.{ .id = 0, .start = 0xb0_0000, .end = (0xb0_0000) + (8) * 4096 }});
+    try free_list.seedContiguousRange(0xb0_0000, 8);
     const original_free = free_list.pageCount();
 
     const fd = try s.createContiguousVmoFdWithPages(
@@ -5414,7 +6717,11 @@ test "contiguous DMA pool VMO close restores and merges its extent" {
 }
 
 test "contiguous DMA pool VMO enforces the ABI page limit" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     var free_list = FreePageList{};
     const oversized = (@as(u64, kernel.dma_pool_max_pages) + 1) * kernel.native_page_size;
 
@@ -5433,12 +6740,16 @@ test "contiguous DMA pool VMO enforces the ABI page limit" {
 }
 
 test "free page diagnostics clip crossing ranges without consuming pages" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
     const list = try std.testing.allocator.create(FreePageList);
     defer std.testing.allocator.destroy(list);
     list.* = .{};
-    try list.appendContiguousRange(0, 0x1_0000_1000, 10);
-    try list.appendContiguousRange(1, 0xffff_e000, 4);
-    try list.appendContiguousRange(2, 0x0800_0000, 3);
+    try list.installRegions(&.{ .{ .id = 2, .start = 0x0800_0000, .end = 0x0800_3000 }, .{ .id = 1, .start = 0xffff_e000, .end = 0x1_0000_2000 }, .{ .id = 0, .start = 0x1_0000_2000, .end = 0x1_0000_c000 } });
+    try list.seedContiguousRange(0x1_0000_2000, 10);
+    try list.seedContiguousRange(0xffff_e000, 4);
+    try list.seedContiguousRange(0x0800_0000, 3);
     const available = list.availableBelow(0x1_0000_0000);
     try std.testing.expectEqual(@as(usize, 5), available.total);
     try std.testing.expectEqual(@as(usize, 3), available.largest_run);
@@ -5448,9 +6759,14 @@ test "free page diagnostics clip crossing ranges without consuming pages" {
 }
 
 test "native vma fault mapping resolves backing page without page capability" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     var free_list = FreePageList{};
-    try free_list.appendContiguousRange(0, 0x1_0000_0000, 2);
+    try free_list.installRegions(&.{.{ .id = 0, .start = 0x1_0000_0000, .end = (0x1_0000_0000) + (2) * 4096 }});
+    try free_list.seedContiguousRange(0x1_0000_0000, 2);
     const page = try s.allocPhysicalPage(&free_list);
     const fd = try s.createAnonymousVmoFd(p0, 4096, fdRights(.{ .map_read = true }), .{}, 0);
     const vmo = s.nativeVmoRefForFd(p0, fd) orelse unreachable;
@@ -5469,7 +6785,11 @@ test "native vma fault mapping resolves backing page without page capability" {
 }
 
 test "DMA pin mode owns writable private COW pages and preserves read-only mappings" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     var free_list = FreePageList{};
 
     const read_only_va: u64 = 0x4510_0000;
@@ -5529,6 +6849,9 @@ test "DMA pin mode owns writable private COW pages and preserves read-only mappi
 }
 
 test "DMA address derivation accepts contiguous pages and rejects fragmented pages" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
     const single_page = [_]u64{0x1200_0000};
     try std.testing.expectEqual(
         @as(?u64, 0x1200_0080),
@@ -5549,9 +6872,14 @@ test "DMA address derivation accepts contiguous pages and rejects fragmented pag
 }
 
 test "COW detach copies only a split VMA range with one free page" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     var free_list = FreePageList{};
-    try free_list.appendContiguousRange(0, 0x800_0000, 8);
+    try free_list.installRegions(&.{.{ .id = 0, .start = 0x800_0000, .end = (0x800_0000) + (8) * 4096 }});
+    try free_list.seedContiguousRange(0x800_0000, 8);
     const original = try s.createNativeCowTable(3, &free_list);
     try s.retainNativeCowTable(original);
     try s.retainNativeCowTable(original);
@@ -5568,7 +6896,8 @@ test "COW detach copies only a split VMA range with one free page" {
         .cow_page_offset = 1,
     };
     var copy_free = FreePageList{};
-    try copy_free.appendContiguousRange(0, 0x900_0000, 1);
+    try copy_free.installRegions(&.{.{ .id = 0, .start = 0x900_0000, .end = (0x900_0000) + (1) * 4096 }});
+    try copy_free.seedContiguousRange(0x900_0000, 1);
     try s.detachSharedEntryCowTable(&slice, &copy_free);
     try std.testing.expectEqual(@as(usize, 0), copy_free.pageCount());
     try std.testing.expectEqual(@as(u32, 0), slice.cow_page_offset);
@@ -5583,9 +6912,14 @@ test "COW detach copies only a split VMA range with one free page" {
 }
 
 test "failed split COW detach preserves shared metadata and returns copied pages" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     var free_list = FreePageList{};
-    try free_list.appendContiguousRange(0, 0xa00_0000, 8);
+    try free_list.installRegions(&.{.{ .id = 0, .start = 0xa00_0000, .end = (0xa00_0000) + (8) * 4096 }});
+    try free_list.seedContiguousRange(0xa00_0000, 8);
     const original = try s.createNativeCowTable(3, &free_list);
     try s.retainNativeCowTable(original);
     try s.retainNativeCowTable(original);
@@ -5603,19 +6937,25 @@ test "failed split COW detach preserves shared metadata and returns copied pages
     const before = slice;
     const store_before = kernel.vmObjectBackingStoreStats().used_entries;
     var copy_free = FreePageList{};
-    try copy_free.appendContiguousRange(0, 0xb00_0000, 1);
+    try copy_free.installRegions(&.{.{ .id = 0, .start = 0xb00_0000, .end = (0xb00_0000) + (1) * 4096 }});
+    try copy_free.seedContiguousRange(0xb00_0000, 1);
     try std.testing.expectError(KernelError.OutOfFreePages, s.detachSharedEntryCowTable(&slice, &copy_free));
-    try std.testing.expectEqualDeep(before, slice);
+    try expectResourceEqualDeep(before, slice);
     try std.testing.expectEqual(@as(usize, 1), copy_free.pageCount());
     try std.testing.expectEqual(store_before, kernel.vmObjectBackingStoreStats().used_entries);
     try std.testing.expectEqual(@as(u32, 2), (s.nativeCowTableSlotConst(original) orelse unreachable).ref_count);
     s.releaseNativeCowTable(original, &free_list);
     s.releaseNativeCowTable(original, &free_list);
     try std.testing.expectEqual(@as(usize, 8), free_list.pageCount());
+    try kernel.ReferenceCheck.check(&s);
 }
 
 test "read-only backing permits private COW but not shared or executable mappings" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     const fd = try s.createAnonymousVmoFd(p0, 4096, fdRights(.{ .map_read = true }), .{}, 0);
     const rw = vmaProt(.{ .read = true, .write = true });
     const rx = vmaProt(.{ .read = true, .exec = true });
@@ -5645,10 +6985,149 @@ test "read-only backing permits private COW but not shared or executable mapping
     try std.testing.expectEqual(rw, (s.vmaEntryConst(p0, va) orelse unreachable).prot);
 }
 
+test "private file VMO partial unmap returns replaced snapshot pages" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    const Cut = enum { head, tail, middle, split, fixed };
+    for (std.meta.tags(Cut)) |cut| {
+        var s: KernelState = undefined;
+        try initFdState(&s);
+        var free_list = FreePageList{};
+        try free_list.installRegions(&.{.{ .id = 0, .start = 4096, .end = (1 << 40) + (1 << 29) }});
+        const va: u64 = 0x46c0_0000;
+        const pages = [_]u64{ 0x8900_0000, 0x8900_1000, 0x8900_2000, 0x8900_3000 };
+        const rights = fdRights(.{ .map_read = true, .map_write = true, .close = true });
+        const fd = try s.createAnonymousVmoFd(p0, 16384, rights, .{}, 0);
+        const ref = s.nativeVmoRefForFd(p0, fd).?;
+        try s.installNativeVmoPages(ref, 0, &pages, null);
+        _ = try s.mmapFd(p0, fd, va, 16384, .{ .read = true, .write = true }, .{ .private = true }, 0);
+        try s.closeFdWithFreeList(p0, fd, &free_list);
+        if (cut == .split) try s.setVmaProtRange(p0, va + 4096, 4096, .{ .read = true });
+        const page: usize = switch (cut) {
+            .head => 0,
+            .tail => 3,
+            else => 1,
+        };
+        if (cut == .fixed) {
+            const replacement = try s.createAnonymousVmoFd(p0, 4096, rights, .{}, 0);
+            var prepared = try s.prepareFixedFdMmap(p0, replacement, va + page * 4096, 4096, .{ .read = true }, .{ .private = true, .fixed = true }, 0, &free_list);
+            // Preparing a replacement must not retire live source backing.
+            try std.testing.expectEqual(@as(?u64, pages[page]), s.nativeVmoPagePaddr(ref, page));
+            s.commitFixedMmapPrepared(&prepared, &free_list);
+            try s.closeFdWithFreeList(p0, replacement, &free_list);
+        } else {
+            var prepared = try s.prepareMunmapRangeWithFreeList(p0, va + page * 4096, 4096, &free_list);
+            s.commitMunmapPrepared(&prepared, &free_list);
+        }
+        try std.testing.expectEqual(@as(usize, 1), free_list.pageCount());
+        try std.testing.expectEqual(@as(?u64, 0), s.nativeVmoPagePaddrOrHole(ref, page));
+        for (pages, 0..) |paddr, i| {
+            if (i != page) try std.testing.expectEqual(@as(?u64, paddr), s.nativeVmoPagePaddr(ref, i));
+        }
+        try s.munmapRangeWithFreeList(p0, va, 16384, &free_list);
+        try std.testing.expectEqual(@as(usize, 4), free_list.pageCount());
+        try std.testing.expect(s.nativeVmoSlot(ref) == null);
+    }
+}
+
+test "private file VMO partial unmap preserves FD view shadow and fork aliases" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    const Alias = enum { fd, view, shadow, shadow_tree, foreign, forked };
+    for (std.meta.tags(Alias)) |alias| {
+        var s: KernelState = undefined;
+        try initFdState(&s);
+        var free_list = FreePageList{};
+        try free_list.installRegions(&.{.{ .id = 0, .start = 4096, .end = (1 << 40) + (1 << 29) }});
+        const va: u64 = 0x46d0_0000;
+        const pages = [_]u64{ 0x8a00_0000, 0x8a00_1000, 0x8a00_2000 };
+        const rights = fdRights(.{ .map_read = true, .transfer = true, .close = true });
+        const fd = try s.createAnonymousVmoFd(p0, 12288, rights, .{}, 0);
+        const ref = s.nativeVmoRefForFd(p0, fd).?;
+        try s.installNativeVmoPages(ref, 0, &pages, null);
+        _ = try s.mmapFd(p0, fd, va, 12288, .{ .read = true }, .{ .private = true }, 0);
+        var view: ?kernel.NativeVmoRef = null;
+        if (alias == .view) {
+            view = try s.createNativePageView(ref, 1);
+            try s.installNativeVmoPages(view.?, 0, pages[1..2], null);
+        }
+        if (alias == .shadow or alias == .shadow_tree) {
+            view = try s.createNativeVmo(.anonymous, 4096);
+            try s.retainNativeVmo(view.?);
+            try s.retainNativeVmo(ref);
+            try s.publishNativeVmoParent(view.?, ref, 4096);
+            if (alias == .shadow_tree) {
+                const child = view.?;
+                view = try s.createNativeVmo(.anonymous, 4096);
+                try s.retainNativeVmo(view.?);
+                try s.retainNativeVmo(child);
+                try s.publishNativeVmoParent(view.?, child, 0);
+                s.releaseNativeVmoWithFreeList(child, &free_list);
+            }
+        }
+        if (alias == .foreign) {
+            const other = try s.transferFd(p0, p1, fd, 16, rights, .{}, .copy);
+            _ = try s.mmapFd(p1, other, va, 4096, .{ .read = true }, .{ .private = true }, 4096);
+            try s.closeFdWithFreeList(p1, other, &free_list);
+        }
+        if (alias == .forked) try s.cloneVmaTableForFork(p0, p1);
+        if (alias != .fd) try s.closeFdWithFreeList(p0, fd, &free_list);
+        try s.munmapRangeWithFreeList(p0, va + 4096, 4096, &free_list);
+        try std.testing.expectEqual(@as(usize, 0), free_list.pageCount());
+        try std.testing.expectEqual(@as(?u64, pages[1]), s.nativeVmoPagePaddr(ref, 1));
+        if (alias == .shadow or alias == .shadow_tree) try std.testing.expectEqual(@as(?u64, pages[1]), s.nativeVmoResolvedPagePaddr(view.?, 0));
+        try s.munmapRangeWithFreeList(p0, va, 12288, &free_list);
+        if (alias == .shadow or alias == .shadow_tree) try std.testing.expectEqual(@as(?u64, pages[1]), s.nativeVmoResolvedPagePaddr(view.?, 0));
+        if (alias == .foreign or alias == .forked) try s.munmapRangeWithFreeList(p1, va, 12288, &free_list);
+        if (view) |v| s.releaseNativeVmoWithFreeList(v, &free_list);
+        if (alias == .fd) try s.closeFdWithFreeList(p0, fd, &free_list);
+        try std.testing.expectEqual(@as(usize, 3), free_list.pageCount());
+        try std.testing.expect(s.nativeVmoSlot(ref) == null);
+    }
+}
+
+test "file VMO same FD replacement and shared partial unmap preserve backing" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    for ([_]bool{ false, true }) |shared| {
+        var s: KernelState = undefined;
+        try initFdState(&s);
+        var free_list = FreePageList{};
+        try free_list.installRegions(&.{.{ .id = 0, .start = 4096, .end = (1 << 40) + (1 << 29) }});
+        const va: u64 = 0x46e0_0000;
+        const pages = [_]u64{ 0x8b00_0000, 0x8b00_1000, 0x8b00_2000, 0x8b00_3000 };
+        const fd = try s.createAnonymousVmoFd(p0, 16384, fdRights(.{ .map_read = true, .close = true }), .{}, 0);
+        const ref = s.nativeVmoRefForFd(p0, fd).?;
+        try s.installNativeVmoPages(ref, 0, &pages, null);
+        _ = try s.mmapFd(p0, fd, va, 16384, .{ .read = true }, .{ .private = !shared, .shared = shared }, 0);
+        if (shared) {
+            try s.closeFdWithFreeList(p0, fd, &free_list);
+            try s.munmapRangeWithFreeList(p0, va + 4096, 4096, &free_list);
+        } else {
+            var prepared = try s.prepareFixedFdMmap(p0, fd, va + 4096, 4096, .{ .read = true }, .{ .fixed = true, .private = true }, 4096, &free_list);
+            s.commitFixedMmapPrepared(&prepared, &free_list);
+            try s.closeFdWithFreeList(p0, fd, &free_list);
+            try std.testing.expectEqual(pages[1], s.nativeVmaFaultMapping(p0, va + 4096, false, false).?.paddr);
+        }
+        try std.testing.expectEqual(@as(usize, 0), free_list.pageCount());
+        for (pages, 0..) |paddr, i| try std.testing.expectEqual(@as(?u64, paddr), s.nativeVmoPagePaddr(ref, i));
+        try s.munmapRangeWithFreeList(p0, va, 16384, &free_list);
+        try std.testing.expectEqual(@as(usize, 4), free_list.pageCount());
+    }
+}
+
 test "private file vma faults read-only then COWs on write" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     var free_list = FreePageList{};
-    try free_list.appendContiguousRange(0, 0x1_0000_0000, 4);
+    try free_list.installRegions(&.{.{ .id = 0, .start = 0x1_0000_0000, .end = (0x1_0000_0000) + (4) * 4096 }});
+    try free_list.seedContiguousRange(0x1_0000_0000, 4);
     const source_page = (try s.allocPhysicalPage(&free_list)).paddr;
 
     const fd = try s.createAnonymousVmoFd(p0, 4096, fdRights(.{
@@ -5678,6 +7157,8 @@ test "private file vma faults read-only then COWs on write" {
     try std.testing.expectEqual(@as(?u64, null), s.nativeVmoPagePaddr(private_vma_before.vmo, 1));
     try std.testing.expectEqual(@as(?u32, 2), s.nativeVmoRefCount(source_vmo));
 
+    const losing_plan = s.prepareNativeVmaCowMapping(p0, 0x4600_0000, true, false);
+    const losing_page = (try s.allocPhysicalPage(&free_list)).paddr;
     const write_mapping = s.ensureNativeVmaCowMappingLockedSlow(
         p0,
         0x4600_0000,
@@ -5685,6 +7166,11 @@ test "private file vma faults read-only then COWs on write" {
         false,
         &free_list,
     ) orelse unreachable;
+    // The winner changed the COW identity while both plans were private.
+    // The caller returns its unused PFN; the loser must publish no second edge.
+    try std.testing.expect(s.commitNativeVmaCowMapping(p0, losing_plan, losing_page, &free_list) == null);
+    try free_list.appendPage(losing_page);
+    try kernel.ReferenceCheck.check(&s);
     try std.testing.expect(write_mapping.paddr != source_page);
     try std.testing.expect(write_mapping.prot.write);
     try std.testing.expectEqual(@as(?u32, 2), s.nativeVmoRefCount(source_vmo));
@@ -5702,11 +7188,12 @@ test "private file vma faults read-only then COWs on write" {
     try std.testing.expectEqual(@as(?u32, 1), s.nativeVmoRefCount(source_vmo));
     try s.munmapRangeWithFreeList(p0, 0x4600_0000, 4096, &free_list);
     try std.testing.expectEqual(@as(?u32, null), s.nativeVmoRefCount(source_vmo));
+    try kernel.ReferenceCheck.check(&s);
 }
 
-fn fillVmaTableExcept(table: *kernel.VmaTable, except: []const usize) void {
+fn fillVmaTableExcept(s: *KernelState, table: *kernel.VmaTable, except: []const usize) void {
     var index: usize = 0;
-    while (index < table.entries.len) : (index += 1) {
+    while (index < former_max_vmas_per_process) : (index += 1) {
         var skip = false;
         for (except) |except_index| {
             if (index == except_index) {
@@ -5714,8 +7201,11 @@ fn fillVmaTableExcept(table: *kernel.VmaTable, except: []const usize) void {
                 break;
             }
         }
-        if (skip or table.entries[index].active) continue;
-        KernelState.installVmaEntry(table, index, .{
+        if (skip or table.entries.get(@intCast(index)) != null) continue;
+        table.reference_slots.prepareIndex(@intCast(index), table.allocator.?) catch unreachable;
+        table.entries.prepareIndex(@intCast(index), table.allocator.?) catch unreachable;
+        table.active_indices.prepareIndex(@intCast(table.active_count), table.allocator.?) catch unreachable;
+        s.installVmaEntry(table, index, .{
             .active = true,
             .start_va = 0x7000_0000 + @as(u64, @intCast(index)) * 0x2000,
             .size_bytes = 4096,
@@ -5724,7 +7214,11 @@ fn fillVmaTableExcept(table: *kernel.VmaTable, except: []const usize) void {
 }
 
 test "fixed mmap prepare reuses a fully covered slot in a full vma table" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     var free_list = FreePageList{};
     const target_va: u64 = 0x5100_0000;
     const source_vmo = try s.createAnonymousVmaWithPages(
@@ -5737,9 +7231,9 @@ test "fixed mmap prepare reuses a fully covered slot in a full vma table" {
         &free_list,
     );
     const table = s.getVmaTable(p0) orelse unreachable;
-    const target_index: usize = @intCast(table.active_indices[0]);
-    fillVmaTableExcept(table, &.{});
-    try std.testing.expectEqual(kernel.max_vmas_per_process, table.active_count);
+    const target_index: usize = @intCast(table.active_indices.get(@intCast(0)).?.*);
+    fillVmaTableExcept(&s, table, &.{});
+    try std.testing.expectEqual(former_max_vmas_per_process, table.active_count);
 
     const dest_fd = try s.createAnonymousVmoFd(
         p0,
@@ -5772,13 +7266,17 @@ test "fixed mmap prepare reuses a fully covered slot in a full vma table" {
     );
     try std.testing.expectEqual(target_index, prepared.destination_index);
     s.commitFixedMmapPrepared(&prepared, &free_list);
-    try std.testing.expectEqual(kernel.max_vmas_per_process, table.active_count);
+    try std.testing.expectEqual(former_max_vmas_per_process, table.active_count);
     try std.testing.expectEqual(dest_vmo, (s.vmaEntryConst(p0, target_va) orelse unreachable).vmo);
     try std.testing.expectEqual(@as(?u32, null), s.nativeVmoRefCount(source_vmo));
 }
 
 test "fixed mmap middle cut fails atomically with only one spare vma slot" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     var free_list = FreePageList{};
     const target_va: u64 = 0x5200_0000;
     const source_vmo = try s.createAnonymousVmaWithPages(
@@ -5791,11 +7289,11 @@ test "fixed mmap middle cut fails atomically with only one spare vma slot" {
         &free_list,
     );
     const table = s.getVmaTable(p0) orelse unreachable;
-    const source_index: usize = @intCast(table.active_indices[0]);
+    const source_index: usize = @intCast(table.active_indices.get(@intCast(0)).?.*);
     const spare_index: usize = if (source_index == 0) 1 else 0;
-    fillVmaTableExcept(table, &.{ source_index, spare_index });
-    try std.testing.expectEqual(kernel.max_vmas_per_process - 1, table.active_count);
-    const original = table.entries[source_index];
+    fillVmaTableExcept(&s, table, &.{ source_index, spare_index });
+    try std.testing.expectEqual(former_max_vmas_per_process - 1, table.active_count);
+    const original = table.entries.get(@intCast(source_index)).?.*;
     const source_refs = s.nativeVmoRefCount(source_vmo);
 
     const dest_fd = try s.createAnonymousVmoFd(
@@ -5807,6 +7305,11 @@ test "fixed mmap middle cut fails atomically with only one spare vma slot" {
     );
     const dest_vmo = s.nativeVmoRefForFd(p0, dest_fd) orelse unreachable;
     const dest_refs = s.nativeVmoRefCount(dest_vmo);
+    var failure = kernel.InvocationStorageTestAllocator{ .fail_at = 1 };
+    defer failure.deinit();
+    const saved_allocator = table.allocator;
+    table.allocator = failure.interface();
+    defer table.allocator = saved_allocator;
     try std.testing.expectError(KernelError.TableFull, s.prepareFixedFdMmap(
         p0,
         dest_fd,
@@ -5817,16 +7320,21 @@ test "fixed mmap middle cut fails atomically with only one spare vma slot" {
         0,
         &free_list,
     ));
-    try std.testing.expectEqual(original, table.entries[source_index]);
-    try std.testing.expect(!table.entries[spare_index].active);
+    try std.testing.expectEqual(original, table.entries.get(@intCast(source_index)).?.*);
+    try std.testing.expect(table.entries.get(@intCast(spare_index)) == null);
     try std.testing.expectEqual(source_refs, s.nativeVmoRefCount(source_vmo));
     try std.testing.expectEqual(dest_refs, s.nativeVmoRefCount(dest_vmo));
 }
 
 test "shared fixed mmap retains aliases offsets and neighbors through fd close" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
     for ([_]kernel.MmapFlags{ .{ .fixed = true, .shared = true }, .{ .fixed = true } }) |flags| {
-        var s = try initFdState();
+        var s: KernelState = undefined;
+        try initFdState(&s);
         var free_list = FreePageList{};
+        try free_list.installRegions(&.{.{ .id = 0, .start = 4096, .end = (1 << 40) + (1 << 29) }});
         const rw = vmaProt(.{ .read = true, .write = true });
         const va: u64 = 0x5500_0000;
         const fd = try s.createAnonymousVmoFd(p0, 3 * 4096, fdRights(.{ .map_read = true, .map_write = true, .close = true }), .{}, 16);
@@ -5849,8 +7357,13 @@ test "shared fixed mmap retains aliases offsets and neighbors through fd close" 
 }
 
 test "remote fixed mapping resolves only caller capabilities and preserves peer aliases" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     var free_list = FreePageList{};
+    try free_list.installRegions(&.{.{ .id = 0, .start = 4096, .end = (1 << 40) + (1 << 29) }});
     const rw = vmaProt(.{ .read = true, .write = true });
     const va: u64 = 0x5700_0000;
     const fd = try s.createAnonymousVmoFd(p0, 8192, fdRights(.{ .map_read = true, .map_write = true, .close = true }), .{}, 16);
@@ -5861,7 +7374,7 @@ test "remote fixed mapping resolves only caller capabilities and preserves peer 
     try std.testing.expect(s.fdEntryConst(p1, fd) == null);
     const before = (s.vmaEntryConst(p1, va) orelse unreachable).*;
     try std.testing.expectError(KernelError.InvalidState, s.prepareFixedFdMmapIntoProcess(p1, fd, p1, va, 4096, rw, .{ .shared = true }, 4096, &free_list));
-    try std.testing.expectEqualDeep(before, (s.vmaEntryConst(p1, va) orelse unreachable).*);
+    try expectResourceEqualDeep(before, (s.vmaEntryConst(p1, va) orelse unreachable).*);
     var prepared = try s.prepareFixedFdMmapIntoProcess(p0, fd, p1, va, 4096, rw, .{ .shared = true }, 4096, &free_list);
     s.commitFixedMmapPrepared(&prepared, &free_list);
     try s.closeFdWithFreeList(p0, fd, &free_list);
@@ -5875,8 +7388,13 @@ test "remote fixed mapping resolves only caller capabilities and preserves peer 
 }
 
 test "shared fixed mmap preflight failures leave old backing intact" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     var free_list = FreePageList{};
+    try free_list.installRegions(&.{.{ .id = 0, .start = 4096, .end = (1 << 40) + (1 << 29) }});
     const va: u64 = 0x5600_0000;
     const rw = vmaProt(.{ .read = true, .write = true });
     const old = try s.createAnonymousVmaWithPages(p0, va, 3 * 4096, rw, rw, .{ .anonymous = true, .private = true }, &free_list);
@@ -5892,7 +7410,12 @@ test "shared fixed mmap preflight failures leave old backing intact" {
     try std.testing.expectError(KernelError.InvalidState, s.prepareFixedFdMmap(p0, fd, va + 4096, 4096, rw, .{ .private = true, .shared = true }, 0, &free_list));
     try std.testing.expectEqual(original, (s.vmaEntryConst(p0, va) orelse unreachable).*);
     const table = s.getVmaTable(p0) orelse unreachable;
-    fillVmaTableExcept(table, &.{1});
+    fillVmaTableExcept(&s, table, &.{1});
+    var failure = kernel.InvocationStorageTestAllocator{ .fail_at = 1 };
+    defer failure.deinit();
+    const saved_allocator = table.allocator;
+    table.allocator = failure.interface();
+    defer table.allocator = saved_allocator;
     try std.testing.expectError(KernelError.TableFull, s.prepareFixedFdMmap(p0, fd, va + 4096, 4096, rw, flags, 4096, &free_list));
     try std.testing.expectEqual(original, (s.vmaEntryConst(p0, va) orelse unreachable).*);
     try std.testing.expectEqual(@as(?u32, 1), s.nativeVmoRefCount(old));
@@ -5900,7 +7423,11 @@ test "shared fixed mmap preflight failures leave old backing intact" {
 }
 
 test "fixed mmap validation and discard preserve the old mapping" {
-    var s = try initFdState();
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
     var free_list = FreePageList{};
     const target_va: u64 = 0x5300_0000;
     const source_vmo = try s.createAnonymousVmaWithPages(
@@ -5972,4 +7499,2010 @@ test "fixed mmap validation and discard preserve the old mapping" {
     try std.testing.expectEqual(@as(?u32, 1), s.nativeVmoRefCount(source_vmo));
     try std.testing.expectEqual(@as(?u32, null), s.nativeVmoRefCount(fresh_vmo));
     try std.testing.expectEqual(original, (s.vmaEntryConst(p0, target_va) orelse unreachable).*);
+}
+
+fn notifyTestHandle(state: *KernelState, owner: PrincipalId, fd: kernel.Fd) kernel.IpcChannelHandle {
+    return state.fdPayloadWithRightsConst(owner, fd, .{}).?.payload.channel;
+}
+
+fn notifyTestChannel(state: *KernelState) !struct { a_owner: PrincipalId, b_owner: PrincipalId, a: kernel.Fd, b: kernel.Fd } {
+    const a_owner = kernel.processPrincipalFromIndex(0).?;
+    const b_owner = kernel.processPrincipalFromIndex(1).?;
+    const rights = kernel.FdRights{ .inspect = true, .transfer = true, .wait = true, .poll = true, .close = true, .send = true, .recv = true };
+    const pair = try state.createIpcChannelPairFds(a_owner, rights, .{}, 16);
+    const b = try state.transferFd(a_owner, b_owner, pair.b, 16, rights, .{}, .move);
+    return .{ .a_owner = a_owner, .b_owner = b_owner, .a = pair.a, .b = b };
+}
+
+test "ipc notify latch is binary, readable, and drained before peer death" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var state: KernelState = undefined;
+    try initFdState(&state);
+    const ch = try notifyTestChannel(&state);
+    try std.testing.expectEqual(kernel.IpcNotifyConsumeResult.empty, try state.consumeIpcNotifyForFd(ch.b_owner, ch.b, true));
+    try std.testing.expectEqual(@as(u64, 0), state.fdPollEvents(ch.b_owner, ch.b, fd_abi.event_readable, 0).?);
+    // Two notifications merge into one latch: the ring, not a count, says how much work exists.
+    _ = try state.ipcNotifyPeerForFd(ch.a_owner, ch.a);
+    _ = try state.ipcNotifyPeerForFd(ch.a_owner, ch.a);
+    try std.testing.expectEqual(fd_abi.event_readable, state.fdPollEvents(ch.b_owner, ch.b, fd_abi.event_readable, 0).?);
+    // The sender's own side stays quiet.
+    try std.testing.expectEqual(@as(u64, 0), state.fdPollEvents(ch.a_owner, ch.a, fd_abi.event_readable, 0).?);
+    try std.testing.expectEqual(kernel.IpcNotifyConsumeResult.consumed, try state.consumeIpcNotifyForFd(ch.b_owner, ch.b, true));
+    try std.testing.expectEqual(kernel.IpcNotifyConsumeResult.empty, try state.consumeIpcNotifyForFd(ch.b_owner, ch.b, true));
+    // Messages and the latch are independent.
+    try std.testing.expect(state.ipcChannelSlotConst(notifyTestHandle(&state, ch.b_owner, ch.b).channel).?.queues[1].isEmpty());
+
+    _ = try state.ipcNotifyPeerForFd(ch.a_owner, ch.a);
+    try state.closeFd(ch.a_owner, ch.a);
+    try std.testing.expectEqual(kernel.IpcNotifyConsumeResult.consumed, try state.consumeIpcNotifyForFd(ch.b_owner, ch.b, false));
+    try std.testing.expectEqual(kernel.IpcNotifyConsumeResult.closed, try state.consumeIpcNotifyForFd(ch.b_owner, ch.b, false));
+    // A notification into a side nobody can read is an error, not a latch.
+    try std.testing.expect((try state.ipcNotifyPeerForFd(ch.b_owner, ch.b)).closed);
+}
+
+test "ipc notify rights follow send, recv and wait" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var state: KernelState = undefined;
+    try initFdState(&state);
+    const owner = kernel.processPrincipalFromIndex(0).?;
+    const pair = try state.createIpcChannelPairFds(owner, .{ .inspect = true, .close = true, .recv = true }, .{}, 16);
+    try std.testing.expectError(KernelError.InvalidState, state.ipcNotifyPeerForFd(owner, pair.a));
+    try std.testing.expectEqual(kernel.IpcNotifyConsumeResult.empty, try state.consumeIpcNotifyForFd(owner, pair.a, false));
+    try std.testing.expectError(KernelError.InvalidState, state.consumeIpcNotifyForFd(owner, pair.a, true));
+    try std.testing.expectError(KernelError.InvalidState, state.registerIpcNotifyWaiterForFd(owner, pair.a, 1, 1, 9));
+}
+
+test "ipc notify detaches the peer waiter but leaves the latch until publication" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var state: KernelState = undefined;
+    try initFdState(&state);
+    const ch = try notifyTestChannel(&state);
+    try state.registerIpcNotifyWaiterForFd(ch.b_owner, ch.b, 3, 5, 77);
+    const result = try state.ipcNotifyPeerForFd(ch.a_owner, ch.a);
+    const target = result.waiter.?;
+    try std.testing.expectEqual(ch.b_owner, target.owner);
+    try std.testing.expectEqual(@as(usize, 3), target.thread_index);
+    try std.testing.expectEqual(@as(u64, 77), target.wait_token);
+    // Detached at claim time: a second waiter is not refused by a published one.
+    try std.testing.expect(state.ipcNotifyWaiterForFd(ch.b_owner, ch.b) == null);
+    // Until the completion is published the latch is kept, so a waiter that
+    // vanished before its claim cannot swallow the notification.
+    try std.testing.expectEqual(kernel.IpcNotifyConsumeResult.consumed, try state.consumeIpcNotifyForFd(ch.b_owner, ch.b, false));
+    try state.registerIpcNotifyWaiterForFd(ch.b_owner, ch.b, 3, 5, 78);
+    // Every completed outcome owns the notification and consumes the latch.
+    for ([_]kernel.IpcNotifyCompletion{ .handed_off, .published, .pending }) |completion| {
+        try state.registerIpcNotifyWaiterForFd(ch.b_owner, ch.b, 3, 5, 78);
+        _ = try state.ipcNotifyPeerForFd(ch.a_owner, ch.a);
+        state.settleIpcPeerNotifyForFd(ch.a_owner, ch.a, completion);
+        try std.testing.expectEqual(kernel.IpcNotifyConsumeResult.empty, try state.consumeIpcNotifyForFd(ch.b_owner, ch.b, false));
+    }
+    // A stale waiter never saw it: the next NOTIFY_WAIT still finds it.
+    try state.registerIpcNotifyWaiterForFd(ch.b_owner, ch.b, 3, 5, 78);
+    _ = try state.ipcNotifyPeerForFd(ch.a_owner, ch.a);
+    state.settleIpcPeerNotifyForFd(ch.a_owner, ch.a, .stale);
+    try std.testing.expectEqual(kernel.IpcNotifyConsumeResult.consumed, try state.consumeIpcNotifyForFd(ch.b_owner, ch.b, false));
+    // Unregister removes only the exact registration.
+    try state.registerIpcNotifyWaiterForFd(ch.b_owner, ch.b, 3, 5, 79);
+    state.unregisterIpcNotifyWaiterForFd(ch.b_owner, ch.b, 3, 5, 78);
+    try std.testing.expect(state.ipcNotifyWaiterForFd(ch.b_owner, ch.b) != null);
+    state.unregisterIpcNotifyWaiterForFd(ch.b_owner, ch.b, 3, 5, 79);
+    try std.testing.expect(state.ipcNotifyWaiterForFd(ch.b_owner, ch.b) == null);
+}
+
+test "ipc notify waiters on both sides complete when the peer closes or the slot is released" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var state: KernelState = undefined;
+    try initFdState(&state);
+    const owner = kernel.processPrincipalFromIndex(0).?;
+    const rights = kernel.FdRights{ .inspect = true, .wait = true, .poll = true, .close = true, .send = true, .recv = true };
+    const pair = try state.createIpcChannelPairFds(owner, rights, .{}, 16);
+    const handle = notifyTestHandle(&state, owner, pair.a);
+    try state.registerIpcNotifyWaiterForFd(owner, pair.a, 1, 1, 11);
+    try state.registerIpcNotifyWaiterForFd(owner, pair.b, 2, 1, 12);
+    var out: [2]kernel.ThreadWakeTarget = undefined;
+    const snapshot = state.ipcChannelNotifyWaiterSnapshot(handle);
+    // A sibling thread closes the side another thread is parked on.
+    try state.closeFd(owner, pair.a);
+    try std.testing.expectEqual(@as(usize, 2), state.takeIpcChannelNotifyWaitersAfterClose(handle, snapshot, &out));
+    try std.testing.expectEqual(@as(u64, 11), out[0].wait_token);
+    try std.testing.expectEqual(@as(u64, 12), out[1].wait_token);
+    // Detached once: a second close-side pass finds nothing left to complete.
+    try std.testing.expectEqual(@as(usize, 0), state.takeIpcChannelNotifyWaitersAfterClose(handle, snapshot, &out));
+
+    // Final release resets the slot; only the pre-close snapshot still names the waiter.
+    try state.registerIpcNotifyWaiterForFd(owner, pair.b, 2, 1, 13);
+    const last = state.ipcChannelNotifyWaiterSnapshot(handle);
+    try state.closeFd(owner, pair.b);
+    try std.testing.expect(state.ipcChannelSlotConst(handle.channel) == null);
+    try std.testing.expectEqual(@as(usize, 1), state.takeIpcChannelNotifyWaitersAfterClose(handle, last, &out));
+    try std.testing.expectEqual(@as(u64, 13), out[0].wait_token);
+}
+
+test "ipc notify poll take leaves message receive waiters armed" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var state: KernelState = undefined;
+    try initFdState(&state);
+    var list = kernel.IpcWaitList{ .allocator = try state.poolAllocator() };
+    defer list.waiters.deinit();
+    const owner = kernel.processPrincipalFromIndex(0).?;
+    const key = kernel.IpcWaitKey{ .kind = .channel, .index = 1, .generation = 1, .side = 0 };
+    _ = try list.register(key, owner, 0, .{ .active = true, .array = 0x1000 }, 20, 1, fd_abi.event_readable, 0, 1, 1, 5, .{ .index = 1, .generation = 1 });
+    _ = try list.register(key, owner, 0x2000, .{}, 20, 0, fd_abi.event_readable, 0, 2, 1, 6, .{ .index = 2, .generation = 1 });
+    var out: [4]kernel.ThreadWakeTarget = undefined;
+    try std.testing.expectEqual(@as(usize, 1), list.takeReadablePollWaiters(out[0..]));
+    try std.testing.expectEqual(@as(u64, 6), out[0].wait_token);
+    // The RECV_WAIT registration is still claimable by a real message.
+    try std.testing.expectEqual(@as(usize, 1), list.takeReadable(out[0..]));
+    try std.testing.expectEqual(@as(u64, 5), out[0].wait_token);
+}
+
+// Models the lock release: republish only when dirty, and otherwise require
+// that the published value already equals a full rescan.
+fn publishTimerDeadline(s: *KernelState, published: *u64) !void {
+    if (s.takeTimerDeadlineDirty()) {
+        published.* = s.nextTimerWaiterDeadline() orelse 0;
+    } else {
+        try std.testing.expectEqual(published.*, s.nextTimerWaiterDeadline() orelse 0);
+    }
+}
+
+test "timer deadline is republished exactly when its inputs change" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
+    // Zero-filled storage must still force the first publication.
+    try std.testing.expect(s.takeTimerDeadlineDirty());
+    try std.testing.expect(!s.takeTimerDeadlineDirty());
+    var published: u64 = 0;
+    const rights = fdRights(.{ .wait = true, .poll = true, .read = true, .write = true, .close = true, .send = true, .recv = true });
+    // IPC doorbells, the hot FS path, leave the timer scan untouched.
+    const pair = try s.createIpcChannelPairFds(p0, rights, .{}, 16);
+    _ = try s.ipcNotifyPeerForFd(p0, pair.a);
+    _ = try s.consumeIpcNotifyForFd(p0, pair.b, false);
+    try std.testing.expect(!s.takeTimerDeadlineDirty());
+
+    const timer = try s.createTimerFd(p0, 100, 0, .{}, rights, 16);
+    try std.testing.expect(s.takeTimerDeadlineDirty());
+    const group = try s.beginFdWaitGroup(p0, 7, 11, 1);
+    try std.testing.expect(try s.registerTaskReadableWaiterForFd(p0, timer, fd_abi.event_readable, 0x1000, 7, 11, 1, group));
+    try publishTimerDeadline(&s, &published);
+    try std.testing.expectEqual(@as(u64, 100), published);
+    try publishTimerDeadline(&s, &published);
+    // An earlier deadline must be published at once.
+    try s.setTimerFd(p0, timer, 40, 0, 0);
+    try publishTimerDeadline(&s, &published);
+    try std.testing.expectEqual(@as(u64, 40), published);
+    // A taken (pending) waiter leaves the scan.
+    var targets: [2]kernel.ThreadWakeTarget = undefined;
+    try std.testing.expectEqual(@as(usize, 1), s.takeReadyTimerWaiters(50, &targets));
+    try publishTimerDeadline(&s, &published);
+    try std.testing.expectEqual(@as(u64, 0), published);
+    s.cancelFdWaitGroup(group, 1);
+    try publishTimerDeadline(&s, &published);
+    // Re-registering, then destroying the timer while its waiter remains.
+    try s.setTimerFd(p0, timer, 70, 0, 0);
+    const again = try s.beginFdWaitGroup(p0, 7, 11, 2);
+    try std.testing.expect(try s.registerTaskReadableWaiterForFd(p0, timer, fd_abi.event_readable, 0x2000, 7, 11, 2, again));
+    try publishTimerDeadline(&s, &published);
+    try std.testing.expectEqual(@as(u64, 70), published);
+    try s.closeFd(p0, timer);
+    try publishTimerDeadline(&s, &published);
+    try std.testing.expectEqual(@as(u64, 0), published);
+    s.cancelFdWaitGroupsForOwner(p0);
+    try publishTimerDeadline(&s, &published);
+}
+
+test "thread terminal objects survive principal and thread slot reuse" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
+    const rights = fdRights(.{ .wait = true, .close = true });
+    const old = try s.createThreadFd(p0, .{
+        .owner_principal_raw = @intFromEnum(p1),
+        .thread_index = 3,
+        .thread_generation = 10,
+        .state = .active,
+    }, rights, .{}, 16);
+    s.markThreadObjectsExitedBySlot(3, 10, .exited, 23);
+    try std.testing.expect(s.removeProcessDescriptor(p1));
+    try std.testing.expect(s.ensureProcessDescriptor(p1, "reused-owner"));
+    const fresh = try s.createThreadFd(p0, .{
+        .owner_principal_raw = @intFromEnum(p1),
+        .thread_index = 3,
+        .thread_generation = 11,
+        .state = .active,
+    }, rights, .{}, 16);
+    s.markThreadObjectsExitedForPrincipal(p1, .stopped, 4);
+    try std.testing.expectEqual(kernel.TaskObjectState.stopped, s.threadObjectForFd(p0, fresh, rights).?.state);
+    s.markThreadObjectsExitedForPrincipal(p1, .continued, 5);
+    try std.testing.expectEqual(kernel.TaskObjectState.continued, s.threadObjectForFd(p0, fresh, rights).?.state);
+    s.markThreadObjectsExitedForPrincipal(p1, .killed, 99);
+    s.markThreadObjectsExitedBySlot(3, 10, .killed, 100);
+    const previous = s.threadObjectForFd(p0, old, rights).?;
+    const latest = s.threadObjectForFd(p0, fresh, rights).?;
+    try std.testing.expectEqual(kernel.TaskObjectState.exited, previous.state);
+    try std.testing.expectEqual(@as(u32, 23), previous.exit_code);
+    try std.testing.expectEqual(kernel.TaskObjectState.killed, latest.state);
+    try std.testing.expectEqual(@as(u32, 99), latest.exit_code);
+}
+
+test "process reuse resets stable VMA and FD bodies after prepared loan ends" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
+    const generation = s.processDescriptor(p0).?.generation;
+    const fd = try s.createAnonymousVmoFd(p0, 4096, fdRights(.{ .map_read = true }), .{}, 0);
+    _ = try s.mmapFd(p0, fd, 0x4300_0000, 4096, vmaProt(.{ .read = true }), .{}, 0);
+    const body_address = @intFromPtr(s.getVmaTable(p0).?);
+    const fd_address = @intFromPtr(s.getFdTable(p0).?);
+    var free_list = FreePageList{};
+    {
+        // Runtime callers retain K+A/S for this entire prepared loan. The
+        // source guard separately rejects moving reset/drop into this interval.
+        var prepared = try s.prepareMunmapRangeWithFreeList(p0, 0x4300_0000, 4096, &free_list);
+        defer s.discardMunmapPrepared(&prepared, &free_list);
+        s.commitMunmapPrepared(&prepared, &free_list);
+    }
+    s.resetProcessRuntimeTables(0);
+    try std.testing.expect(s.removeProcessDescriptor(p0));
+    try std.testing.expectEqual(p0, s.createProcessDescriptor("reused VMA body").?);
+    try std.testing.expect(s.processDescriptor(p0).?.generation != generation);
+    try std.testing.expectEqual(body_address, @intFromPtr(s.getVmaTable(p0).?));
+    try std.testing.expectEqual(fd_address, @intFromPtr(s.getFdTable(p0).?));
+    try std.testing.expectEqual(@as(usize, 0), s.getVmaTable(p0).?.active_count);
+    try std.testing.expect(s.fdEntryConst(p0, fd) == null);
+    try std.testing.expect(s.vmaEntryConst(p0, 0x4300_0000) == null);
+}
+
+test "invocation VMO workspace exact create and grow sizes and maximum backing" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    for ([_]usize{ 511, 512, 513, 131072 }) |count| {
+        var s: KernelState = undefined;
+        try initFdState(&s);
+        var backend = kernel.InvocationStorageTestAllocator{};
+        defer backend.deinit();
+        s.invocation_test_allocator = backend.interface();
+        var free_list = FreePageList{};
+        const high: u64 = 20 << 30;
+        try free_list.installRegions(&.{.{ .id = 0, .start = high, .end = high + @as(u64, count) * 4096 }});
+        try free_list.seedContiguousRange(high, count);
+        const fd = try s.createAnonymousVmoFdWithPages(p0, (count - 1) * 4096, fdRights(.{ .resize = true, .close = true }), .{}, 16, &free_list);
+        const ref = s.nativeVmoRefForFd(p0, fd).?;
+        try std.testing.expectEqual(@as(usize, 1), backend.calls);
+        try std.testing.expectEqual(try kernel.InvocationStorageTestAllocator.allocationPages(u64, count - 1), backend.last_pages);
+        try std.testing.expectEqual(@as(usize, 0), backend.active());
+        try s.growVmoFdWithPages(p0, fd, count * 4096, &free_list);
+        try std.testing.expectEqual(@as(usize, 2), backend.calls);
+        try std.testing.expectEqual(try kernel.InvocationStorageTestAllocator.allocationPages(u64, 1), backend.last_pages);
+        for (0..count) |i| try std.testing.expectEqual(@as(?u64, high + i * 4096), s.nativeVmoPagePaddr(ref, i));
+        try std.testing.expectEqual(@as(usize, 0), backend.active());
+        try s.closeFdWithFreeList(p0, fd, &free_list);
+        try std.testing.expectEqual(count, free_list.pageCount());
+        const full = try s.createAnonymousVmoFdWithPages(p0, count * 4096, fdRights(.{ .close = true }), .{}, 16, &free_list);
+        try std.testing.expectEqual(try kernel.InvocationStorageTestAllocator.allocationPages(u64, count), backend.last_pages);
+        try s.closeFdWithFreeList(p0, full, &free_list);
+        const growing = try s.createAnonymousVmoFdWithPages(p0, 4096, fdRights(.{ .resize = true, .close = true }), .{}, 16, &free_list);
+        try s.growVmoFdWithPages(p0, growing, count * 4096, &free_list);
+        try std.testing.expectEqual(try kernel.InvocationStorageTestAllocator.allocationPages(u64, count - 1), backend.last_pages);
+        try s.closeFdWithFreeList(p0, growing, &free_list);
+        try std.testing.expectEqual(count, free_list.pageCount());
+        // Beyond the former size limit, exhaustion is physical, not admission.
+        try std.testing.expectError(KernelError.OutOfFreePages, s.createAnonymousVmoFdWithPages(p0, 131073 * 4096, fdRights(.{ .close = true }), .{}, 16, &free_list));
+    }
+}
+
+var invocation_zero_calls: usize = 0;
+var invocation_zero_fail_at: usize = 0;
+fn invocationZero(_: u64) bool {
+    invocation_zero_calls += 1;
+    return invocation_zero_calls != invocation_zero_fail_at;
+}
+
+test "invocation VMO workspace allocation zeroing and return failures preserve old backing" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
+    var backend = kernel.InvocationStorageTestAllocator{};
+    defer backend.deinit();
+    s.invocation_test_allocator = backend.interface();
+    var free_list = FreePageList{};
+    const high: u64 = 20 << 30;
+    try free_list.installRegions(&.{.{ .id = 0, .start = high, .end = high + 8 * 4096 }});
+    try free_list.seedContiguousRange(high, 8);
+    const rights = fdRights(.{ .resize = true, .close = true });
+    backend.fail_at = 1;
+    try std.testing.expectError(KernelError.OutOfFreePages, s.createAnonymousVmoFdWithPages(p0, 4096, rights, .{}, 16, &free_list));
+    try std.testing.expectEqual(@as(usize, 8), free_list.pageCount());
+    backend.fail_at = 0;
+    const fd = try s.createAnonymousVmoFdWithPages(p0, 4096, rights, .{}, 16, &free_list);
+    const ref = s.nativeVmoRefForFd(p0, fd).?;
+    const old = s.nativeVmoSlot(ref).?.*;
+    backend.fail_at = backend.calls + 1;
+    try std.testing.expectError(KernelError.OutOfFreePages, s.growVmoFdWithPages(p0, fd, 4 * 4096, &free_list));
+    try expectVmoSlotEqual(old, s.nativeVmoSlot(ref).?.*);
+    try std.testing.expectEqual(@as(usize, 7), free_list.pageCount());
+    backend.fail_at = 0;
+    for ([_]usize{ 1, 2, 3 }) |failure| {
+        invocation_zero_calls = 0;
+        invocation_zero_fail_at = failure;
+        s.zero_physical_page_hook = invocationZero;
+        backend.fail_return = true;
+        try std.testing.expectError(KernelError.InvalidState, s.growVmoFdWithPages(p0, fd, 4 * 4096, &free_list));
+        try expectVmoSlotEqual(old, s.nativeVmoSlot(ref).?.*);
+        try std.testing.expectEqual(@as(usize, 7), free_list.pageCount());
+        try std.testing.expect(s.descriptor_storage.pending != null);
+        const attempts = backend.returns;
+        s.retryInvocationStorage();
+        try std.testing.expectEqual(attempts + 1, backend.returns);
+        backend.fail_return = false;
+        s.retryInvocationStorage();
+        try std.testing.expect(s.descriptor_storage.pending == null);
+    }
+    s.zero_physical_page_hook = null;
+    backend.fail_return = true;
+    try s.growVmoFdWithPages(p0, fd, 4 * 4096, &free_list);
+    try std.testing.expectEqual(@as(?u64, 4 * 4096), s.nativeVmoSize(ref));
+    try std.testing.expect(s.descriptor_storage.pending != null);
+    backend.fail_return = false;
+    s.retryInvocationStorage();
+    try std.testing.expectEqual(@as(usize, 0), backend.active());
+    try s.closeFdWithFreeList(p0, fd, &free_list);
+    try std.testing.expectEqual(@as(usize, 8), free_list.pageCount());
+}
+
+test "invocation workspace uses identity grant and returns its metadata independently" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
+    s.invocation_test_allocator = null;
+    var free_list = FreePageList{};
+    const low: u64 = @intFromPtr(&fd_capacity_backing);
+    const high: u64 = 20 << 30;
+    try free_list.installRegions(&.{ .{ .id = 0, .start = low, .end = low + 8 * 4096 }, .{ .id = 1, .start = high, .end = high + 513 * 4096 } });
+    try free_list.seedContiguousRange(low, 8);
+    try free_list.seedContiguousRange(high, 513);
+    const fd = try s.createAnonymousVmoFdWithPages(p0, 513 * 4096 - 1, fdRights(.{ .close = true }), .{}, 16, &free_list);
+    try std.testing.expectEqual(@as(usize, 8), free_list.pageCount());
+    try std.testing.expect(s.descriptor_storage.pending == null);
+    try s.closeFdWithFreeList(p0, fd, &free_list);
+    try std.testing.expectEqual(@as(usize, 521), free_list.pageCount());
+}
+
+test "contiguous DMA arithmetic insertion zero failures and maximum" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    for ([_]usize{ 511, 512, 513, 16384 }) |count| {
+        var s: KernelState = undefined;
+        try initFdState(&s);
+        var free_list = FreePageList{};
+        const low: u64 = 0x200000;
+        try free_list.installRegions(&.{.{ .id = 0, .start = low, .end = low + count * 4096 }});
+        try free_list.seedContiguousRange(low, count);
+        const rights = fdRights(.{ .close = true });
+        s.zero_physical_page_hook = invocationZero;
+        invocation_zero_calls = 0;
+        invocation_zero_fail_at = count;
+        try std.testing.expectError(KernelError.InvalidState, s.createContiguousVmoFdWithPages(p0, count * 4096, rights, .{}, 16, &free_list));
+        try std.testing.expectEqual(count, free_list.pageCount());
+        try std.testing.expectEqual(@as(u64, 0), kernel.vmObjectBackingStoreStats().used_entries);
+        invocation_zero_calls = 0;
+        invocation_zero_fail_at = 0;
+        const fd = try s.createContiguousVmoFdWithPages(p0, count * 4096 - 1, rights, .{}, 16, &free_list);
+        try std.testing.expectEqual(count, invocation_zero_calls);
+        const ref = s.nativeVmoRefForFd(p0, fd).?;
+        for (0..count) |i| try std.testing.expectEqual(@as(?u64, low + i * 4096), s.nativeVmoPagePaddr(ref, i));
+        try s.closeFdWithFreeList(p0, fd, &free_list);
+        try std.testing.expectEqual(count, free_list.pageCount());
+    }
+}
+
+test "contiguous DMA backing capacity failure returns whole staged grant" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
+    defer if (!kernel.initRuntimeStorage(runtime_storage[0..])) unreachable;
+    var free_list = FreePageList{};
+    try free_list.installRegions(&.{.{ .id = 0, .start = 0x200000, .end = 0x204000 }});
+    try free_list.seedContiguousRange(0x200000, 4);
+    kernel.useBackingPmmForTest(&free_list);
+    try std.testing.expectError(KernelError.OutOfFreePages, s.createContiguousVmoFdWithPages(p0, 4 * 4096, fdRights(.{ .close = true }), .{}, 16, &free_list));
+    try std.testing.expectEqual(@as(usize, 4), free_list.pageCount());
+    try std.testing.expectEqual(@as(u64, 0), kernel.vmObjectBackingStoreStats().used_entries);
+    try std.testing.expect(s.fdEntryConst(p0, 16) == null);
+}
+
+test "invocation identity workspace rejected PMM return survives invocation end" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
+    s.invocation_test_allocator = null;
+    var free_list = FreePageList{};
+    const low: u64 = @intFromPtr(&fd_capacity_backing);
+    try free_list.installRegions(&.{.{ .id = 0, .start = 4096, .end = (1 << 40) + (1 << 29) }});
+    try free_list.seedContiguousRange(low, 2);
+    var hold: ?DmaHold = null;
+    defer if (hold) |*h| h.end();
+    {
+        var scratch = s.beginInvocationStorage(&free_list);
+        _ = try scratch.reserve(u64, 513, .replaceable);
+        try std.testing.expectEqual(@as(usize, 0), free_list.pageCount());
+        hold = try DmaHold.init(low, 2);
+        try scratch.rollback();
+    }
+    try std.testing.expect(s.descriptor_storage.pending != null);
+    s.retryInvocationStorage();
+    try std.testing.expect(s.descriptor_storage.pending != null);
+    hold.?.end();
+    s.retryInvocationStorage();
+    try std.testing.expect(s.descriptor_storage.pending == null);
+    try std.testing.expectEqual(@as(usize, 2), free_list.pageCount());
+    try std.testing.expectEqual(low, try free_list.popContiguousBelow(2, KernelState.low_memory_limit));
+}
+
+fn markedCount(table: anytype, mask: u8) usize {
+    var iterator = table.marked(mask);
+    var count: usize = 0;
+    while (iterator.next() != null) count += 1;
+    return count;
+}
+
+fn groupCount(s: *const KernelState, thread_index: u32) u64 {
+    return if (s.fd_wait_group_thread_counts.get(thread_index)) |count| count.* else 0;
+}
+
+test "every runtime resource pool crosses its former bound and reuses generations" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
+    defer s.deinitPools();
+    inline for (.{
+        .{ "fd_objects", former_max_fd_objects },
+        .{ "pipes", former_max_pipes },
+        .{ "native_vmos", former_max_native_vmos },
+        .{ "ipc_endpoints", former_max_ipc_endpoints },
+        .{ "ipc_channels", former_max_ipc_channels },
+        .{ "ipc_replies", former_max_ipc_replies },
+        .{ "task_fd_waiters", former_max_task_fd_waiters },
+        .{ "fd_wait_groups", former_max_fd_wait_groups },
+    }) |case| {
+        const table = &@field(s, case[0]);
+        const first = try s.allocatePool(table, null, std.math.maxInt(u32));
+        for (0..case[1] + 1) |_| _ = try s.allocatePool(table, null, std.math.maxInt(u32));
+        try std.testing.expectEqual(first.value, table.resolve(first.ref).?);
+        try std.testing.expect(table.live > case[1]);
+        table.remove(first.value, null);
+        try std.testing.expect(table.resolve(first.ref) == null);
+        const reused = try s.allocatePool(table, null, std.math.maxInt(u32));
+        try std.testing.expectEqual(first.ref.index, reused.ref.index);
+        try std.testing.expect(first.ref.generation != reused.ref.generation);
+    }
+}
+
+test "runtime pool allocation failure publishes no resource" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
+    defer s.deinitPools();
+    var backend = kernel.InvocationStorageTestAllocator{ .fail_at = 1 };
+    defer backend.deinit();
+    s.pool_allocator = backend.interface();
+    try std.testing.expectError(KernelError.OutOfFreePages, s.createKernelObject(.event, .{ .event = 1 }));
+    try std.testing.expectEqual(@as(usize, 0), s.fd_objects.live);
+    try std.testing.expectEqual(@as(usize, 0), backend.active());
+}
+
+test "VMA entries and active indices grow past 8192 without moving a live entry" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
+    defer s.deinitPools();
+    const table = s.getVmaTable(p0).?;
+    defer table.reference_slots.deinit();
+    defer table.entries.deinit();
+    defer table.active_indices.deinit();
+    fillVmaTableExcept(&s, table, &.{});
+    const before = table.entries.get(0).?;
+    const index = KernelState.findFreeVma(table).?;
+    try std.testing.expect(index >= former_max_vmas_per_process);
+    s.installVmaEntry(table, index, .{ .active = true, .start_va = 0x9000_0000, .size_bytes = 4096 });
+    try std.testing.expectEqual(former_max_vmas_per_process + 1, table.active_count);
+    try std.testing.expectEqual(before, table.entries.get(0).?);
+    try std.testing.expectEqual(@as(u32, @intCast(index)), table.active_indices.get(@intCast(table.active_count - 1)).?.*);
+}
+
+test "IPC waiter and group links cross old bounds and complete every item in batches" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
+    defer s.deinitPools();
+    const rights = fdRights(.{ .send = true, .recv = true, .wait = true, .poll = true, .close = true });
+    const pair = try s.createIpcChannelPairFds(p0, rights, .{}, 16);
+    const peer = s.fdPayloadWithRightsConst(p0, pair.b, .{}).?.payload.channel;
+    const group = try s.beginFdWaitGroup(p0, 7, 11, 123);
+    const items = former_max_fd_wait_group_links + 17;
+    for (0..items) |index| {
+        try std.testing.expect(try s.registerIpcPollWaitersForFd(p0, pair.a, fd_abi.event_hangup, 0x1000 + index * 24, 7, 11, 123, group));
+    }
+    try s.armFdWaitGroup(group);
+    try s.closeFd(p0, pair.b);
+    var batch: [32]kernel.ThreadWakeTarget = undefined;
+    try std.testing.expectEqual(batch.len, s.takeIpcChannelPeerCloseWaiters(peer, &batch));
+    // Model the scheduler claim. State detachment preserves links but removes
+    // every registration before the caller starts copying a bounded batch.
+    s.detachFdWaitGroup(group, 123);
+    var cursor: u64 = 0;
+    var total: usize = 0;
+    while (true) {
+        const count = s.takeFdWaitGroupReadyBatch(group, 123, &cursor, &batch);
+        if (count == 0) break;
+        for (batch[0..count]) |target| {
+            try std.testing.expectEqual(@as(u64, 0x1000 + total * 24), target.pollfd_va);
+            try std.testing.expectEqual(fd_abi.event_hangup, target.revents);
+            total += 1;
+        }
+    }
+    try std.testing.expectEqual(items, total);
+    s.cancelFdWaitGroup(group, 123);
+    try std.testing.expectEqual(@as(usize, 0), s.fd_wait_groups.live);
+    try std.testing.expectEqual(@as(usize, 0), s.takeIpcChannelPeerCloseWaiters(peer, &batch));
+    try s.closeFd(p0, pair.a);
+}
+
+test "COW empty body rejected grant retries without another allocation" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
+    var backend = kernel.InvocationStorageTestAllocator{};
+    defer backend.deinit();
+    s.pool_allocator = backend.interface();
+    defer s.native_cow_tables.deinit();
+    var free_list: FreePageList = .{};
+    const ref = try s.createNativeCowTable(1, &free_list);
+    try s.retainNativeCowTable(ref);
+    backend.fail_return = true;
+    s.releaseNativeCowTable(ref, null);
+    try std.testing.expect(s.nativeCowTableSlot(ref) == null);
+    try std.testing.expect(s.native_cow_tables.body_owner.retired != null);
+    try std.testing.expect(s.hasPendingDataReturns());
+    s.drainPendingDataReturns();
+    try std.testing.expect(s.hasPendingDataReturns());
+    backend.fail_return = false;
+    s.drainPendingDataReturns();
+    try std.testing.expect(!s.hasPendingDataReturns());
+    try std.testing.expect(s.native_cow_tables.body_owner.retired == null);
+}
+
+test "process storage creates 65537 principals and retires exhausted generations" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    // Host-only low mapping supplies real dereferenceable PMM fixture pages
+    // below the kernel identity window, without a multi-GB static test ELF.
+    const bytes = try std.posix.mmap(@ptrFromInt(4 * 1024 * 1024 * 1024), 1536 * 1024 * 1024, .{ .READ = true, .WRITE = true }, .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0);
+    defer std.posix.munmap(bytes);
+    try std.testing.expect(@intFromPtr(bytes.ptr) + bytes.len <= 16 * 1024 * 1024 * 1024);
+    var state: KernelState = undefined;
+    try initFdState(&state);
+    var list: FreePageList = .{};
+    try list.installRegions(&.{.{ .id = 121, .start = @intFromPtr(bytes.ptr), .end = @intFromPtr(bytes.ptr) + bytes.len }});
+    try list.seedContiguousRange(@intFromPtr(bytes.ptr), bytes.len / 4096);
+    defer {
+        // Snapshot teardown still borrows stable FD table bodies.
+        state.deinitPools();
+        releaseFixtureOwner(&state.fd_tables_extra.directory_owner);
+        releaseFixtureOwner(&state.fd_tables_extra.body_owner);
+        releaseFixtureOwner(&state.fd_tables_extra.metadata_owner);
+        releaseFixtureOwner(&state.descriptor_storage);
+        releaseFixtureOwner(&state.vma_directory_storage);
+        releaseFixtureOwner(&state.vma_body_storage);
+    }
+    try std.testing.expect(state.ensureProcessCapacity(65537, &list));
+    for (0..65537) |index| {
+        const principal = kernel.processPrincipalFromIndex(index).?;
+        try std.testing.expect(state.ensureProcessDescriptor(principal, "large"));
+        try std.testing.expect(state.isActiveProcess(principal));
+    }
+    const last = kernel.processPrincipalFromIndex(65536).?;
+    try std.testing.expect(state.removeProcessDescriptor(last));
+    state.process_descriptors_extra[65536 - kernel.process_count].generation = kernel.types.max_process_generation;
+    try std.testing.expect(!state.ensureProcessDescriptor(last, "retired"));
+    try std.testing.expect(state.createProcessDescriptorWithCapacityLimit("retired", &list, 65537) == null);
+    const next = state.createProcessDescriptor("fresh").?;
+    try std.testing.expectEqual(@as(u32, 65537), @intFromEnum(next));
+    try std.testing.expect(kernel.processPrincipalFromIndex((@as(usize, 1) << 31) - 1) != null);
+    try std.testing.expect(kernel.processPrincipalFromIndex(@as(usize, 1) << 31) == null);
+    try std.testing.expect(kernel.processIndexFromPrincipal(.Device0) == null);
+    try std.testing.expect(state.nextProcessCapacity(kernel.process_principal_value_count + 1) == null);
+}
+
+test "process storage descriptor relocation retains retired generation history" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var state: KernelState = undefined;
+    try initFdState(&state);
+    var list: FreePageList = .{};
+    try list.installRegions(&.{.{ .id = 129, .start = @intFromPtr(&fd_capacity_backing), .end = @intFromPtr(&fd_capacity_backing) + fd_capacity_backing.len }});
+    try list.seedContiguousRange(@intFromPtr(&fd_capacity_backing), fd_capacity_backing.len / 4096);
+    defer {
+        // Snapshot teardown still borrows stable FD table bodies.
+        state.deinitPools();
+        releaseFixtureOwner(&state.fd_tables_extra.directory_owner);
+        releaseFixtureOwner(&state.fd_tables_extra.body_owner);
+        releaseFixtureOwner(&state.fd_tables_extra.metadata_owner);
+        releaseFixtureOwner(&state.descriptor_storage);
+        releaseFixtureOwner(&state.vma_directory_storage);
+        releaseFixtureOwner(&state.vma_body_storage);
+    }
+    try std.testing.expect(state.ensureProcessCapacity(64, &list));
+    const principal = kernel.processPrincipalFromIndex(32).?;
+    try std.testing.expect(state.ensureProcessDescriptor(principal, "history"));
+    try std.testing.expect(state.removeProcessDescriptor(principal));
+    state.process_descriptors_extra[0].generation = kernel.types.max_process_generation;
+    const old = state.process_descriptors_extra.ptr;
+    try std.testing.expect(state.ensureProcessCapacity(128, &list));
+    try std.testing.expect(state.process_descriptors_extra.ptr != old);
+    try std.testing.expect(state.descriptor_storage.retired == null);
+    try std.testing.expectEqual(kernel.types.max_process_generation, state.processDescriptorSlotConst(32).?.generation);
+    try std.testing.expect(!state.ensureProcessDescriptor(principal, "must remain retired"));
+}
+
+test "fd entries exceed 4096 with stable loans clone grants and complete reclamation" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
+    var free_list = FreePageList{};
+    const pages = fd_capacity_backing.len / 4096;
+    try free_list.installRegions(&.{.{ .id = 123, .start = @intFromPtr(&fd_capacity_backing), .end = @intFromPtr(&fd_capacity_backing) + pages * 4096 }});
+    try free_list.seedContiguousRange(@intFromPtr(&fd_capacity_backing), pages);
+    try s.ensureFdTableCapacity(p0, 256, &free_list);
+    const rights = fdRights(.{ .dup = true, .transfer = true, .close = true });
+    const object = try createTestFdObject(&s, 99);
+    const first = try s.installFd(p0, object, rights, .{}, 16);
+    const loan = s.fdEntryConst(p0, first).?;
+    try s.ensureFdTableCapacity(p0, 8192, &free_list);
+    const storage = &s.getFdTable(p0).?.entries;
+    inline for (.{ &storage.directory_owner, &storage.metadata_owner, &storage.body_owner }) |owner| {
+        var cursor = owner.published;
+        while (cursor) |record| : (cursor = record.next) {
+            try std.testing.expectEqual(@as(usize, 1), record.allocation.pages);
+        }
+    }
+    try std.testing.expectEqual(loan, s.fdEntryConst(p0, first).?);
+    for (1..4200) |i| {
+        const fd = try s.dupFd(p0, first, @intCast(16 + i), rights, .{});
+        try std.testing.expectEqual(16 + i, fd);
+    }
+    try std.testing.expectEqual(@as(?u32, 4200), s.kernelObjectRefCount(object));
+    try s.ensureFdTableCapacity(p1, 8192, &free_list);
+    try s.cloneFdTableForFork(p0, p1);
+    try std.testing.expectEqual(@as(?u32, 8400), s.kernelObjectRefCount(object));
+    const child = kernel.processPrincipalFromIndex(2).?;
+    try s.grantFdsForProcessCreate(p0, child, &.{.{
+        .source_fd = 4215,
+        .target_fd = 5000,
+        .rights = kernel.fdRightsToBits(rights),
+        .flags = 0,
+    }}, &free_list);
+    try std.testing.expect(s.fdEntryConst(child, 5000) != null);
+    try s.closeFdWithFreeList(p0, 4215, &free_list);
+    try std.testing.expect(s.fdEntryConst(p1, 4215) != null);
+    try std.testing.expectEqual(loan, s.fdEntryConst(p0, first).?);
+    try std.testing.expectError(KernelError.InvalidState, s.ensureFdTableCapacity(p0, kernel.fd_number_capacity + 1, &free_list));
+    try std.testing.expect(KernelState.fdIndex(fd_abi.thread_self_fd) == null);
+    try std.testing.expect(KernelState.fdIndex(std.math.maxInt(u32)) == null);
+    s.releasePrincipalNativeMemory(p0, &free_list);
+    s.releasePrincipalNativeMemory(p1, &free_list);
+    s.releasePrincipalNativeMemory(child, &free_list);
+    try std.testing.expectEqual(@as(?u32, null), s.kernelObjectRefCount(object));
+    try std.testing.expectEqual(pages, free_list.pageCount());
+}
+
+test "fd entry growth failure preserves publication and borrowed entries" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    for (1..10) |fail_at| {
+        var s: KernelState = undefined;
+        try initFdState(&s);
+        var free_list = FreePageList{};
+        const pages = fd_capacity_backing.len / 4096;
+        try free_list.installRegions(&.{.{ .id = 124, .start = @intFromPtr(&fd_capacity_backing), .end = @intFromPtr(&fd_capacity_backing) + pages * 4096 }});
+        try free_list.seedContiguousRange(@intFromPtr(&fd_capacity_backing), pages);
+        try s.ensureFdTableCapacity(p0, 256, &free_list);
+        const object = try createTestFdObject(&s, 100);
+        const fd = try s.installFd(p0, object, fdRights(.{ .close = true }), .{}, 16);
+        const loan = s.fdEntryConst(p0, fd).?;
+        const table = s.getFdTable(p0).?;
+        var failure = kernel.InvocationStorageTestAllocator{ .fail_at = fail_at };
+        defer failure.deinit();
+        defer s.releasePrincipalNativeMemory(p0, &free_list);
+        try std.testing.expectError(KernelError.OutOfFreePages, table.ensureCapacity(512, failure.interface(), &s.object_directory_leaf, &s.fd_retired));
+        try std.testing.expectEqual(@as(usize, 256), table.capacity);
+        try std.testing.expectEqual(loan, s.fdEntryConst(p0, fd).?);
+        // A completed private block may survive the failure. It remains owned
+        // by this allocator and must be returned at teardown, even after retry.
+        try s.ensureFdTableCapacity(p0, 512, &free_list);
+        try std.testing.expectEqual(loan, s.fdEntryConst(p0, fd).?);
+        s.releasePrincipalNativeMemory(p0, &free_list);
+        try std.testing.expectEqual(@as(usize, 0), failure.active());
+        try std.testing.expectEqual(pages, free_list.pageCount());
+    }
+}
+
+test "large VMO last-page fault fork partial unmap and final data return" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
+    var free_list = FreePageList{};
+    const physical: u64 = 20 << 30;
+    try free_list.installRegions(&.{.{ .id = 73, .start = physical, .end = physical + 16 * 4096 }});
+    try free_list.seedContiguousRange(physical, 16);
+    const count: u64 = 131073;
+    const size = count * 4096;
+    const va: u64 = 0x40000000;
+    const last = va + size - 4096;
+    const fd = try s.createZeroOnDemandVmoFd(p0, size, fdRights(.{ .close = true, .map_read = true, .map_write = true }), .{}, 16);
+    const ref = s.nativeVmoRefForFd(p0, fd).?;
+    _ = try s.mmapFd(p0, fd, va, size, .{ .read = true, .write = true }, .{ .private = true }, 0);
+    const plan = s.prepareNativeVmaCowMapping(p0, last, true, false);
+    try std.testing.expectEqual(.allocate_zero, plan.kind);
+    const own = (try s.allocPhysicalPage(&free_list)).paddr;
+    _ = s.commitNativeVmaCowMapping(p0, plan, own, &free_list).?;
+    try s.cloneFdTableForFork(p0, p1);
+    try s.cloneVmaTableForFork(p0, p1);
+    const child = s.ensureNativeVmaCowMappingLockedSlow(p1, last, true, false, &free_list).?;
+    try std.testing.expect(child.paddr != own);
+    try s.munmapRangeWithFreeList(p0, last, 4096, &free_list);
+    try std.testing.expectEqual(child.paddr, s.nativeVmaFaultMapping(p1, last, false, false).?.paddr);
+    try std.testing.expect(s.nativeVmoSlot(ref) != null);
+    s.releasePrincipalNativeMemory(p0, &free_list);
+    s.releasePrincipalNativeMemory(p1, &free_list);
+    try std.testing.expect(s.nativeVmoSlot(ref) == null);
+    try std.testing.expectEqual(@as(usize, 16), free_list.pageCount());
+    try std.testing.expectEqual(@as(u64, 0), kernel.vmObjectBackingStoreStats().used_entries);
+}
+
+test "VMO backing standalone insertion counts cold preparation and warm publication" {
+    var s: KernelState = undefined;
+    try initFdState(&s);
+    const ref = try s.createNativeVmo(.anonymous, 8192);
+    const slot = s.nativeVmoSlot(ref).?;
+    const before = slot.page_store.lock.takes;
+    try s.installNativeVmoPages(ref, 0, &.{4096}, null);
+    try std.testing.expectEqual(@as(usize, 2), slot.page_store.lock.takes - before);
+    const warm = slot.page_store.lock.takes;
+    try s.installNativeVmoPages(ref, 1, &.{8192}, null);
+    try std.testing.expectEqual(@as(usize, 1), slot.page_store.lock.takes - warm);
+    const read = slot.page_store.lock.takes;
+    try std.testing.expectEqual(@as(?u64, 4096), s.nativeVmoPagePaddr(ref, 0));
+    try std.testing.expectEqual(@as(usize, 1), slot.page_store.lock.takes - read);
+    s.clearNativeVmoSlot(slot);
+}
+
+test "VMO backing batch metadata OOM leaves PFNs and original issuer unchanged" {
+    for (1..5) |failure| {
+        var s: KernelState = undefined;
+        try initFdState(&s);
+        var backend = kernel.InvocationStorageTestAllocator{};
+        defer backend.deinit();
+        kernel.backing_index.test_allocator = backend.interface();
+        defer kernel.backing_index.test_allocator = null;
+        const ref = try s.createNativeVmo(.anonymous, 1024 * 4096);
+        const slot = s.nativeVmoSlot(ref).?;
+        defer s.clearNativeVmoSlot(slot);
+        try s.installNativeVmoPages(ref, 0, &.{4096}, null);
+        const initial = backend.active();
+        backend.fail_at = backend.calls + failure;
+        var pages: [257]u64 = undefined;
+        for (&pages, 0..) |*page, i| page.* = (i + 2) * 4096;
+        try std.testing.expectError(KernelError.OutOfFreePages, s.installNativeVmoPages(ref, 256, &pages, null));
+        try std.testing.expectEqual(@as(?u64, 4096), s.nativeVmoPagePaddr(ref, 0));
+        for (256..513) |i| try std.testing.expectEqual(@as(?u64, 0), s.nativeVmoPagePaddrOrHole(ref, i));
+        try std.testing.expectEqual(@as(u64, 1), slot.page_store.used);
+        try std.testing.expectEqual(initial, backend.active());
+        try std.testing.expectEqual(@as(usize, 1), backend.last_pages);
+    }
+}
+
+test "VMO logical size checked rounding preserves u32 count boundary" {
+    var s: KernelState = undefined;
+    try initFdState(&s);
+    const size = @as(u64, kernel.max_vmo_logical_pages) * 4096;
+    const ref = try s.createNativeVmo(.anonymous, size);
+    const slot = s.nativeVmoSlot(ref).?;
+    try std.testing.expectEqual(@as(u32, 0xffffffff), slot.page_count);
+    s.clearNativeVmoSlot(slot);
+    for ([_]u64{ 0, size + 1, std.math.maxInt(u64) }) |bad|
+        try std.testing.expectError(KernelError.InvalidState, s.createNativeVmo(.anonymous, bad));
+}
+
+test "VMO metadata rejected returns drain after owner destruction without new allocation" {
+    var s: KernelState = undefined;
+    try initFdState(&s);
+    var backend = kernel.InvocationStorageTestAllocator{};
+    defer backend.deinit();
+    kernel.backing_index.test_allocator = backend.interface();
+    defer kernel.backing_index.test_allocator = null;
+    const ref = try s.createNativeVmo(.anonymous, 4096);
+    const slot = s.nativeVmoSlot(ref).?;
+    try s.installNativeVmoPages(ref, 0, &.{4096}, null);
+    backend.fail_return = true;
+    s.clearNativeVmoSlot(slot);
+    try std.testing.expect(s.hasPendingDataReturns());
+    const active = backend.active();
+    const calls = backend.calls;
+    const returns = backend.returns;
+    s.drainPendingDataReturns();
+    try std.testing.expectEqual(active, backend.active());
+    try std.testing.expectEqual(returns + active, backend.returns);
+    backend.fail_return = false;
+    s.drainPendingDataReturns();
+    try std.testing.expect(!s.hasPendingDataReturns());
+    try std.testing.expectEqual(@as(usize, 0), backend.active());
+    try std.testing.expectEqual(calls, backend.calls);
+}
+
+test "VMO fault commit folds lookup into publication for root and shadow" {
+    var s: KernelState = undefined;
+    try initFdState(&s);
+    const rw = vmaProt(.{ .read = true, .write = true });
+    const ref = try s.createNativeVmo(.anonymous, 3 * 4096);
+    try s.createVmaWithRetainedVmo(p0, 0x40000000, 3 * 4096, rw, rw, mmapFlags(.{ .anonymous = true, .shared = true }), ref, 0);
+    const slot = s.nativeVmoSlot(ref).?;
+    for (0..2) |i| {
+        const plan = s.prepareNativeVmaFaultMapping(p0, 0x40000000 + i * 4096, false, false);
+        const before = slot.page_store.lock.takes;
+        try std.testing.expectEqual(@as(u64, (i + 1) * 4096), s.commitNativeVmaFaultMapping(p0, plan, (i + 1) * 4096, null).?.paddr);
+        try std.testing.expectEqual(@as(usize, if (i == 0) 2 else 1), slot.page_store.lock.takes - before);
+        const winner = slot.page_store.lock.takes;
+        try std.testing.expectEqual(@as(u64, (i + 1) * 4096), s.commitNativeVmaFaultMapping(p0, plan, 12288, null).?.paddr);
+        try std.testing.expectEqual(@as(usize, 1), slot.page_store.lock.takes - winner);
+    }
+    const child = try s.createNativeVmo(.anonymous, 3 * 4096);
+    try s.retainNativeVmo(ref);
+    const child_slot = s.nativeVmoSlot(child).?;
+    try s.publishNativeVmoParent(child, ref, 0);
+    try s.createVmaWithRetainedVmo(p0, 0x50000000, 3 * 4096, rw, rw, mmapFlags(.{ .anonymous = true, .shared = true }), child, 0);
+    const plan = s.prepareNativeVmaFaultMapping(p0, 0x50002000, false, false);
+    const parent_before = slot.page_store.lock.takes;
+    const child_before = child_slot.page_store.lock.takes;
+    try std.testing.expectEqual(@as(u64, 16384), s.commitNativeVmaFaultMapping(p0, plan, 16384, null).?.paddr);
+    try std.testing.expectEqual(@as(usize, 1), slot.page_store.lock.takes - parent_before);
+    try std.testing.expectEqual(@as(usize, 2), child_slot.page_store.lock.takes - child_before);
+    // An earlier prepared hole can lose to a parent publication.
+    const parent_plan = kernel.NativeVmaFaultPlan{ .kind = .allocate_zero, .entry_index = plan.entry_index, .fault_page_va = 0x50000000, .vmo = child, .vmo_page_index = 0 };
+    const parent_winner = slot.page_store.lock.takes;
+    const child_loser = child_slot.page_store.lock.takes;
+    try std.testing.expectEqual(@as(u64, 4096), s.commitNativeVmaFaultMapping(p0, parent_plan, 20480, null).?.paddr);
+    try std.testing.expectEqual(@as(usize, 1), slot.page_store.lock.takes - parent_winner);
+    try std.testing.expectEqual(@as(usize, 1), child_slot.page_store.lock.takes - child_loser);
+    std.debug.print("VMO fault commit backing locks root cold=2 warm=1 winner=1; shadow hole=2+parent1 parent-winner=1+parent1 (old 2/2/1 and 2+parent1/1+parent1)\n", .{});
+    s.clearNativeVmoSlot(child_slot);
+    s.clearNativeVmoSlot(slot);
+}
+
+test "VMO COW insertion folds absence check into publication" {
+    var s: KernelState = undefined;
+    try initFdState(&s);
+    var free_list = FreePageList{};
+    const ref = try s.createNativeCowTable(2, &free_list);
+    const slot = s.nativeCowTableSlot(ref).?;
+    const cold = slot.page_store.lock.takes;
+    try s.setNativeCowPagePaddr(ref, 0, 4096, null);
+    try std.testing.expectEqual(@as(usize, 2), slot.page_store.lock.takes - cold);
+    const warm = slot.page_store.lock.takes;
+    try s.setNativeCowPagePaddr(ref, 1, 8192, null);
+    try std.testing.expectEqual(@as(usize, 1), slot.page_store.lock.takes - warm);
+    try std.testing.expectError(KernelError.InvalidState, s.setNativeCowPagePaddr(ref, 0, 12288, null));
+    try std.testing.expectEqual(@as(?u64, 4096), s.nativeCowPagePaddr(ref, 0));
+    _ = kernel.freeVmoBackingPageStore(slot.page_store_start, slot.page_count, slot.page_store_start.owner);
+    s.native_cow_tables.remove(slot, null);
+    try kernel.ReferenceCheck.check(&s);
+}
+
+test "VMO metadata physical zero is never consumed as an allocator grant" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
+    var issuer = FreePageList{};
+    try issuer.installRegions(&.{.{ .id = 91, .start = 0, .end = 4096 }});
+    try std.testing.expectError(KernelError.InvalidState, issuer.seedContiguousRange(0, 1));
+    kernel.useBackingPmmForTest(&issuer);
+    defer kernel.backing_index.test_allocator = null;
+    const ref = try s.createNativeVmo(.anonymous, 4096);
+    const slot = s.nativeVmoSlot(ref).?;
+    defer s.clearNativeVmoSlot(slot);
+    try std.testing.expectError(KernelError.OutOfFreePages, s.installNativeVmoPages(ref, 0, &.{4096}, &issuer));
+    try std.testing.expectEqual(@as(usize, 0), issuer.pageCount());
+    try std.testing.expect(slot.page_store.root == null);
+    try std.testing.expectEqual(@as(u64, 0), kernel.vmObjectBackingStoreStats().used_entries);
+}
+
+test "reference graph detects missing duplicate generation and ownership negatives" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    var s: KernelState = undefined;
+    try initFdState(&s);
+    var free_list: FreePageList = .{};
+    const fd = try s.createAnonymousVmoFd(p0, 4096, fdRights(.{ .close = true, .map_read = true }), .{}, 16);
+    _ = try s.mmapFd(p0, fd, 0x4000_0000, 4096, vmaProt(.{ .read = true }), mmapFlags(.{ .shared = true }), 0);
+    try kernel.ReferenceCheck.check(&s);
+    const source_fd = @constCast(s.fdEntryConst(p0, fd).?);
+    const real = source_fd.authority.reference.?;
+    const substitute = try s.reference_nodes.reserve(try s.poolAllocator());
+    substitute.target = real.target;
+    substitute.identity = real.identity;
+    substitute.range = real.range;
+    source_fd.authority.reference = substitute;
+    try std.testing.expectError(error.Missing, kernel.ReferenceCheck.check(&s));
+    source_fd.authority.reference = real;
+    substitute.target = null;
+    kernel.ReferenceIndex.Pool.cancel(substitute);
+    const entry = @constCast(s.vmaEntryConst(p0, 0x4000_0000).?);
+    const pair = entry.references.?;
+    entry.references = null;
+    try std.testing.expectError(error.Missing, kernel.ReferenceCheck.check(&s));
+    entry.references = pair;
+    const generation = pair.vmo.identity.owner_generation;
+    pair.vmo.identity.owner_generation +%= 1;
+    try std.testing.expectError(error.Identity, kernel.ReferenceCheck.check(&s));
+    pair.vmo.identity.owner_generation = generation;
+    const root = pair.vmo.target.?;
+    var duplicate: @TypeOf(pair.vmo) = .{};
+    root.retainTemporary();
+    root.connect(&duplicate, pair.vmo.identity, pair.vmo.range, true);
+    try std.testing.expectError(error.Duplicate, kernel.ReferenceCheck.check(&s));
+    @TypeOf(root.*).disconnect(&duplicate, true);
+    root.releaseTemporary();
+    root.retainTemporary();
+    try std.testing.expectError(error.Ownership, kernel.ReferenceCheck.check(&s));
+    root.releaseTemporary();
+    try kernel.ReferenceCheck.check(&s);
+    try s.munmapRangeWithFreeList(p0, 0x4000_0000, 4096, &free_list);
+    try s.closeFdWithFreeList(p0, fd, &free_list);
+    try kernel.ReferenceCheck.check(&s);
+    try std.testing.expectEqual(@as(usize, 0), s.reference_nodes.nodes.live);
+    s.reference_nodes.reclaim();
+    try std.testing.expect(s.reference_nodes.nodes.body_owner.published == null);
+}
+
+test "reference queue wrap attachment compaction and revoke partial failure" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    var s: KernelState = undefined;
+    try initFdState(&s);
+    var free_list: FreePageList = .{};
+    const rights = fdRights(.{ .close = true, .transfer = true, .revoke = true, .map_read = true });
+    const a = try s.createAnonymousVmoFd(p0, 8192, rights, .{}, 16);
+    const b = try s.createAnonymousVmoFd(p0, 4096, rights, .{}, 16);
+    const endpoint = try s.createIpcEndpointFd(p0, fdRights(.{ .send = true, .recv = true, .close = true }), .{}, 16);
+    const fds = [_]kernel.IpcSendFd{
+        .{ .fd = a, .rights = fdRights(.{ .close = true }), .move = false },
+        .{ .fd = b, .rights = fdRights(.{ .close = true }), .move = false },
+        .{ .fd = a, .rights = fdRights(.{ .close = true }), .move = false },
+    };
+    for (0..2) |_| try s.ipcSend(p0, endpoint, .{ .fds = &fds }, &free_list);
+    for (0..35) |_| {
+        const received = try s.ipcRecv(p0, endpoint, 3, 16, &free_list);
+        for (received.fds[0..received.fd_count]) |item| try s.closeFdWithFreeList(p0, item.fd, &free_list);
+        try s.ipcSend(p0, endpoint, .{ .fds = &fds }, &free_list);
+        try kernel.ReferenceCheck.check(&s);
+    }
+    _ = try s.mmapFd(p0, a, 0x4000_0000, 4096, vmaProt(.{ .read = true }), mmapFlags(.{ .shared = true }), 0);
+    _ = try s.mmapFdIntoProcess(p0, a, p1, 0x4100_0000, 4096, vmaProt(.{ .read = true }), mmapFlags(.{ .shared = true }), 0);
+    const Failing = struct {
+        calls: *usize,
+        pub fn unmap(self: @This(), _: kernel.PrincipalId, _: u64, _: u64) bool {
+            self.calls.* += 1;
+            return self.calls.* != 2;
+        }
+    };
+    var calls: usize = 0;
+    try std.testing.expectError(KernelError.InvalidState, s.revokeVmoFdWithFreeList(p0, a, &free_list, Failing{ .calls = &calls }));
+    try kernel.ReferenceCheck.check(&s);
+    _ = try s.revokeVmoFdWithFreeList(p0, a, &free_list, NoopUnmapper{});
+    try kernel.ReferenceCheck.check(&s);
+    const remaining = try s.ipcRecv(p0, endpoint, 3, 16, &free_list);
+    try std.testing.expectEqual(@as(usize, 1), remaining.fd_count);
+    try s.closeFdWithFreeList(p0, remaining.fds[0].fd, &free_list);
+    try s.closeFdWithFreeList(p0, endpoint, &free_list);
+    try s.closeFdWithFreeList(p0, b, &free_list);
+    try kernel.ReferenceCheck.check(&s);
+    try std.testing.expectEqual(@as(usize, 0), s.reference_nodes.nodes.live);
+}
+
+const ReferenceFailureAllocator = struct {
+    upstream: kernel.ReferenceIndex.Allocator,
+    calls: usize = 0,
+    fail_at: usize = 0,
+    fail_return: bool = false,
+    fn interface(self: *@This()) kernel.ReferenceIndex.Allocator {
+        return .{ .context = self, .acquire = acquire, .release = release };
+    }
+    fn acquire(context: *anyopaque, pages: usize) ?kernel.ReferenceIndex.MappedExtent {
+        const self: *@This() = @ptrCast(@alignCast(context));
+        self.calls += 1;
+        if (self.calls == self.fail_at) return null;
+        return self.upstream.acquire(self.upstream.context, pages);
+    }
+    fn release(context: *anyopaque, extent: kernel.ReferenceIndex.PhysicalExtent) bool {
+        const self: *@This() = @ptrCast(@alignCast(context));
+        if (self.fail_return) return false;
+        return self.upstream.release(self.upstream.context, extent);
+    }
+};
+const ReferenceOperation = enum { mmap, fork, dup, send, recv };
+fn referenceReservationCase(operation: ReferenceOperation, fail_at: usize) !usize {
+    var s: KernelState = undefined;
+    try initFdState(&s);
+    var free_list: FreePageList = .{};
+    var failure: ReferenceFailureAllocator = .{ .upstream = try s.poolAllocator(), .fail_at = fail_at };
+    defer s.deinitPools();
+    defer {
+        s.releasePrincipalNativeMemory(p0, &free_list);
+        s.releasePrincipalNativeMemory(p1, &free_list);
+        s.reference_nodes.reclaim();
+    }
+    const rights = fdRights(.{ .close = true, .dup = true, .transfer = true, .map_read = true });
+    const fd = try s.createAnonymousVmoFd(p0, 8192, rights, .{}, 16);
+    const endpoint = try s.createIpcEndpointFd(p0, fdRights(.{ .send = true, .recv = true, .close = true }), .{}, 16);
+    const attachment: kernel.IpcSendFd = .{ .fd = fd, .rights = fdRights(.{ .close = true }), .move = false };
+    const attachments = [_]kernel.IpcSendFd{attachment} ** 19;
+    if (operation == .fork) {
+        _ = try s.mmapFd(p0, fd, 0x4000_0000, 4096, vmaProt(.{ .read = true }), mmapFlags(.{ .shared = true }), 0);
+        _ = try s.mmapFd(p0, fd, 0x4100_0000, 4096, vmaProt(.{ .read = true }), mmapFlags(.{ .shared = true }), 4096);
+    }
+    if (operation == .recv) try s.ipcSend(p0, endpoint, .{ .fds = &attachments }, &free_list);
+    var drafts: [64]?*kernel.ReferenceIndex.Node = .{null} ** 64;
+    defer for (drafts) |draft| if (draft) |node| kernel.ReferenceIndex.Pool.cancel(node);
+    if (operation == .dup or operation == .send) {
+        var i: usize = 0;
+        while (s.reference_nodes.nodes.hasPreparedFree()) : (i += 1) drafts[i] = try s.reference_nodes.reserve(try s.poolAllocator());
+    }
+    s.pool_allocator = failure.interface();
+    if (operation == .mmap) s.getVmaTable(p0).?.allocator = failure.interface();
+    if (operation == .fork) s.getVmaTable(p1).?.allocator = failure.interface();
+    const result: KernelError!void = switch (operation) {
+        .mmap => blk: {
+            _ = s.mmapFd(p0, fd, 0x4000_0000, 8192, vmaProt(.{ .read = true }), mmapFlags(.{ .shared = true }), 0) catch |err| break :blk err;
+            break :blk {};
+        },
+        .fork => s.cloneVmaTableForFork(p0, p1),
+        .dup => blk: {
+            _ = s.dupFd(p0, fd, 16, rights, .{}) catch |err| break :blk err;
+            break :blk {};
+        },
+        .send => s.ipcSend(p0, endpoint, .{ .fds = &attachments }, &free_list),
+        .recv => blk: {
+            _ = s.ipcRecv(p0, endpoint, 19, 16, &free_list) catch |err| break :blk err;
+            break :blk {};
+        },
+    };
+    if (fail_at == 0) try result else {
+        if (result) |_| return error.ExpectedReservationFailure else |err| try std.testing.expect(err == KernelError.OutOfFreePages or err == KernelError.TableFull);
+    }
+    try kernel.ReferenceCheck.check(&s);
+    return failure.calls;
+}
+
+test "reference all reservation positions preserve source and rollback ownership" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    for (std.enums.values(ReferenceOperation)) |operation| {
+        const positions = try referenceReservationCase(operation, 0);
+        try std.testing.expect(positions != 0);
+        for (1..positions + 1) |position| _ = try referenceReservationCase(operation, position);
+        std.debug.print("reference {s} reservation OOM positions={} PASS\n", .{ @tagName(operation), positions });
+    }
+}
+
+fn referenceObjectCreationCase(fail_at: usize) !usize {
+    var s: KernelState = undefined;
+    try initFdState(&s);
+    var free_list: FreePageList = .{};
+    var failure: ReferenceFailureAllocator = .{ .upstream = try s.poolAllocator(), .fail_at = fail_at };
+    s.pool_allocator = failure.interface();
+    defer s.deinitPools();
+    const result = s.createAnonymousVmoFd(p0, 4096, fdRights(.{ .close = true }), .{}, 16);
+    if (fail_at == 0) {
+        try s.closeFdWithFreeList(p0, try result, &free_list);
+    } else if (result) |_| return error.ExpectedReservationFailure else |err| try std.testing.expect(err == KernelError.OutOfFreePages);
+    try kernel.ReferenceCheck.check(&s);
+    try std.testing.expectEqual(@as(usize, 0), s.object_reference_slots.live);
+    try std.testing.expectEqual(@as(usize, 0), s.reference_nodes.nodes.live);
+    return failure.calls;
+}
+
+test "reference object publication reserves before consuming ownership at every OOM" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    const count = try referenceObjectCreationCase(0);
+    for (1..count + 1) |i| _ = try referenceObjectCreationCase(i);
+    std.debug.print("reference object creation OOM positions={} PASS\n", .{count});
+}
+
+test "reference fork failure after first published FD rolls back nodes and retains" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    var s: KernelState = undefined;
+    try initFdState(&s);
+    defer s.deinitPools();
+    var free_list: FreePageList = .{};
+    const rights = fdRights(.{ .close = true });
+    _ = try s.createAnonymousVmoFd(p0, 4096, rights, .{}, 16);
+    const second = try s.createAnonymousVmoFd(p0, 4096, rights, .{}, 16);
+    const object = s.kernelObjectSlot(s.fdEntryConst(p0, second).?.object).?;
+    const count = object.ref_count;
+    object.ref_count = std.math.maxInt(u32);
+    try std.testing.expectError(KernelError.TableFull, s.cloneFdTableForFork(p0, p1));
+    object.ref_count = count;
+    try kernel.ReferenceCheck.check(&s);
+    try std.testing.expectEqual(@as(usize, 2), s.reference_nodes.nodes.live);
+    s.releasePrincipalNativeMemory(p0, &free_list);
+    s.releasePrincipalNativeMemory(p1, &free_list);
+    try kernel.ReferenceCheck.check(&s);
+    try std.testing.expectEqual(@as(usize, 0), s.reference_nodes.nodes.live);
+    try std.testing.expectEqual(@as(usize, 0), s.object_reference_slots.live);
+}
+
+test "reference object return retry needs no later object allocation" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    var s: KernelState = undefined;
+    try initFdState(&s);
+    var backend: ReferenceFailureAllocator = .{ .upstream = try s.poolAllocator() };
+    s.pool_allocator = backend.interface();
+    defer s.deinitPools();
+    var free_list: FreePageList = .{};
+    const fd = try s.createAnonymousVmoFd(p0, 4096, fdRights(.{ .close = true }), .{}, 16);
+    backend.fail_return = true;
+    try s.closeFdWithFreeList(p0, fd, &free_list);
+    try kernel.ReferenceCheck.check(&s);
+    try std.testing.expect(kernel.ReferenceIndex.pendingStorage(&s.object_reference_slots));
+    s.retryReferenceStorage();
+    try std.testing.expect(kernel.ReferenceIndex.pendingStorage(&s.object_reference_slots));
+    backend.fail_return = false;
+    s.retryReferenceStorage();
+    try std.testing.expect(!kernel.ReferenceIndex.pendingStorage(&s.object_reference_slots));
+    try std.testing.expect(!s.reference_nodes.needs_reclaim);
+    try std.testing.expectEqual(@as(usize, 0), s.object_reference_slots.live);
+}
+
+test "reference staged MMIO overlay publishes the final pinned address" {
+    var s: KernelState = undefined;
+    try initFdState(&s);
+    defer s.deinitPools();
+    const fd = try s.createMmioRegionFd(p0, .{ .device = 1, .bar_index = 0, .paddr = 0xa000_0000, .user_va = 0, .size = 4096 }, fdRights(.{ .close = true }), .{}, 16);
+    try kernel.ReferenceCheck.check(&s);
+    const payload = s.fdPayloadWithRights(p0, fd, .{}).?.payload;
+    payload.mmio_region.user_va = 0x4100_0000;
+    try std.testing.expectError(error.Range, kernel.ReferenceCheck.check(&s));
+    payload.mmio_region.user_va = 0;
+    s.publishMmioOverlayAddress(p0, fd, 0x4100_0000, 0);
+    try kernel.ReferenceCheck.check(&s);
+    try std.testing.expect(kernel.ReferenceCheck.pinnedOverlap(&s, p0, 0x4100_0000, 4096, null));
+    try std.testing.expect(!kernel.ReferenceCheck.pinnedOverlap(&s, p0, 0x4200_0000, 4096, null));
+    try s.closeFd(p0, fd);
+    try kernel.ReferenceCheck.check(&s);
+}
+
+test "reference empty channels require only single page allocations" {
+    var s: KernelState = undefined;
+    try initFdState(&s);
+    const Tracker = struct {
+        upstream: kernel.ReferenceIndex.Allocator,
+        largest: usize = 0,
+        live: usize = 0,
+        peak: usize = 0,
+        fn acquire(context: *anyopaque, pages: usize) ?kernel.ReferenceIndex.MappedExtent {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            const grant = self.upstream.acquire(self.upstream.context, pages) orelse return null;
+            self.largest = @max(self.largest, pages);
+            self.live += pages;
+            self.peak = @max(self.peak, self.live);
+            return grant;
+        }
+        fn release(context: *anyopaque, grant: kernel.ReferenceIndex.PhysicalExtent) bool {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            if (!self.upstream.release(self.upstream.context, grant)) return false;
+            self.live -= grant.pages;
+            return true;
+        }
+    };
+    var allocator: Tracker = .{ .upstream = try s.poolAllocator() };
+    s.pool_allocator = .{ .context = &allocator, .acquire = Tracker.acquire, .release = Tracker.release };
+    defer s.deinitPools();
+    var channels: [4200]kernel.IpcChannelRef = undefined;
+    for (&channels) |*channel| channel.* = try s.createIpcChannel();
+    std.debug.print("reference 4200 empty channels sizeof(message/queue/channel)={}/{}/{} max-request-pages={} peak-pages={}\n", .{ @sizeOf(kernel.types.IpcMessage), @sizeOf(kernel.types.IpcQueue), @sizeOf(kernel.types.IpcChannelSlot), allocator.largest, allocator.peak });
+    try std.testing.expectEqual(@as(usize, 1), allocator.largest);
+    try std.testing.expectEqual(@as(usize, 0), s.reference_nodes.nodes.live);
+    try std.testing.expectEqual(@as(usize, 0), s.object_reference_slots.live);
+    for (channels) |channel| {
+        s.releaseIpcChannelHandle(.{ .channel = channel, .side = 0 });
+        s.releaseIpcChannelHandle(.{ .channel = channel, .side = 1 });
+    }
+    try kernel.ReferenceCheck.check(&s);
+    s.deinitPools();
+    try std.testing.expectEqual(@as(usize, 0), allocator.live);
+}
+
+test "reference queue attributes preserve every right and flag without cross contamination" {
+    const object: kernel.KernelObjectRef = .{ .kind = .vmo, .index = 123, .generation = 456 };
+    for (0..64) |bit| for (0..16) |flags| {
+        const bits = @as(u64, 1) << @as(u6, @intCast(bit));
+        const item = kernel.IpcTransferredFd.init(object, @bitCast(bits), @bitCast(@as(u32, @intCast(flags))));
+        try std.testing.expectEqual(bits & kernel.types.fd_known_rights_mask, kernel.fdRightsToBits(item.rights()));
+        try std.testing.expectEqual(@as(u32, @intCast(flags)), kernel.fdFlagsToBits(item.flags()));
+        try std.testing.expectEqualDeep(object, item.object());
+    };
+}
+
+// The same fixture is appended to the captured A tree. It observes lifetimes
+// before pool teardown, so an equal retain/temporary leak cannot hide in an oracle.
+const SteadyCounts = struct {
+    free: usize,
+    vmos: usize,
+    cows: usize,
+    objects: usize,
+    channels: usize,
+    endpoints: usize,
+    replies: usize,
+    nodes: usize = 0,
+    records: usize = 0,
+    pairs: usize = 0,
+    temporary: u64 = 0,
+    fn read(s: *KernelState, pages: *FreePageList) @This() {
+        var result: @This() = .{ .free = pages.pageCount(), .vmos = s.native_vmos.live, .cows = s.native_cow_tables.live, .objects = s.fd_objects.live, .channels = s.ipc_channels.live, .endpoints = s.ipc_endpoints.live, .replies = s.ipc_replies.live };
+        if (@hasDecl(kernel, "ReferenceCheck")) {
+            result.nodes = s.reference_nodes.nodes.live;
+            result.records = s.object_reference_slots.live;
+            var v = s.native_vmos.iterator();
+            while (v.next()) |i| result.temporary += i.value.references.temporary;
+            var c = s.native_cow_tables.iterator();
+            while (c.next()) |i| result.temporary += i.value.references.temporary;
+            var o = s.fd_objects.iterator();
+            while (o.next()) |i| if (i.value.reference_state) |r| {
+                result.temporary += r.holders.temporary;
+            };
+            for (0..s.process_capacity) |p| if (s.vmaTableForProcessIndex(p)) |t| {
+                result.pairs += t.reference_slots.live;
+            };
+        }
+        return result;
+    }
+};
+
+const SteadyAllocator = struct {
+    const Interface = @TypeOf(invocation_allocator.interface());
+    const Mapped = @typeInfo(@typeInfo(@TypeOf(@as(kernel.InvocationStorageTestAllocator, undefined).slots)).array.child).optional.child;
+    const Physical = @TypeOf(@as(Mapped, undefined).allocation);
+    upstream: Interface,
+    live: usize = 0,
+    peak: usize = 0,
+    fn interface(self: *@This()) Interface {
+        return .{ .context = self, .acquire = acquire, .release = release };
+    }
+    fn acquire(context: *anyopaque, pages: usize) ?Mapped {
+        const self: *@This() = @ptrCast(@alignCast(context));
+        const grant = self.upstream.acquire(self.upstream.context, pages) orelse return null;
+        self.live += pages;
+        self.peak = @max(self.live, self.peak);
+        return grant;
+    }
+    fn release(context: *anyopaque, grant: Physical) bool {
+        const self: *@This() = @ptrCast(@alignCast(context));
+        if (!self.upstream.release(self.upstream.context, grant)) return false;
+        self.live -= grant.pages;
+        return true;
+    }
+};
+
+test "steady lifetime returns all ownership to baseline without teardown" {
+    const Fixture = struct {
+        fn steadyCycle(s: *KernelState, free: *FreePageList, mode: usize) !void {
+            const rw = vmaProt(.{ .read = true, .write = true });
+            const rights = fdRights(.{ .inspect = true, .close = true, .dup = true, .transfer = true, .map_read = true, .map_write = true, .revoke = true });
+            const va = 0x4000_0000;
+            switch (mode) {
+                0, 1, 2, 3 => {
+                    const fd = try s.createAnonymousVmoFdWithPages(p0, 16384, rights, .{}, 16, free);
+                    _ = try s.mmapFd(p0, fd, va, 16384, rw, mmapFlags(.{ .private = true }), 0);
+                    try s.closeFdWithFreeList(p0, fd, free);
+                    if (mode == 0) try s.munmapRangeWithFreeList(p0, va + 4096, 4096, free);
+                    if (mode == 1) {
+                        try s.setVmaProtRange(p0, va + 4096, 4096, vmaProt(.{ .read = true }));
+                        try s.setVmaProtRange(p0, va + 4096, 4096, rw);
+                    }
+                    if (mode == 2 or mode == 3) {
+                        try s.cloneVmaTableForFork(p0, p1);
+                        if (mode == 3) {
+                            const plan = s.prepareNativeVmaCowMapping(p1, va, true, false);
+                            const loser = (try s.allocPhysicalPage(free)).paddr;
+                            _ = s.ensureNativeVmaCowMappingLockedSlow(p1, va, true, false, free) orelse return error.NoCow;
+                            try std.testing.expect(s.commitNativeVmaCowMapping(p1, plan, loser, free) == null);
+                            try free.appendPage(loser);
+                        }
+                        s.releasePrincipalNativeMemory(p1, free);
+                    }
+                    try s.munmapRangeWithFreeList(p0, va, 16384, free);
+                },
+                4 => {
+                    const fd = try s.createAnonymousVmoFdWithPages(p0, 4096, rights, .{}, 16, free);
+                    _ = try s.dupFd(p0, fd, 16, rights, .{ .cloexec = true });
+                    try s.closeCloexecFdsWithFreeList(p0, free);
+                    try s.closeFdWithFreeList(p0, fd, free);
+                },
+                5, 6, 7 => {
+                    const fd = try s.createAnonymousVmoFdWithPages(p0, 4096, rights, .{}, 16, free);
+                    const pair = try s.createIpcChannelPairFds(p0, fdRights(.{ .send = true, .recv = true, .close = true }), .{}, 16);
+                    const fds = [_]kernel.IpcSendFd{.{ .fd = fd, .rights = rights, .move = false }};
+                    for (0..35) |_| {
+                        try s.ipcSend(p0, pair.a, .{ .fds = &fds }, free);
+                        const received = try s.ipcRecv(p0, pair.b, 1, 16, free);
+                        try s.closeFdWithFreeList(p0, received.fds[0].fd, free);
+                    }
+                    try s.ipcSend(p0, pair.a, .{ .fds = &fds }, free);
+                    if (mode == 7) _ = try s.revokeVmoFdWithFreeList(p0, fd, free, NoopUnmapper{});
+                    try s.closeFdWithFreeList(p0, pair.b, free);
+                    try s.closeFdWithFreeList(p0, pair.a, free);
+                    if (mode != 7) try s.closeFdWithFreeList(p0, fd, free);
+                },
+                8 => {
+                    const fd = try s.createAnonymousVmoFdWithPages(p0, 4096, rights, .{}, 16, free);
+                    const endpoint = try s.createIpcEndpointFd(p0, fdRights(.{ .call = true, .recv = true, .close = true }), .{}, 16);
+                    const fds = [_]kernel.IpcSendFd{.{ .fd = fd, .rights = rights, .move = false }};
+                    const call = try s.ipcCall(p0, endpoint, .{ .fds = &fds }, .{ .owner = p0 }, free);
+                    const request = try s.ipcRecv(p0, endpoint, 1, 16, free);
+                    const extracted = try s.ipcExtractReply(p0, request.call, 16);
+                    try s.closeFdWithFreeList(p0, request.fds[0].fd, free);
+                    try s.closeFdWithFreeList(p0, extracted, free);
+                    s.releaseIpcCallReference(call);
+                    try s.closeFdWithFreeList(p0, endpoint, free);
+                    try s.closeFdWithFreeList(p0, fd, free);
+                },
+                9 => {
+                    const fd = try s.createAnonymousVmoFdWithPages(p0, 8192, rights, .{}, 16, free);
+                    const parent = s.nativeVmoRefForFd(p0, fd).?;
+                    const view = try s.createNativePageView(parent, 1);
+                    const object = try s.createKernelObject(.vmo, .{ .vmo = view });
+                    const child = try s.installFd(p0, object, rights, .{}, 16);
+                    try s.closeFdWithFreeList(p0, fd, free);
+                    try s.closeFdWithFreeList(p0, child, free);
+                },
+                10 => {
+                    const dma = try s.createDmaBufferFd(p0, .{ .device = 1, .user_va = va, .iova = 0x9000_0000, .size = 4096 }, fdRights(.{ .close = true }), .{}, 16);
+                    const mmio = try s.createMmioRegionFd(p0, .{ .device = 1, .bar_index = 0, .paddr = 0xa000_0000, .user_va = va + 4096, .size = 4096 }, fdRights(.{ .close = true }), .{}, 16);
+                    try s.closeFdWithFreeList(p0, dma, free);
+                    try s.closeFdWithFreeList(p0, mmio, free);
+                },
+                11 => {
+                    for ([_]PrincipalId{ p0, p1 }) |p| {
+                        const fd = try s.createAnonymousVmoFdWithPages(p, 4096, rights, .{}, 16, free);
+                        _ = try s.mmapFd(p, fd, va, 4096, rw, mmapFlags(.{ .private = true }), 0);
+                        try s.closeFdWithFreeList(p, fd, free);
+                    }
+                    try s.replaceVmaTableForExec(p0, p1, free);
+                    s.releasePrincipalNativeMemory(p0, free);
+                    s.releasePrincipalNativeMemory(p1, free);
+                },
+                12 => {
+                    const fd = try s.createAnonymousVmoFdWithPages(p0, 8192, rights, .{}, 16, free);
+                    const parent = s.nativeVmoRefForFd(p0, fd).?;
+                    const child = try s.createNativeVmo(.anonymous, 4096);
+                    try s.retainNativeVmo(child);
+                    try s.retainNativeVmo(parent);
+                    if (@hasDecl(KernelState, "publishNativeVmoParent")) try s.publishNativeVmoParent(child, parent, 4096) else s.nativeVmoSlot(child).?.backing.parent = .{ .ref = parent, .offset = 4096 };
+                    try s.closeFdWithFreeList(p0, fd, free);
+                    s.releaseNativeVmoWithFreeList(child, free);
+                },
+                13 => {
+                    const fd = try s.createAnonymousVmoFdWithPages(p0, 4096, rights, .{}, 16, free);
+                    const vmo = s.nativeVmoRefForFd(p0, fd).?;
+                    const paddr = s.nativeVmoPagePaddr(vmo, 0).?;
+                    var hold = try DmaHold.init(paddr, 1);
+                    defer hold.end();
+                    try s.closeFdWithFreeList(p0, fd, free);
+                    try std.testing.expect(s.hasPendingDataReturns());
+                    hold.end();
+                    s.drainPendingDataReturns();
+                    try std.testing.expect(!s.hasPendingDataReturns());
+                },
+                else => unreachable,
+            }
+        }
+    };
+
+    var fixture = try physicalFixture();
+    defer fixture.deinit();
+    var s: KernelState = undefined;
+    try initFdState(&s);
+    var tracker: SteadyAllocator = .{ .upstream = try s.poolAllocator() };
+    s.pool_allocator = tracker.interface();
+    defer s.deinitPools();
+    var free: FreePageList = .{};
+    try free.installRegions(&.{.{ .id = 0, .start = 0x60_0000, .end = 0x70_0000 }});
+    try free.seedContiguousRange(0x60_0000, 256);
+    const baseline = SteadyCounts.read(&s, &free);
+    for (0..14) |mode| {
+        var initial_storage: ?usize = null;
+        for (0..32) |cycle| {
+            try Fixture.steadyCycle(&s, &free, mode);
+            if (@hasDecl(kernel, "ReferenceCheck")) try kernel.ReferenceCheck.check(&s);
+            const actual = SteadyCounts.read(&s, &free);
+            if (initial_storage) |expected| {
+                if (tracker.live != expected) std.debug.print("steady metadata mode={} cycle={} expected={} actual={} pages\n", .{ mode, cycle, expected, tracker.live });
+                try std.testing.expectEqual(expected, tracker.live);
+            } else initial_storage = tracker.live;
+            if (!std.meta.eql(baseline, actual)) std.debug.print("steady mode={} cycle={} initial={any} actual={any}\n", .{ mode, cycle, baseline, actual });
+            try std.testing.expectEqualDeep(baseline, actual);
+        }
+        std.debug.print("steady mode={} cycles=32 PMM/VMO/COW/object/node/record/pair/temporary baseline PASS\n", .{mode});
+    }
+    // Reusable directory capacity is not a live reference. At the end of
+    // the owner lifetime, even that capacity must return to its issuer.
+    s.releasePrincipalNativeMemory(p0, &free);
+    s.releasePrincipalNativeMemory(p1, &free);
+    s.deinitPools();
+    try std.testing.expectEqual(@as(usize, 0), tracker.live);
+}
+
+test "steady census detects balanced temporary retain leaks independently of edges" {
+    var fixture = try physicalFixture();
+    defer fixture.deinit();
+    var s: KernelState = undefined;
+    try initFdState(&s);
+    defer s.deinitPools();
+    var free: FreePageList = .{};
+    const before = kernel.ReferenceCheck.census(&s, &free);
+    const vmo = try s.createNativeVmo(.anonymous, 4096);
+    try s.retainNativeVmo(vmo);
+    // This is internally consistent, yet not a return to the quiescent baseline.
+    try kernel.ReferenceCheck.check(&s);
+    const leaked = kernel.ReferenceCheck.census(&s, &free);
+    try std.testing.expectEqual(before.vmos + 1, leaked.vmos);
+    try std.testing.expectEqual(before.temporary + 1, leaked.temporary);
+    s.releaseNativeVmoWithFreeList(vmo, &free);
+    const after = kernel.ReferenceCheck.census(&s, &free);
+    try std.testing.expectEqual(before.vmos, after.vmos);
+    try std.testing.expectEqual(before.temporary, after.temporary);
+}
+
+test "steady 4200 live channel pairs return storage and ownership each cycle" {
+    var fixture = try physicalFixture();
+    defer fixture.deinit();
+    var s: KernelState = undefined;
+    try initFdState(&s);
+    var free: FreePageList = .{};
+    try free.installRegions(&.{.{ .id = 0, .start = @intFromPtr(&fd_capacity_backing), .end = @intFromPtr(&fd_capacity_backing) + fd_capacity_backing.len }});
+    try free.seedContiguousRange(@intFromPtr(&fd_capacity_backing), fd_capacity_backing.len / 4096);
+    try s.ensureFdTableCapacity(p0, 16384, &free);
+    var tracker: SteadyAllocator = .{ .upstream = try s.poolAllocator() };
+    s.pool_allocator = tracker.interface();
+    defer s.deinitPools();
+    const Pair = KernelState.IpcChannelPair;
+    var pairs: [4200]Pair = undefined;
+    var steady_pages: ?usize = null;
+    for (0..3) |cycle| {
+        for (&pairs) |*pair| {
+            const made = try s.createIpcChannelPairFds(p0, fdRights(.{ .send = true, .recv = true, .close = true }), .{}, 16);
+            pair.* = .{ .a = made.a, .b = made.b };
+        }
+        std.debug.print("steady burst cycle={} live=4200 pages={} peak={}\n", .{ cycle, tracker.live, tracker.peak });
+        for (pairs) |pair| {
+            try s.closeFd(p0, pair.a);
+            try s.closeFd(p0, pair.b);
+        }
+        if (@hasDecl(kernel, "ReferenceCheck")) {
+            s.retryReferenceStorage();
+            try kernel.ReferenceCheck.check(&s);
+            try std.testing.expectEqual(@as(usize, 0), s.reference_nodes.nodes.live);
+            try std.testing.expectEqual(@as(usize, 0), s.object_reference_slots.live);
+        }
+        try std.testing.expectEqual(@as(usize, 0), s.fd_objects.live);
+        try std.testing.expectEqual(@as(usize, 0), s.ipc_channels.live);
+        if (steady_pages) |n| try std.testing.expectEqual(n, tracker.live) else steady_pages = tracker.live;
+        std.debug.print("steady burst closed cycle={} cached-pages={}\n", .{ cycle, tracker.live });
+    }
+    s.releasePrincipalNativeMemory(p0, &free);
+    s.deinitPools();
+    try std.testing.expectEqual(@as(usize, 0), tracker.live);
+    try std.testing.expectEqual(@as(usize, fd_capacity_backing.len / 4096), free.pageCount());
+}
+
+test "reference packed queue identity keeps full slot and generation for every kind" {
+    inline for (@typeInfo(kernel.types.KernelObjectKind).@"enum".fields) |field| {
+        for ([_]u32{ 0, 1, 0x80000000, 0xffffffff }) |index| for ([_]u32{ 0, 1, 0x80000000, 0xffffffff }) |generation| {
+            const ref: kernel.KernelObjectRef = .{ .kind = @enumFromInt(field.value), .index = index, .generation = generation };
+            const item = kernel.IpcTransferredFd.init(ref, @bitCast(kernel.types.fd_known_rights_mask), @bitCast(kernel.types.fd_known_flags_mask));
+            try std.testing.expectEqualDeep(ref, item.object());
+            try std.testing.expectEqual(kernel.types.fd_known_rights_mask, kernel.fdRightsToBits(item.rights()));
+            try std.testing.expectEqual(kernel.types.fd_known_flags_mask, kernel.fdFlagsToBits(item.flags()));
+        };
+    }
+    try std.testing.expectEqual(@as(usize, 16), @sizeOf(kernel.IpcTransferredFd));
+}
+
+test "C reverse operation visits ignore unrelated process VMO FD and queues" {
+    const Fixture = struct {
+        fn indexedVisitCase(unrelated: usize) ![5]usize {
+            var s: KernelState = undefined;
+            try initFdState(&s);
+            var free: FreePageList = .{};
+            try free.installRegions(&.{.{ .id = 0, .start = 4096, .end = (1 << 40) + (1 << 29) }});
+            const rights = fdRights(.{ .close = true, .dup = true, .transfer = true, .revoke = true, .map_read = true });
+            var growth: FreePageList = .{};
+            try growth.installRegions(&.{.{ .id = 0, .start = @intFromPtr(&fd_capacity_backing), .end = @intFromPtr(&fd_capacity_backing) + fd_capacity_backing.len }});
+            try growth.seedContiguousRange(@intFromPtr(&fd_capacity_backing), fd_capacity_backing.len / 4096);
+            // Grow unrelated process tables as well as VMA/VMO/FD and IPC pools.
+            try std.testing.expect(s.ensureProcessCapacity(kernel.process_count + unrelated, &growth));
+            for (0..unrelated) |i| {
+                const principal = kernel.processPrincipalFromIndex(kernel.process_count + i).?;
+                try std.testing.expect(s.ensureProcessDescriptor(principal, "unrelated"));
+                const fd = try s.createAnonymousVmoFd(principal, 4096, rights, .{}, 0);
+                _ = try s.mmapFd(principal, fd, 0x5000_0000, 4096, vmaProt(.{ .read = true }), mmapFlags(.{ .shared = true }), 0);
+                _ = try s.createIpcEndpointFd(principal, fdRights(.{ .close = true }), .{}, 0);
+            }
+            const fd = try s.createAnonymousVmoFd(p0, 12288, rights, .{}, 0);
+            const ref = s.nativeVmoRefForFd(p0, fd).?;
+            try s.installNativeVmoPages(ref, 0, &.{0x8900_0000}, null);
+            _ = try s.mmapFd(p0, fd, 0x4000_0000, 12288, vmaProt(.{ .read = true }), mmapFlags(.{ .shared = true }), 0);
+            _ = try s.mmapFdIntoProcess(p0, fd, p1, 0x4100_0000, 4096, vmaProt(.{ .read = true }), mmapFlags(.{ .shared = true }), 0);
+            var out: [5]usize = undefined;
+            kernel.ReferenceIndex.visits = 0;
+            try std.testing.expect(!s.nativeVmoTreeMappingsOverlapPinnedUserObjects(ref));
+            out[0] = kernel.ReferenceIndex.visits;
+            kernel.ReferenceIndex.visits = 0;
+            try s.validateRamCacheMappings(ref, 0, &.{0x8900_0000});
+            out[1] = kernel.ReferenceIndex.visits;
+            kernel.ReferenceIndex.visits = 0;
+            s.releaseUnmappedAnonymousVmoPageRange(p0, ref, 1, 1, &free);
+            out[2] = kernel.ReferenceIndex.visits;
+            kernel.ReferenceIndex.visits = 0;
+            _ = try s.revokeVmoFdWithFreeList(p0, fd, &free, NoopUnmapper{});
+            out[3] = kernel.ReferenceIndex.visits;
+            try kernel.ReferenceCheck.check(&s);
+            try std.testing.expect(s.nativeVmoSlot(ref) == null);
+            // Also count successful general-path reclamation: two surviving
+            // disjoint VMAs, no FD/temporary, and an owned page in their gap.
+            const gap_fd = try s.createAnonymousVmoFd(p0, 12288, rights, .{}, 0);
+            const gap = s.nativeVmoRefForFd(p0, gap_fd).?;
+            try s.installNativeVmoPages(gap, 1, &.{0x8900_1000}, null);
+            _ = try s.mmapFd(p0, gap_fd, 0x4000_0000, 4096, vmaProt(.{ .read = true }), mmapFlags(.{ .anonymous = true }), 0);
+            _ = try s.mmapFdIntoProcess(p0, gap_fd, p1, 0x4100_0000, 4096, vmaProt(.{ .read = true }), mmapFlags(.{ .anonymous = true }), 8192);
+            try s.closeFdWithFreeList(p0, gap_fd, &free);
+            const before = free.pageCount();
+            kernel.ReferenceIndex.visits = 0;
+            s.releaseUnmappedAnonymousVmoPageRange(p0, gap, 1, 1, &free);
+            out[4] = kernel.ReferenceIndex.visits;
+            try std.testing.expectEqual(before + 1, free.pageCount());
+            try std.testing.expectEqual(@as(?u64, 0), s.nativeVmoPagePaddrOrHole(gap, 1));
+            try s.munmapRangeWithFreeList(p0, 0x4000_0000, 4096, &free);
+            try s.munmapRangeWithFreeList(p1, 0x4100_0000, 4096, &free);
+            try kernel.ReferenceCheck.check(&s);
+            for (0..unrelated) |i| s.releasePrincipalNativeMemory(kernel.processPrincipalFromIndex(kernel.process_count + i).?, &free);
+            return out;
+        }
+    };
+
+    var fixture = try physicalFixture();
+    defer fixture.deinit();
+    const small = try Fixture.indexedVisitCase(0);
+    const large = try Fixture.indexedVisitCase(128);
+    try std.testing.expectEqualDeep(small, large);
+    std.debug.print("C visits pinned/ram-cache/blocked-partial/revoke/reclaimed-partial unrelated=0/128: {any} == {any}\n", .{ small, large });
+}
+
+test "FD wait storage reuses warm capacity and pressure reclaim preserves armed generations" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
+    const Allocator = @typeInfo(@TypeOf(s.pool_allocator)).optional.child;
+    const AcquireResult = @typeInfo(@typeInfo(@TypeOf(@as(Allocator, undefined).acquire)).pointer.child).@"fn".return_type.?;
+    const Extent = @typeInfo(@typeInfo(@TypeOf(@as(Allocator, undefined).release)).pointer.child).@"fn".params[1].type.?;
+    const ReleaseResult = @typeInfo(@typeInfo(@TypeOf(@as(Allocator, undefined).release)).pointer.child).@"fn".return_type.?;
+    const Counting = struct {
+        backing: Allocator,
+        calls: usize = 0,
+        returns: usize = 0,
+        fn acquire(context: *anyopaque, pages: usize) AcquireResult {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.calls += 1;
+            return self.backing.acquire(self.backing.context, pages);
+        }
+        fn release(context: *anyopaque, extent: Extent) ReleaseResult {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            const result = self.backing.release(self.backing.context, extent);
+            self.returns += 1;
+            return result;
+        }
+        fn active(self: *const @This()) usize {
+            return self.calls - self.returns;
+        }
+    };
+    var backend = Counting{ .backing = try s.poolAllocator() };
+    s.pool_allocator = .{ .context = &backend, .acquire = Counting.acquire, .release = Counting.release };
+    defer s.deinitPools();
+    const rights = fdRights(.{ .send = true, .recv = true, .wait = true, .poll = true, .close = true });
+    const pair = try s.createIpcChannelPairFds(p0, rights, .{}, 16);
+    var stale: kernel.FdWaitGroupRef = .{};
+    var warm_calls: usize = 0;
+    var warm_returns: usize = 0;
+    for (0..8) |round| {
+        const token: u64 = round + 1;
+        const group = try s.beginFdWaitGroup(p0, 7, 11, token);
+        // Alternating sizes exercises dense link numbering after free-list reuse.
+        const count: usize = if (round % 2 == 0) 300 else 1;
+        for (0..count) |index| {
+            try std.testing.expect(try s.registerIpcPollWaitersForFd(p0, pair.a, fd_abi.event_readable, 0x1000 + index * 24, 7, 11, token, group));
+        }
+        try s.armFdWaitGroup(group);
+        if (round != 0) {
+            s.cancelFdWaitGroup(stale, token - 1);
+            try std.testing.expectEqual(@as(u64, 1), groupCount(&s, 7));
+        }
+        s.cancelFdWaitGroup(group, token);
+        stale = group;
+        if (round == 0) {
+            warm_calls = backend.calls;
+            warm_returns = backend.returns;
+        } else {
+            try std.testing.expectEqual(warm_calls, backend.calls);
+            try std.testing.expectEqual(warm_returns, backend.returns);
+        }
+    }
+    const active = try s.beginFdWaitGroup(p0, 7, 11, 100);
+    try std.testing.expect(try s.registerIpcPollWaitersForFd(p0, pair.a, fd_abi.event_readable, 0x1000, 7, 11, 100, active));
+    try s.armFdWaitGroup(active);
+    s.reclaimFdWaitStorage();
+    try std.testing.expectEqual(@as(u64, 1), groupCount(&s, 7));
+    s.cancelFdWaitGroup(active, 100);
+    const before = backend.active();
+    s.reclaimFdWaitStorage();
+    try std.testing.expect(backend.active() < before);
+    const reused = try s.beginFdWaitGroup(p0, 7, 11, 101);
+    s.cancelFdWaitGroup(active, 100);
+    try std.testing.expectEqual(@as(u64, 1), groupCount(&s, 7));
+    s.cancelFdWaitGroup(reused, 101);
+}
+
+// LPR eventfd allocates a channel pair before publishing its Linux FD.
+test "LPR FD4200 sequential channel and growing supervisor wait set" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
+    const Allocator = @typeInfo(@TypeOf(s.pool_allocator)).optional.child;
+    const AcquireResult = @typeInfo(@typeInfo(@TypeOf(@as(Allocator, undefined).acquire)).pointer.child).@"fn".return_type.?;
+    const Extent = @typeInfo(@typeInfo(@TypeOf(@as(Allocator, undefined).release)).pointer.child).@"fn".params[1].type.?;
+    const ReleaseResult = @typeInfo(@typeInfo(@TypeOf(@as(Allocator, undefined).release)).pointer.child).@"fn".return_type.?;
+    const Counting = struct {
+        backing: Allocator,
+        calls: usize = 0,
+        pages: usize = 0,
+        limit: usize = std.math.maxInt(usize),
+        failed_pages: usize = 0,
+        returns: usize = 0,
+        fn acquire(context: *anyopaque, pages: usize) AcquireResult {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            if (pages > self.limit -| self.pages) {
+                self.failed_pages = pages;
+                return null;
+            }
+            const grant = self.backing.acquire(self.backing.context, pages) orelse return null;
+            self.calls += 1;
+            self.pages += pages;
+            return grant;
+        }
+        fn release(context: *anyopaque, extent: Extent) ReleaseResult {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            const result = self.backing.release(self.backing.context, extent);
+            if (result) {
+                self.returns += 1;
+                self.pages -= extent.pages;
+            }
+            return result;
+        }
+        fn active(self: *const @This()) usize {
+            return self.calls - self.returns;
+        }
+    };
+    var backend = Counting{ .backing = try s.poolAllocator() };
+    s.pool_allocator = .{ .context = &backend, .acquire = Counting.acquire, .release = Counting.release };
+    defer s.deinitPools();
+
+    var free_list = FreePageList{};
+    const base = @intFromPtr(&fd_capacity_backing);
+    try free_list.installRegions(&.{.{ .id = 0, .start = base, .end = base + fd_capacity_backing.len }});
+    try free_list.seedContiguousRange(base, fd_capacity_backing.len / 4096);
+    defer s.releasePrincipalNativeMemory(p0, &free_list);
+    const rights = fdRights(.{ .send = true, .recv = true, .wait = true, .poll = true, .close = true });
+    var waits: [4200]kernel.Fd = undefined;
+    for (0..4200) |i| {
+        try s.ensureFdTableCapacity(p0, 16 + 2 * (i + 1), &free_list);
+        const pair = try s.createIpcChannelPairFds(p0, rights, .{}, 16);
+        waits[i] = pair.a;
+        if (!std.math.isPowerOfTwo(i + 1) and i != 4199) continue;
+        const group = try s.beginFdWaitGroup(p0, 7, 11, i + 1);
+        for (waits[0 .. i + 1], 0..) |fd, j| {
+            try std.testing.expect(try s.registerIpcPollWaitersForFd(p0, fd, fd_abi.event_readable, 0x1000 + j * 24, 7, 11, i + 1, group));
+        }
+        try s.armFdWaitGroup(group);
+        s.cancelFdWaitGroup(group, i + 1);
+    }
+    std.debug.print("LPR_HOST opened=4200 native_fds=8400 incremental_capacity=true growing_wait_set=true fd_pmm_free={d}\n", .{free_list.pageCount()});
+}
+
+// Memory pressure originates in an unrelated page request, not a wait registration.
+// All allocator traffic shares the actual PMM, including the reclaim retry.
+test "PMM OOM reaches detached wait cache for unrelated page allocation" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
+    var free_list = FreePageList{};
+    const base = @intFromPtr(&fd_capacity_backing);
+    try free_list.installRegions(&.{.{ .id = 0, .start = base, .end = base + fd_capacity_backing.len }});
+    try free_list.seedContiguousRange(base, fd_capacity_backing.len / 4096);
+    const Allocator = @typeInfo(@TypeOf(s.pool_allocator)).optional.child;
+    const Result = @typeInfo(@typeInfo(@TypeOf(@as(Allocator, undefined).acquire)).pointer.child).@"fn".return_type.?;
+    const Extent = @typeInfo(@typeInfo(@TypeOf(@as(Allocator, undefined).release)).pointer.child).@"fn".params[1].type.?;
+    const Backend = struct {
+        fn acquire(context: *anyopaque, pages: usize) Result {
+            const fl: *FreePageList = @ptrCast(@alignCast(context));
+            const grant = fl.popContiguousOwnedInRange(pages, 4096, std.math.maxInt(u64)) catch return null;
+            const bytes: [*]align(4096) u8 = @ptrFromInt(grant.physical.toInt());
+            return .{ .allocation = grant, .bytes = bytes[0 .. pages * 4096] };
+        }
+        fn release(context: *anyopaque, grant: Extent) bool {
+            const fl: *FreePageList = @ptrCast(@alignCast(context));
+            fl.appendContiguousRange(grant.physical.toInt(), grant.pages) catch return false;
+            return true;
+        }
+    };
+    s.pool_allocator = .{ .context = &free_list, .acquire = Backend.acquire, .release = Backend.release };
+    free_list.reclaimable.register(&s.wait_storage_cache);
+    defer s.deinitPools();
+    defer s.releasePrincipalNativeMemory(p0, &free_list);
+    var held: std.ArrayList(u64) = .empty;
+    defer held.deinit(std.testing.allocator);
+    defer for (held.items) |page| free_list.appendContiguousRange(page, 1) catch unreachable;
+    var waits: [300]kernel.Fd = undefined;
+    const rights = fdRights(.{ .send = true, .recv = true, .wait = true, .poll = true, .close = true });
+    for (&waits, 0..) |*fd, i| {
+        try s.ensureFdTableCapacity(p0, 16 + 2 * (i + 1), &free_list);
+        const pair = try s.createIpcChannelPairFds(p0, rights, .{}, 16);
+        fd.* = pair.a;
+    }
+    const group = try s.beginFdWaitGroup(p0, 7, 11, 1);
+    for (waits, 0..) |fd, i| try std.testing.expect(try s.registerIpcPollWaitersForFd(p0, fd, fd_abi.event_readable, 0x1000 + i * 24, 7, 11, 1, group));
+    try s.armFdWaitGroup(group);
+    s.cancelFdWaitGroup(group, 1);
+    const retained = s.wait_storage_cache.pages;
+    try std.testing.expect(retained != 0);
+    const free = free_list.pageCount();
+    try held.ensureTotalCapacity(std.testing.allocator, free);
+    for (0..free) |_| held.appendAssumeCapacity(try free_list.popFront());
+    try std.testing.expectEqual(@as(usize, 0), free_list.pageCount());
+    // A single unrelated physical allocation must use the common retry.
+    const recovered = try free_list.popFront();
+    defer free_list.appendContiguousRange(recovered, 1) catch unreachable;
+    try std.testing.expect(s.wait_storage_cache.pages < retained);
+    std.debug.print("COMMON_OOM cache_before={d} cache_after={d} pmm_free_before=0 pmm_free_after={d} unrelated_page=PASS\n", .{ retained, s.wait_storage_cache.pages, free_list.pageCount() });
+}
+
+fn expectVmaAddressIndex(s: *KernelState, owner: PrincipalId) !void {
+    const table = s.getVmaTable(owner).?;
+    try table.address_index.validate();
+    try std.testing.expectEqual(table.active_count, table.address_index.count);
+    for (0..table.active_count) |position| {
+        const slot = table.active_indices.get(@intCast(position)).?.*;
+        const entry = table.entries.get(slot).?;
+        try std.testing.expect(entry.references.?.address_owner == table);
+        try std.testing.expectEqual(slot, entry.references.?.address_node.key.slot);
+        try std.testing.expect(table.entryForVa(entry.start_va) == entry);
+        try std.testing.expect(table.entryForVa(entry.endVa() - 1) == entry);
+        var depth: usize = 0;
+        var cursor = table.address_index.root;
+        while (cursor) |node| {
+            depth += 1;
+            if (node == entry) break;
+            cursor = node.references.?.address_node.child[@intFromBool(entry.start_va > node.start_va)];
+        }
+        try std.testing.expect(depth <= 2 * (std.math.log2_int(usize, table.active_count + 1) + 1));
+    }
+}
+
+test "VMA address index survives split trim fork exec transfer and many mappings" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
+    var free_list = FreePageList{};
+    const base: u64 = 0x6000_0000;
+    const rw = vmaProt(.{ .read = true, .write = true });
+    const flags = mmapFlags(.{ .private = true, .anonymous = true, .noreserve = true });
+    // Permute insertion order and cross storage leaves; no fixed VMA cap.
+    for (0..1025) |i| {
+        const n = (i * 513) % 1025;
+        _ = try s.createAnonymousVmaWithPages(p0, base + n * 32768, 16384, rw, rw, flags, &free_list);
+    }
+    try expectVmaAddressIndex(&s, p0);
+    try s.setVmaProtRange(p0, base + 4096, 4096, .{});
+    try expectVmaAddressIndex(&s, p0);
+    try s.setVmaProtRange(p0, base + 4096, 4096, rw);
+    try expectVmaAddressIndex(&s, p0);
+    try s.munmapRangeWithFreeList(p0, base + 32768 + 4096, 4096, &free_list);
+    try expectVmaAddressIndex(&s, p0);
+    try std.testing.expect(s.vmaEntryForVaConst(p0, base + 32768 + 4096) == null);
+    try s.munmapRangeWithFreeList(p0, base + 65536, 4096, &free_list);
+    try expectVmaAddressIndex(&s, p0);
+    try s.munmapRangeWithFreeList(p0, base + 98304 + 12288, 4096, &free_list);
+    try expectVmaAddressIndex(&s, p0);
+    try s.cloneVmaTableForFork(p0, p1);
+    try expectVmaAddressIndex(&s, p0);
+    try expectVmaAddressIndex(&s, p1);
+    try s.replaceVmaTableForExec(p2, p1, &free_list);
+    try expectVmaAddressIndex(&s, p1);
+    try expectVmaAddressIndex(&s, p2);
+    s.releasePrincipalNativeMemory(p0, &free_list);
+    s.releasePrincipalNativeMemory(p2, &free_list);
+    try expectVmaAddressIndex(&s, p0);
+    try expectVmaAddressIndex(&s, p2);
+    // Adjacent anonymous growth retains one node and extends its range.
+    _ = try s.createAnonymousVmaWithPages(p0, base, 4096, .{}, rw, flags, &free_list);
+    _ = try s.createAnonymousVmaWithPages(p0, base + 4096, 4096, .{}, rw, flags, &free_list);
+    try expectVmaAddressIndex(&s, p0);
+    try std.testing.expectEqual(@as(usize, 1), s.getVmaTable(p0).?.active_count);
+    try std.testing.expect(s.vmaEntryForVaConst(p0, base + 8191) != null);
+    s.releasePrincipalNativeMemory(p0, &free_list);
+}
+
+test "VMA address index storage footprint" {
+    const Before = struct {
+        references: @FieldType(kernel.VmaEntry, "references") = null,
+        active: bool = false,
+        start_va: u64 = 0,
+        size_bytes: u64 = 0,
+        prot: kernel.VmaProt = .{},
+        max_prot: kernel.VmaProt = .{},
+        flags: kernel.MmapFlags = .{},
+        vmo: kernel.NativeVmoRef = .{},
+        vmo_offset: u64 = 0,
+        cow_table: kernel.NativeCowTableRef = .{},
+        cow_page_offset: u32 = 0,
+    };
+    const Ref = @typeInfo(@typeInfo(@FieldType(kernel.VmaEntry, "references")).optional.child).pointer.child;
+    try std.testing.expectEqual(@sizeOf(Before), @sizeOf(kernel.VmaEntry));
+    try std.testing.expectEqual(@as(usize, 32), @FieldType(kernel.VmaTable, "entries").block_slots);
+    try std.testing.expectEqual(@as(usize, 8), @FieldType(kernel.VmaTable, "reference_slots").block_slots);
+    std.debug.print("VMA footprint before_entry={} entry={} reference_pair={} before_block={} block={} refs_block={} object={}\n", .{
+        @sizeOf(Before),                                                  @sizeOf(kernel.VmaEntry),                           @sizeOf(Ref),
+        std.math.floorPowerOfTwo(usize, @max(1, 3072 / @sizeOf(Before))), @FieldType(kernel.VmaTable, "entries").block_slots, @FieldType(kernel.VmaTable, "reference_slots").block_slots,
+        @sizeOf(kernel.KernelObjectSlot),
+    });
+}
+
+test "IPC poll direct queue unlinks before slot reuse and preserves FIFO" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var state: KernelState = undefined;
+    try initFdState(&state);
+    var list = kernel.IpcWaitList{ .allocator = try state.poolAllocator() };
+    defer list.waiters.deinit();
+    const owner = kernel.processPrincipalFromIndex(0).?;
+    const key = kernel.IpcWaitKey{ .kind = .channel, .index = 1, .generation = 1, .side = 0 };
+    for (1..4) |tid| {
+        _ = try list.register(key, owner, 0x1000 + tid * 24, .{}, 20, 0, fd_abi.event_readable, 0, tid, 1, tid, .{ .index = @intCast(tid), .generation = 1 });
+    }
+    const old = list.poll_head.?.next.?;
+    const old_generation = old.registration.slot_generation;
+    list.removeWaiter(old);
+    const fresh = try list.register(key, owner, 0x4000, .{}, 20, 0, fd_abi.event_readable, 0, 4, 1, 4, .{ .index = 4, .generation = 1 });
+    try std.testing.expect(fresh.slot_generation != old_generation);
+    var targets: [1]kernel.ThreadWakeTarget = undefined;
+    for ([_]usize{ 1, 3, 4 }) |tid| {
+        try std.testing.expectEqual(@as(usize, 1), list.takeReadablePollWaiters(&targets));
+        try std.testing.expectEqual(tid, targets[0].thread_index);
+        list.unregister(tid, 1);
+    }
+    try std.testing.expect(list.poll_head == null and list.poll_tail == null);
+    try std.testing.expectEqual(@as(usize, 0), list.waiters.live);
+}
+
+// The VM failed in the channel Body grant, after PMM drained every CPU cache.
+// Exercise the real table with a finite page budget, not a fixed FD limit.
+test "channel FD4200 fits finite backing without four page bodies" {
+    const Table = @FieldType(KernelState, "ipc_channels");
+    const Allocator = @typeInfo(@FieldType(KernelState, "pool_allocator")).optional.child;
+    const Mapped = @typeInfo(@typeInfo(@typeInfo(@FieldType(Allocator, "acquire")).pointer.child).@"fn".return_type.?).optional.child;
+    const Extent = @typeInfo(@typeInfo(@FieldType(Allocator, "release")).pointer.child).@"fn".params[1].type.?;
+    const Backend = struct {
+        pages: usize = 0,
+        peak: usize = 0,
+        largest: usize = 0,
+        failed: usize = 0,
+        fn acquire(ctx: *anyopaque, pages: usize) ?Mapped {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (pages > 21204 -| self.pages) {
+                self.failed = pages;
+                return null;
+            }
+            const bytes = std.testing.allocator.alignedAlloc(u8, .fromByteUnits(4096), pages * 4096) catch return null;
+            self.pages += pages;
+            self.peak = @max(self.peak, self.pages);
+            self.largest = @max(self.largest, pages);
+            return .{ .allocation = .{ .physical = .fromInt(@intFromPtr(bytes.ptr)), .pages = pages, .region_id = 1 }, .bytes = bytes };
+        }
+        fn release(ctx: *anyopaque, grant: Extent) bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            const ptr: [*]align(4096) u8 = @ptrFromInt(grant.physical.toInt());
+            std.testing.allocator.free(ptr[0 .. grant.pages * 4096]);
+            self.pages -= grant.pages;
+            return true;
+        }
+    };
+    var backend = Backend{};
+    var table = Table{};
+    defer table.deinit();
+    const allocator: Allocator = .{ .context = &backend, .acquire = Backend.acquire, .release = Backend.release };
+    var opened: usize = 0;
+    while (opened < 4200) : (opened += 1) {
+        _ = table.allocate(allocator, null, std.math.maxInt(u32)) catch |err| {
+            std.debug.print("CHANNEL_PRESSURE opened={d} pages={d} failed_grant={d}\n", .{ opened, backend.pages, backend.failed });
+            return err;
+        };
+    }
+    try std.testing.expectEqual(@as(usize, 1), backend.largest);
+    std.debug.print("CHANNEL_PRESSURE opened={d} peak_pages={d} largest={d}\n", .{ opened, backend.peak, backend.largest });
 }

@@ -18,27 +18,29 @@ static char last_log[256];
  * trap if accidentally selected, rather than mask a changed dispatch. */
 #define UNUSED3(name) int64_t name(uint64_t a, uint64_t b, uint64_t c) \
     { (void)a; (void)b; (void)c; assert(0); return -1; }
+#define UNUSED3_WAIT(name) int64_t name(uint64_t a, uint64_t b, uint64_t c, unsigned *wait_not_ready) \
+    { (void)a; (void)b; (void)c; (void)wait_not_ready; assert(0); return -1; }
 #define UNUSED2(name) int64_t name(uint64_t a, uint64_t b) \
     { (void)a; (void)b; assert(0); return -1; }
-UNUSED3(lpr_linux_socket_read)
-UNUSED3(lpr_linux_socket_write)
-UNUSED3(lpr_linux_socket_readv)
-UNUSED3(lpr_linux_socket_writev)
+UNUSED3_WAIT(lpr_linux_socket_read)
+UNUSED3_WAIT(lpr_linux_socket_write)
+UNUSED3_WAIT(lpr_linux_socket_readv)
+UNUSED3_WAIT(lpr_linux_socket_writev)
 UNUSED3(lpr_linux_socket_ioctl)
 UNUSED2(lpr_linux_socket_fstat)
-UNUSED3(lpr_backend_write)
-UNUSED3(lpr_backend_writev)
-UNUSED3(lpr_backend_ioctl)
+UNUSED3_WAIT(lpr_backend_write)
+UNUSED3_WAIT(lpr_backend_writev)
+UNUSED3_WAIT(lpr_backend_ioctl)
 UNUSED2(lpr_backend_fstat)
-int64_t lpr_unix_socket_io(const lpr_fd_pin_t *p, uint64_t a, uint64_t b, int w, uint64_t f)
+int64_t lpr_unix_socket_io(const lpr_fd_pin_t *p, uint64_t a, uint64_t b, int w, uint64_t f, unsigned *wait_not_ready __attribute__((unused)))
 { (void)p; (void)a; (void)b; (void)w; (void)f; assert(0); return -1; }
-int64_t lpr_unix_socket_iov(const lpr_fd_pin_t *p, uint64_t a, uint64_t b, int w, uint64_t f, uint32_t *m)
+int64_t lpr_unix_socket_iov(const lpr_fd_pin_t *p, uint64_t a, uint64_t b, int w, uint64_t f, uint32_t *m, unsigned *wait_not_ready __attribute__((unused)))
 { (void)p; (void)a; (void)b; (void)w; (void)f; (void)m; assert(0); return -1; }
 int64_t lpr_unix_socket_ioctl(const lpr_fd_pin_t *p, uint64_t a, uint64_t b)
 { (void)p; (void)a; (void)b; assert(0); return -1; }
 int64_t lpr_unix_socket_stat(const lpr_fd_pin_t *p, uint64_t a)
 { (void)p; (void)a; assert(0); return -1; }
-int64_t lpr_backend_readv(const lpr_fd_pin_t *p, uint64_t a, uint64_t b)
+int64_t lpr_backend_readv(const lpr_fd_pin_t *p, uint64_t a, uint64_t b, unsigned *wait_not_ready __attribute__((unused)))
 { (void)p; (void)a; (void)b; assert(0); return -1; }
 int64_t lpr_filed_fstat_pinned(const lpr_fd_pin_t *p, uint64_t a)
 { (void)p; (void)a; assert(0); return -1; }
@@ -56,13 +58,13 @@ int lpr_fd_table_pin(lpr_fd_table_t *table, lpr_linux_fd_t fd, lpr_fd_pin_t *pin
 }
 int lpr_fd_table_unpin(lpr_fd_table_t *table, const lpr_fd_pin_t *pin, lpr_fd_drop_t *drop)
 { assert(table == &lpr_control_fd_table && pin->fd == 3); *drop = (lpr_fd_drop_t){0}; ++unpins; return 0; }
-int64_t lpr_backend_read(const lpr_fd_pin_t *pin, uint64_t buf, uint64_t count)
+int64_t lpr_backend_read(const lpr_fd_pin_t *pin, uint64_t buf, uint64_t count, unsigned *wait_not_ready __attribute__((unused)))
 {
     assert(pin->fd == 3 && pin->ops_id == kind && buf == 0x10000 && count == UINT64_MAX);
     ++dispatched;
     return read_result;
 }
-void lpr_epoll_note_fd_state(uint64_t fd, uint32_t events, int64_t result)
+void lpr_epoll_note_fd_state(uint64_t fd, uint32_t events, int64_t result, unsigned *wait_not_ready __attribute__((unused)))
 { assert(fd == 3 && events == LPR_EPOLL_IO_READ && result == read_result); ++notes; }
 int64_t lpr_pacha_syscall2(uint64_t nr, uint64_t data, uint64_t bytes)
 {
@@ -97,7 +99,7 @@ int main(void)
 #endif
             for (unsigned i = 0; i < 10; ++i) {
                 read_result = i & 1 ? -LPR_LINUX_EAGAIN : 37;
-                assert(lpr_linux_read(3, 0x10000, UINT64_MAX) == read_result);
+                assert(lpr_linux_read(3, 0x10000, UINT64_MAX, 0) == read_result);
             }
             assert(pins == 10 && unpins == 10 && dispatched == 10 && notes == 10);
 #if defined(LPR_BOOT_DIAGNOSTICS) && LPR_BOOT_DIAGNOSTICS
@@ -116,4 +118,14 @@ int main(void)
         }
     }
     puts("LPR_FD3_READ_DIAGNOSTIC_UNIT_PASS");
+}
+
+#include "lpr_ipc_mock.h"
+int64_t lpr_ipc_message(uint64_t nr, uint64_t fd, uint64_t send, uint64_t receive,
+    uint64_t timeout, uint64_t flags, int *committed) {
+    return test_lpr_ipc_noncall(nr, fd, send, receive, timeout, flags, committed);
+}
+
+int64_t lpr_pacha_syscall4(uint64_t nr,uint64_t a,uint64_t b,uint64_t c,uint64_t d) {
+    (void)nr;(void)a;(void)b;(void)c;(void)d;abort();
 }

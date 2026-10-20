@@ -1,8 +1,9 @@
+#include <pacha/abi.h>
 #pragma once
 #include "../lpr_fd/allocate.h"
 
 static inline int lpr_drm_install(uint64_t handle, uint64_t flags,
-    int native_wait_fd, uint32_t node_kind)
+    pacha_fd_t native_wait_fd, uint32_t node_kind)
 {
     lpr_drm_backend_t *backend = lpr_backend_state_alloc(sizeof(*backend));
     if (backend == 0) return -LPR_LINUX_ENOMEM;
@@ -27,7 +28,7 @@ static inline int lpr_drm_install(uint64_t handle, uint64_t flags,
 
 /* Publish the complete DMA-BUF backend atomically. The caller retains the
  * native FD and PRIME token on failure, and transfers both on success. */
-static inline int lpr_dmabuf_install(int native_fd, int lease_fd, uint64_t token,
+static inline int lpr_dmabuf_install(pacha_fd_t native_fd, pacha_fd_t lease_fd, uint64_t token,
     uint64_t size, uint64_t flags)
 {
     lpr_dmabuf_backend_t *backend = lpr_backend_state_alloc(sizeof(*backend));

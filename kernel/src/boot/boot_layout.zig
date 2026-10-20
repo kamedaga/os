@@ -12,6 +12,9 @@ pub const user_va: u64 = 0x20000000;
 pub const user_low_va: u64 = 0x00010000;
 pub const user_elf_base_va: u64 = user_va;
 pub const user_stack_top: u64 = process_abi.default_stack_top_va;
+// Bootstrap backing, not a process stack-size limit. These pages are mapped
+// like other user pages; later VMO/process mappings may supply a larger stack.
+// The boot loader supplies only argv0/auxv here, not arbitrary exec arguments.
 pub const initial_user_stack_pages: usize = 16;
 pub const initial_user_stack_bytes: usize = initial_user_stack_pages * 4096;
 pub const user_stack_base_va: u64 = user_stack_top - initial_user_stack_bytes;

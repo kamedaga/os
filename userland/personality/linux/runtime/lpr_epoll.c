@@ -154,8 +154,8 @@ int64_t lpr_linux_epoll_create1(uint64_t flags)
     instance->generation = 1;
     instance->capacity = LPR_EPOLL_MAX_INTERESTS;
 
-    int wait_fd = -1;
-    int notify_fd = -1;
+    pacha_fd_t wait_fd = -1;
+    pacha_fd_t notify_fd = -1;
     const int pair_status = lpr_native_wait_pair(&wait_fd, &notify_fd);
     if (pair_status != 0) {
         (void)lpr_pacha_syscall2(
@@ -174,8 +174,8 @@ int64_t lpr_linux_epoll_create1(uint64_t flags)
     const int fd = lpr_fd_alloc_state(LPR_FD_OPS_EPOLL, flags,
         LPR_EPOLL_INSTANCE_BYTES, &record, sizeof(record));
     if (fd < 0) {
-        (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)wait_fd);
-        (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)notify_fd);
+        (void)lpr_close_native_fd_if_open((uint64_t)wait_fd);
+        (void)lpr_close_native_fd_if_open((uint64_t)notify_fd);
         (void)lpr_pacha_syscall2(
             PACHAOS_SYSCALL_MUNMAP,
             (uint64_t)(uintptr_t)instance,
@@ -185,14 +185,11 @@ int64_t lpr_linux_epoll_create1(uint64_t flags)
     return fd;
 }
 
-static void lpr_epoll_notify_native(int notify_fd)
+static void lpr_epoll_notify_native(pacha_fd_t notify_fd)
 {
     if (notify_fd < 16) return;
     const struct pacha_ipc_msg message = {0};
-    (void)lpr_pacha_syscall2(
-        PACHAOS_SYSCALL_IPC_SEND,
-        (uint64_t)(uint32_t)notify_fd,
-        (uint64_t)(uintptr_t)&message);
+    (void)lpr_ipc_message(PACHAOS_SYSCALL_IPC_SEND, (uint64_t)notify_fd, (uint64_t)(uintptr_t)((uint64_t)(uintptr_t)&message), 0, 0, 0, 0);
 }
 
 static int lpr_epoll_interest_matches(
@@ -360,7 +357,7 @@ int64_t lpr_linux_epoll_ctl(uint64_t epfd_raw, uint64_t op, uint64_t fd_raw, uin
         interest->events = event.events;
         interest->data = event.data;
         instance->generation++;
-        const int notify_fd =
+        const pacha_fd_t notify_fd =
             ((lpr_epoll_backend_t *)lpr_backend_state_from_ofd(epoll_object))->notify_fd.raw;
         lpr_fd_table_unlock(&lpr_control_fd_table);
         lpr_epoll_notify_native(notify_fd);
@@ -381,7 +378,7 @@ int64_t lpr_linux_epoll_ctl(uint64_t epfd_raw, uint64_t op, uint64_t fd_raw, uin
         instance->interests[found].data = event.data;
         instance->generation++;
     }
-    const int notify_fd =
+    const pacha_fd_t notify_fd =
         ((lpr_epoll_backend_t *)lpr_backend_state_from_ofd(epoll_object))->notify_fd.raw;
     lpr_fd_table_unlock(&lpr_control_fd_table);
     lpr_epoll_notify_native(notify_fd);
@@ -559,7 +556,7 @@ static int64_t lpr_epoll_scan_fd(
     lpr_linux_epoll_event_t *events,
     uint32_t maxevents,
     int cached_sockets,
-    int consume);
+    int consume, unsigned *wait_not_ready __attribute__((unused)));
 
 static int64_t lpr_epoll_scan(
     uint32_t epfd,
@@ -568,7 +565,7 @@ static int64_t lpr_epoll_scan(
     lpr_linux_epoll_event_t *events,
     uint32_t maxevents,
     int cached_sockets,
-    int consume)
+    int consume, unsigned *wait_not_ready __attribute__((unused)))
 {
     lpr_linux_pollfd_t pollfds[LPR_EPOLL_MAX_INTERESTS];
     for (uint32_t i = 0; i < count; i++) {
@@ -579,8 +576,8 @@ static int64_t lpr_epoll_scan(
         pollfds[i].revents = 0;
     }
     const int64_t poll_status = cached_sockets ?
-        lpr_linux_poll_cached((uint64_t)(uintptr_t)pollfds, count) :
-        lpr_linux_poll_current((uint64_t)(uintptr_t)pollfds, count);
+        lpr_linux_poll_cached((uint64_t)(uintptr_t)pollfds, count, wait_not_ready) :
+        lpr_linux_poll_current((uint64_t)(uintptr_t)pollfds, count, wait_not_ready);
     if (poll_status < 0) {
         return poll_status;
     }
@@ -600,7 +597,7 @@ static int64_t lpr_epoll_scan(
                 &nested_event,
                 1,
                 cached_sockets,
-                0);
+                0, wait_not_ready);
             if (nested_ready < 0) {
                 return nested_ready;
             }
@@ -658,14 +655,14 @@ static int64_t lpr_epoll_scan_fd(
     lpr_linux_epoll_event_t *events,
     uint32_t maxevents,
     int cached_sockets,
-    int consume)
+    int consume, unsigned *wait_not_ready __attribute__((unused)))
 {
     lpr_epoll_snapshot_t snapshot[LPR_EPOLL_MAX_INTERESTS];
     uint32_t count = 0;
     const int64_t status = lpr_epoll_snapshot(epfd, snapshot, &count);
     if (status != 0) return status;
     return lpr_epoll_scan(
-        epfd, snapshot, count, events, maxevents, cached_sockets, consume);
+        epfd, snapshot, count, events, maxevents, cached_sockets, consume, wait_not_ready);
 }
 
 int64_t lpr_epoll_add_wait_graph(
@@ -742,7 +739,7 @@ int64_t lpr_linux_epoll_wait(
     uint64_t epfd_raw,
     uint64_t events_raw,
     uint64_t maxevents_raw,
-    uint64_t timeout_raw)
+    uint64_t timeout_raw, unsigned *wait_not_ready __attribute__((unused)))
 {
     if (epfd_raw > LPR_LINUX_FD_MAX) {
         return -LPR_LINUX_EBADF;
@@ -781,7 +778,7 @@ int64_t lpr_linux_epoll_wait(
             (lpr_linux_epoll_event_t *)(uintptr_t)events_raw,
             (uint32_t)maxevents_raw,
             cached_sockets,
-            1);
+            1, wait_not_ready);
 #if defined(LPR_GLYCIN_DIAG) && LPR_GLYCIN_DIAG
         if (__atomic_load_n(&lpr_glycin_diag_armed, __ATOMIC_ACQUIRE) != 0u &&
             __atomic_load_n(
@@ -813,13 +810,13 @@ int64_t lpr_linux_epoll_wait(
         lpr_wait_graph_init(&graph);
         status = lpr_epoll_add_wait_graph(epfd_raw, &graph);
         if (status != 0) return status;
-        status = lpr_wait_graph_block(&graph, &deadline);
+        status = lpr_wait_graph_block(&graph, &deadline, wait_not_ready);
         if (status != 0) return status;
         cached_sockets = 1;
     }
 }
 
-int64_t lpr_epoll_poll_events(uint64_t fd, uint32_t events)
+int64_t lpr_epoll_poll_events(uint64_t fd, uint32_t events, unsigned *wait_not_ready __attribute__((unused)))
 {
     if (!lpr_linux_epoll_fd_active(fd))
         return -LPR_LINUX_EBADF;
@@ -829,14 +826,14 @@ int64_t lpr_epoll_poll_events(uint64_t fd, uint32_t events)
         &event,
         1,
         1,
-        0);
+        0, wait_not_ready);
     if (ready < 0)
         return ready;
     return ready != 0 && (events & LPR_EPOLLIN) != 0 ? LPR_EPOLLIN : 0;
 }
 
 void lpr_epoll_note_fd_state(
-    uint64_t fd_raw, uint32_t io_events, int64_t result)
+    uint64_t fd_raw, uint32_t io_events, int64_t result, unsigned *wait_not_ready __attribute__((unused)))
 {
     if (fd_raw > LPR_LINUX_FD_MAX) return;
     const uint32_t fd = (uint32_t)fd_raw;
@@ -889,13 +886,13 @@ void lpr_epoll_note_fd_state(
         .revents = 0,
     };
     if (lpr_linux_poll_current(
-            (uint64_t)(uintptr_t)&pollfd, 1) < 0)
+            (uint64_t)(uintptr_t)&pollfd, 1, wait_not_ready) < 0)
     {
         return;
     }
     const uint32_t current =
         (uint16_t)pollfd.revents & LPR_EPOLL_READY_BITS;
-    int notify_fds[LPR_WAIT_GRAPH_MAX_LEAVES];
+    pacha_fd_t notify_fds[LPR_WAIT_GRAPH_MAX_LEAVES];
     uint32_t notify_count = 0;
 
     lpr_fd_table_lock(&lpr_control_fd_table);
@@ -955,7 +952,7 @@ int64_t lpr_linux_epoll_pwait(
     uint64_t maxevents,
     uint64_t timeout,
     uint64_t sigmask,
-    uint64_t sigsetsize)
+    uint64_t sigsetsize, unsigned *wait_not_ready __attribute__((unused)))
 {
     uint64_t old_mask = 0;
     if (sigmask != 0) {
@@ -977,15 +974,15 @@ int64_t lpr_linux_epoll_pwait(
             return mask_status;
         }
     }
-    const int64_t result = lpr_linux_epoll_wait(epfd, events, maxevents, timeout);
+    const int64_t result = lpr_linux_epoll_wait(epfd, events, maxevents, timeout, wait_not_ready);
     if (sigmask != 0) {
         /* Keep the temporary mask active until a native signal published
          * concurrently with an fd event has had a chance to claim the Linux
          * return frame.  Signal delivery abandons this dispatch stack; the
          * signal frame restores old_mask on rt_sigreturn. */
-        lpr_linux_deliver_native_pending_frame(
+        lpr_linux_deliver_native_pending_frame_after_wait(
             result == LPR_WAIT_RESTART_SYSCALL ?
-                -LPR_LINUX_EINTR : result);
+                -LPR_LINUX_EINTR : result, wait_not_ready);
         (void)lpr_linux_rt_sigprocmask(
             LPR_LINUX_SIG_SETMASK,
             (uint64_t)(uintptr_t)&old_mask,
@@ -1002,7 +999,7 @@ void lpr_epoll_before_close(uint64_t fd_raw)
         return;
     }
     const uint32_t fd = (uint32_t)fd_raw;
-    int notify_fds[LPR_WAIT_GRAPH_MAX_LEAVES];
+    pacha_fd_t notify_fds[LPR_WAIT_GRAPH_MAX_LEAVES];
     uint32_t notify_count = 0;
     lpr_fd_table_lock(&lpr_control_fd_table);
     if (fd >= lpr_control_fd_table.entry_count || !lpr_control_fd_table.entries[fd].active) {

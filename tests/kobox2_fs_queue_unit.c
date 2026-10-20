@@ -25,6 +25,8 @@ static unsigned private_wakes;
 static uint64_t blocked_sequence;
 static unsigned mock_limit = 100, mock_outstanding;
 static int client_receive_error[2];
+static int client_readable[2]; /* WAIT_MANY reports this doorbell readable. */
+static int client_latched[2]; /* The kernel notify latch of this doorbell. */
 static kobox_linux_fs_publish_fn mock_publish;
 static int defer_collect;
 static _Thread_local uint64_t notification_mask;
@@ -127,14 +129,19 @@ long pacha_syscall4(uint64_t op, uint64_t a, uint64_t b, uint64_t c, uint64_t d)
     struct pacha_pollfd *events = (void *)(uintptr_t)a;
     assert(events[0].fd == 40);
     assert(b >= 2 && events[1].fd == 31);
-    for (size_t i = 2; i < b; ++i) assert(many_clients ? events[i].fd == 100 :
-        events[i].fd == 100 || events[i].fd == 101);
+    long ready = 0;
+    for (size_t i = 2; i < b; ++i) {
+        assert(many_clients ? events[i].fd == 100 : events[i].fd == 100 || events[i].fd == 101);
+        events[i].revents = !many_clients && client_readable[events[i].fd - 100] ?
+            PACHA_FD_EVENT_READABLE : 0;
+        ready += events[i].revents != 0;
+    }
     assert(c == 0 || c == 1);
     ++wait_calls;
-    return PACHA_SYSCALL_ERR_NOT_READY;
+    return ready ? ready : PACHA_SYSCALL_ERR_NOT_READY;
 }
 
-int ph_ipc_init(struct ph_ipc *ipc, int fd, uint64_t generation) {
+int ph_ipc_init(struct ph_ipc *ipc, pacha_fd_t fd, uint64_t generation) {
     assert(!ipc->generation && (fd == 100 || fd == 101 || fd == 30 || fd == 31) && generation == 7);
     *ipc = (struct ph_ipc){.generation = generation, .fd = fd, .admitted = 1};
     return 0;
@@ -148,6 +155,13 @@ int ph_ipc_receive(struct ph_ipc *ipc, uint64_t generation, struct ph_ipc_packet
     if (!queued->operation) return -EAGAIN;
     *packet = *queued;
     memset(queued, 0, sizeof(*queued));
+    return 0;
+}
+int ph_ipc_notify_consume(pacha_fd_t fd) {
+    assert(fd == 100 || fd == 101);
+    if (client_receive_error[fd - 100]) return client_receive_error[fd - 100];
+    if (!client_latched[fd - 100]) return -EAGAIN;
+    client_latched[fd - 100] = 0;
     return 0;
 }
 int ph_ipc_packet_release(struct ph_ipc_packet *packet) {
@@ -178,12 +192,8 @@ int ph_ipc_send(struct ph_ipc *ipc, struct ph_ipc_packet *packet) {
         else ++client_released;
         return 0;
     }
-    if (ipc && ipc->fd >= 100 && ipc->fd <= 101) {
-        assert(packet->operation == PH_FS_QUEUE_NOTIFY && packet->generation == 7 &&
-            packet->correlation == (uint64_t)(ipc->fd - 100 + 20) && packet->value == 2);
-        ++client_sends;
-        return 0;
-    }
+    /* Client doorbells are latches; a packet send on one is a regression. */
+    assert(!ipc || ipc->fd < 100 || ipc->fd > 101);
     if (packet->operation == PH_FS_EXCHANGE_RELEASED) {
         assert(packet->generation == 7 && packet->correlation >= 3 &&
             !packet->value && !packet->fd_count);
@@ -198,11 +208,9 @@ int ph_ipc_send(struct ph_ipc *ipc, struct ph_ipc_packet *packet) {
 }
 
 int ph_ipc_notify(const struct ph_ipc_notice *notice) {
-    struct ph_ipc ipc = {.fd = notice->fd};
-    struct ph_ipc_packet packet = {.operation = notice->operation,
-        .generation = notice->generation, .correlation = notice->correlation,
-        .value = notice->value};
-    int result = ph_ipc_send(&ipc, &packet);
+    assert(!lock_depth && notice->fd >= 100 && notice->fd <= 101);
+    ++client_sends;
+    int result = 0;
     if (pause_notice) {
         assert(!pthread_mutex_lock(&notice_mutex));
         notice_entered = 1;
@@ -633,8 +641,12 @@ static void direct_clients(struct ph_lifecycle_service *service, struct driver *
     kb2_fs_request_t r = {.opcode = KB2_FILESYSTEM_OP_PREAD, .generation = 7,
         .sequence = 210, .client = 9, .capabilities = UINT64_MAX, .length = 16};
     assert(!kb2_fs_request_encode(request, sizeof(request), sizeof(request), &r));
+    /* Idle passes skip re-arming an unchanged ring; the arm already in force
+     * must still make the client's next publish request a doorbell. */
+    for (unsigned i = 0; i < 3; ++i) assert(!quantum(service));
     int notify;
     assert(!ph_fs_channel_submit(&drivers[0], &pending[0], request, sizeof(request), 80, &notify));
+    assert(notify);
     pump(service); assert(routed_client == 7);
     struct ph_fs_pending *done = NULL;
     assert(!ph_fs_channel_poll(&drivers[0], &done));
@@ -704,7 +716,13 @@ static void direct_clients(struct ph_lifecycle_service *service, struct driver *
     assert(!kb2_fs_request_encode(request, sizeof(request), sizeof(request), &r));
     assert(!ph_fs_channel_submit(&drivers[0], &pending[0], request, sizeof(request), 80, &notify));
     unsigned before_death = data_calls;
+    /* The native helper consumes doorbells; its failed receive marks the
+     * client, and the owner faults it on its next pass. */
     client_receive_error[0] = -EPIPE;
+    client_readable[0] = 1;
+    assert(!service->wait(service->context, 40, 0));
+    client_readable[0] = 0;
+    assert(queue->clients->doorbell_fault);
     pump(service);
     assert(queue->clients->lane.retiring && queue->clients->lane.mapping &&
         queue->clients->lane.inflight == 1 && !queue->clients->release_requested);
@@ -745,8 +763,19 @@ static void direct_clients(struct ph_lifecycle_service *service, struct driver *
     assert(!kb2_fs_request_encode(request, sizeof(request), sizeof(request), &r));
     assert(!ph_fs_channel_submit(&drivers[1], &pending[1], request, sizeof(request), 80, &notify));
     calls = data_calls;
+    /* A latched doorbell is consumed and leaves the client healthy. */
+    client_latched[1] = 1;
+    client_readable[1] = 1;
+    assert(!service->wait(service->context, 40, 0));
+    client_readable[1] = 0;
+    assert(!client_latched[1] && !queue->clients->doorbell_fault);
+    /* Readable without a latch is a queued packet the client forged. */
     client_packets[1] = (struct ph_ipc_packet){.operation = PH_FS_CLIENT_PREPARE,
         .generation = 7, .correlation = 22, .value = 1};
+    client_readable[1] = 1;
+    assert(!service->wait(service->context, 40, 0));
+    client_readable[1] = 0;
+    assert(!client_packets[1].operation && queue->clients->doorbell_fault);
     pump(service);
     assert(!queue->closing && queue->workers && data_calls == calls);
     detach.correlation = 21;

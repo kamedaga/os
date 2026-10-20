@@ -506,7 +506,7 @@ void ph_main(void) {
 #if PH_SANDBOX_AMDGPU
     PH_CHECK(config->log_endpoint_fd == 0 ||
              config->log_endpoint_fd == PH_SANDBOX_LOG_FD);
-    ph_boot_set_log_fd((int)config->log_endpoint_fd);
+    ph_boot_set_log_fd((pacha_fd_t)config->log_endpoint_fd);
     PH_CHECK(config->firmware_address == PH_SANDBOX_FIRMWARE_ADDRESS &&
              config->firmware_size >= sizeof(struct ph_firmware_bundle) &&
              config->firmware_size <=

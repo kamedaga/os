@@ -22,7 +22,7 @@ static int native_status(long result) {
 }
 
 static int valid_fd(uint64_t fd) {
-    return fd >= 16 && fd < PACHA_FD_TABLE_LIMIT;
+    return fd >= 16 && fd < PACHA_THREAD_SELF_FD;
 }
 
 static int check_generation(const struct ph_ipc *ipc, uint64_t generation) {
@@ -36,7 +36,7 @@ static int check_admission(const struct ph_ipc *ipc, uint64_t generation) {
     return ipc->admitted ? 0 : -ESHUTDOWN;
 }
 
-int ph_ipc_init(struct ph_ipc *ipc, int fd, uint64_t generation) {
+int ph_ipc_init(struct ph_ipc *ipc, pacha_fd_t fd, uint64_t generation) {
     struct pacha_fd_info info = {0};
 
     if (!ipc || !valid_fd((uint64_t)fd) || !generation) return -EINVAL;
@@ -86,8 +86,7 @@ int ph_ipc_send(struct ph_ipc *ipc, struct ph_ipc_packet *packet) {
         .word2 = packet->correlation, .word3 = packet->value,
         .fds = packet->fds, .fd_count = packet->fd_count,
     };
-    result = native_status(pacha_syscall2(PACHA_IPC_SYSCALL_SEND,
-        (uint64_t)ipc->fd, (uintptr_t)&message));
+    result = native_status(pacha_ipc_message_syscall(PACHA_IPC_SYSCALL_SEND, (uint64_t)ipc->fd, (struct pacha_ipc_msg *)(uintptr_t)((uintptr_t)&message), 0, 0, 0, 0));
     if (result) return result;
     for (size_t i = 0; i < packet->fd_count; ++i) {
         if (packet->fds[i].transfer_flags & PACHA_IPC_TRANSFER_MOVE)
@@ -97,13 +96,13 @@ int ph_ipc_send(struct ph_ipc *ipc, struct ph_ipc_packet *packet) {
 }
 
 int ph_ipc_notify(const struct ph_ipc_notice *notice) {
-    if (!notice || !valid_fd((uint64_t)notice->fd) ||
-        !notice->operation || !notice->generation) return -EINVAL;
-    struct pacha_ipc_msg message = {.word0 = notice->operation,
-        .word1 = notice->generation, .word2 = notice->correlation,
-        .word3 = notice->value};
-    return native_status(pacha_syscall2(PACHA_IPC_SYSCALL_SEND,
-        (uint64_t)notice->fd, (uintptr_t)&message));
+    if (!notice || !valid_fd((uint64_t)notice->fd)) return -EINVAL;
+    return native_status(pacha_syscall1(PACHA_IPC_SYSCALL_NOTIFY, (uint64_t)notice->fd));
+}
+
+int ph_ipc_notify_consume(pacha_fd_t fd) {
+    if (!valid_fd((uint64_t)fd)) return -EINVAL;
+    return native_status(pacha_syscall3(PACHA_IPC_SYSCALL_NOTIFY_WAIT, (uint64_t)fd, 0, 0));
 }
 
 int ph_ipc_packet_release(struct ph_ipc_packet *packet) {
@@ -140,10 +139,8 @@ int ph_ipc_receive_wait(struct ph_ipc *ipc, uint64_t generation,
         .fds = packet->fds, .fd_capacity = PACHA_IPC_MAX_TRANSFER_FDS,
     };
     result = native_status(timeout_ticks ?
-        pacha_syscall4(PACHA_IPC_SYSCALL_RECV_WAIT,
-            (uint64_t)ipc->fd, (uintptr_t)&message, timeout_ticks, 0) :
-        pacha_syscall2(PACHA_IPC_SYSCALL_RECV,
-            (uint64_t)ipc->fd, (uintptr_t)&message));
+        pacha_ipc_message_syscall(PACHA_IPC_SYSCALL_RECV_WAIT, (uint64_t)ipc->fd, 0, (struct pacha_ipc_msg *)(uintptr_t)((uintptr_t)&message), timeout_ticks, 0, 0) :
+        pacha_ipc_message_syscall(PACHA_IPC_SYSCALL_RECV, (uint64_t)ipc->fd, 0, (struct pacha_ipc_msg *)(uintptr_t)((uintptr_t)&message), 0, 0, 0));
     if (result) {
         /* On failure native IPC rolls back installed FDs. Do not close any
          * numbers left by a partial copyout: they may have been recycled. */

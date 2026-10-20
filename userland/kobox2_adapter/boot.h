@@ -2,13 +2,14 @@
 #ifndef PACHA_KOBOX_BOOT_H
 #define PACHA_KOBOX_BOOT_H
 
+#include <pacha/abi.h>
 #include <stddef.h>
 
 struct kobox_linux_boot_layout;
 struct kobox_linux_task_report;
 
 /* Optional SEND-only owner grant for selected Linux diagnostic lines. */
-void ph_boot_set_log_fd(int fd);
+void ph_boot_set_log_fd(pacha_fd_t fd);
 /* Runtime faults cannot rely on the startup-only management receiver. */
 void ph_boot_log_fault(unsigned long vector, unsigned long error,
     unsigned long core_relative, unsigned long ip, unsigned long address);

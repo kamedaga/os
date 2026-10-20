@@ -59,8 +59,8 @@ __attribute__((used, noreturn)) static void bases_worker(unsigned i) {
     for (unsigned round = 0; round < 512; ++round) {
         unsigned waits = 0;
         while (__atomic_load_n(&turn, __ATOMIC_ACQUIRE) != i) {
-            const uint64_t rc = pacha_syscall3(PACHA_RUNTIME_SYSCALL_FUTEX_WAIT,
-                (uintptr_t)&turn, 1 - i, 20);
+            const uint64_t rc = pacha_syscall4(PACHA_RUNTIME_SYSCALL_FUTEX_WAIT,
+                (uintptr_t)&turn, 1 - i, 20, 0);
             if ((rc != 0 && rc != PACHA_SYSCALL_ERR_NOT_READY &&
                  rc != PACHA_FUTEX_WAIT_TIMED_OUT_STATUS) || ++waits > 1000) goto failed;
         }

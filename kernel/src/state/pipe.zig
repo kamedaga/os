@@ -7,12 +7,10 @@ const capsule = types.capsule;
 const initial_process_count = types.initial_process_count;
 const initial_process_capacity = types.initial_process_capacity;
 const process_count = types.process_count;
-const max_process_slots = types.max_process_slots;
+const process_principal_value_count = types.process_principal_value_count;
 const initial_thread_capacity = types.initial_thread_capacity;
-const max_thread_slots = types.max_thread_slots;
-const device_count = types.device_count;
+const thread_id_value_count = types.thread_id_value_count;
 const device_principal_raw = types.device_principal_raw;
-const principal_count = types.principal_count;
 const PrincipalRaw = types.PrincipalRaw;
 const PrincipalId = types.PrincipalId;
 const CapsuleKind = types.CapsuleKind;
@@ -22,8 +20,6 @@ const CapsuleSnapshot = types.CapsuleSnapshot;
 const CapsuleDmaDirection = types.CapsuleDmaDirection;
 const CapsuleIrqKind = types.CapsuleIrqKind;
 const MapProt = types.MapProt;
-const EndpointRoute = types.EndpointRoute;
-const Region = types.Region;
 const ProcessDescriptor = types.ProcessDescriptor;
 const ProcessStatus = types.ProcessStatus;
 const DebugProcessLifecycleReason = types.DebugProcessLifecycleReason;
@@ -32,8 +28,6 @@ const DmaDeviceId = types.DmaDeviceId;
 const invalid_dma_device_id = types.invalid_dma_device_id;
 const Fd = types.Fd;
 const fd_table_entries = types.fd_table_entries;
-const max_fd_objects = types.max_fd_objects;
-const max_pipes = types.max_pipes;
 const pipe_buffer_bytes = types.pipe_buffer_bytes;
 const fd_known_flags_mask = types.fd_known_flags_mask;
 const fd_known_rights_mask = types.fd_known_rights_mask;
@@ -63,12 +57,8 @@ const FdEntry = types.FdEntry;
 const FdInfo = types.FdInfo;
 const FdTable = types.FdTable;
 const FdTransferMode = types.FdTransferMode;
-const max_ipc_endpoints = types.max_ipc_endpoints;
-const max_ipc_channels = types.max_ipc_channels;
-const max_ipc_replies = types.max_ipc_replies;
 const max_ipc_queue_messages = types.max_ipc_queue_messages;
 const max_ipc_message_fds = types.max_ipc_message_fds;
-const max_ipc_waiters = types.max_ipc_waiters;
 const IpcEndpointRef = types.IpcEndpointRef;
 const IpcChannelRef = types.IpcChannelRef;
 const IpcChannelHandle = types.IpcChannelHandle;
@@ -79,8 +69,6 @@ const ThreadWakeTarget = types.ThreadWakeTarget;
 const FdWaitRegistrationRef = types.FdWaitRegistrationRef;
 const FdWaitGroupRef = types.FdWaitGroupRef;
 const TaskFdWaiter = types.TaskFdWaiter;
-const max_task_fd_waiters = types.max_task_fd_waiters;
-const max_ipc_object_waiters = types.max_ipc_object_waiters;
 const PipeSlot = types.PipeSlot;
 const IpcWaitList = types.IpcWaitList;
 const IpcTransferredFd = types.IpcTransferredFd;
@@ -94,8 +82,6 @@ const IpcSendMessage = types.IpcSendMessage;
 const IpcRecvFd = types.IpcRecvFd;
 const IpcRecvResult = types.IpcRecvResult;
 const native_page_size = types.native_page_size;
-const max_native_vmos = types.max_native_vmos;
-const max_vmas_per_process = types.max_vmas_per_process;
 const NativeVmoKind = types.NativeVmoKind;
 const NativeVmoRef = types.NativeVmoRef;
 const NativeCowTableRef = types.NativeCowTableRef;
@@ -106,18 +92,10 @@ const MmapFlags = types.MmapFlags;
 const VmaEntry = types.VmaEntry;
 const VmaTable = types.VmaTable;
 const NativeVmaFaultMapping = types.NativeVmaFaultMapping;
-const EndpointTable = types.EndpointTable;
-const PublishedEndpointTable = types.PublishedEndpointTable;
-const max_vmo_backing_pages = types.max_vmo_backing_pages;
-const max_vmo_backing_store_pages = types.max_vmo_backing_store_pages;
 const RegionFreeRange = types.RegionFreeRange;
 const FreePageList = types.FreePageList;
 const PageCapability = types.PageCapability;
-const empty_vmo_backing_page_store = types.empty_vmo_backing_page_store;
-const vmo_backing_page_store = types.vmo_backing_page_store;
 const empty_process_descriptors_extra = types.empty_process_descriptors_extra;
-const empty_endpoint_tables_extra = types.empty_endpoint_tables_extra;
-const empty_fd_tables_extra = types.empty_fd_tables_extra;
 const empty_vma_tables_extra = types.empty_vma_tables_extra;
 const processPrincipalFromIndex = types.processPrincipalFromIndex;
 const processIndexFromPrincipal = types.processIndexFromPrincipal;
@@ -138,44 +116,26 @@ const initRuntimeStorage = types.initRuntimeStorage;
 
 pub fn pipeSlot(self: anytype, pipe_ref: PipeRef) ?*PipeSlot {
     if (pipe_ref.isNull()) return null;
-    const index: usize = @intCast(pipe_ref.index);
-    if (index >= max_pipes) return null;
-    const slot = &self.pipes[index];
-    if (!slot.active or slot.generation != pipe_ref.generation) return null;
-    return slot;
+    return self.pipes.resolve(.{ .index = pipe_ref.index, .generation = pipe_ref.generation });
 }
 
 pub fn pipeSlotConst(self: anytype, pipe_ref: PipeRef) ?*const PipeSlot {
     if (pipe_ref.isNull()) return null;
-    const index: usize = @intCast(pipe_ref.index);
-    if (index >= max_pipes) return null;
-    const slot = &self.pipes[index];
-    if (!slot.active or slot.generation != pipe_ref.generation) return null;
-    return slot;
+    return self.pipes.resolve(.{ .index = pipe_ref.index, .generation = pipe_ref.generation });
 }
 
 pub fn createPipe(self: anytype) KernelError!PipeRef {
-    var offset: usize = 0;
-    while (offset < max_pipes) : (offset += 1) {
-        const index = (self.next_pipe_scan + offset) % max_pipes;
-        const slot = &self.pipes[index];
-        if (slot.active) continue;
-        if (slot.generation == 0) slot.generation = 1;
-        const generation = slot.generation;
-        slot.* = .{
-            .active = true,
-            .generation = generation,
-            .read_refs = 1,
-            .write_refs = 1,
-        };
-        self.next_pipe_scan = (index + 1) % max_pipes;
-        return .{ .index = @intCast(index), .generation = generation };
-    }
-    return KernelError.TableFull;
+    const allocation = try self.allocatePool(&self.pipes, null, std.math.maxInt(u32));
+    const slot = allocation.value;
+    slot.active = true;
+    slot.read_refs = 1;
+    slot.write_refs = 1;
+    return .{ .index = allocation.ref.index, .generation = allocation.ref.generation };
 }
 
-pub fn clearPipeSlot(slot: *PipeSlot) void {
-    slot.* = .{ .generation = nextObjectGeneration(slot.generation) };
+pub fn clearPipeSlot(self: anytype, slot: *PipeSlot) void {
+    for (&slot.waiters) |*list| list.waiters.deinitInto(&self.pipes.body_owner);
+    self.pipes.remove(slot, null);
 }
 
 pub fn releasePipeEndpoint(self: anytype, endpoint: PipeEndpointObject) void {
@@ -185,7 +145,7 @@ pub fn releasePipeEndpoint(self: anytype, endpoint: PipeEndpointObject) void {
     } else {
         if (slot.read_refs != 0) slot.read_refs -= 1;
     }
-    if (slot.read_refs == 0 and slot.write_refs == 0) @TypeOf(self.*).clearPipeSlot(slot);
+    if (slot.read_refs == 0 and slot.write_refs == 0) self.clearPipeSlot(slot);
 }
 
 pub fn pipeEndpointFromPayload(payload: *const KernelObjectPayload) ?PipeEndpointObject {
@@ -312,7 +272,7 @@ pub fn createPipePairFds(
     try self.requireActiveProcess(owner);
     const pipe_ref = try self.createPipe();
     const read_object = self.createKernelObject(.pipe, .{ .pipe = .{ .pipe = pipe_ref, .write = false } }) catch |err| {
-        if (self.pipeSlot(pipe_ref)) |slot| @TypeOf(self.*).clearPipeSlot(slot);
+        if (self.pipeSlot(pipe_ref)) |slot| self.clearPipeSlot(slot);
         return err;
     };
     errdefer if (self.kernelObjectSlot(read_object)) |slot| self.clearKernelObjectSlot(slot);
@@ -364,11 +324,12 @@ pub fn registerPipeWaiterForFd(
         .side = if (endpoint.write) 1 else 0,
     };
     const waiters = self.pipeWaitListForEndpoint(endpoint) orelse return KernelError.InvalidState;
-    const registration = try waiters.register(
+    waiters.allocator = try self.waitPoolAllocator();
+    const registration = waiters.register(
         key,
         owner,
         pollfd_va,
-        0,
+        .{},
         0,
         0,
         requested_events,
@@ -377,12 +338,14 @@ pub fn registerPipeWaiterForFd(
         thread_generation,
         wait_token,
         group,
-    );
+    ) catch |err| {
+        return err;
+    };
     self.linkFdWaitRegistration(group, registration) catch |err| {
-        if (registration.slot < waiters.waiters.len) {
-            const waiter = &waiters.waiters[registration.slot];
+        if (registration.slot < waiters.waiters.capacity) {
+            const waiter = waiters.waiters.resolve(.{ .index = registration.slot, .generation = registration.slot_generation }).?;
             if (waiter.active and waiter.registration.matches(registration) and
-                waiter.binding.group.matches(group)) waiter.* = .{};
+                waiter.binding.group.matches(group)) waiter.list.?.removeWaiter(waiter);
         }
         return err;
     };

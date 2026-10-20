@@ -99,7 +99,7 @@ int lpr_unix_socket_handoff(struct lpr_unix_socket *socket, struct lpr_unix_sock
     *record = (struct lpr_unix_socket){ .socket = socket->socket, .type = socket->type,
         .flags = socket->flags, .listening = socket->listening,
         .send_timeout_ns = socket->send_timeout_ns, .receive_timeout_ns = socket->receive_timeout_ns,
-        .handoff_fd = (int32_t)cap.fd,
+        .handoff_fd = (pacha_fd_t)cap.fd,
         .mapping = { .fds = {-1, -1} } };
     return 0;
 }

@@ -158,7 +158,7 @@ static int yield_to_waiter(void)
     return 0;
 }
 
-static long arm(int fd, uint64_t deadline, uint64_t interval)
+static long arm(long fd, uint64_t deadline, uint64_t interval)
 {
     uint64_t spec[4] = { interval / 1000000000ull, interval % 1000000000ull,
         deadline / 1000000000ull, deadline % 1000000000ull };

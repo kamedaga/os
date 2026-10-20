@@ -1,3 +1,4 @@
+const lock_diagnostics = @import("sync/lock_diagnostics.zig");
 const std = @import("std");
 const rtc = @import("rtc.zig");
 const hpet = @import("hpet.zig");
@@ -75,7 +76,15 @@ const PvSlot = struct {
     registered: bool = false,
     stable: bool = false,
 };
-var pv_slots: [@import("smp.zig").max_cpus]PvSlot = @splat(.{});
+// RTC/pvclock starts before MADT allocation. Only the BSP exists then;
+// transfer its registration into the runtime rows before starting any AP.
+var bsp_pv_slot: [1]PvSlot = @splat(.{});
+var pv_slots: []PvSlot = &bsp_pv_slot;
+pub fn initCpuStorage(count: usize) !void {
+    const rows = try @import("arch/x86_64/cpu_runtime.zig").alloc(PvSlot, count);
+    rows[0] = pv_slots[0];
+    pv_slots = rows;
+}
 var pv_enabled: bool = false;
 var highres_realtime_offset_ns: u64 = 0;
 
@@ -144,6 +153,7 @@ const PvMonotonic = struct {
     page: *ClockPageHeader = &clock_page.header,
     fallback: HpetFallback = .{},
     publication_lock: u8 = 0,
+    diagnostic_record: lock_diagnostics.Record = .{},
 
     fn last(self: *const PvMonotonic) u64 {
         return @atomicLoad(u64, &self.page.floor_ns, .monotonic);
@@ -154,6 +164,8 @@ const PvMonotonic = struct {
     }
 
     fn tryPublishPv(self: *PvMonotonic, ns: u64) u64 {
+        const diagnostic_if = lock_diagnostics.maskInterrupts();
+        defer lock_diagnostics.restoreInterrupts(diagnostic_if);
         if (@cmpxchgStrong(u8, &self.publication_lock, 0, 1, .acquire, .monotonic) != null) {
             // Returning only the old floor could undercut a fast read already
             // returned from this same PV clock. The ceiling clamp keeps the
@@ -161,7 +173,11 @@ const PvMonotonic = struct {
             // floor update needs no lock because fallback starts above it.
             return publishMonotonic(&self.page.floor_ns, @min(ns, self.ceiling()));
         }
-        defer @atomicStore(u8, &self.publication_lock, 0, .release);
+        lock_diagnostics.acquiredTry(&self.diagnostic_record, .{ .class = .clock_publication });
+        defer {
+            lock_diagnostics.releasing(&self.diagnostic_record);
+            @atomicStore(u8, &self.publication_lock, 0, .release);
+        }
         if (self.fallback.state() != 0) return self.last();
         const published = publishMonotonic(&self.page.floor_ns, ns);
         self.raiseCeilingLocked(published);
@@ -176,9 +192,19 @@ const PvMonotonic = struct {
 
     /// Publish the epoch and open fast reads, unless a fallback already began.
     fn enable(self: *PvMonotonic, pv_origin: u64, ns_origin: u64) void {
-        while (@cmpxchgWeak(u8, &self.publication_lock, 0, 1, .acquire, .monotonic) != null)
+        var diagnostic_if = lock_diagnostics.maskInterrupts();
+        defer lock_diagnostics.restoreInterrupts(diagnostic_if);
+        lock_diagnostics.beforeAcquire(&self.diagnostic_record, .{ .class = .clock_publication });
+        while (@cmpxchgWeak(u8, &self.publication_lock, 0, 1, .acquire, .monotonic) != null) {
+            lock_diagnostics.restoreInterrupts(diagnostic_if);
             std.atomic.spinLoopHint();
-        defer @atomicStore(u8, &self.publication_lock, 0, .release);
+            diagnostic_if = lock_diagnostics.maskInterrupts();
+        }
+        lock_diagnostics.acquired(&self.diagnostic_record, .{ .class = .clock_publication });
+        defer {
+            lock_diagnostics.releasing(&self.diagnostic_record);
+            @atomicStore(u8, &self.publication_lock, 0, .release);
+        }
         if (self.fallback.state() != 0) return;
         self.page.pv_origin = pv_origin;
         self.page.ns_origin = ns_origin;
@@ -189,9 +215,15 @@ const PvMonotonic = struct {
     }
 
     fn beginFallback(self: *PvMonotonic) bool {
+        const diagnostic_if = lock_diagnostics.maskInterrupts();
+        defer lock_diagnostics.restoreInterrupts(diagnostic_if);
         if (@cmpxchgStrong(u8, &self.publication_lock, 0, 1, .acquire, .monotonic) != null)
             return false;
-        defer @atomicStore(u8, &self.publication_lock, 0, .release);
+        lock_diagnostics.acquiredTry(&self.diagnostic_record, .{ .class = .clock_publication });
+        defer {
+            lock_diagnostics.releasing(&self.diagnostic_record);
+            @atomicStore(u8, &self.publication_lock, 0, .release);
+        }
         if (self.fallback.state() != 0) return false;
         // The sequentially consistent store is a full barrier on x86: a reader
         // that still sees fast == 1 afterwards loaded its ceiling before this
@@ -209,6 +241,7 @@ pub fn kernelStaticStorageEndAddr() usize {
     end = @max(end, @intFromPtr(&clock) + @sizeOf(Clock));
     end = @max(end, @intFromPtr(&bootstrap_counter) + @sizeOf(BootstrapCounter));
     end = @max(end, @intFromPtr(&pv_slots) + @sizeOf(@TypeOf(pv_slots)));
+    end = @max(end, @intFromPtr(&bsp_pv_slot) + @sizeOf(@TypeOf(bsp_pv_slot)));
     end = @max(end, @intFromPtr(&pv_monotonic) + @sizeOf(PvMonotonic));
     end = @max(end, @intFromPtr(&clock_page) + @sizeOf(ClockPage));
     end = @max(end, @intFromPtr(&pv_enabled) + @sizeOf(bool));
@@ -227,8 +260,8 @@ pub fn initializeHighResolution(
     if (!hpet.initialize(rsdp, mmio_allowed)) return false;
     const now = hpet.monotonicNs() orelse return false;
     highres_realtime_offset_ns = (unixTimeSeconds() *| 1_000_000_000) -| now;
-    const online = @import("smp.zig").onlineCpuMask();
-    if (online != 0 and (stableCpuMask() & online) == online) {
+    const online = @import("smp.zig").onlineCpuSet();
+    if (online.count() != 0 and allOnlineClocksStable(online)) {
         if (readPvCounter(slotTime(0), true)) |pv_now| {
             // Pair the KVM clock with the existing monotonic epoch. KVM's
             // system_time is not the HPET epoch and must never be returned raw.
@@ -451,13 +484,20 @@ pub fn registerCpu(slot: usize, kernel_pointer_paddr: *const fn (usize) ?u64) vo
     }
 }
 
-pub fn stableCpuMask() u64 {
-    var mask: u64 = 0;
-    for (&pv_slots, 0..) |*slot, index| {
-        if (@atomicLoad(bool, &slot.registered, .acquire) and slot.stable)
-            mask |= @as(u64, 1) << @intCast(index);
+pub fn stableCpuCount() usize {
+    var count: usize = 0;
+    for (pv_slots) |*slot| {
+        if (@atomicLoad(bool, &slot.registered, .acquire) and slot.stable) count += 1;
     }
-    return mask;
+    return count;
+}
+
+fn allOnlineClocksStable(online: @import("cpu_set.zig").CpuSet) bool {
+    for (0..online.capacity) |cpu| {
+        if (!online.contains(cpu)) continue;
+        if (cpu >= pv_slots.len or !@atomicLoad(bool, &pv_slots[cpu].registered, .acquire) or !pv_slots[cpu].stable) return false;
+    }
+    return true;
 }
 
 pub fn usesStableKvmClock() bool {
@@ -702,4 +742,17 @@ test "clock page is one exclusive page holding only vCPU 0's pvclock" {
     try std.testing.expectEqual(@as(usize, 0), @intFromPtr(&clock_page) % 4096);
     try std.testing.expectEqual(@as(usize, 4096), @sizeOf(@TypeOf(clock_page)));
     try std.testing.expectEqual(@as(usize, 64), @intFromPtr(&clock_page.pv0) - @intFromPtr(&clock_page));
+}
+
+test "lock admission clock publication enable blocking and runtime try" {
+    if (!lock_diagnostics.enabled) return;
+    var header: ClockPageHeader = .{};
+    var time: PvMonotonic = .{ .page = &header };
+    time.enable(1, 1);
+    try std.testing.expectEqual(lock_diagnostics.order.Mode.blocking, time.diagnostic_record.mode);
+    _ = time.tryPublishPv(2);
+    try std.testing.expectEqual(lock_diagnostics.order.Mode.try_once, time.diagnostic_record.mode);
+    try std.testing.expect(time.beginFallback());
+    try std.testing.expect(!time.diagnostic_record.linked);
+    lock_diagnostics.assertRootEmpty();
 }

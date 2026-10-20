@@ -145,8 +145,8 @@ int ph_usb_input_service_init(struct ph_usb_input_service *input, void *core,
         PACHA_FD_RIGHT_WAIT | PACHA_FD_RIGHT_POLL;
     long event = pacha_syscall3(PACHA_FD_SYSCALL_EVENTFD_CREATE,
         0, rights, PACHA_FD_FLAG_NONBLOCK);
-    if (event < 16 || event >= PACHA_FD_TABLE_LIMIT) return -ENOMEM;
-    input->event_fd = (int)event;
+    if (event < 16 || event >= PACHA_THREAD_SELF_FD) return -ENOMEM;
+    input->event_fd = (pacha_fd_t)event;
     input->notify = (struct kobox_linux_input_notify){
         .context = input, .notify = notify_input};
     input->generation = generation;

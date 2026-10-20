@@ -8,12 +8,10 @@ const capsule = types.capsule;
 const initial_process_count = types.initial_process_count;
 const initial_process_capacity = types.initial_process_capacity;
 const process_count = types.process_count;
-const max_process_slots = types.max_process_slots;
+const process_principal_value_count = types.process_principal_value_count;
 const initial_thread_capacity = types.initial_thread_capacity;
-const max_thread_slots = types.max_thread_slots;
-const device_count = types.device_count;
+const thread_id_value_count = types.thread_id_value_count;
 const device_principal_raw = types.device_principal_raw;
-const principal_count = types.principal_count;
 const PrincipalRaw = types.PrincipalRaw;
 const PrincipalId = types.PrincipalId;
 const CapsuleKind = types.CapsuleKind;
@@ -23,8 +21,6 @@ const CapsuleSnapshot = types.CapsuleSnapshot;
 const CapsuleDmaDirection = types.CapsuleDmaDirection;
 const CapsuleIrqKind = types.CapsuleIrqKind;
 const MapProt = types.MapProt;
-const EndpointRoute = types.EndpointRoute;
-const Region = types.Region;
 const ProcessDescriptor = types.ProcessDescriptor;
 const ProcessStatus = types.ProcessStatus;
 const DebugProcessLifecycleReason = types.DebugProcessLifecycleReason;
@@ -33,8 +29,6 @@ const DmaDeviceId = types.DmaDeviceId;
 const invalid_dma_device_id = types.invalid_dma_device_id;
 const Fd = types.Fd;
 const fd_table_entries = types.fd_table_entries;
-const max_fd_objects = types.max_fd_objects;
-const max_pipes = types.max_pipes;
 const pipe_buffer_bytes = types.pipe_buffer_bytes;
 const fd_known_flags_mask = types.fd_known_flags_mask;
 const fd_known_rights_mask = types.fd_known_rights_mask;
@@ -64,12 +58,8 @@ const FdEntry = types.FdEntry;
 const FdInfo = types.FdInfo;
 const FdTable = types.FdTable;
 const FdTransferMode = types.FdTransferMode;
-const max_ipc_endpoints = types.max_ipc_endpoints;
-const max_ipc_channels = types.max_ipc_channels;
-const max_ipc_replies = types.max_ipc_replies;
 const max_ipc_queue_messages = types.max_ipc_queue_messages;
 const max_ipc_message_fds = types.max_ipc_message_fds;
-const max_ipc_waiters = types.max_ipc_waiters;
 const IpcEndpointRef = types.IpcEndpointRef;
 const IpcChannelRef = types.IpcChannelRef;
 const IpcChannelHandle = types.IpcChannelHandle;
@@ -78,8 +68,6 @@ const IpcWaitKey = types.IpcWaitKey;
 const IpcWaiter = types.IpcWaiter;
 const ThreadWakeTarget = types.ThreadWakeTarget;
 const TaskFdWaiter = types.TaskFdWaiter;
-const max_task_fd_waiters = types.max_task_fd_waiters;
-const max_ipc_object_waiters = types.max_ipc_object_waiters;
 const PipeSlot = types.PipeSlot;
 const IpcWaitList = types.IpcWaitList;
 const IpcTransferredFd = types.IpcTransferredFd;
@@ -93,32 +81,20 @@ const IpcSendMessage = types.IpcSendMessage;
 const IpcRecvFd = types.IpcRecvFd;
 const IpcRecvResult = types.IpcRecvResult;
 const native_page_size = types.native_page_size;
-const max_native_vmos = types.max_native_vmos;
-const max_vmas_per_process = types.max_vmas_per_process;
-const native_cow_table_slots_per_chunk = types.native_cow_table_slots_per_chunk;
 const NativeVmoKind = types.NativeVmoKind;
 const NativeVmoRef = types.NativeVmoRef;
 const NativeCowTableRef = types.NativeCowTableRef;
 const NativeVmoSlot = types.NativeVmoSlot;
 const NativeCowTableSlot = types.NativeCowTableSlot;
-const NativeCowTableChunk = types.NativeCowTableChunk;
 const VmaProt = types.VmaProt;
 const MmapFlags = types.MmapFlags;
 const VmaEntry = types.VmaEntry;
 const VmaTable = types.VmaTable;
 const NativeVmaFaultMapping = types.NativeVmaFaultMapping;
-const EndpointTable = types.EndpointTable;
-const PublishedEndpointTable = types.PublishedEndpointTable;
-const max_vmo_backing_pages = types.max_vmo_backing_pages;
-const max_vmo_backing_store_pages = types.max_vmo_backing_store_pages;
 const RegionFreeRange = types.RegionFreeRange;
 const FreePageList = types.FreePageList;
 const PageCapability = types.PageCapability;
-const empty_vmo_backing_page_store = types.empty_vmo_backing_page_store;
-const vmo_backing_page_store = types.vmo_backing_page_store;
 const empty_process_descriptors_extra = types.empty_process_descriptors_extra;
-const empty_endpoint_tables_extra = types.empty_endpoint_tables_extra;
-const empty_fd_tables_extra = types.empty_fd_tables_extra;
 const empty_vma_tables_extra = types.empty_vma_tables_extra;
 const processPrincipalFromIndex = types.processPrincipalFromIndex;
 const processIndexFromPrincipal = types.processIndexFromPrincipal;
@@ -142,29 +118,37 @@ const initRuntimeStorage = types.initRuntimeStorage;
 
 pub fn nativeVmoSlot(self: anytype, vmo_ref: NativeVmoRef) ?*NativeVmoSlot {
     if (vmo_ref.isNull()) return null;
-    const index: usize = @intCast(vmo_ref.index);
-    if (index >= max_native_vmos) return null;
-    const slot = &self.native_vmos[index];
-    if (slot.kind == .none or slot.generation != vmo_ref.generation) return null;
-    return slot;
+    const leaf = @constCast(&self.vmo_directory_leaf);
+    const flags = leaf.lock();
+    const slot = self.native_vmos.resolve(.{ .index = vmo_ref.index, .generation = vmo_ref.generation });
+    leaf.unlock(flags);
+    // AS/shared-VM exclusion protects the body after the directory loan ends.
+    const value = slot orelse return null;
+    if (value.kind == .none or value.pending_data_return != null) return null;
+    return value;
 }
 
 pub fn nativeVmoSlotConst(self: anytype, vmo_ref: NativeVmoRef) ?*const NativeVmoSlot {
     if (vmo_ref.isNull()) return null;
-    const index: usize = @intCast(vmo_ref.index);
-    if (index >= max_native_vmos) return null;
-    const slot = &self.native_vmos[index];
-    if (slot.kind == .none or slot.generation != vmo_ref.generation) return null;
-    return slot;
+    const leaf = @constCast(&self.vmo_directory_leaf);
+    const flags = leaf.lock();
+    const slot = self.native_vmos.resolve(.{ .index = vmo_ref.index, .generation = vmo_ref.generation });
+    leaf.unlock(flags);
+    // AS/shared-VM exclusion protects the body after the directory loan ends.
+    const value = slot orelse return null;
+    if (value.kind == .none or value.pending_data_return != null) return null;
+    return value;
 }
 
-pub fn clearNativeVmoSlot(slot: *NativeVmoSlot) void {
+pub fn clearNativeVmoSlot(self: anytype, slot: *NativeVmoSlot) void {
+    types.references.Root.disconnect(&slot.parent_edge, true);
     std.debug.assert(slot.ram_cache_state == .wb);
-    const next_generation = nextObjectGeneration(slot.generation);
+    std.debug.assert(slot.pending_data_return == null);
+
     if (slot.has_page_store and slot.page_count != 0) {
         _ = freeVmoBackingPageStore(slot.page_store_start, slot.page_count, slot.page_store_owner);
     }
-    slot.* = .{ .generation = next_generation };
+    self.native_vmos.remove(slot, &self.vmo_directory_leaf);
 }
 
 pub fn releaseNativeVmoOwnedPages(slot: *NativeVmoSlot, free_list: *FreePageList) void {
@@ -187,37 +171,26 @@ pub fn createNativeVmoWithPageStore(
     allocate_page_store: bool,
 ) KernelError!NativeVmoRef {
     if (kind == .none or size_bytes == 0) return KernelError.InvalidState;
-    const aligned_size = @TypeOf(self.*).pageAlignUp(size_bytes);
-    const page_count_u64 = aligned_size / native_page_size;
-    if (page_count_u64 == 0 or page_count_u64 > types.max_vmo_logical_pages or
-        (kind != .anonymous and page_count_u64 > max_vmo_backing_pages)) return KernelError.InvalidState;
-    const page_count: u32 = @intCast(page_count_u64);
-    var offset: usize = 0;
-    while (offset < max_native_vmos) : (offset += 1) {
-        const index = (self.next_native_vmo_scan + offset) % max_native_vmos;
-        const slot = &self.native_vmos[index];
-        if (slot.kind != .none or slot.ref_count != 0) continue;
-        if (slot.generation == 0) slot.generation = 1;
-        const page_store_owner = vmoBackingStoreOwner(.native_vmo, @intCast(index), slot.generation);
-        const page_store_start = if (allocate_page_store)
-            allocEmptyVmoBackingPageStore(page_count, page_store_owner) orelse return KernelError.TableFull
-        else
-            0;
-        slot.kind = kind;
-        slot.size_bytes = aligned_size;
-        slot.page_count = page_count;
-        slot.page_store_start = page_store_start;
-        slot.page_store_owner = page_store_owner;
-        slot.has_page_store = allocate_page_store;
-        slot.zero_on_demand = false;
-        slot.ref_count = 0;
-        self.next_native_vmo_scan = (index + 1) % max_native_vmos;
-        return .{
-            .index = @intCast(index),
-            .generation = slot.generation,
-        };
-    }
-    return KernelError.TableFull;
+    const page_count = try types.checkedVmoPageCount(size_bytes);
+    const aligned_size = @as(u64, page_count) * native_page_size;
+    const allocation = try self.allocatePool(&self.native_vmos, &self.vmo_directory_leaf, std.math.maxInt(u31));
+    const index = allocation.ref.index;
+    const slot = allocation.value;
+    errdefer self.native_vmos.remove(slot, &self.vmo_directory_leaf);
+    const page_store_owner = vmoBackingStoreOwner(.native_vmo, @intCast(index), slot.generation);
+    const page_store_start = if (allocate_page_store)
+        allocEmptyVmoBackingPageStore(&slot.page_store, page_count, page_store_owner) orelse return KernelError.OutOfFreePages
+    else
+        types.BackingRef{};
+    slot.kind = kind;
+    slot.size_bytes = aligned_size;
+    slot.page_count = page_count;
+    slot.page_store_start = page_store_start;
+    slot.page_store_owner = page_store_owner;
+    slot.has_page_store = allocate_page_store;
+    slot.zero_on_demand = false;
+    slot.ref_count = 0;
+    return .{ .index = allocation.ref.index, .generation = allocation.ref.generation };
 }
 
 pub fn createNativeVmo(self: anytype, kind: NativeVmoKind, size_bytes: u64) KernelError!NativeVmoRef {
@@ -233,7 +206,7 @@ pub fn createNativePageView(
     parent: NativeVmoRef,
     page_count: usize,
 ) KernelError!NativeVmoRef {
-    if (page_count == 0 or page_count > max_vmo_backing_pages)
+    if (page_count == 0 or page_count > types.max_vmo_logical_pages)
         return KernelError.InvalidState;
     const parent_slot = self.nativeVmoSlotConst(parent) orelse
         return KernelError.InvalidState;
@@ -247,10 +220,9 @@ pub fn createNativePageView(
     try self.retainNativeVmo(view);
     var keep_view = false;
     errdefer if (!keep_view) self.releaseNativeVmo(view);
-    const view_slot = self.nativeVmoSlot(view) orelse
-        return KernelError.InvalidState;
     try self.retainNativeVmo(parent);
-    view_slot.backing.parent.ref = parent;
+    errdefer self.releaseNativeVmo(parent);
+    try self.publishNativeVmoParent(view, parent, 0);
     keep_view = true;
     return view;
 }
@@ -270,7 +242,7 @@ pub fn createNativeDeviceMemoryBacking(
         backing.device == invalid_dma_device_id or backing.bar_index >= 6 or
         bar_base == 0 or bar_base % native_page_size != 0 or
         bar_size == 0 or bar_size % native_page_size != 0 or
-        page_offsets.len == 0 or page_offsets.len > max_vmo_backing_pages)
+        page_offsets.len == 0 or page_offsets.len > types.max_vmo_logical_pages)
         return KernelError.InvalidState;
     _ = std.math.add(u64, bar_base, bar_size) catch return KernelError.InvalidState;
     for (page_offsets) |offset| {
@@ -314,11 +286,12 @@ pub fn kernelClockPageVmo(self: anytype, paddr: u64, free_list: ?*FreePageList) 
     try self.retainNativeVmo(ref);
     errdefer self.releaseNativeVmo(ref);
     try setVmoBackingPageStorePaddrs(slot.page_store_start, slot.page_count, 0, slot.page_store_owner, &.{paddr}, free_list);
+    slot.references.connect(&self.clock_reference, .{ .kind = .kernel }, .{}, true);
     self.kernel_clock_page_vmo = ref;
     return ref;
 }
 
-pub fn activateNativeDeviceMemory(self: anytype, ref: NativeVmoRef, pat_slot: u8, token: u16) KernelError!void {
+pub fn activateNativeDeviceMemory(self: anytype, ref: NativeVmoRef, pat_slot: u8, token: u64) KernelError!void {
     const slot = self.nativeVmoSlot(ref) orelse return KernelError.InvalidState;
     if (slot.kind != .device_memory or slot.ref_count != 1 or
         slot.backing.device.state != .staged or pat_slot > 7 or
@@ -341,10 +314,15 @@ fn retireDeviceMemory(self: anytype, slot: *NativeVmoSlot) bool {
 
 pub fn nextDeviceMemoryRetirement(self: anytype) ?NativeVmoRef {
     if (self.pending_device_retirements == 0) return null;
-    for (&self.native_vmos, 0..) |*slot, index| {
-        if (slot.kind == .device_memory and slot.ref_count == 0 and
-            slot.backing.device.state == .retiring)
-            return .{ .index = @intCast(index), .generation = slot.generation };
+    {
+        var pool_iter_3 = self.native_vmos.iterator();
+        while (pool_iter_3.next()) |pool_entry_3| {
+            const slot = pool_entry_3.value;
+            const index: usize = pool_entry_3.ref.index;
+            if (slot.kind == .device_memory and slot.ref_count == 0 and
+                slot.backing.device.state == .retiring)
+                return .{ .index = @intCast(index), .generation = slot.generation };
+        }
     }
     return null;
 }
@@ -356,7 +334,7 @@ pub fn finishDeviceMemoryRetirement(self: anytype, ref: NativeVmoRef) KernelErro
         return KernelError.InvalidState;
     // Caller has completed ordered PTE/cache retirement. Generation advances
     // only now, so a delayed retirement cannot consume a reused slot's lease.
-    @TypeOf(self.*).clearNativeVmoSlot(slot);
+    self.clearNativeVmoSlot(slot);
     self.pending_device_retirements -= 1;
 }
 
@@ -390,7 +368,7 @@ pub fn prepareNativeRamCacheLifetime(self: anytype, ref: NativeVmoRef) KernelErr
         slot.ref_count == 0 or !slot.has_page_store or slot.ram_cache_state == .retiring)
         return KernelError.InvalidState;
     const owner = vmoBackingStoreOwner(.native_vmo, ref.index, ref.generation);
-    if (slot.page_store_owner != owner or slot.page_store_start != owner) return KernelError.InvalidState;
+    if (slot.page_store_owner != owner or slot.page_store_start.owner != owner) return KernelError.InvalidState;
     return .{ .slot = slot, .owner = owner };
 }
 
@@ -410,9 +388,14 @@ fn retireRamCache(self: anytype, slot: *NativeVmoSlot) bool {
 
 pub fn nextRamCacheRetirement(self: anytype) ?NativeVmoRef {
     if (self.pending_ram_cache_retirements == 0) return null;
-    for (&self.native_vmos, 0..) |*slot, index| {
-        if (slot.ram_cache_state == .retiring and slot.ref_count == 0)
-            return .{ .index = @intCast(index), .generation = slot.generation };
+    {
+        var pool_iter_4 = self.native_vmos.iterator();
+        while (pool_iter_4.next()) |pool_entry_4| {
+            const slot = pool_entry_4.value;
+            const index: usize = pool_entry_4.ref.index;
+            if (slot.ram_cache_state == .retiring and slot.ref_count == 0)
+                return .{ .index = @intCast(index), .generation = slot.generation };
+        }
     }
     return null;
 }
@@ -436,9 +419,9 @@ pub fn finishRamCacheRetirement(self: anytype, ref: NativeVmoRef, snapshot: *con
         // PMM insertion can fail independently of successful WB restoration.
         // Keep the zero-ref owner for retry, never discard its remaining PFNs.
         slot.ram_cache_state = .retiring;
-        return KernelError.TooManyFreeRanges;
+        return KernelError.PageQuarantined;
     }
-    @TypeOf(self.*).clearNativeVmoSlot(slot);
+    self.clearNativeVmoSlot(slot);
     self.pending_ram_cache_retirements -= 1;
 }
 
@@ -447,7 +430,7 @@ pub fn retiredRamCacheOwner(self: anytype, ref: NativeVmoRef) KernelError!u64 {
     const owner = vmoBackingStoreOwner(.native_vmo, ref.index, ref.generation);
     if (slot.kind != .anonymous or !slot.backing.parent.ref.isNull() or !slot.has_page_store or
         slot.ref_count != 0 or slot.ram_cache_state != .retiring or
-        slot.page_store_owner != owner or slot.page_store_start != owner or
+        slot.page_store_owner != owner or slot.page_store_start.owner != owner or
         self.pending_ram_cache_retirements == 0 or self.nativeVmoTreeMappingsOverlapPinnedUserObjects(ref))
         return KernelError.InvalidState;
     return owner;
@@ -497,14 +480,19 @@ pub fn nativeVmoDevicePatSlot(self: anytype, ref: NativeVmoRef) ?u3 {
 pub fn deviceMemoryCacheConflict(self: anytype, base: u64, size: u64, wc: bool) bool {
     if (size == 0) return true;
     const end = std.math.add(u64, base, size) catch return true;
-    for (&self.native_vmos, 0..) |*slot, index| {
-        if (slot.kind != .device_memory or slot.backing.device.state == .staged) continue;
-        if ((slot.backing.device.cache == .wc) == wc) continue;
-        const range = self.deviceMemoryPhysicalBounds(.{
-            .index = @intCast(index),
-            .generation = slot.generation,
-        }) orelse return true;
-        if (base < range.base + range.size and range.base < end) return true;
+    {
+        var pool_iter_5 = self.native_vmos.iterator();
+        while (pool_iter_5.next()) |pool_entry_5| {
+            const slot = pool_entry_5.value;
+            const index: usize = pool_entry_5.ref.index;
+            if (slot.kind != .device_memory or slot.backing.device.state == .staged) continue;
+            if ((slot.backing.device.cache == .wc) == wc) continue;
+            const range = self.deviceMemoryPhysicalBounds(.{
+                .index = @intCast(index),
+                .generation = slot.generation,
+            }) orelse return true;
+            if (base < range.base + range.size and range.base < end) return true;
+        }
     }
     return false;
 }
@@ -513,27 +501,30 @@ pub fn ensureNativeVmoPageStore(slot: *NativeVmoSlot) KernelError!void {
     if (slot.ram_cache_state == .retiring) return KernelError.InvalidState;
     if (slot.has_page_store) return;
     if (slot.page_count == 0) return KernelError.InvalidState;
-    slot.page_store_start = allocEmptyVmoBackingPageStore(slot.page_count, slot.page_store_owner) orelse return KernelError.TableFull;
+    slot.page_store_start = allocEmptyVmoBackingPageStore(&slot.page_store, slot.page_count, slot.page_store_owner) orelse return KernelError.TableFull;
     slot.has_page_store = true;
 }
 
 pub fn retainNativeVmo(self: anytype, vmo_ref: NativeVmoRef) KernelError!void {
     const slot = self.nativeVmoSlot(vmo_ref) orelse return KernelError.InvalidState;
+    if (slot.pending_data_return != null) return KernelError.InvalidState;
     if (slot.ram_cache_state == .retiring) return KernelError.InvalidState;
     if (slot.kind == .device_memory and slot.backing.device.state == .retiring)
         return KernelError.InvalidState;
     if (slot.ref_count == std.math.maxInt(u32)) return KernelError.TableFull;
+    slot.references.retainTemporary();
     slot.ref_count += 1;
 }
 
 pub fn releaseNativeVmo(self: anytype, vmo_ref: NativeVmoRef) void {
     const slot = self.nativeVmoSlot(vmo_ref) orelse return;
     if (slot.ref_count == 0) return;
+    slot.references.releaseTemporary();
     slot.ref_count -= 1;
     if (slot.ref_count == 0) {
         if (retireDeviceMemory(self, slot) or retireRamCache(self, slot)) return;
         const parent: NativeVmoRef = if (vmoKindHasParentArm(slot.kind)) slot.backing.parent.ref else .{};
-        @TypeOf(self.*).clearNativeVmoSlot(slot);
+        self.clearNativeVmoSlot(slot);
         if (!parent.isNull()) self.releaseNativeVmo(parent);
     }
 }
@@ -541,6 +532,7 @@ pub fn releaseNativeVmo(self: anytype, vmo_ref: NativeVmoRef) void {
 pub fn releaseNativeVmoWithFreeList(self: anytype, vmo_ref: NativeVmoRef, free_list: *FreePageList) void {
     const slot = self.nativeVmoSlot(vmo_ref) orelse return;
     if (slot.ref_count == 0) return;
+    slot.references.releaseTemporary();
     slot.ref_count -= 1;
     if (slot.ref_count == 0) {
         if (retireDeviceMemory(self, slot) or retireRamCache(self, slot)) return;
@@ -549,10 +541,21 @@ pub fn releaseNativeVmoWithFreeList(self: anytype, vmo_ref: NativeVmoRef, free_l
         smp_perf.vmoAdd(.final_drop_logical_pages, slot.page_count);
         if (slot.has_page_store) smp_perf.vmoAdd(.final_drop_with_store, 1);
         var profile_stage = smp_perf.timestamp();
-        @TypeOf(self.*).releaseNativeVmoOwnedPages(slot, free_list);
+        const expected_owner = vmoBackingStoreOwner(.native_vmo, vmo_ref.index, vmo_ref.generation);
+        // Validate the slot identity before scanning: a self-consistent but
+        // foreign token must not return another live VMO's pages.
+        if (vmoDataOwnerMatches(slot, expected_owner))
+            @TypeOf(self.*).releaseNativeVmoOwnedPages(slot, free_list);
         smp_perf.vmoElapsed(.final_owned_cycles, profile_stage);
+        if (vmoDataReturnUnfinished(slot, expected_owner)) {
+            // Final drop cannot discard a failed PMM return. Keep generation,
+            // kind and the parent's retain until a later successful drain.
+            slot.pending_data_return = free_list;
+            _ = @atomicRmw(usize, &self.pending_data_returns, .Add, 1, .release);
+            return;
+        }
         profile_stage = smp_perf.timestamp();
-        @TypeOf(self.*).clearNativeVmoSlot(slot);
+        self.clearNativeVmoSlot(slot);
         smp_perf.vmoElapsed(.final_clear_cycles, profile_stage);
         // Only local stages are timed; do not count recursive parent work twice.
         if (!parent.isNull()) self.releaseNativeVmoWithFreeList(parent, free_list);
@@ -580,11 +583,11 @@ pub fn growVmoFdWithPages(self: anytype, owner: PrincipalId, fd: Fd, new_capacit
     const slot = self.nativeVmoSlot(vmo_ref) orelse return KernelError.InvalidState;
     if (slot.kind != .anonymous or slot.ram_cache_state == .retiring or !slot.backing.parent.ref.isNull() or !slot.has_page_store or
         new_capacity == 0 or new_capacity % native_page_size != 0 or
-        new_capacity < slot.size_bytes or new_capacity / native_page_size > max_vmo_backing_pages)
+        new_capacity < slot.size_bytes)
         return KernelError.InvalidState;
+    const new_count = try types.checkedVmoPageCount(new_capacity);
     if (new_capacity == slot.size_bytes) return;
     const old_count = slot.page_count;
-    const new_count: u32 = @intCast(new_capacity / native_page_size);
     if (slot.size_bytes != @as(u64, old_count) * native_page_size)
         return KernelError.InvalidState;
 
@@ -600,15 +603,19 @@ pub fn growVmoFdWithPages(self: anytype, owner: PrincipalId, fd: Fd, new_capacit
     // Like eager VMO_CREATE, keep unpublished allocations outside the backing
     // index until its all-or-nothing insertion succeeds. FD-backed faults do
     // not allocate holes, so merely increasing the logical size is not enough.
-    var pages: [max_vmo_backing_pages]u64 = undefined;
+    var scratch = self.beginInvocationStorage(free_list);
+    defer scratch.rollback() catch @panic("invalid invocation storage rollback");
+    const pages = scratch.reserve(u64, @as(usize, new_count - old_count), .replaceable) catch return KernelError.OutOfFreePages;
     var allocated: usize = 0;
     errdefer {
-        // Match eager VMO_CREATE's allocator contract. PMM may itself reject
-        // a return (quarantine/range-table exhaustion); do not mistake this
-        // best-effort resource return for rollback of the untouched old VMO.
+        // Intrusive PMM needs no return metadata allocation. DMA-held PFNs
+        // remain in the common retention ledger until device drain is proved.
         while (allocated != 0) {
             allocated -= 1;
-            free_list.appendPage(0, pages[allocated]) catch {};
+            free_list.appendPage(pages[allocated]) catch |err| switch (err) {
+                error.PageQuarantined => {},
+                else => @panic("invalid PMM return"),
+            };
         }
     }
     const added: usize = new_count - old_count;
@@ -645,14 +652,7 @@ pub fn growUniqueAnonymousVmo(
         return false;
     }
     const new_size = slot.size_bytes + additional_size_bytes;
-    const new_page_count_u64 = new_size / native_page_size;
-    if (new_page_count_u64 == 0 or
-        new_page_count_u64 > max_vmo_backing_pages or
-        new_page_count_u64 > std.math.maxInt(u32))
-    {
-        return false;
-    }
-    const new_page_count: u32 = @intCast(new_page_count_u64);
+    const new_page_count = types.checkedVmoPageCount(new_size) catch return false;
     const new_store_start = growVmoBackingPageStore(
         slot.page_store_start,
         slot.page_count,
@@ -702,12 +702,15 @@ pub fn nativeVmoResolvedPagePaddr(self: anytype, vmo_ref: NativeVmoRef, page_ind
 pub fn nativeVmoResolvedPagePaddrOrZero(self: anytype, vmo_ref: NativeVmoRef, page_index: usize) ?u64 {
     var current = vmo_ref;
     var page = page_index;
-    for (0..max_native_vmos) |_| {
+    const flags = @constCast(&self.vmo_directory_leaf).lock();
+    const traversal_bound: usize = @intCast(self.native_vmos.capacity);
+    @constCast(&self.vmo_directory_leaf).unlock(flags);
+    for (0..traversal_bound) |_| {
         const slot = self.nativeVmoSlotConst(current) orelse return null;
         if (page >= slot.page_count) return null;
         if (slot.has_page_store) {
             const owner = vmoBackingStoreOwner(.native_vmo, current.index, current.generation);
-            if (slot.page_store_owner != owner or slot.page_store_start != owner) return null;
+            if (slot.page_store_owner != owner or slot.page_store_start.owner != owner) return null;
             const own = vmoBackingPageStorePaddr(slot.page_store_start, slot.page_count, page) orelse return null;
             // The clock page store holds exactly the published kernel page;
             // anything else would expose unrelated kernel-image memory.
@@ -721,6 +724,33 @@ pub fn nativeVmoResolvedPagePaddrOrZero(self: anytype, vmo_ref: NativeVmoRef, pa
         current = slot.backing.parent.ref;
     }
     return null;
+}
+
+/// Fault commit only, under the existing AS/shared-VM lifetime exclusion.
+/// Merge the previous root lookup and insert so metadata allocation does not
+/// add an owner-lock acquisition. Parent locks are never nested inside it.
+pub fn resolveOrInstallNativeVmoPage(self: anytype, ref: NativeVmoRef, index: u32, candidate: u64, free_list: ?*FreePageList) KernelError!u64 {
+    const slot = self.nativeVmoSlot(ref) orelse return KernelError.InvalidState;
+    if (slot.kind != .anonymous or slot.ram_cache_state != .wb or index >= slot.page_count or candidate == 0 or candidate & 4095 != 0)
+        return KernelError.InvalidState;
+    try @TypeOf(self.*).ensureNativeVmoPageStore(slot);
+    const owner = vmoBackingStoreOwner(.native_vmo, ref.index, ref.generation);
+    if (slot.page_store_owner != owner or slot.page_store_start.owner != owner) return KernelError.InvalidState;
+    const Context = struct {
+        state: @TypeOf(self),
+        parent: NativeVmoRef,
+        offset: u64,
+        index: u32,
+        fn resolve(c: @This()) types.backing_index.Error!u64 {
+            if (c.offset % native_page_size != 0) return error.InvalidState;
+            const page = std.math.add(usize, @intCast(c.offset / native_page_size), c.index) catch return error.InvalidState;
+            return c.state.nativeVmoResolvedPagePaddrOrZero(c.parent, page) orelse error.InvalidState;
+        }
+    };
+    return slot.page_store.resolveOrInsert(slot.page_store_start, index, candidate, types.backingAllocator(free_list) catch null, !slot.backing.parent.ref.isNull(), Context{ .state = self, .parent = slot.backing.parent.ref, .offset = slot.backing.parent.offset, .index = index }, Context.resolve) catch |err| return switch (err) {
+        error.OutOfMemory => KernelError.OutOfFreePages,
+        error.InvalidState => KernelError.InvalidState,
+    };
 }
 
 pub fn nativeVmoIsZeroOnDemand(self: anytype, vmo_ref: NativeVmoRef) bool {
@@ -740,7 +770,7 @@ pub fn nativeRamCachePages(self: anytype, vmo_ref: NativeVmoRef, first: usize, o
         out.len > slot.page_count - first)
         return KernelError.InvalidState;
     const owner = vmoBackingStoreOwner(.native_vmo, vmo_ref.index, vmo_ref.generation);
-    if (slot.page_store_owner != owner or slot.page_store_start != owner)
+    if (slot.page_store_owner != owner or slot.page_store_start.owner != owner)
         return KernelError.InvalidState;
     for (out, 0..) |*paddr, index| {
         paddr.* = vmoBackingPageStorePaddr(slot.page_store_start, slot.page_count, first + index) orelse
@@ -756,9 +786,9 @@ fn ramCacheOverlapsBlockingPin(self: anytype, principal: PrincipalId, start_va: 
     const PinRange = struct { start: u64, size: u64 };
     const end_va = std.math.add(u64, start_va, bytes) catch return true;
     const principal_raw = @intFromEnum(principal);
-    var candidates = self.pinned_object_slots.iterator(.{});
-    while (candidates.next()) |object_index| {
-        const slot = &self.fd_objects[object_index];
+    var candidates = @import("vma.zig").pinnedObjectCursor(self, principal);
+    while (candidates.next()) |edge| {
+        const slot = self.kernelObjectSlot(.{ .kind = @enumFromInt(edge.identity.container), .index = edge.identity.index, .generation = edge.identity.generation }) orelse unreachable;
         if (slot.ref_count == 0) continue;
         const range: PinRange = switch (slot.payload) {
             .dma_mapping => continue,
@@ -797,6 +827,39 @@ fn checkRamCacheMapping(self: anytype, principal: PrincipalId, entry: *const typ
 /// shadows can inherit the root on a later fault and are rejected on overlap.
 /// Caller holds all VM locks and separately checks actual PTE/supervisor aliases.
 pub fn validateRamCacheMappings(self: anytype, ref: NativeVmoRef, first_page: usize, sorted_pages: []const u64) RamCacheMappingError!void {
+    const result = indexedRamCacheMappings(self, ref, first_page, sorted_pages);
+    if (comptime @import("reference_check.zig").enabled) {
+        const old = oldValidateRamCacheMappings(self, ref, first_page, sorted_pages);
+        // Alias iteration order may select a different rejection reason;
+        // acceptance must be identical.
+        const accepted = if (result) |_| true else |_| false;
+        const old_accepted = if (old) |_| true else |_| false;
+        if (accepted != old_accepted) @import("reference_check.zig").failure(error.RamCacheMismatch);
+    }
+    return result;
+}
+// Stackless DFS uses the already retained parent links. All VM locks exclude
+// publication/removal for this read, so it needs no allocation or depth-sized
+// stack and visits only this VMO's descendants and reverse edges.
+fn nextVmoDescendant(self: anytype, root: NativeVmoRef, current: NativeVmoRef) ?NativeVmoRef {
+    var slot = self.nativeVmoSlot(current) orelse unreachable;
+    if (types.references.first(&slot.references, .child)) |edge|
+        return .{ .index = edge.identity.index, .generation = edge.identity.generation };
+    var child = current;
+    while (!nativeVmoRefsEqual(child, root)) {
+        const parent = slot.backing.parent.ref;
+        const parent_slot = self.nativeVmoSlot(parent) orelse unreachable;
+        var siblings = types.references.Cursor.after(&parent_slot.references, &slot.parent_edge);
+        while (siblings.next()) |edge| {
+            if (edge.identity.kind == .child)
+                return .{ .index = edge.identity.index, .generation = edge.identity.generation };
+        }
+        child = parent;
+        slot = parent_slot;
+    }
+    return null;
+}
+fn indexedRamCacheMappings(self: anytype, ref: NativeVmoRef, first_page: usize, sorted_pages: []const u64) RamCacheMappingError!void {
     const paging = @import("../memory/ram_cache_paging.zig");
     paging.validatePages(sorted_pages, @as(u64, 1) << 52) catch return error.Invalid;
     const root = self.nativeVmoSlotConst(ref) orelse return error.Invalid;
@@ -809,12 +872,14 @@ pub fn validateRamCacheMappings(self: anytype, ref: NativeVmoRef, first_page: us
     }
     const first_byte: u64 = @as(u64, @intCast(first_page)) * native_page_size;
     const end_byte = first_byte + @as(u64, @intCast(sorted_pages.len)) * native_page_size;
-    for (0..self.process_capacity) |process_index| {
-        const table = self.vmaTableForProcessIndexConst(process_index) orelse continue;
-        const principal = @TypeOf(self.*).processPrincipal(process_index);
-        for (table.active_indices[0..table.active_count]) |entry_index| {
-            const entry = &table.entries[entry_index];
-            if (!entry.active) continue;
+    var current: ?NativeVmoRef = ref;
+    while (current) |mapped| : (current = nextVmoDescendant(self, ref, mapped)) {
+        const source = self.nativeVmoSlot(mapped) orelse return error.Invalid;
+        var cursor = types.references.Cursor.init(&source.references);
+        while (cursor.next()) |edge| {
+            if (edge.identity.kind != .vma) continue;
+            const entry = resolveVmaEdge(self, mapped, edge.identity) orelse return error.Invalid;
+            const principal = @TypeOf(self.*).processPrincipal(edge.identity.owner);
             const backing = self.nativeVmoSlotConst(entry.vmo) orelse return error.Invalid;
             // Neither BAR pages nor the kernel clock page take RAM cache policy.
             if (backing.kind == .device_memory or backing.kind == .kernel_page) continue;
@@ -835,7 +900,7 @@ pub fn validateRamCacheMappings(self: anytype, ref: NativeVmoRef, first_page: us
                 const slot = self.nativeVmoSlotConst(ancestor) orelse return error.Invalid;
                 if (slot.kind != .anonymous or slot.backing.parent.ref.isNull()) break;
                 depth += 1;
-                if (depth > self.native_vmos.len) return error.Invalid;
+                if (depth > self.native_vmos.capacity) return error.Invalid;
                 offset = std.math.add(u64, offset, slot.backing.parent.offset) catch return error.Invalid;
                 ancestor = slot.backing.parent.ref;
             }
@@ -864,61 +929,24 @@ pub fn nativeVmoRefsEqual(a: NativeVmoRef, b: NativeVmoRef) bool {
     return a.index == b.index and a.generation == b.generation;
 }
 
-fn nativeCowTableStorageSlot(self: anytype, index: usize) ?*NativeCowTableSlot {
-    const ordinal = index / native_cow_table_slots_per_chunk;
-    const slot_index = index % native_cow_table_slots_per_chunk;
-    if (ordinal >= self.native_cow_table_chunk_count) return null;
-    if (ordinal == 0) return &self.native_cow_table_initial.slots[slot_index];
-
-    var chunk = self.native_cow_table_overflow_head;
-    while (chunk) |current| : (chunk = current.next) {
-        if (current.ordinal == ordinal) return &current.slots[slot_index];
-    }
-    return null;
-}
-
-fn nativeCowTableStorageSlotConst(self: anytype, index: usize) ?*const NativeCowTableSlot {
-    const ordinal = index / native_cow_table_slots_per_chunk;
-    const slot_index = index % native_cow_table_slots_per_chunk;
-    if (ordinal >= self.native_cow_table_chunk_count) return null;
-    if (ordinal == 0) return &self.native_cow_table_initial.slots[slot_index];
-
-    var chunk = self.native_cow_table_overflow_head;
-    while (chunk) |current| : (chunk = current.next) {
-        if (current.ordinal == ordinal) return &current.slots[slot_index];
-    }
-    return null;
-}
-
 pub fn nativeCowTableSlot(self: anytype, table_ref: NativeCowTableRef) ?*NativeCowTableSlot {
     if (table_ref.isNull()) return null;
-    const slot = nativeCowTableStorageSlot(self, @intCast(table_ref.index)) orelse return null;
-    if (!slot.active or slot.generation != table_ref.generation) return null;
+    // Shared VM exclusion spans lookup through the final use, including fault
+    // callers. Empty body reclamation therefore cannot invalidate this loan.
+    const slot = self.native_cow_tables.resolve(.{ .index = table_ref.index, .generation = table_ref.generation }) orelse return null;
+    if (slot.pending_data_return != null) return null;
     return slot;
 }
 
 pub fn nativeCowTableSlotConst(self: anytype, table_ref: NativeCowTableRef) ?*const NativeCowTableSlot {
-    if (table_ref.isNull()) return null;
-    const slot = nativeCowTableStorageSlotConst(self, @intCast(table_ref.index)) orelse return null;
-    if (!slot.active or slot.generation != table_ref.generation) return null;
-    return slot;
+    return nativeCowTableSlot(self, table_ref);
 }
 
-fn appendNativeCowTableChunk(self: anytype, free_list: *FreePageList) KernelError!void {
-    // Backing-store owner tokens reserve bit 63 for the object kind, leaving
-    // a full u32 generation and a u31 flat COW-table index.
-    const max_chunk_count = (@as(usize, std.math.maxInt(u31)) + 1) /
-        native_cow_table_slots_per_chunk;
-    if (self.native_cow_table_chunk_count >= max_chunk_count) return KernelError.TableFull;
-    const storage = @TypeOf(self.*).allocKernelSlice(NativeCowTableChunk, free_list, 1) orelse
-        return KernelError.OutOfFreePages;
-    const chunk = &storage[0];
-    chunk.* = .{
-        .next = self.native_cow_table_overflow_head,
-        .ordinal = @intCast(self.native_cow_table_chunk_count),
-    };
-    self.native_cow_table_overflow_head = chunk;
-    self.native_cow_table_chunk_count += 1;
+fn refreshCowStorageReturnHint(self: anytype) void {
+    var pending = false;
+    inline for (.{ &self.native_cow_tables.directory_owner, &self.native_cow_tables.metadata_owner, &self.native_cow_tables.body_owner }) |owner|
+        pending = pending or owner.pending != null or owner.retired != null;
+    @atomicStore(u8, &self.pending_cow_storage_return, @intFromBool(pending), .release);
 }
 
 pub fn createNativeCowTable(
@@ -926,39 +954,27 @@ pub fn createNativeCowTable(
     page_count: u32,
     free_list: *FreePageList,
 ) KernelError!NativeCowTableRef {
+    _ = free_list;
+    defer refreshCowStorageReturnHint(self);
     if (page_count == 0) return KernelError.InvalidState;
-    while (true) {
-        const capacity = self.native_cow_table_chunk_count * native_cow_table_slots_per_chunk;
-        var offset: usize = 0;
-        while (offset < capacity) : (offset += 1) {
-            const index = (self.next_native_cow_table_scan + offset) % capacity;
-            if (index > std.math.maxInt(u31)) return KernelError.TableFull;
-            const slot = nativeCowTableStorageSlot(self, index) orelse return KernelError.InvalidState;
-            if (slot.active or slot.ref_count != 0) continue;
-            if (slot.generation == 0) slot.generation = 1;
-            const page_store_owner = vmoBackingStoreOwner(.native_cow, @intCast(index), slot.generation);
-            // COW tables may be created directly from a page-fault path. The
-            // sparse backing index has its own innermost lock, so reserving a
-            // logical table does not require the global syscall-state lock.
-            const page_store_start = allocEmptyVmoBackingPageStore(page_count, page_store_owner) orelse return KernelError.TableFull;
-            slot.active = true;
-            slot.ref_count = 0;
-            slot.page_count = page_count;
-            slot.page_store_start = page_store_start;
-            self.next_native_cow_table_scan = (index + 1) % capacity;
-            return .{
-                .index = @intCast(index),
-                .generation = slot.generation,
-            };
-        }
-        try appendNativeCowTableChunk(self, free_list);
-        self.next_native_cow_table_scan = capacity;
-    }
+    // Reuse the common grant owner and persistent generation directory. The
+    // backing token reserves bit 63 for kind, hence the u31 index boundary.
+    const allocation = try self.allocatePool(&self.native_cow_tables, null, std.math.maxInt(u31));
+    errdefer self.native_cow_tables.remove(allocation.value, null);
+    const slot = allocation.value;
+    const owner = vmoBackingStoreOwner(.native_cow, allocation.ref.index, slot.generation);
+    const start = allocEmptyVmoBackingPageStore(&slot.page_store, page_count, owner) orelse return KernelError.TableFull;
+    slot.active = true;
+    slot.page_count = page_count;
+    slot.page_store_start = start;
+    return .{ .index = allocation.ref.index, .generation = slot.generation };
 }
 
 pub fn retainNativeCowTable(self: anytype, table_ref: NativeCowTableRef) KernelError!void {
     const slot = self.nativeCowTableSlot(table_ref) orelse return KernelError.InvalidState;
+    if (slot.pending_data_return != null) return KernelError.InvalidState;
     if (slot.ref_count == std.math.maxInt(u32)) return KernelError.TableFull;
+    slot.references.retainTemporary();
     slot.ref_count += 1;
 }
 
@@ -980,7 +996,7 @@ pub fn clearNativeCowPageSlots(
 
 // Callers hold the VM transaction and have established that no live alias
 // owns this range (or that the entire VMO/COW table is on final release).
-fn releaseBackingRange(start: u64, page_count: u32, owner: u64, first: usize, end: usize, free_list: ?*FreePageList) void {
+fn releaseBackingRange(start: types.BackingRef, page_count: u32, owner: u64, first: usize, end: usize, free_list: ?*FreePageList) void {
     var pages: [64]types.BackedPage = undefined;
     var cursor = first;
     while (cursor < end) {
@@ -1000,13 +1016,17 @@ fn releaseBackingRange(start: u64, page_count: u32, owner: u64, first: usize, en
                     _ = std.math.add(u64, next, native_page_size) catch break;
                 }
                 if (run_end - run_start > 1) {
-                    if (fl.appendContiguousRange(0, pages[run_start].paddr, run_end - run_start)) |_| {
+                    if (fl.appendContiguousRange(pages[run_start].paddr, run_end - run_start)) |_| {
                         for (pages[run_start..run_end]) |page| {
                             setVmoBackingPageStorePaddr(start, page_count, page.index, owner, 0, null) catch {};
                         }
                         run_start = run_end;
                         continue;
-                    } else |_| {
+                    } else |err| {
+                        switch (err) {
+                            error.PageQuarantined => {},
+                            else => @panic("invalid PMM return"),
+                        }
                         // Range insertion is atomic on failure. Preserve the
                         // old best-effort per-page fallback and backing entries
                         // for pages that could not be returned.
@@ -1014,7 +1034,10 @@ fn releaseBackingRange(start: u64, page_count: u32, owner: u64, first: usize, en
                 }
             }
             for (pages[run_start..run_end]) |page| {
-                if (free_list) |fl| fl.appendPage(0, page.paddr) catch continue;
+                if (free_list) |fl| fl.appendPage(page.paddr) catch |err| switch (err) {
+                    error.PageQuarantined => continue,
+                    else => @panic("invalid PMM return"),
+                };
                 setVmoBackingPageStorePaddr(start, page_count, page.index, owner, 0, null) catch {};
             }
             run_start = run_end;
@@ -1023,18 +1046,104 @@ fn releaseBackingRange(start: u64, page_count: u32, owner: u64, first: usize, en
 }
 
 pub fn releaseNativeCowTable(self: anytype, table_ref: NativeCowTableRef, free_list: ?*FreePageList) void {
+    defer refreshCowStorageReturnHint(self);
     const slot = self.nativeCowTableSlot(table_ref) orelse return;
     if (slot.ref_count == 0) return;
+    slot.references.releaseTemporary();
     slot.ref_count -= 1;
     if (slot.ref_count != 0) return;
     self.clearNativeCowPageSlots(table_ref, 0, slot.page_count, free_list);
+    const owner = vmoBackingStoreOwner(.native_cow, table_ref.index, table_ref.generation);
+    if (free_list) |destination| {
+        if (backingReturnUnfinished(slot.page_store_start, slot.page_count, owner)) {
+            // active keeps this slot out of the allocator even at refcount 0.
+            slot.pending_data_return = destination;
+            _ = @atomicRmw(usize, &self.pending_data_returns, .Add, 1, .release);
+            return;
+        }
+    }
     _ = freeVmoBackingPageStore(
         slot.page_store_start,
         slot.page_count,
         vmoBackingStoreOwner(.native_cow, table_ref.index, table_ref.generation),
     );
-    const next_generation = @TypeOf(self.*).nextObjectGeneration(slot.generation);
-    slot.* = .{ .generation = next_generation };
+    self.native_cow_tables.remove(slot, null);
+}
+
+fn backingReturnUnfinished(start: types.BackingRef, count: u32, owner: u64) bool {
+    var remaining: [1]types.BackedPage = undefined;
+    // A rejected lookup cannot authorize discarding the last owner record.
+    const found = types.snapshotVmoBackingPagesChecked(start, count, owner, 0, count, &remaining) catch return true;
+    return found != 0;
+}
+
+fn vmoHasOwnedDataStore(slot: *const NativeVmoSlot) bool {
+    // Views/device/kernel pages borrow their backing and must never return it.
+    return slot.has_page_store and slot.kind != .page_view and
+        slot.kind != .device_memory and slot.kind != .kernel_page;
+}
+
+fn vmoDataOwnerMatches(slot: *const NativeVmoSlot, expected_owner: u64) bool {
+    return !vmoHasOwnedDataStore(slot) or
+        types.vmoBackingPageStoreOwnerMatches(slot.page_store_start, slot.page_count, slot.page_store_owner, expected_owner);
+}
+
+fn vmoDataReturnUnfinished(slot: *const NativeVmoSlot, expected_owner: u64) bool {
+    if (!vmoDataOwnerMatches(slot, expected_owner)) return true;
+    return vmoHasOwnedDataStore(slot) and
+        backingReturnUnfinished(slot.page_store_start, slot.page_count, expected_owner);
+}
+
+pub fn hasPendingDataReturns(self: anytype) bool {
+    return types.backing_index.hasPending() or
+        @import("../memory/dma_retention.zig").hasRetained() or
+        @atomicLoad(usize, &self.pending_data_returns, .acquire) != 0 or
+        @atomicLoad(u8, &self.pending_cow_storage_return, .acquire) != 0;
+}
+
+/// Caller holds KernelState -> all-AS -> shared-VM. Finalizers may arrive
+/// from either domain, so neither lock alone excludes all pending writers.
+/// One finite traversal only: rejected pages stay owned for a later call.
+/// No allocator argument is accepted: retries use the failed destination,
+/// whose lifetime must cover every retained slot (global PMM in production).
+pub fn drainPendingDataReturns(self: anytype) void {
+    @import("fd.zig").retryForcedDma(self);
+    if (!self.hasPendingDataReturns()) return;
+    types.reclaimVmoBackingStorage();
+    self.native_cow_tables.reclaim();
+    defer refreshCowStorageReturnHint(self);
+    {
+        var pool_iter_6 = self.native_vmos.iterator();
+        while (pool_iter_6.next()) |pool_entry_6| {
+            const slot = pool_entry_6.value;
+            const index: usize = pool_entry_6.ref.index;
+            const destination = slot.pending_data_return orelse continue;
+            std.debug.assert(slot.ref_count == 0 and slot.ram_cache_state == .wb);
+            const expected_owner = vmoBackingStoreOwner(.native_vmo, @intCast(index), slot.generation);
+            if (!vmoDataOwnerMatches(slot, expected_owner)) continue;
+            @TypeOf(self.*).releaseNativeVmoOwnedPages(slot, destination);
+            if (vmoDataReturnUnfinished(slot, expected_owner)) continue;
+            const parent: NativeVmoRef = if (vmoKindHasParentArm(slot.kind)) slot.backing.parent.ref else .{};
+            slot.pending_data_return = null;
+            self.clearNativeVmoSlot(slot);
+            _ = @atomicRmw(usize, &self.pending_data_returns, .Sub, 1, .acq_rel);
+            // This retained edge belongs to the retiring child, not each retry.
+            if (!parent.isNull()) self.releaseNativeVmoWithFreeList(parent, destination);
+        }
+    }
+    var cow_iterator = self.native_cow_tables.iterator();
+    while (cow_iterator.next()) |entry| {
+        const index = entry.ref.index;
+        const slot = entry.value;
+        const destination = slot.pending_data_return orelse continue;
+        std.debug.assert(slot.active and slot.ref_count == 0);
+        const owner = vmoBackingStoreOwner(.native_cow, @intCast(index), slot.generation);
+        releaseBackingRange(slot.page_store_start, slot.page_count, owner, 0, slot.page_count, destination);
+        if (backingReturnUnfinished(slot.page_store_start, slot.page_count, owner)) continue;
+        _ = freeVmoBackingPageStore(slot.page_store_start, slot.page_count, owner);
+        self.native_cow_tables.remove(slot, null);
+        _ = @atomicRmw(usize, &self.pending_data_returns, .Sub, 1, .acq_rel);
+    }
 }
 
 pub fn nativeCowPagePaddr(self: anytype, table_ref: NativeCowTableRef, page_index: u32) ?u64 {
@@ -1074,19 +1183,9 @@ pub fn setNativeCowPagePaddr(
     const table = self.nativeCowTableSlotConst(table_ref) orelse return KernelError.InvalidState;
     const page_store_owner = vmoBackingStoreOwner(.native_cow, table_ref.index, table_ref.generation);
     if (page_index >= table.page_count) return KernelError.InvalidState;
-    if (vmoBackingPageStorePaddr(table.page_store_start, table.page_count, page_index)) |existing| {
-        if (existing != 0) return KernelError.InvalidState;
-    } else {
-        return KernelError.InvalidState;
-    }
-    try setVmoBackingPageStorePaddr(
-        table.page_store_start,
-        table.page_count,
-        page_index,
-        page_store_owner,
-        paddr,
-        free_list,
-    );
+    // Batch insertion validates absence under the publication lock, folding
+    // the former separate lookup into the same transaction.
+    try setVmoBackingPageStorePaddrs(table.page_store_start, table.page_count, page_index, page_store_owner, &.{paddr}, free_list);
 }
 
 pub fn entryCowPageIndex(entry: *const VmaEntry, fault_page_va: u64) ?u32 {
@@ -1115,6 +1214,7 @@ pub fn ensureEntryCowTable(
     try self.retainNativeCowTable(table_ref);
     entry.cow_table = table_ref;
     entry.cow_page_offset = 0;
+    self.refreshVmaReferences(entry);
 }
 
 pub fn detachSharedEntryCowTable(self: anytype, entry: *VmaEntry, free_list: *FreePageList) KernelError!void {
@@ -1123,7 +1223,7 @@ pub fn detachSharedEntryCowTable(self: anytype, entry: *VmaEntry, free_list: *Fr
     const old_ref = entry.cow_table;
     const old_table = self.nativeCowTableSlotConst(old_ref) orelse return KernelError.InvalidState;
     const old_owner = vmoBackingStoreOwner(.native_cow, old_ref.index, old_ref.generation);
-    if (old_table.page_store_start != old_owner) return KernelError.InvalidState;
+    if (old_table.page_store_start.owner != old_owner) return KernelError.InvalidState;
     // mprotect/munmap splits retain the original table with an offset. Only
     // this VMA's slice belongs in its private snapshot; copying the whole
     // original table duplicates unrelated pages once per split at fork.
@@ -1150,7 +1250,10 @@ pub fn detachSharedEntryCowTable(self: anytype, entry: *VmaEntry, free_list: *Fr
         for (pages[0..count]) |page| {
             const copied_paddr = (self.allocPhysicalPage(free_list) catch return KernelError.OutOfFreePages).paddr;
             var copied_installed = false;
-            defer if (!copied_installed) free_list.appendPage(0, copied_paddr) catch {};
+            defer if (!copied_installed) free_list.appendPage(copied_paddr) catch |err| switch (err) {
+                error.PageQuarantined => {},
+                else => @panic("invalid PMM return"),
+            };
             if (!@TypeOf(self.*).copyPhysicalPage(copied_paddr, page.paddr)) return KernelError.InvalidState;
             try self.setNativeCowPagePaddr(new_ref, page.index - old_offset, copied_paddr, free_list);
             copied_installed = true;
@@ -1159,6 +1262,7 @@ pub fn detachSharedEntryCowTable(self: anytype, entry: *VmaEntry, free_list: *Fr
 
     entry.cow_table = new_ref;
     entry.cow_page_offset = 0;
+    self.refreshVmaReferences(entry);
     self.releaseNativeCowTable(old_ref, free_list);
     installed = true;
 }
@@ -1169,22 +1273,15 @@ pub fn detachSharedEntryCowTable(self: anytype, entry: *VmaEntry, free_list: *Fr
 // VM transaction held through page return; this does not replace TLB
 // completion or change physical-page lifetime ordering.
 fn soleVmaExcludesPageRange(self: anytype, owner: PrincipalId, vmo_ref: NativeVmoRef, slot: *const NativeVmoSlot, first_page: usize, release_end: usize) bool {
+    _ = self;
+    _ = vmo_ref;
     if (slot.ref_count != 1) return false;
-    const table = self.getVmaTableConst(owner) orelse return false;
-    var found = false;
-    for (table.active_indices[0..table.active_count]) |index| {
-        const entry = &table.entries[index];
-        if (!entry.active or !@TypeOf(self.*).nativeVmoRefsEqual(entry.vmo, vmo_ref)) continue;
-        if (found) return false;
-        found = true;
-        if (entry.size_bytes == 0 or entry.size_bytes % native_page_size != 0 or
-            entry.vmo_offset % native_page_size != 0) return false;
-        const entry_first = entry.vmo_offset / native_page_size;
-        const entry_count = entry.size_bytes / native_page_size;
-        if (entry_first >= slot.page_count or entry_count > slot.page_count - entry_first) return false;
-        if (first_page < entry_first + entry_count and release_end > entry_first) return false;
-    }
-    return found;
+    const root = @constCast(&slot.references);
+    const counts = root.ownership();
+    if (counts.edges != 1 or counts.temporary != 0) return false;
+    const edge = types.references.first(root, .vma) orelse return false;
+    if (edge.identity.owner != (types.processIndexFromPrincipal(owner) orelse return false)) return false;
+    return !types.references.overlap(first_page * native_page_size, (release_end - first_page) * native_page_size, edge.range.offset, edge.range.size);
 }
 
 pub fn releaseUnmappedAnonymousVmoPageRange(
@@ -1201,60 +1298,14 @@ pub fn releaseUnmappedAnonymousVmoPageRange(
     if (first_page >= slot.page_count or page_count > @as(usize, slot.page_count) - first_page) return;
     const release_end = first_page + page_count;
     const sole_vma = soleVmaExcludesPageRange(self, owner, vmo_ref, slot, first_page, release_end);
-
-    // A page view borrows parent pages without owning them. Until every view
-    // is gone, keep the parent backing intact even if its FD and VMAs have
-    // otherwise disappeared. This deliberately pins the whole parent: views
-    // are bounded and do not form a deeper tree.
-    if (!sole_vma) {
-        for (self.native_vmos[0..]) |*candidate| {
-            if (directPageViewOf(candidate, vmo_ref)) return;
-        }
+    const carrier = if (sole_vma) false else types.references.backingCarrier(&slot.references, first_page, page_count);
+    if (comptime @import("reference_check.zig").enabled) {
+        // The old search cannot see unpublished retains. Apply the explicit
+        // temporary-owner safety rule to both proofs before comparing them.
+        const old = oldBackingCarrier(self, owner, vmo_ref, slot, first_page, page_count) or slot.references.ownership().temporary != 0;
+        if (old != carrier) @import("reference_check.zig").failure(error.PartialUnmapMismatch);
     }
-
-    const profile_start = smp_perf.timestamp();
-    defer smp_perf.vmoElapsed(.partial_total_cycles, profile_start);
-    smp_perf.vmoAdd(.partial_calls, 1);
-    smp_perf.vmoAdd(.partial_requested_pages, page_count);
-    if (!slot.has_page_store) smp_perf.vmoAdd(.partial_no_page_store, 1);
-    if (!sole_vma) {
-        const profile_stage = smp_perf.timestamp();
-        defer smp_perf.vmoElapsed(.partial_fd_scan_cycles, profile_stage);
-        for (self.fd_objects[0..]) |object_slot| {
-            if (object_slot.kind != .vmo or object_slot.ref_count == 0) continue;
-            const object_vmo = switch (object_slot.payload) {
-                .vmo => |object_ref| object_ref,
-                else => continue,
-            };
-            if (@TypeOf(self.*).nativeVmoRefsEqual(object_vmo, vmo_ref)) {
-                smp_perf.vmoAdd(.partial_fd_alias, 1);
-                return;
-            }
-        }
-    }
-
-    if (!sole_vma) {
-        const profile_stage = smp_perf.timestamp();
-        defer smp_perf.vmoElapsed(.partial_vma_scan_cycles, profile_stage);
-        var process_index: usize = 0;
-        while (process_index < self.process_capacity) : (process_index += 1) {
-            const table = self.vmaTableForProcessIndexConst(process_index) orelse continue;
-            var active_index: usize = 0;
-            while (active_index < table.active_count) : (active_index += 1) {
-                const entry_index: usize = @intCast(table.active_indices[active_index]);
-                const entry = &table.entries[entry_index];
-                if (!@TypeOf(self.*).nativeVmoRefsEqual(entry.vmo, vmo_ref)) continue;
-                const entry_first_page: usize = @intCast(entry.vmo_offset / native_page_size);
-                const entry_page_count: usize = @intCast(entry.size_bytes / native_page_size);
-                const entry_end_page = entry_first_page + entry_page_count;
-                if (first_page < entry_end_page and release_end > entry_first_page) {
-                    smp_perf.vmoAdd(.partial_vma_alias, 1);
-                    return;
-                }
-            }
-        }
-    }
-
+    if (carrier) return;
     if (!slot.has_page_store) return;
     const profile_pages = smp_perf.timestamp();
     defer smp_perf.vmoElapsed(.partial_page_cycles, profile_pages);
@@ -1270,7 +1321,7 @@ pub fn readFdVmoBytes(
     if (out.len == 0) return 0;
     const table = try self.fdTableForActiveProcess(owner);
     const fd_index = table.index(fd) orelse return KernelError.InvalidState;
-    const fd_entry = table.slots()[fd_index];
+    const fd_entry = table.at(fd_index).*;
     if (fd_entry.object.isNull() or !fd_entry.rights.read) return KernelError.InvalidState;
     const object_slot = self.kernelObjectSlotConst(fd_entry.object) orelse return KernelError.InvalidState;
     const vmo_ref = switch (object_slot.payload) {
@@ -1278,11 +1329,11 @@ pub fn readFdVmoBytes(
         else => return KernelError.InvalidState,
     };
     const vmo = self.nativeVmoSlotConst(vmo_ref) orelse return KernelError.InvalidState;
-    if (fd_entry.offset >= vmo.size_bytes) return 0;
-    const max_len: usize = @intCast(@min(@as(u64, @intCast(out.len)), vmo.size_bytes - fd_entry.offset));
+    if (fd_entry.cursor.offset >= vmo.size_bytes) return 0;
+    const max_len: usize = @intCast(@min(@as(u64, @intCast(out.len)), vmo.size_bytes - fd_entry.cursor.offset));
     var copied: usize = 0;
     while (copied < max_len) {
-        const absolute = fd_entry.offset + @as(u64, @intCast(copied));
+        const absolute = fd_entry.cursor.offset + @as(u64, @intCast(copied));
         const page_index: usize = @intCast(absolute / native_page_size);
         const page_offset: usize = @intCast(absolute % native_page_size);
         const paddr = self.nativeVmoResolvedPagePaddrOrZero(vmo_ref, page_index) orelse return KernelError.InvalidState;
@@ -1295,7 +1346,7 @@ pub fn readFdVmoBytes(
         copied += chunk;
     }
     const update_table = try self.fdTableForActiveProcess(owner);
-    update_table.slots()[fd_index].offset = fd_entry.offset + @as(u64, @intCast(copied));
+    update_table.at(fd_index).*.cursor.offset = fd_entry.cursor.offset + @as(u64, @intCast(copied));
     return copied;
 }
 
@@ -1352,23 +1403,33 @@ pub fn nativeVmoRefForRevokeFd(self: anytype, owner: PrincipalId, fd: Fd) Kernel
     return self.nativeVmoRefForKernelObject(entry.object) orelse KernelError.InvalidState;
 }
 
-pub fn nativeVmoMappingsOverlapPinnedUserObjects(
-    self: anytype,
-    vmo_ref: NativeVmoRef,
-) bool {
-    var process_index: usize = 0;
-    while (process_index < self.process_capacity) : (process_index += 1) {
-        const table = self.vmaTableForProcessIndexConst(process_index) orelse continue;
-        const owner = @TypeOf(self.*).processPrincipal(process_index);
-        var active_index: usize = 0;
-        while (active_index < table.active_count) : (active_index += 1) {
-            const entry_index: usize = @intCast(table.active_indices[active_index]);
-            const entry = &table.entries[entry_index];
-            if (!entry.active or !@TypeOf(self.*).nativeVmoRefsEqual(entry.vmo, vmo_ref)) continue;
-            if (self.rangeOverlapsPinnedUserObject(owner, entry.start_va, entry.size_bytes)) return true;
-        }
+pub fn nativeVmoMappingsOverlapPinnedUserObjects(self: anytype, vmo_ref: NativeVmoRef) bool {
+    const result = indexedMappingsPinned(self, vmo_ref);
+    if (comptime @import("reference_check.zig").enabled) {
+        if (result != oldNativeVmoMappingsOverlapPinnedUserObjects(self, vmo_ref))
+            @import("reference_check.zig").failure(error.PinnedMismatch);
+    }
+    return result;
+}
+fn indexedMappingsPinned(self: anytype, vmo_ref: NativeVmoRef) bool {
+    const slot = self.nativeVmoSlot(vmo_ref) orelse return false;
+    var cursor = types.references.Cursor.init(&slot.references);
+    while (cursor.next()) |edge| {
+        if (edge.identity.kind != .vma) continue;
+        const entry = resolveVmaEdge(self, vmo_ref, edge.identity) orelse return true;
+        if (self.rangeOverlapsPinnedUserObject(@TypeOf(self.*).processPrincipal(edge.identity.owner), entry.start_va, entry.size_bytes)) return true;
     }
     return false;
+}
+// The caller's outer VM transaction preserves the source between the leaf
+// snapshot and this generation check. No source lookup occurs under leaf.
+fn resolveVmaEdge(self: anytype, ref: NativeVmoRef, id: types.references.Identity) ?*types.VmaEntry {
+    const desc = self.processDescriptorSlotConst(id.owner) orelse return null;
+    if (desc.generation != id.owner_generation) return null;
+    const table = self.vmaTableForProcessIndex(id.owner) orelse return null;
+    const entry = table.entries.resolve(.{ .index = id.index, .generation = id.generation }) orelse return null;
+    if (!entry.active or !nativeVmoRefsEqual(entry.vmo, ref)) return null;
+    return entry;
 }
 
 fn directPageViewOf(slot: *const NativeVmoSlot, parent: NativeVmoRef) bool {
@@ -1382,82 +1443,34 @@ pub fn nativeVmoTreeMappingsOverlapPinnedUserObjects(
     vmo_ref: NativeVmoRef,
 ) bool {
     if (self.nativeVmoMappingsOverlapPinnedUserObjects(vmo_ref)) return true;
-    for (self.native_vmos[0..], 0..) |*slot, index| {
-        if (!directPageViewOf(slot, vmo_ref)) continue;
-        const child = NativeVmoRef{
-            .index = @intCast(index),
-            .generation = slot.generation,
-        };
-        if (self.nativeVmoMappingsOverlapPinnedUserObjects(child)) return true;
+    const root = self.nativeVmoSlot(vmo_ref) orelse return false;
+    var cursor = types.references.Cursor.init(&root.references);
+    while (cursor.next()) |edge| {
+        if (edge.identity.kind != .child) continue;
+        const child: NativeVmoRef = .{ .index = edge.identity.index, .generation = edge.identity.generation };
+        const slot = self.nativeVmoSlotConst(child) orelse return true;
+        if (directPageViewOf(slot, vmo_ref) and self.nativeVmoMappingsOverlapPinnedUserObjects(child)) return true;
     }
     return false;
 }
 
-pub fn revokeNativeVmoFromFdTablesWithFreeList(
-    self: anytype,
-    vmo_ref: NativeVmoRef,
-    free_list: *FreePageList,
-) void {
-    var process_index: usize = 0;
-    while (process_index < self.process_capacity) : (process_index += 1) {
-        const table = self.fdTableForProcessIndex(process_index) orelse continue;
-        var fd_index: usize = 0;
-        while (fd_index < table.slots().len) : (fd_index += 1) {
-            const object_ref = table.slots()[fd_index].object;
-            if (object_ref.isNull()) continue;
-            if (!self.kernelObjectMatchesNativeVmo(object_ref, vmo_ref)) continue;
-            table.slots()[fd_index] = .{};
-            self.releaseKernelObjectWithFreeList(object_ref, free_list);
-        }
+fn revokeVmoObjectHolders(self: anytype, vmo_ref: NativeVmoRef, free_list: *FreePageList, kind: types.references.Kind) void {
+    const slot = self.nativeVmoSlot(vmo_ref) orelse return;
+    // The caller pins this VMO. Removing one FD object cannot invalidate the
+    // successor object edge while K/all-AS excludes other source publishers.
+    var cursor = types.references.Cursor.init(&slot.references);
+    while (cursor.next()) |edge| {
+        if (edge.identity.kind != .fd_object) continue;
+        const object: KernelObjectRef = .{ .kind = .vmo, .index = edge.identity.index, .generation = edge.identity.generation };
+        std.debug.assert(self.kernelObjectMatchesNativeVmo(object, vmo_ref));
+        @import("fd.zig").revokeObjectHolders(self, object, free_list, kind);
     }
 }
-
-pub fn revokeNativeVmoFromIpcQueueWithFreeList(
-    self: anytype,
-    queue: *IpcQueue,
-    vmo_ref: NativeVmoRef,
-    free_list: *FreePageList,
-) void {
-    var msg_offset: usize = 0;
-    while (msg_offset < queue.len) : (msg_offset += 1) {
-        const msg_index = queue.slotIndex(msg_offset);
-        const msg = &queue.messages[msg_index];
-        var fd_index: usize = 0;
-        while (fd_index < msg.fd_count and fd_index < max_ipc_message_fds) {
-            const object_ref = msg.fds[fd_index].object;
-            if (object_ref.isNull() or !self.kernelObjectMatchesNativeVmo(object_ref, vmo_ref)) {
-                fd_index += 1;
-                continue;
-            }
-            self.releaseKernelObjectWithFreeList(object_ref, free_list);
-            var shift_index = fd_index + 1;
-            while (shift_index < msg.fd_count and shift_index < max_ipc_message_fds) : (shift_index += 1) {
-                msg.fds[shift_index - 1] = msg.fds[shift_index];
-            }
-            if (msg.fd_count != 0) msg.fd_count -= 1;
-            msg.fds[msg.fd_count] = .{};
-        }
-    }
+pub fn revokeNativeVmoFromFdTablesWithFreeList(self: anytype, vmo_ref: NativeVmoRef, free_list: *FreePageList) void {
+    revokeVmoObjectHolders(self, vmo_ref, free_list, .fd_entry);
 }
-
-pub fn revokeNativeVmoFromIpcMessagesWithFreeList(
-    self: anytype,
-    vmo_ref: NativeVmoRef,
-    free_list: *FreePageList,
-) void {
-    for (self.ipc_endpoints[0..]) |*slot| {
-        if (!slot.active) continue;
-        self.revokeNativeVmoFromIpcQueueWithFreeList(&slot.queue, vmo_ref, free_list);
-    }
-    for (self.ipc_channels[0..]) |*slot| {
-        if (!slot.active) continue;
-        self.revokeNativeVmoFromIpcQueueWithFreeList(&slot.queues[0], vmo_ref, free_list);
-        self.revokeNativeVmoFromIpcQueueWithFreeList(&slot.queues[1], vmo_ref, free_list);
-    }
-    for (self.ipc_replies[0..]) |*slot| {
-        if (!slot.active) continue;
-        self.revokeNativeVmoFromIpcQueueWithFreeList(&slot.queue, vmo_ref, free_list);
-    }
+pub fn revokeNativeVmoFromIpcMessagesWithFreeList(self: anytype, vmo_ref: NativeVmoRef, free_list: *FreePageList) void {
+    revokeVmoObjectHolders(self, vmo_ref, free_list, .ipc);
 }
 
 pub fn revokeNativeVmoFromVmaTablesWithFreeList(
@@ -1466,24 +1479,28 @@ pub fn revokeNativeVmoFromVmaTablesWithFreeList(
     free_list: *FreePageList,
     unmapper: anytype,
 ) KernelError!void {
-    var process_index: usize = 0;
-    while (process_index < self.process_capacity) : (process_index += 1) {
-        const table = self.vmaTableForProcessIndex(process_index) orelse continue;
-        const owner = @TypeOf(self.*).processPrincipal(process_index);
-        var active_pos: usize = 0;
-        while (active_pos < table.active_count) {
-            const vma_index: usize = @intCast(table.active_indices[active_pos]);
-            const entry = &table.entries[vma_index];
-            if (!entry.active or !@TypeOf(self.*).nativeVmoRefsEqual(entry.vmo, vmo_ref)) {
-                active_pos += 1;
-                continue;
-            }
-            if (!unmapper.unmap(owner, entry.start_va, entry.size_bytes)) return KernelError.InvalidState;
-            const entry_vmo = entry.vmo;
-            self.releaseVmaCowResources(entry, free_list);
-            @TypeOf(self.*).clearVmaEntry(table, vma_index);
-            self.releaseNativeVmoWithFreeList(entry_vmo, free_list);
-        }
+    const slot = self.nativeVmoSlot(vmo_ref) orelse return KernelError.InvalidState;
+    // Pin across callback/withdrawal. Caller has already acquired K -> all-AS;
+    // no outer lock or unmapper is entered while a target leaf is held.
+    try self.retainNativeVmo(vmo_ref);
+    defer self.releaseNativeVmoWithFreeList(vmo_ref, free_list);
+    while (types.references.first(&slot.references, .vma)) |edge| {
+        const id = edge.identity;
+        const desc = self.processDescriptorSlotConst(id.owner) orelse return KernelError.InvalidState;
+        if (desc.generation != id.owner_generation) return KernelError.InvalidState;
+        const table = self.vmaTableForProcessIndex(id.owner) orelse return KernelError.InvalidState;
+        const entry = table.entries.resolve(.{ .index = id.index, .generation = id.generation }) orelse return KernelError.InvalidState;
+        if (!entry.active or !@TypeOf(self.*).nativeVmoRefsEqual(entry.vmo, vmo_ref)) return KernelError.InvalidState;
+        const owner = @TypeOf(self.*).processPrincipal(id.owner);
+        // unmap includes the TLB acknowledgement. Failure keeps this edge and
+        // its original retain; only the temporary pin is returned by defer.
+        if (!unmapper.unmap(owner, entry.start_va, entry.size_bytes)) return KernelError.InvalidState;
+        self.releaseVmaCowResources(entry, free_list);
+        @TypeOf(self.*).clearVmaEntry(table, id.index);
+        self.releaseNativeVmoWithFreeList(vmo_ref, free_list);
+        table.reference_slots.reclaimEmptyBodies();
+        table.entries.reclaimEmptyBodies();
+        table.active_indices.reclaimEmptyBodies();
     }
 }
 
@@ -1495,25 +1512,181 @@ pub fn revokeVmoFdWithFreeList(
     unmapper: anytype,
 ) KernelError!NativeVmoRef {
     const vmo_ref = try self.nativeVmoRefForRevokeFd(owner, fd);
-    // Page views cannot derive further views, so one bounded direct-child
-    // scan is the complete descendant set. Revoke children before the parent:
-    // each child final drop releases its parent retain.
-    var child_index: usize = 0;
-    while (child_index < self.native_vmos.len) : (child_index += 1) {
-        const slot = &self.native_vmos[child_index];
+    // The migration oracle matches exact source identities (including queue
+    // sequence/position), hence also the filtered revoke target set. It only
+    // observes; all withdrawals below are driven by the new index.
+    if (comptime @import("reference_check.zig").enabled)
+        @import("reference_check.zig").check(self) catch |err| @import("reference_check.zig").failure(err);
+    try self.retainNativeVmo(vmo_ref);
+    defer self.releaseNativeVmoWithFreeList(vmo_ref, free_list);
+    const root = self.nativeVmoSlot(vmo_ref) orelse unreachable;
+    var children = types.references.Cursor.init(&root.references);
+    while (children.next()) |edge| {
+        if (edge.identity.kind != .child) continue;
+        const child: NativeVmoRef = .{ .index = edge.identity.index, .generation = edge.identity.generation };
+        const slot = self.nativeVmoSlot(child) orelse return KernelError.InvalidState;
         if (!directPageViewOf(slot, vmo_ref)) continue;
-        const child = NativeVmoRef{
-            .index = @intCast(child_index),
-            .generation = slot.generation,
-        };
-        try self.revokeNativeVmoFromVmaTablesWithFreeList(child, free_list, unmapper);
-        self.revokeNativeVmoFromFdTablesWithFreeList(child, free_list);
-        self.revokeNativeVmoFromIpcMessagesWithFreeList(child, free_list);
-        if (self.nativeVmoSlotConst(child) != null)
-            return KernelError.InvalidState;
+        try self.retainNativeVmo(child);
+        {
+            defer self.releaseNativeVmoWithFreeList(child, free_list);
+            try self.revokeNativeVmoFromVmaTablesWithFreeList(child, free_list, unmapper);
+            self.revokeNativeVmoFromFdTablesWithFreeList(child, free_list);
+            self.revokeNativeVmoFromIpcMessagesWithFreeList(child, free_list);
+        }
+        if (self.nativeVmoSlotConst(child) != null) return KernelError.InvalidState;
     }
     try self.revokeNativeVmoFromVmaTablesWithFreeList(vmo_ref, free_list, unmapper);
     self.revokeNativeVmoFromFdTablesWithFreeList(vmo_ref, free_list);
     self.revokeNativeVmoFromIpcMessagesWithFreeList(vmo_ref, free_list);
     return vmo_ref;
+}
+
+/// Consume an already prepared parent retain. The child is still unpublished,
+/// so no fault can observe its backing arm before the matching edge exists.
+pub fn publishNativeVmoParent(self: anytype, child: NativeVmoRef, parent: NativeVmoRef, offset: u64) KernelError!void {
+    if (@TypeOf(self.*).nativeVmoRefsEqual(child, parent)) return KernelError.InvalidState;
+    const slot = self.nativeVmoSlot(child) orelse return KernelError.InvalidState;
+    const source = self.nativeVmoSlot(parent) orelse return KernelError.InvalidState;
+    if (!vmoKindHasParentArm(slot.kind) or source.kind != .anonymous or !slot.backing.parent.ref.isNull() or slot.references.ownership().edges != 0) return KernelError.InvalidState;
+    if (offset % native_page_size != 0 or offset > source.size_bytes or (slot.kind == .anonymous and slot.size_bytes > source.size_bytes - offset)) return KernelError.InvalidState;
+    slot.backing.parent = .{ .ref = parent, .offset = offset };
+    source.references.connect(&slot.parent_edge, .{ .kind = .child, .index = child.index, .generation = child.generation }, .{ .size = slot.size_bytes, .offset = offset }, true);
+}
+
+fn oldBackingCarrier(self: anytype, owner: PrincipalId, vmo_ref: NativeVmoRef, slot: *const NativeVmoSlot, first_page: usize, page_count: usize) bool {
+    const release_end = first_page + page_count;
+    _ = owner;
+    _ = slot;
+    // An independent oracle must not trust the edge used by the fast path.
+    const sole_vma = false;
+
+    // Page views and anonymous shadows borrow parent pages without owning
+    // them. A shadow's inherited pages can still be faulted after the parent's
+    // FD and direct VMAs disappear, so a direct borrower pins the whole parent.
+    // Descendants retain each intervening parent, preserving deeper trees too.
+    if (!sole_vma) {
+        {
+            var pool_iter_7 = self.native_vmos.iterator();
+            while (pool_iter_7.next()) |pool_entry_7| {
+                const candidate = pool_entry_7.value;
+                if (vmoKindHasParentArm(candidate.kind) and
+                    @TypeOf(self.*).nativeVmoRefsEqual(candidate.backing.parent.ref, vmo_ref))
+                {
+                    return true;
+                }
+            }
+        }
+    }
+
+    if (!sole_vma) {
+        {
+            var pool_iter_2 = self.fd_objects.iterator();
+            while (pool_iter_2.next()) |pool_entry_2| {
+                const object_slot = pool_entry_2.value.*;
+                if (object_slot.kind != .vmo or object_slot.ref_count == 0) continue;
+                const object_vmo = switch (object_slot.payload) {
+                    .vmo => |object_ref| object_ref,
+                    else => continue,
+                };
+                if (@TypeOf(self.*).nativeVmoRefsEqual(object_vmo, vmo_ref)) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    if (!sole_vma) {
+        var process_index: usize = 0;
+        while (process_index < self.process_capacity) : (process_index += 1) {
+            const table = self.vmaTableForProcessIndexConst(process_index) orelse continue;
+            var active_index: usize = 0;
+            while (active_index < table.active_count) : (active_index += 1) {
+                const entry_index: usize = @intCast(table.active_indices.get(@intCast(active_index)).?.*);
+                const entry = (table.entries.get(@intCast(entry_index)).?);
+                if (!@TypeOf(self.*).nativeVmoRefsEqual(entry.vmo, vmo_ref)) continue;
+                const entry_first_page: usize = @intCast(entry.vmo_offset / native_page_size);
+                const entry_page_count: usize = @intCast(entry.size_bytes / native_page_size);
+                const entry_end_page = entry_first_page + entry_page_count;
+                if (first_page < entry_end_page and release_end > entry_first_page) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    return false;
+}
+
+fn oldNativeVmoMappingsOverlapPinnedUserObjects(
+    self: anytype,
+    vmo_ref: NativeVmoRef,
+) bool {
+    var process_index: usize = 0;
+    while (process_index < self.process_capacity) : (process_index += 1) {
+        const table = self.vmaTableForProcessIndexConst(process_index) orelse continue;
+        const owner = @TypeOf(self.*).processPrincipal(process_index);
+        var active_index: usize = 0;
+        while (active_index < table.active_count) : (active_index += 1) {
+            const entry_index: usize = @intCast(table.active_indices.get(@intCast(active_index)).?.*);
+            const entry = (table.entries.get(@intCast(entry_index)).?);
+            if (!entry.active or !@TypeOf(self.*).nativeVmoRefsEqual(entry.vmo, vmo_ref)) continue;
+            if (self.rangeOverlapsPinnedUserObject(owner, entry.start_va, entry.size_bytes)) return true;
+        }
+    }
+    return false;
+}
+
+fn oldValidateRamCacheMappings(self: anytype, ref: NativeVmoRef, first_page: usize, sorted_pages: []const u64) RamCacheMappingError!void {
+    const paging = @import("../memory/ram_cache_paging.zig");
+    paging.validatePages(sorted_pages, @as(u64, 1) << 52) catch return error.Invalid;
+    const root = self.nativeVmoSlotConst(ref) orelse return error.Invalid;
+    if (root.kind != .anonymous or !root.backing.parent.ref.isNull() or !root.has_page_store or
+        root.ram_cache_state == .retiring or first_page >= root.page_count or
+        sorted_pages.len > root.page_count - first_page) return error.Invalid;
+    for (0..sorted_pages.len) |index| {
+        const pa = self.nativeVmoOwnPagePaddr(ref, first_page + index) orelse return error.Invalid;
+        if (!paging.pagesIntersect(sorted_pages, pa, 4096)) return error.Invalid;
+    }
+    const first_byte: u64 = @as(u64, @intCast(first_page)) * native_page_size;
+    const end_byte = first_byte + @as(u64, @intCast(sorted_pages.len)) * native_page_size;
+    for (0..self.process_capacity) |process_index| {
+        const table = self.vmaTableForProcessIndexConst(process_index) orelse continue;
+        const principal = @TypeOf(self.*).processPrincipal(process_index);
+        for (0..table.active_count) |active_position| {
+            const entry_index = table.active_indices.get(@intCast(active_position)).?.*;
+            const entry = (table.entries.get(@intCast(entry_index)).?);
+            if (!entry.active) continue;
+            const backing = self.nativeVmoSlotConst(entry.vmo) orelse return error.Invalid;
+            // Neither BAR pages nor the kernel clock page take RAM cache policy.
+            if (backing.kind == .device_memory or backing.kind == .kernel_page) continue;
+            if (directPageViewOf(backing, ref)) {
+                const start: usize = @intCast(entry.vmo_offset / native_page_size);
+                const count: usize = @intCast(entry.size_bytes / native_page_size);
+                for (0..count) |index| {
+                    const pa = self.nativeVmoOwnPagePaddr(entry.vmo, start + index) orelse continue;
+                    if (paging.pagesIntersect(sorted_pages, pa, 4096))
+                        try checkRamCacheMapping(self, principal, entry, @as(u64, @intCast(index)) * native_page_size, native_page_size);
+                }
+                continue;
+            }
+            var ancestor = entry.vmo;
+            var offset = entry.vmo_offset;
+            var depth: usize = 0;
+            while (!@TypeOf(self.*).nativeVmoRefsEqual(ancestor, ref)) {
+                const slot = self.nativeVmoSlotConst(ancestor) orelse return error.Invalid;
+                if (slot.kind != .anonymous or slot.backing.parent.ref.isNull()) break;
+                depth += 1;
+                if (depth > self.native_vmos.capacity) return error.Invalid;
+                offset = std.math.add(u64, offset, slot.backing.parent.offset) catch return error.Invalid;
+                ancestor = slot.backing.parent.ref;
+            }
+            if (!@TypeOf(self.*).nativeVmoRefsEqual(ancestor, ref)) continue;
+            const mapping_end = std.math.add(u64, offset, entry.size_bytes) catch return error.Invalid;
+            const overlap_start = @max(first_byte, offset);
+            const overlap_end = @min(end_byte, mapping_end);
+            if (overlap_start >= overlap_end) continue;
+            if (depth != 0) return error.ShadowAlias;
+            try checkRamCacheMapping(self, principal, entry, overlap_start - offset, overlap_end - overlap_start);
+        }
+    }
 }

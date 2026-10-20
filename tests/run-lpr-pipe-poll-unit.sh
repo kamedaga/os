@@ -6,7 +6,7 @@ mkdir -p .artifacts/tests/lpr-pipe-poll
 /usr/bin/clang -std=c11 -O1 -g -Wall -Wextra -Werror \
   -fsanitize=address,undefined -fno-omit-frame-pointer \
   -ffunction-sections -fdata-sections -Wl,--gc-sections \
-  -Iuserland/libipc/include -Iuserland/libpacha/include \
+  -Iuserland -Ikobox2/protocol/include -Ikobox2/protocol/generated/include -Iuserland/libipc/include -Iuserland/libpacha/include \
   -Iuserland/personality/include -Imusl/pachaos/include \
   -Iuserland/daemons/common/include -Iuserland/filed/include \
   -Iuserland/termd/include -Iuserland/gpud/include -Iuserland/inputd/include \

@@ -29,7 +29,7 @@ int filed_storage_owner_client_config(struct filed_storage_owner *owner, uint64_
     *config=configured; return 0;
 }
 int filed_storage_owner_client_bind(struct filed_storage_owner *owner,
-    const struct ph_fs_channel_config *config,int vmo,int doorbell)
+    const struct ph_fs_channel_config *config,pacha_fd_t vmo,pacha_fd_t doorbell)
 {
     assert(owner == (void *)1234 && config->generation==77 && config->channel_id==next_id);
     assert(vmo==90 && doorbell==91 && !release_step);
@@ -40,7 +40,7 @@ int filed_storage_owner_client_release(struct filed_storage_owner *owner,uint64_
     assert(owner==(void *)1234 && id==configured.channel_id && release_step==0);
     ++releases; ++release_step; return release_error;
 }
-int pacha_fd_get_info(int fd,struct pacha_fd_info *info)
+int pacha_fd_get_info(pacha_fd_t fd,struct pacha_fd_info *info)
 {
     if(fd==70) { *info=(struct pacha_fd_info){.kind=PACHA_FD_KIND_REPLY}; return 0; }
     if(fd==80) { *info=(struct pacha_fd_info){.kind=PACHA_FD_KIND_VMO,.size=sizeof(control)}; return 0; }
@@ -53,7 +53,7 @@ int pacha_fd_get_info(int fd,struct pacha_fd_info *info)
         PH_FS_CLIENT_DOORBELL_RIGHTS)};
     return 0;
 }
-void *pacha_mmap(int fd,uint64_t size,uint64_t prot,uint64_t flags,uint64_t offset)
+void *pacha_mmap(pacha_fd_t fd,uint64_t size,uint64_t prot,uint64_t flags,uint64_t offset)
 {
     /* filed must never map the client queue payload, only the control VMO. */
     assert(fd==80 && size==sizeof(control) && !offset);
@@ -62,7 +62,7 @@ void *pacha_mmap(int fd,uint64_t size,uint64_t prot,uint64_t flags,uint64_t offs
 }
 int pacha_munmap(void *p,uint64_t size)
 { assert(p==control && size==sizeof(control)); return 0; }
-int pacha_fd_close(int fd)
+int pacha_fd_close(pacha_fd_t fd)
 {
     assert(fd==70 || fd==80 || fd==90 || fd==91);
     ++closes[fd];
@@ -74,20 +74,21 @@ int pacha_fd_close(int fd)
     }
     return 0;
 }
-int pacha_ipc_recv(int fd,struct pacha_ipc_msg *message)
+int pacha_ipc_recv(pacha_fd_t fd,struct pacha_ipc_msg *message)
 {
     assert(fd==60 && message->fd_capacity>=4);
     message->word0=incoming_request.opcode;message->word1=KB2_FILESYSTEM_REQUEST_SIZE;
     message->word2=KB2_FILESYSTEM_RESPONSE_SIZE;message->word3=incoming_request.sequence;
-    message->fd_count=incoming_sources+2;
+    message->fd_count=incoming_sources+1;
     message->fds[0]=(struct pacha_ipc_fd){.fd=80};
     for(size_t i=0;i<incoming_sources;++i) message->fds[i+1]=(struct pacha_ipc_fd){.fd=90+i};
-    message->fds[message->fd_count-1]=(struct pacha_ipc_fd){.fd=70};
+    
     return 0;
 }
-int pacha_ipc_reply(int fd,const struct pacha_ipc_msg *message)
+int pacha_ipc_reply(pacha_fd_t fd,const struct pacha_ipc_msg *message)
 {
-    assert(fd==70 && !message->fd_count && message->word3==incoming_request.sequence);
+    if (reply_error && !message->word0) return reply_error;
+    assert(fd==PACHA_IPC_REPLY_IMPLICIT && !message->fd_count && message->word3==incoming_request.sequence);
     ++replied; return reply_error;
 }
 
@@ -115,20 +116,20 @@ int filed_storage_close(filed_runtime_t *a,uint64_t b) { assert(a==&runtime && b
 int filed_storage_executable_mapping(filed_runtime_t *a,uint64_t b) { abort(); }
 int filed_storage_exec_open(filed_runtime_t *a,uint64_t b,const char *c,uint64_t *d) { abort(); }
 int filed_storage_exec_close(filed_runtime_t *a,uint64_t b) { abort(); }
-int filed_client_create(filed_runtime_t *a,const kb2_fs_request_t *b,const uint8_t *c,size_t d,int *e,uint64_t *f) { abort(); }
+int filed_client_create(filed_runtime_t *a,const kb2_fs_request_t *b,const uint8_t *c,size_t d,pacha_fd_t *e,uint64_t *f) { abort(); }
 int filed_client_credentials(filed_runtime_t *a,const kb2_fs_request_t *b,const uint8_t *c,size_t d) { abort(); }
 int filed_client_release(filed_runtime_t *a,struct filed_client *b) { abort(); }
 int filed_owner_control(filed_runtime_t *a,kb2_fs_request_t *b,const uint8_t *c,size_t d,kb2_fs_response_t *e) { abort(); }
-int pacha_vmo_create(uint64_t a,uint64_t b,uint32_t c) { abort(); }
-long pacha_fd_fcntl(int a,uint64_t b,uint64_t c,uint64_t d) { abort(); }
+pacha_fd_t pacha_vmo_create(uint64_t a,uint64_t b,uint32_t c) { abort(); }
+long pacha_fd_fcntl(pacha_fd_t a,uint64_t b,uint64_t c,uint64_t d) { abort(); }
 long pacha_syscall2(uint64_t a,uint64_t b,uint64_t c) { abort(); }
-int filed_exec_handle(filed_runtime_t *a,filed_handle_id_t b,const filed_exec_path_t *c,const int *d,uint64_t e,int f,int *g,int *h) { abort(); }
-int filed_exec_linux_lpr_prepare_self(filed_runtime_t *a,filed_handle_id_t b,const filed_exec_path_t *c,int *d,int *e) { abort(); }
+int filed_exec_handle(filed_runtime_t *a,filed_handle_id_t b,const filed_exec_path_t *c,const pacha_fd_t *d,uint64_t e,pacha_fd_t f,pacha_fd_t *g,pacha_fd_t *h) { abort(); }
+int filed_exec_linux_lpr_prepare_self(filed_runtime_t *a,filed_handle_id_t b,const filed_exec_path_t *c,pacha_fd_t *d,pacha_fd_t *e) { abort(); }
 #pragma GCC diagnostic pop
 
-static kb2_fs_response_t dispatch(kb2_fs_request_t *r,const int *sources,size_t count)
+static kb2_fs_response_t dispatch(kb2_fs_request_t *r,const pacha_fd_t *sources,size_t count)
 {
-    uint8_t bytes[KB2_FILESYSTEM_REQUEST_SIZE]={0},out[128];size_t used=0,fd_count=0;int fds[3];
+    uint8_t bytes[KB2_FILESYSTEM_REQUEST_SIZE]={0},out[128];size_t used=0,fd_count=0;pacha_fd_t fds[3];
     assert(!kb2_fs_request_encode(bytes,sizeof(bytes),sizeof(bytes),r));
     assert(!dispatch_wire(&runtime,r,bytes,sizeof(bytes),out,sizeof(out),&used,sources,count,fds,&fd_count));
     kb2_fs_response_t response;
@@ -171,7 +172,7 @@ static void native_receive(kb2_fs_request_t request,size_t sources)
     incoming_request=request;incoming_sources=sources;
     assert(!kb2_fs_request_encode(control,KB2_FILESYSTEM_REQUEST_SIZE,KB2_FILESYSTEM_REQUEST_SIZE,&request));
     assert(filed_receive(&runtime,60)==reply_error);
-    assert(replied==1 && closes[70]==1 && closes[80]==1 && mapped_control==1);
+    assert(replied==1 && closes[70]==0 && closes[80]==1 && mapped_control==1);
 }
 static void test_device_route(void)
 {
@@ -181,7 +182,7 @@ static void test_device_route(void)
     uint8_t bytes[KB2_FILESYSTEM_REQUEST_SIZE+sizeof("/alias")],out[KB2_FILESYSTEM_RESPONSE_SIZE+KB2_FILESYSTEM_STATX_SIZE];
     assert(!kb2_fs_request_encode(bytes,KB2_FILESYSTEM_REQUEST_SIZE,sizeof(bytes),&r));
     memcpy(bytes+KB2_FILESYSTEM_REQUEST_SIZE,"/alias",sizeof("/alias"));
-    size_t used=0,count=0;int fds[3];kb2_fs_response_t response;
+    size_t used=0,count=0;pacha_fd_t fds[3];kb2_fs_response_t response;
     assert(!dispatch_wire(&runtime,&r,bytes,sizeof(bytes),out,sizeof(out),&used,NULL,0,fds,&count));
     assert(!kb2_fs_response_decode(out,used,&response) && !response.result && !count &&
         response.handle==432 && response.service==FILED_SERVICE_GPUD_DRM &&
@@ -201,7 +202,7 @@ static void test_device_route(void)
 }
 int main(void)
 {
-    int sources[2]={90,91};
+    pacha_fd_t sources[2]={90,91};
     setup(); kb2_fs_request_t attach=reserve(65536);
     assert(attach.length==65536 && !dispatch(&attach,sources,2).result && binds==1);
     assert(!mapped_control && runtime.sessions->attached);

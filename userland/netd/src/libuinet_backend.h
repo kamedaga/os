@@ -1,3 +1,4 @@
+#include <pacha/abi.h>
 #pragma once
 
 #include "netd_internal.h"
@@ -26,7 +27,7 @@ int netd_libuinet_socket_open(
     uint64_t domain,
     uint64_t type,
     uint64_t protocol,
-    int notify_fd,
+    pacha_fd_t notify_fd,
     uint64_t *out_handle);
 int netd_libuinet_socket_dup(uint64_t handle);
 int netd_libuinet_socket_connect(uint64_t handle, uint32_t addr_be, uint16_t port_be, uint64_t flags);
@@ -34,7 +35,7 @@ int netd_libuinet_socket_bind(uint64_t handle, uint32_t addr_be,
     uint16_t port_be, int reuseaddr, uint32_t *out_addr_be,
     uint16_t *out_port_be);
 int netd_libuinet_socket_listen(uint64_t handle, uint32_t backlog);
-int netd_libuinet_socket_accept(uint64_t handle, int notify_fd,
+int netd_libuinet_socket_accept(uint64_t handle, pacha_fd_t notify_fd,
     uint64_t *out_handle, uint32_t *out_peer_addr_be,
     uint16_t *out_peer_port_be, uint32_t *out_local_addr_be,
     uint16_t *out_local_port_be);

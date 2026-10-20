@@ -3,10 +3,24 @@
 /// requests and converts them into boot/entry.zig resources.
 const std = @import("std");
 pub const smp_profile_enabled = @import("smp_profile_options").enabled;
+pub const b3_profile_enabled = @import("ipc_profile_options").b3_enabled;
 pub const ipc_profile_enabled = @import("ipc_profile_options").ipc_enabled;
 pub const kernel_log_ring_enabled = @import("kernel_log_ring_options").log_ring_enabled;
+pub const kernel_reference_checks_enabled = @import("kernel_lock_check_options").reference_checks_enabled;
+pub const kernel_lock_checks_enabled = @import("kernel_lock_check_options").lock_checks_enabled;
+pub const stack_high_water_enabled = @import("stack_paint_options").stack_high_water_enabled;
 const kernel_api = @import("kernel_boot_api");
 const x86_platform = kernel_api.x86_platform;
+
+// Physical execution identity, independent of the logical thread selected by
+// handoff. Unmapped/unknown AP or IST stacks must not masquerade as CPU zero.
+pub fn lockDiagnosticsCpuSlot() ?usize {
+    var rsp: u64 = 0;
+    asm volatile ("mov %%rsp, %[out]"
+        : [out] "=r" (rsp),
+    );
+    return x86_platform.cpuSlotForStackPointer(rsp).index();
+}
 const entry = kernel_api.entry;
 const kernel_runtime = kernel_api.kernel_runtime;
 const limine = @import("protocol.zig");
@@ -113,6 +127,18 @@ fn haltForever() noreturn {
 // ---------------------------------------------------------------------------
 
 pub export fn _start() callconv(.c) noreturn {
+    if (comptime stack_high_water_enabled) {
+        // Limine's stack is still current: painting after the switch would
+        // overwrite our own frames and lose boot's maximum usage.
+        var initial_rsp: u64 = 0;
+        asm volatile ("mov %%rsp, %[out]"
+            : [out] "=r" (initial_rsp),
+        );
+        if (!x86_platform.paintUnusedBspStacks(initial_rsp)) {
+            asm volatile ("cli" ::: .{ .memory = true });
+            haltForever();
+        }
+    }
     const boot_stack_top = @as(usize, @intCast(x86_platform.ring0StackTop())) & ~@as(usize, 0xF);
     asm volatile (
         \\mov %[stack_top], %%rsp

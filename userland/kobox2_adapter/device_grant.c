@@ -78,7 +78,7 @@ int ph_device_grant_take(struct ph_device_grant *out, struct ph_bootstrap_receiv
     if (index >= bundle->resource_count) return -EINVAL;
     struct ph_bootstrap_item *item = &bundle->items[2 + bundle->artifact_count + index];
     uint64_t fd = item->capability.fd;
-    if (fd < 16 || fd >= PACHA_FD_TABLE_LIMIT || item->size ||
+    if (fd < 16 || fd >= PACHA_THREAD_SELF_FD || item->size ||
         item->capability.rights != PH_DEVICE_FUNCTION_RIGHTS ||
         item->capability.flags != PACHA_FD_FLAG_CLOEXEC || item->capability.transfer_flags) return -EACCES;
     struct pacha_fd_info info = {0};
@@ -93,7 +93,7 @@ int ph_device_grant_take(struct ph_device_grant *out, struct ph_bootstrap_receiv
     if (capsule.flags & PACHA_CAPSULE_DMA_QUARANTINED || !(capsule.flags & PACHA_CAPSULE_DMA_TRANSLATED))
         return -ENODEV;
     *out = (struct ph_device_grant){.generation = authority->generation, .object_id = authority->object_id,
-        .native_device = capsule.device, .fd = (int)fd};
+        .native_device = capsule.device, .fd = (pacha_fd_t)fd};
     item->capability.fd = PH_IPC_NO_FD;
     return 0;
 }

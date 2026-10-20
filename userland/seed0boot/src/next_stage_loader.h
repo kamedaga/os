@@ -1,3 +1,4 @@
+#include <pacha/abi.h>
 #ifndef SEED0BOOT_NEXT_STAGE_LOADER_H
 #define SEED0BOOT_NEXT_STAGE_LOADER_H
 
@@ -5,7 +6,7 @@
 #include "pacha/ipc.h"
 
 struct seed0_loaded_process {
-    int process_fd;
+    pacha_fd_t process_fd;
     uint64_t runtime_entry;
     uint64_t load_bias;
     uint64_t phdr_va;
@@ -22,12 +23,12 @@ int seed0_load_elf_process(
     uint64_t grant_count,
     struct seed0_loaded_process *out);
 int seed0_map_bytes_into_process(
-    int process_fd,
+    pacha_fd_t process_fd,
     uint64_t target_va,
     const void *data,
     uint64_t size,
     uint64_t prot);
-int seed0_start_process(const struct seed0_loaded_process *loaded, const char *argv0, int bootstrap_fd);
+int seed0_start_process(const struct seed0_loaded_process *loaded, const char *argv0, pacha_fd_t bootstrap_fd);
 int seed0_stage_next_elf(const char *path, const unsigned char *image, uint32_t image_size);
 
 #endif

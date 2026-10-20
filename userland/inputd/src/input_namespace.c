@@ -14,9 +14,9 @@
 /* These buffers format inputd's fixed namespace plus a UINT16_MAX index;
  * they are not limits on paths accepted by the filesystem service. */
 enum { INPUT_NAMESPACE_PATH_BYTES = 256 };
-struct namespace_client { int endpoint; };
+struct namespace_client { pacha_fd_t endpoint; };
 
-static int begin(struct namespace_client *client, int endpoint)
+static int begin(struct namespace_client *client, pacha_fd_t endpoint)
 {
     client->endpoint = endpoint;
     return endpoint < 16 ? -EINVAL : 0;
@@ -133,7 +133,7 @@ static const char *input_files[] = {"name", "phys", "uniq", "properties", "ueven
     "capabilities/msc", "capabilities/led", "capabilities/snd",
     "capabilities/ff", "capabilities/sw"};
 
-int inputd_namespace_remove(int filed_fd, uint32_t index)
+int inputd_namespace_remove(pacha_fd_t filed_fd, uint32_t index)
 {
     if (index > UINT16_MAX) return -EINVAL;
     struct namespace_client c;
@@ -168,7 +168,7 @@ int inputd_namespace_remove(int filed_fd, uint32_t index)
     return status;
 }
 
-int inputd_namespace_publish(int filed_fd, const struct inputd_public_device *d,
+int inputd_namespace_publish(pacha_fd_t filed_fd, const struct inputd_public_device *d,
     const struct kb_input_device_snapshot *s)
 {
     if (!d || !s || d->event_index > UINT16_MAX ||

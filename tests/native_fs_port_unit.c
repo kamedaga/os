@@ -5,6 +5,7 @@
 #include "filed/exec.h"
 #include "filed/runtime.h"
 
+static long high_fd_closed;
 static unsigned char used[4096];
 static uint64_t fd_flags[4096];
 static uint64_t capacity_now=256;
@@ -38,6 +39,7 @@ static int mock_process_create(const struct pacha_process_fd_grant *grants,uint6
 long native_test_raw(long n,long a,long b,long c,long d,long e,long f)
 {
     (void)e; (void)f;
+    if (n == PACHAOS_SYSCALL_FD_CLOSE && a > INT_MAX) { high_fd_closed = a; return 0; }
     switch (n) {
     case PACHAOS_SYSCALL_FD_TABLE: {
         struct { uint64_t capacity,maximum,free_slots; } *info=(void *)b;
@@ -53,7 +55,7 @@ long native_test_raw(long n,long a,long b,long c,long d,long e,long f)
     case PACHAOS_SYSCALL_FD_CLOSE:
         assert(a>=16 && a<4096 && used[a]); used[a]=0;
         free(vmo_data[a]); vmo_data[a]=NULL; vmo_sizes[a]=0; vmo_rights[a]=0; return 0;
-    case 41:
+    case PACHAOS_SYSCALL_FD_GET_INFO:
         if (a==FILE_ENDPOINT) {
             struct { uint64_t kind,rights,flags,size,extra; } *info=(void *)b;
             *info=(typeof(*info)){5,PACHAOS_FD_RIGHT_CALL|PACHAOS_FD_RIGHT_INSPECT|PACHAOS_FD_RIGHT_TRANSFER,0,0,0};
@@ -77,11 +79,11 @@ long native_test_raw(long n,long a,long b,long c,long d,long e,long f)
         memset((void *)b,0,sizeof(struct __pachaos_kstat));
         ((struct __pachaos_kstat *)b)->st_mode=0020000; return 0;
     case PACHAOS_SYSCALL_FD_POLL: {
-        struct __pachaos_pollfd *fds=(void *)a;
+        struct pacha_pollfd *fds=(void *)a;
         assert(b==72);
         fds[0].revents=PACHAOS_POLL_READABLE; return 1;
     }
-    case 40:
+    case PACHAOS_SYSCALL_FD_DUP:
         assert(a>=16 && a<4096 && used[a]);
         for (long i=b;i<(long)capacity_now;++i) if (i>=16 && !used[i]) { used[i]=1; fd_flags[i]=(uint64_t)d; return i; }
         return 3;
@@ -94,8 +96,8 @@ long native_test_raw(long n,long a,long b,long c,long d,long e,long f)
 }
 int fs_call(kb2_fs_request_t *r,const char *path,const char *second,
     const void *data,size_t data_size,void *out,size_t capacity,
-    kb2_fs_response_t *reply,const int *sources,size_t source_count,
-    int *received,size_t *received_count)
+    kb2_fs_response_t *reply,const long *sources,size_t source_count,
+    long *received,size_t *received_count)
 {
     (void)second; (void)received; (void)received_count;
     *reply=(kb2_fs_response_t){.opcode=r->opcode};
@@ -260,6 +262,14 @@ int main(void)
     assert(exec_argc==300 && exec_envc==80 && exec_handles==300);
     for (unsigned i=0;i<300;++i) assert(call(SYS_close,descriptors[i],0,0,0)==0);
     assert(files==NULL);
+    assert(fd_status(0xfffffffdL) == 0xfffffffdL);
+    assert(fd_status(PACHAOS_THREAD_SELF_FD) == -EIO);
+    assert(fd_status(UINT32_MAX) == -EIO);
+    assert(posix_fd_result(INT_MAX) == INT_MAX);
+    assert(posix_fd_result((long)INT_MAX + 1) == -EMFILE);
+    assert(high_fd_closed == (long)INT_MAX + 1);
+    assert(posix_fd_result(0xfffffffdL) == -EMFILE);
+    assert(high_fd_closed == 0xfffffffdL);
     struct __pachaos_linux_pollfd pollfds[72];
     for (unsigned i=0;i<72;++i) pollfds[i]=(struct __pachaos_linux_pollfd){reserve_fd(16,0),LINUX_POLLIN,0};
     assert(call(SYS_fstat,pollfds[0].fd,(long)&st,0,0)==0 && st.st_mode==0020000);

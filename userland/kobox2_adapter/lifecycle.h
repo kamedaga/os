@@ -2,6 +2,7 @@
 #ifndef PACHA_KOBOX_LIFECYCLE_H
 #define PACHA_KOBOX_LIFECYCLE_H
 
+#include <pacha/abi.h>
 #include "host.h"
 #include "ipc.h"
 #include "boot/lifecycle.h"
@@ -58,7 +59,7 @@ struct ph_lifecycle_service {
     int (*stop)(void *context);
     /* Optional preallocated native doorbell. next drains and validates it;
      * lifecycle only includes it in the receiver's blocking wait. */
-    int wake_fd;
+    pacha_fd_t wake_fd;
     /* Synchronous: exclusive staging owner. Async: readiness helper only;
      * snapshot endpoint numbers under a short metadata lock, never access
      * mutable ring/request state or retain client pointers across the wait.
@@ -66,7 +67,7 @@ struct ph_lifecycle_service {
      * registered endpoints plus control without a fixed client-count ceiling.
      * Return zero after a wake/timeout, negative on transport failure; next
      * drains hints and rechecks authoritative rings before any admission. */
-    int (*wait)(void *context, int control_fd, uint64_t timeout_ticks);
+    int (*wait)(void *context, pacha_fd_t control_fd, uint64_t timeout_ticks);
 };
 
 struct ph_lifecycle {
@@ -80,6 +81,9 @@ struct ph_lifecycle {
     atomic_uint quiescing;
     atomic_int async_error;
     atomic_uint helper_parked;
+    /* Async: the helper saw an endpoint ready; the owner receives control. */
+    atomic_uint control_hint;
+    unsigned control_skips; /* Owner only: advances since the last receive. */
     int work_result;
     struct ph_lifecycle_service service;
     uint64_t generation, token;

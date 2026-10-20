@@ -88,28 +88,26 @@ int filed_unix_path_receive(filed_runtime_t *rt)
     struct pacha_ipc_msg message={.fds=fds,.fd_capacity=PACHA_IPC_MAX_TRANSFER_FDS};
     int status=pacha_ipc_recv(rt->unix_path_fd,&message);
     if(status) return status;
-    int reply=-1;
+    pacha_fd_t reply=PACHA_IPC_REPLY_IMPLICIT;
     struct pacha_fd_info info;
-    if(message.fd_count && !pacha_fd_get_info((int)fds[message.fd_count-1].fd,&info) &&
-        info.kind==PACHA_FD_KIND_REPLY) reply=(int)fds[message.fd_count-1].fd;
     struct filed_unix_path *page=NULL;
     status=-EINVAL;
-    if(reply>=16 && message.fd_count==2 && message.word0==FILED_UNIX_PATH_MAGIC &&
-        !pacha_fd_get_info((int)fds[0].fd,&info) && info.kind==PACHA_FD_KIND_VMO &&
+    if(message.fd_count==1 && message.word0==FILED_UNIX_PATH_MAGIC &&
+        !pacha_fd_get_info((pacha_fd_t)fds[0].fd,&info) && info.kind==PACHA_FD_KIND_VMO &&
         info.size>=4096)
-        page=pacha_mmap((int)fds[0].fd,4096,PACHA_PROT_READ|PACHA_PROT_WRITE,
+        page=pacha_mmap((pacha_fd_t)fds[0].fd,4096,PACHA_PROT_READ|PACHA_PROT_WRITE,
                          PACHA_MMAP_SHARED,0);
     if(page) {
         struct filed_unix_path request=*page;
         status=request.magic==FILED_UNIX_PATH_MAGIC ? open_path(rt,&request) : -EINVAL;
         request.status=status;*page=request;
     }
-    if(reply>=16) {
+    {
         struct pacha_ipc_msg response={.word0=FILED_UNIX_PATH_MAGIC,
             .word1=(uint64_t)(int64_t)status};
         (void)pacha_ipc_reply(reply,&response);
     }
     if(page) (void)pacha_munmap(page,4096);
-    for(size_t i=0;i<message.fd_count;++i) (void)pacha_fd_close((int)fds[i].fd);
+    for(size_t i=0;i<message.fd_count;++i) (void)pacha_fd_close((pacha_fd_t)fds[i].fd);
     return 0;
 }

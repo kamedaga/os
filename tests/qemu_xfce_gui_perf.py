@@ -415,15 +415,11 @@ class VM:
                     snapshot['tsc_hz'] = 1e9*(2**32)/(mult*(2.0**shift))
                     snapshot['tsc_source'] = 'stable KVM pvclock snapshot'
         for name in ('smp_perf_counters','munmap_perf_counters','vmo_perf_counters'):
-            if not re.search(r' B '+name+r'$',symbols,re.M):
-                if name == 'vmo_perf_counters': continue  # Older diagnostic ELF.
+            if not re.search(r' [BD] '+name+r'$',symbols,re.M):
+                if name == 'vmo_perf_counters': continue
                 raise ValueError(f'missing diagnostic symbol: {name}')
-            address = int(re.search(r'^([0-9a-f]+) B '+name+r'$',symbols,re.M)[1],16)
-            physical = address-bases['Virtual']+bases['Physical']
-            path = self.out/(label+'-'+name+'.bin')
-            self.qmp.execute('pmemsave',dict(val=physical,size=64*16*8,filename=str(path)))
-            words = struct.unpack('<1024Q',path.read_bytes())
-            snapshot[name] = [sum(words[cpu*16+i] for cpu in range(64)) for i in range(16)]
+            from kernel_lock_profile import read_counter_rows
+            snapshot[name] = read_counter_rows(elf,self.qmp,bases,self.out,name,16,label)
         (self.out/(label+'-counters.json')).write_text(json.dumps(snapshot,indent=2))
         print(snapshot,flush=True)
         return snapshot

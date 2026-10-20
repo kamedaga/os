@@ -38,7 +38,7 @@ kb2_status_t gpud_launch_begin(struct gpud_launch_transaction *transaction,
         !request->grants) return KB2_STATUS_RESOURCE_DENIED;
     const struct pacha_process_fd_grant *grant = request->grants;
     const uint64_t allowed = PH_IPC_CHANNEL_RIGHTS | PACHA_FD_RIGHT_CLOSE;
-    if (grant->source_fd < 16 || grant->source_fd >= PACHA_FD_TABLE_LIMIT ||
+    if (grant->source_fd < 16 || grant->source_fd >= PACHA_THREAD_SELF_FD ||
         grant->source_fd == (uint64_t)ipc->fd ||
         grant->target_fd != PH_SANDBOX_CHANNEL_FD || grant->rights & ~allowed ||
         (grant->rights & PH_IPC_CHANNEL_RIGHTS) != PH_IPC_CHANNEL_RIGHTS ||
@@ -52,7 +52,7 @@ kb2_status_t gpud_launch_begin(struct gpud_launch_transaction *transaction,
     if (request->grant_count == 2) {
         const struct pacha_process_fd_grant *log = &request->grants[1];
         const uint64_t log_rights = PACHA_FD_RIGHT_SEND | PACHA_FD_RIGHT_CLOSE;
-        if (log->source_fd < 16 || log->source_fd >= PACHA_FD_TABLE_LIMIT ||
+        if (log->source_fd < 16 || log->source_fd >= PACHA_THREAD_SELF_FD ||
             log->source_fd == grant->source_fd ||
             log->source_fd == (uint64_t)ipc->fd ||
             log->target_fd != PH_SANDBOX_LOG_FD ||

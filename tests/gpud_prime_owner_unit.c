@@ -3,7 +3,7 @@
 #include "../userland/gpud/drm_service.c"
 
 static int revoked, released, closed, fail_pair, hungup;
-int pacha_fd_get_info(int fd, struct pacha_fd_info *out)
+int pacha_fd_get_info(pacha_fd_t fd, struct pacha_fd_info *out)
 {
     assert(fd == 80);
     *out = (struct pacha_fd_info){.kind = PACHA_FD_KIND_VMO,
@@ -28,8 +28,8 @@ int pacha_ipc_channel_create(struct pacha_ipc_channel_pair *pair,
     *pair = (struct pacha_ipc_channel_pair){.a = 81, .b = 82};
     return 0;
 }
-int pacha_fd_close(int fd) { assert(fd >= 16); ++closed; return 0; }
-int pacha_vmo_revoke(int fd) { assert(fd == 80); ++revoked; return 0; }
+int pacha_fd_close(pacha_fd_t fd) { assert(fd >= 16); ++closed; return 0; }
+int pacha_vmo_revoke(pacha_fd_t fd) { assert(fd == 80); ++revoked; return 0; }
 int gpud_gpu_rpc_release_mapping(struct gpud_gpu_rpc *rpc,
     uint64_t correlation, uint64_t token)
 { (void)rpc; assert(correlation && token); ++released; return 0; }
@@ -37,7 +37,7 @@ long pacha_fd_poll(struct pacha_pollfd *fds, uint64_t count)
 {
     long ready = 0;
     for (uint64_t i = 0; i < count; ++i) {
-        fds[i].revents = fds[i].fd == hungup ? PACHA_FD_EVENT_HANGUP : 0;
+        fds[i].revents = fds[i].fd == (uint64_t)hungup ? PACHA_FD_EVENT_HANGUP : 0;
         ready += !!fds[i].revents;
     }
     return ready;

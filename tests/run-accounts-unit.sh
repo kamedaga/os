@@ -10,6 +10,8 @@ clang -std=c11 -O2 -g -Wall -Wextra -Werror -fsanitize=address,undefined \
 clang -std=c11 -O2 -g -Wall -Wextra -Werror -fsanitize=address,undefined \
   -fno-omit-frame-pointer -I"$repo_root/userland/libaccount/include" \
   -I"$repo_root/userland/libipc/include" -I"$repo_root/userland/libpacha/include" \
-  -I"$repo_root/userland/filed/include" \
+  -I"$repo_root/userland/filed/include" -I"$repo_root/userland/libfiled_client/include" \
+  -I"$repo_root/kobox2/protocol/include" -I"$repo_root/kobox2/protocol/generated/include" \
+  "$repo_root/userland/libfiled_client/src/client.c" "$repo_root/kobox2/protocol/src/filesystem.c" \
   "$repo_root/tests/accounts_filed_unit.c" "$repo_root/userland/libaccount/src/account.c" -o "$out/filed"
 "$out/filed"

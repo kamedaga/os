@@ -5,7 +5,7 @@ static int64_t credential_call(lprs_credential_request_t *request)
     lpr_linux_process_state_init();
     if (!lpr_supervisor_enabled) return -LPR_LINUX_ENOSYS;
     void *page = 0;
-    int fd = lpr_create_standalone_wire_page(&page);
+    pacha_fd_t fd = lpr_create_standalone_wire_page(&page);
     if (fd < 0) return fd;
     request->token = lpr_supervisor_token;
     void *payload = lpr_supervisor_payload(page);

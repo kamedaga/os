@@ -160,10 +160,10 @@ static int memory_map(void *context, void *address, uint64_t physical,
         if (!(protection & KOBOX_LINUX_MEMORY_WRITE)) flags |= PACHA_CAPSULE_MMIO_READ_ONLY;
         long fd = pacha_syscall6(PACHA_CAPSULE_SYSCALL_DERIVE_MMIO,
             config->device_fd, bar, target, length, flags, physical - first_page);
-        if (fd < 16 || fd >= PACHA_FD_TABLE_LIMIT) {
+        if (fd < 16 || fd >= PACHA_THREAD_SELF_FD) {
             return fd == 0 ? -EPROTO : native_status(fd);
         }
-        *slot = (struct ph_pci_mapping){.address = target, .length = length, .fd = (int)fd};
+        *slot = (struct ph_pci_mapping){.address = target, .length = length, .fd = (pacha_fd_t)fd};
         return 0;
     }
     return -ERANGE;
@@ -245,7 +245,7 @@ int ph_pci_init(struct ph_pci *pci, const struct ph_pci_config *config) {
         PACHA_FD_RIGHT_MMIO_MAP_READ;
 
     if (!pci || !config || pci->config.generation || !config->generation ||
-        config->device_fd < 16 || config->device_fd >= PACHA_FD_TABLE_LIMIT ||
+        config->device_fd < 16 || config->device_fd >= PACHA_THREAD_SELF_FD ||
         config->segment > UINT16_MAX || config->bus > UINT8_MAX || config->devfn > UINT8_MAX ||
         !config->reservation || !config->reservation_size ||
         ((uintptr_t)config->reservation | config->reservation_size) % PH_PCI_PAGE_SIZE ||

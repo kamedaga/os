@@ -54,8 +54,8 @@ typedef struct filed_exec_image {
 } filed_exec_image_t;
 
 typedef struct filed_exec_plan {
-    int process_fd;
-    int thread_fd;
+    pacha_fd_t process_fd;
+    pacha_fd_t thread_fd;
     uint64_t runtime_entry;
     uint64_t main_entry;
     uint64_t interpreter_base;
@@ -177,7 +177,7 @@ static int filed_exec_validate_elf_ehdr_prefix(const unsigned char *bytes)
     return 0;
 }
 
-static void filed_exec_discard_process_fd(int process_fd)
+static void filed_exec_discard_process_fd(pacha_fd_t process_fd)
 {
     if (process_fd >= 16) {
         (void)pacha_syscall2(
@@ -372,7 +372,7 @@ static int filed_exec_validate_elf_header(const filed_exec_image_t *image)
 }
 
 static int filed_exec_map_segment(
-    int process_fd,
+    pacha_fd_t process_fd,
     const filed_exec_image_t *image,
     const unsigned char *ph,
     uint16_t index,
@@ -410,7 +410,7 @@ static int filed_exec_map_segment(
         PACHA_FD_RIGHT_MAP_READ |
         PACHA_FD_RIGHT_MAP_WRITE |
         PACHA_FD_RIGHT_MAP_EXEC;
-    const int vmo_fd = pacha_vmo_create(map_size, vmo_rights, 0);
+    const pacha_fd_t vmo_fd = pacha_vmo_create(map_size, vmo_rights, 0);
     if (vmo_fd < 16) {
         return -12;
     }
@@ -495,7 +495,7 @@ static int filed_exec_get_interp_path(const filed_exec_image_t *image, char *out
 }
 
 static int filed_exec_load_image_into_process(
-    int process_fd,
+    pacha_fd_t process_fd,
     const filed_exec_image_t *image,
     uint64_t dyn_base,
     filed_exec_loaded_image_t *loaded)
@@ -616,7 +616,7 @@ static int filed_exec_load_image(
         PACHA_FD_RIGHT_SPAWN |
         PACHA_FD_RIGHT_MAP_INTO |
         PACHA_FD_RIGHT_SET_CONTEXT;
-    const int process_fd = pacha_process_create(process_rights, 0, grants, grant_count);
+    const pacha_fd_t process_fd = pacha_process_create(process_rights, 0, grants, grant_count);
     if (process_fd < 16) {
         return -12;
     }
@@ -716,7 +716,7 @@ static const char *filed_exec_request_arg(
 static int filed_exec_start_plan_impl(
     filed_exec_plan_t *plan,
     const filed_exec_path_t *request,
-    int bootstrap_fd, uint64_t *argv_va, uint64_t *envp_va)
+    pacha_fd_t bootstrap_fd, uint64_t *argv_va, uint64_t *envp_va)
 {
     if (plan == NULL || request == NULL || plan->process_fd < 16) {
         return -22;
@@ -729,7 +729,7 @@ static int filed_exec_start_plan_impl(
         PACHA_FD_RIGHT_CLOSE |
         PACHA_FD_RIGHT_MAP_READ |
         PACHA_FD_RIGHT_MAP_WRITE;
-    const int stack_fd = pacha_vmo_create(PACHA_PROCESS_DEFAULT_STACK_SIZE, stack_rights, 0);
+    const pacha_fd_t stack_fd = pacha_vmo_create(PACHA_PROCESS_DEFAULT_STACK_SIZE, stack_rights, 0);
     if (stack_fd < 16) {
         return -12;
     }
@@ -866,7 +866,7 @@ static int filed_exec_start_plan_impl(
         PACHA_FD_RIGHT_KILL |
         PACHA_FD_RIGHT_START |
         PACHA_FD_RIGHT_SET_CONTEXT;
-    const int thread_fd = pacha_thread_create(
+    const pacha_fd_t thread_fd = pacha_thread_create(
         plan->process_fd,
         plan->runtime_entry,
         stack_base + sp,
@@ -892,7 +892,7 @@ static int filed_exec_start_plan_impl(
 
 
 static int filed_exec_start_plan(filed_exec_plan_t *plan,
-    const filed_exec_path_t *request, int bootstrap_fd)
+    const filed_exec_path_t *request, pacha_fd_t bootstrap_fd)
 {
     if (!request || request->argc > SIZE_MAX / sizeof(uint64_t) - 1 ||
         request->envc > SIZE_MAX / sizeof(uint64_t)) return -7;
@@ -911,11 +911,11 @@ int filed_exec_native_handle(
     struct filed_runtime *runtime,
     filed_handle_id_t handle_id,
     const filed_exec_path_t *request,
-    const int *inherit_fds,
+    const pacha_fd_t *inherit_fds,
     uint64_t inherit_fd_count,
-    int bootstrap_fd,
-    int *out_process_fd,
-    int *out_thread_fd)
+    pacha_fd_t bootstrap_fd,
+    pacha_fd_t *out_process_fd,
+    pacha_fd_t *out_thread_fd)
 {
     filed_exec_image_t image;
     filed_exec_plan_t plan;

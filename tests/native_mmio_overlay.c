@@ -1,3 +1,4 @@
+enum { fd_growth_test_count = 4200 };
 /* SPDX-License-Identifier: MIT */
 /* Reuse the dedicated virtio-rng discovery and real page-fault probes. This
  * fixture runs as boot init, not through the rootfs/service launch path. */
@@ -14,9 +15,20 @@
 #define MAP_NORESERVE (UINT64_C(1) << 5)
 #define RESERVATION_FLAGS (PACHA_MMAP_PRIVATE | PACHA_MMAP_ANONYMOUS | MAP_NORESERVE)
 
+/* This freestanding fixture supplies the adapter's boot diagnostic sink. */
+void ph_boot_log_gpu_bar_export_failure(unsigned long reason, long status,
+    unsigned long bar, unsigned long protection, unsigned long cache,
+    unsigned long page_count, unsigned long first_page, unsigned long last_page)
+{
+    log_text("MMIO export failure: ");
+    log_number(reason); log_number((uint64_t)status); log_number(bar);
+    log_number(protection); log_number(cache); log_number(page_count);
+    log_number(first_page); log_number(last_page);
+}
+
 static unsigned char racer_stack[65536] __attribute__((aligned(PAGE)));
 static uint64_t racer_ready, racer_stop, racer_attempts, racer_failure;
-static uint64_t pressure_fds[PACHA_FD_TABLE_LIMIT];
+static uint64_t pressure_fds[fd_growth_test_count];
 
 __attribute__((used, noreturn)) void overlay_racer_body(void) {
     __atomic_store_n(&racer_ready, 1, __ATOMIC_RELEASE);
@@ -126,27 +138,28 @@ int main(void) {
     close_fd(ordinary);
     expect_fault(ordinary_address + register_offset + 20, 0);
 
-    stage = "overlay-fd-exhaustion";
+    stage = "overlay-fd-growth";
     uint64_t before[3], after[3];
     CHECK(call(PACHA_FD_SYSCALL_TABLE, 0, (uintptr_t)before, 0, 0, 0, 0) == 0);
     size_t held = 0;
-    for (; held < PACHA_FD_TABLE_LIMIT; ++held) {
+    for (; held < fd_growth_test_count; ++held) {
         uint64_t fd = call(PACHA_FD_SYSCALL_DUP, DEVICE_FD, 16,
             query(DEVICE_FD).rights, 0, 0, 0);
-        if (!is_fd(fd)) break;
+        CHECK(is_fd(fd));
         pressure_fds[held] = fd;
     }
-    CHECK(held && held < PACHA_FD_TABLE_LIMIT);
+    CHECK(held == fd_growth_test_count);
     CHECK(call(PACHA_FD_SYSCALL_TABLE, 0, (uintptr_t)after, 0, 0, 0, 0) == 0);
-    CHECK(after[2] == 0);
+    CHECK(after[0] - after[2] == before[0] - before[2] + held);
     for (unsigned round = 0; round < 8; ++round) {
         CHECK(host->memory_map(&port, (void *)(ARENA + PAGE), physical, PAGE,
-            KOBOX_LINUX_MEMORY_READ, KOBOX_MMIO_UC) < 0);
+            KOBOX_LINUX_MEMORY_READ, KOBOX_MMIO_UC) == 0);
+        CHECK(host->memory_unmap(&port, (void *)(ARENA + PAGE), PAGE) == 0);
         reservation_survived();
     }
     while (held) close_fd(pressure_fds[--held]);
     CHECK(call(PACHA_FD_SYSCALL_TABLE, 0, (uintptr_t)after, 0, 0, 0, 0) == 0);
-    CHECK(after[2] == before[2]);
+    CHECK(after[0] - after[2] == before[0] - before[2]);
     const uint64_t racer = start_racer();
 
     for (unsigned round = 0; round < 32; ++round) {
@@ -185,7 +198,8 @@ int main(void) {
     *(volatile uint64_t *)(ARENA + PAGE) = UINT64_C(0x1122334455667788);
     CHECK(call(PACHA_VM_SYSCALL_MPROTECT, ARENA + PAGE, PAGE, 0, 0, 0, 0) == 0);
     CHECK(host->memory_map(&port, (void *)(ARENA + PAGE), physical, PAGE,
-        KOBOX_LINUX_MEMORY_READ, KOBOX_MMIO_UC) < 0);
+        KOBOX_LINUX_MEMORY_READ, KOBOX_MMIO_UC) == 0);
+        CHECK(host->memory_unmap(&port, (void *)(ARENA + PAGE), PAGE) == 0);
     CHECK(call(PACHA_VM_SYSCALL_MPROTECT, ARENA + PAGE, PAGE, PACHA_PROT_READ, 0, 0, 0) == 0);
     CHECK(*(volatile uint64_t *)(ARENA + PAGE) == UINT64_C(0x1122334455667788));
     CHECK(ph_pci_revoke(&port, 1) == 0 && ph_pci_destroy(&port) == 0);

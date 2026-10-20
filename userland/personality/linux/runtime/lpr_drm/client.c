@@ -10,7 +10,7 @@
 #include "../../../../../kobox2/protocol/include/kobox2/amdgpu_cs_shape.h"
 
 static int64_t amdgpu_info_failure(uint32_t query, uint32_t bytes,
-    const char *phase, int64_t status)
+    const char *phase, int64_t status, unsigned *wait_not_ready __attribute__((unused)))
 {
     char line[192], *out = line;
     const char *prefix = "LPR DRM AMDGPU_INFO failed phase=";
@@ -28,7 +28,7 @@ static int64_t amdgpu_info_failure(uint32_t query, uint32_t bytes,
     *out++ = '\n';
     /* stderr follows the application's RAM log redirection, not kernel log
      * storage. In particular, pre-RPC validation failures remain visible. */
-    (void)lpr_linux_write(2, (uint64_t)(uintptr_t)line, (uint64_t)(out - line));
+    (void)lpr_linux_write(2, (uint64_t)(uintptr_t)line, (uint64_t)(out - line), wait_not_ready);
     return status;
 }
 
@@ -113,8 +113,8 @@ typedef struct lpr_drm_event_cookie {
 static volatile uint32_t lpr_drm_event_cookie_lock;
 static volatile uint64_t lpr_drm_event_token_counter;
 /* Owned with the cached tty/DRM wire page under termd_rpc.lock_word. */
-static int lpr_drm_request_channel_fd;
-static int lpr_drm_aux_cache_fd;
+static pacha_fd_t lpr_drm_request_channel_fd;
+static pacha_fd_t lpr_drm_aux_cache_fd;
 static void *lpr_drm_aux_cache;
 static int lpr_drm_aux_cache_busy;
 static lpr_drm_event_cookie_t
@@ -127,7 +127,7 @@ enum {
 };
 
 typedef struct lpr_drm_mapping_lease {
-    int fd;
+    pacha_fd_t fd;
     uint32_t fragments;
     uint32_t conservative;
 } lpr_drm_mapping_lease_t;
@@ -352,7 +352,7 @@ void lpr_drm_mapping_fork_child(void)
 }
 
 static int64_t lpr_drm_map_received(
-    int vmo_fd, int lease_fd, uint64_t address, uint64_t length,
+    pacha_fd_t vmo_fd, pacha_fd_t lease_fd, uint64_t address, uint64_t length,
     uint64_t prot, uint64_t flags, uint64_t offset)
 {
     const uint64_t span = lpr_drm_page_span(length);
@@ -611,12 +611,8 @@ static int64_t lpr_gpud_drm_ioctl_inline(gpud_drm_ioctl_request_t *ioctl)
     struct pacha_ipc_msg reply = {
         .fds = fds, .fd_capacity = PACHA_IPC_MAX_TRANSFER_FDS,
     };
-    const int64_t reply_fd = lpr_pacha_syscall2(PACHAOS_SYSCALL_IPC_CALL,
-        LPR_GPUD_DRM_ENDPOINT_FD, (uint64_t)(uintptr_t)&request);
-    if (reply_fd < 16)
-        return lpr_pacha_status_to_errno(reply_fd);
-    const int64_t status = lpr_native_ipc_recv_wait((uint64_t)reply_fd, &reply);
-    (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, (uint64_t)reply_fd);
+    const int64_t status = lpr_native_ipc_call_wait(
+        LPR_GPUD_DRM_ENDPOINT_FD, &request, &reply, NULL);
     if (status != 0)
         return lpr_pacha_status_to_errno(status);
     /* Never leak unexpected capabilities, including a malformed error reply. */
@@ -632,14 +628,14 @@ static int64_t lpr_gpud_drm_ioctl_inline(gpud_drm_ioctl_request_t *ioctl)
     return 0;
 }
 
-static void lpr_gpud_drm_drop_channel(int endpoint)
+static void lpr_gpud_drm_drop_channel(pacha_fd_t endpoint)
 {
     if (endpoint < 16 || endpoint != lpr_drm_request_channel_fd) return;
     lpr_drm_request_channel_fd = 0;
     (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, (uint64_t)(uint32_t)endpoint);
 }
 
-static int lpr_gpud_drm_bind_page(int page_fd, void *page)
+static pacha_fd_t lpr_gpud_drm_bind_page(pacha_fd_t page_fd, void *page)
 {
     if (page_fd != lpr_tty_wire_page_fd || page != lpr_tty_wire_page)
         return LPR_GPUD_DRM_ENDPOINT_FD;
@@ -665,12 +661,8 @@ static int lpr_gpud_drm_bind_page(int page_fd, void *page)
         .fds = fds, .fd_count = 2u + auxiliary};
     struct pacha_ipc_fd reply_fds[PACHA_IPC_MAX_TRANSFER_FDS];
     struct pacha_ipc_msg reply = {.fds = reply_fds, .fd_capacity = PACHA_IPC_MAX_TRANSFER_FDS};
-    int64_t reply_fd = lpr_pacha_syscall2(PACHAOS_SYSCALL_IPC_CALL,
-        LPR_GPUD_DRM_ENDPOINT_FD, (uintptr_t)&request);
-    if (reply_fd < 16) status = lpr_pacha_status_to_errno(reply_fd);
-    else {
-        status = lpr_native_ipc_recv_wait((uint64_t)reply_fd, &reply);
-        (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, (uint64_t)reply_fd);
+    {
+        status = lpr_native_ipc_call_wait(LPR_GPUD_DRM_ENDPOINT_FD, &request, &reply, NULL);
         if (status) status = lpr_pacha_status_to_errno(status);
         else {
             for (uint32_t i = 0; i < reply.fd_count; ++i)
@@ -686,20 +678,20 @@ static int lpr_gpud_drm_bind_page(int page_fd, void *page)
         (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, pair[0]);
         return (int)status;
     }
-    lpr_drm_request_channel_fd = (int)pair[0];
+    lpr_drm_request_channel_fd = (pacha_fd_t)pair[0];
     return lpr_drm_request_channel_fd;
 }
 
 static int64_t lpr_gpud_drm_call_transfers_many(
     uint32_t op,
-    int page_fd,
+    pacha_fd_t page_fd,
     void *page,
     uint32_t payload_size,
     uint64_t *out_result,
-    int *out_received_fds,
+    pacha_fd_t *out_received_fds,
     uint32_t received_capacity,
     uint32_t *out_received_count,
-    const int *transfer_fds,
+    const pacha_fd_t *transfer_fds,
     const uint8_t *temporary_vmos,
     uint32_t transfer_count)
 {
@@ -711,7 +703,7 @@ static int64_t lpr_gpud_drm_call_transfers_many(
             (transfer_fds == 0 || temporary_vmos == 0))) {
         return -LPR_LINUX_ENODEV;
     }
-    const int endpoint = lpr_gpud_drm_bind_page(page_fd, page);
+    const pacha_fd_t endpoint = lpr_gpud_drm_bind_page(page_fd, page);
     if (endpoint < 16) return endpoint;
     const int bound = endpoint != LPR_GPUD_DRM_ENDPOINT_FD;
     const int bound_aux = bound && transfer_count && temporary_vmos[0] &&
@@ -745,7 +737,7 @@ static int64_t lpr_gpud_drm_call_transfers_many(
     fds[0].rights = PACHA_FD_RIGHT_TRANSFER | PACHA_FD_RIGHT_CLOSE |
         PACHA_FD_RIGHT_MAP_READ | PACHA_FD_RIGHT_MAP_WRITE;
     for (uint32_t i = 0; i < transfer_count; i++) {
-        const int transfer_fd = transfer_fds[i];
+        const pacha_fd_t transfer_fd = transfer_fds[i];
         const int temporary_vmo = temporary_vmos[i] != 0;
         struct pacha_fd_info info;
         const uint64_t temporary_rights = PACHA_FD_RIGHT_TRANSFER |
@@ -753,14 +745,14 @@ static int64_t lpr_gpud_drm_call_transfers_many(
             PACHA_FD_RIGHT_MAP_WRITE;
         const uint64_t retained_rights = PACHA_FD_RIGHT_TRANSFER |
             PACHA_FD_RIGHT_DUP | PACHA_FD_RIGHT_SET_FLAGS;
-        if (!lpr_native_fd_info((uint64_t)(uint32_t)transfer_fd, &info) ||
+        if (!lpr_native_fd_info((uint64_t)transfer_fd, &info) ||
             (temporary_vmo ? info.kind != PACHA_FD_KIND_VMO :
                 (info.kind != PACHA_FD_KIND_VMO && info.kind != PACHA_FD_KIND_CHANNEL)) ||
             (info.rights & (temporary_vmo ? temporary_rights : retained_rights)) !=
                 (temporary_vmo ? temporary_rights : retained_rights)) {
             return -LPR_LINUX_EBADF;
         }
-        fds[i + 1u].fd = (uint64_t)(uint32_t)transfer_fd;
+        fds[i + 1u].fd = (uint64_t)transfer_fd;
         fds[i + 1u].rights = temporary_vmo ?
             PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_MAP_READ | PACHA_FD_RIGHT_MAP_WRITE :
             info.kind == PACHA_FD_KIND_VMO ?
@@ -778,18 +770,8 @@ static int64_t lpr_gpud_drm_call_transfers_many(
     request.word3 = request_id;
     request.fds = fds + bound + bound_aux;
     request.fd_count = 1u + transfer_count - bound - bound_aux;
-    const int64_t reply_fd = lpr_pacha_syscall2(
-        PACHAOS_SYSCALL_IPC_CALL,
-        (uint64_t)(uint32_t)endpoint,
-        (uint64_t)(uintptr_t)&request);
-    if (reply_fd < 16) {
-        lpr_gpud_drm_drop_channel(endpoint);
-        return lpr_pacha_status_to_errno(reply_fd);
-    }
-    const int64_t recv_status = lpr_native_ipc_recv_wait(
-        (uint64_t)(uint32_t)reply_fd,
-        &reply);
-    (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, (uint64_t)(uint32_t)reply_fd);
+    const int64_t recv_status = lpr_native_ipc_call_wait(
+        (uint64_t)endpoint, &request, &reply, NULL);
     if (recv_status != 0) {
         /* Submission may already have run. Forget the failed connection for
          * a future call, but never replay this request on another endpoint. */
@@ -828,7 +810,7 @@ static int64_t lpr_gpud_drm_call_transfers_many(
             return -LPR_LINUX_EIO;
         }
     for (uint32_t i = 0; i < reply.fd_count; ++i)
-        out_received_fds[i] = (int)(uint32_t)reply_fds[i].fd;
+        out_received_fds[i] = (pacha_fd_t)reply_fds[i].fd;
     if (out_received_count != 0)
         *out_received_count = (uint32_t)reply.fd_count;
     return 0;
@@ -836,12 +818,12 @@ static int64_t lpr_gpud_drm_call_transfers_many(
 
 static int64_t lpr_gpud_drm_call_transfers(
     uint32_t op,
-    int page_fd,
+    pacha_fd_t page_fd,
     void *page,
     uint32_t payload_size,
     uint64_t *out_result,
-    int *out_received_fd,
-    const int *transfer_fds,
+    pacha_fd_t *out_received_fd,
+    const pacha_fd_t *transfer_fds,
     const uint8_t *temporary_vmos,
     uint32_t transfer_count)
 {
@@ -853,15 +835,15 @@ static int64_t lpr_gpud_drm_call_transfers(
 
 static int64_t lpr_gpud_drm_call_transfer(
     uint32_t op,
-    int page_fd,
+    pacha_fd_t page_fd,
     void *page,
     uint32_t payload_size,
     uint64_t *out_result,
-    int *out_received_fd,
-    int transfer_fd,
+    pacha_fd_t *out_received_fd,
+    pacha_fd_t transfer_fd,
     int temporary_vmo)
 {
-    const int transfer_fds[1] = {transfer_fd};
+    const pacha_fd_t transfer_fds[1] = {transfer_fd};
     const uint8_t temporary_vmos[1] = {temporary_vmo != 0};
     const uint32_t transfer_count = transfer_fd >= 16 ? 1u : 0u;
     return lpr_gpud_drm_call_transfers(
@@ -878,11 +860,11 @@ static int64_t lpr_gpud_drm_call_transfer(
 
 static int64_t lpr_gpud_drm_call(
     uint32_t op,
-    int page_fd,
+    pacha_fd_t page_fd,
     void *page,
     uint32_t payload_size,
     uint64_t *out_result,
-    int *out_received_fd)
+    pacha_fd_t *out_received_fd)
 {
     return lpr_gpud_drm_call_transfers(
         op, page_fd, page, payload_size, out_result, out_received_fd,
@@ -892,7 +874,7 @@ static int64_t lpr_gpud_drm_call(
 static int lpr_drm_aux_create(
     uint64_t size,
     int reusable,
-    int *out_fd,
+    pacha_fd_t *out_fd,
     void **out_mapping,
     uint64_t *out_map_size)
 {
@@ -933,7 +915,7 @@ static int lpr_drm_aux_create(
         return (int)lpr_pacha_status_to_errno(mapped);
     }
     lpr_memset((void *)(uintptr_t)mapped, 0, map_size);
-    *out_fd = (int)(uint32_t)fd;
+    *out_fd = (pacha_fd_t)fd;
     *out_mapping = (void *)(uintptr_t)mapped;
     *out_map_size = map_size;
     if (cacheable) {
@@ -947,7 +929,7 @@ static int lpr_drm_aux_create(
     return 0;
 }
 
-static void lpr_drm_aux_destroy(int fd, void *mapping, uint64_t map_size)
+static void lpr_drm_aux_destroy(pacha_fd_t fd, void *mapping, uint64_t map_size)
 {
     if (fd == lpr_drm_aux_cache_fd && mapping == lpr_drm_aux_cache &&
         map_size == GPUD_DRM_AUX_REUSE_BYTES) {
@@ -967,7 +949,7 @@ static int lpr_drm_prepare_virtgpu_context(
     uint64_t argument,
     int reusable_aux,
     gpud_drm_ioctl_request_t *request,
-    int *aux_fd,
+    pacha_fd_t *aux_fd,
     void **aux_mapping,
     uint64_t *aux_map_size)
 {
@@ -1045,7 +1027,7 @@ static int lpr_drm_prepare_virtgpu_context(
 static int lpr_drm_prepare_atomic(
     uint64_t arg,
     gpud_drm_mode_atomic_wire_t *wire,
-    int *out_input_wait_fd)
+    pacha_fd_t *out_input_wait_fd)
 {
     if (arg == 0 || wire == 0 || out_input_wait_fd == 0) {
         return -LPR_LINUX_EFAULT;
@@ -1115,7 +1097,7 @@ int64_t lpr_drm_open_path(const char *path, uint64_t flags)
         return -LPR_LINUX_ENOENT;
     }
     void *page = 0;
-    const int page_fd = lpr_create_tty_wire_page(&page);
+    const pacha_fd_t page_fd = lpr_create_tty_wire_page(&page);
     if (page_fd < 0) {
         return page_fd;
     }
@@ -1123,8 +1105,8 @@ int64_t lpr_drm_open_path(const char *path, uint64_t flags)
     lpr_memset(open, 0, sizeof(*open));
     open->device_minor = render ? 128u : 0u;
     open->flags = flags;
-    int native_wait_fd = -1;
-    int remote_wait_fd = -1;
+    pacha_fd_t native_wait_fd = -1;
+    pacha_fd_t remote_wait_fd = -1;
     const int pair_status = lpr_native_wait_pair(&native_wait_fd, &remote_wait_fd);
     if (pair_status != 0) {
         lpr_destroy_tty_wire_page(page_fd, page);
@@ -1135,18 +1117,18 @@ int64_t lpr_drm_open_path(const char *path, uint64_t flags)
         GPUD_DRM_OP_OPEN_NODE, page_fd, page, sizeof(*open), &handle, 0,
         remote_wait_fd, 0);
     (void)lpr_close_native_fd_if_open(
-        (uint64_t)(uint32_t)remote_wait_fd);
+        (uint64_t)remote_wait_fd);
     remote_wait_fd = -1;
     lpr_destroy_tty_wire_page(page_fd, page);
     if (status != 0) {
-        (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)native_wait_fd);
+        (void)lpr_close_native_fd_if_open((uint64_t)native_wait_fd);
         return status;
     }
     const int fd = lpr_drm_install(handle, flags, native_wait_fd,
         udmabuf ? LPR_DRM_NODE_UDMABUF : render ? LPR_DRM_NODE_RENDER : 0);
     if (fd < 0) {
         (void)lpr_drm_close_handle(handle);
-        (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)native_wait_fd);
+        (void)lpr_close_native_fd_if_open((uint64_t)native_wait_fd);
     }
     return fd;
 }
@@ -1179,7 +1161,7 @@ int64_t lpr_drm_stat_path(const char *path, uint64_t statbuf)
 int64_t lpr_drm_close_handle(uint64_t handle)
 {
     void *page = 0;
-    const int page_fd = lpr_create_tty_wire_page(&page);
+    const pacha_fd_t page_fd = lpr_create_tty_wire_page(&page);
     if (page_fd < 0) {
         return page_fd;
     }
@@ -1195,7 +1177,7 @@ int64_t lpr_drm_close_handle(uint64_t handle)
 int64_t lpr_drm_dup_handle(uint64_t handle)
 {
     void *page = 0;
-    const int page_fd = lpr_create_tty_wire_page(&page);
+    const pacha_fd_t page_fd = lpr_create_tty_wire_page(&page);
     if (page_fd < 0) return page_fd;
     gpud_drm_handle_request_t *dup = (gpud_drm_handle_request_t *)lpr_gpud_drm_payload(page);
     lpr_memset(dup, 0, sizeof(*dup));
@@ -1208,13 +1190,13 @@ int64_t lpr_drm_dup_handle(uint64_t handle)
 
 int64_t lpr_drm_transfer_dup_handle(
     uint64_t handle,
-    int lease_fd,
+    pacha_fd_t lease_fd,
     uint64_t *out_handle)
 {
     if (out_handle == 0 || lease_fd < 16) return -LPR_LINUX_EINVAL;
     *out_handle = 0;
     void *page = 0;
-    const int page_fd = lpr_create_tty_wire_page(&page);
+    const pacha_fd_t page_fd = lpr_create_tty_wire_page(&page);
     if (page_fd < 0) return page_fd;
     gpud_drm_handle_request_t *dup = (gpud_drm_handle_request_t *)lpr_gpud_drm_payload(page);
     lpr_memset(dup, 0, sizeof(*dup));
@@ -1230,7 +1212,7 @@ int64_t lpr_drm_transfer_dup_handle(
         0);
     lpr_destroy_tty_wire_page(page_fd, page);
     if (status == 0 && *out_handle == handle) {
-        (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)lease_fd);
+        (void)lpr_close_native_fd_if_open((uint64_t)lease_fd);
         return 0;
     }
     return status != 0 ? status : -LPR_LINUX_EIO;
@@ -1239,7 +1221,7 @@ int64_t lpr_drm_transfer_dup_handle(
 int64_t lpr_drm_prime_ref(uint32_t op, uint64_t token)
 {
     void *page = 0;
-    const int page_fd = lpr_create_tty_wire_page(&page);
+    const pacha_fd_t page_fd = lpr_create_tty_wire_page(&page);
     if (page_fd < 0) return page_fd;
     gpud_drm_prime_token_request_t *request = (gpud_drm_prime_token_request_t *)lpr_gpud_drm_payload(page);
     lpr_memset(request, 0, sizeof(*request));
@@ -1249,11 +1231,11 @@ int64_t lpr_drm_prime_ref(uint32_t op, uint64_t token)
     return status;
 }
 
-int64_t lpr_drm_prime_transfer_acquire(uint64_t token, int lease_fd)
+int64_t lpr_drm_prime_transfer_acquire(uint64_t token, pacha_fd_t lease_fd)
 {
     if (token == 0 || lease_fd < 16) return -LPR_LINUX_EINVAL;
     void *page = 0;
-    const int page_fd = lpr_create_tty_wire_page(&page);
+    const pacha_fd_t page_fd = lpr_create_tty_wire_page(&page);
     if (page_fd < 0) return page_fd;
     gpud_drm_prime_token_request_t *request =
         (gpud_drm_prime_token_request_t *)lpr_gpud_drm_payload(page);
@@ -1270,7 +1252,7 @@ int64_t lpr_drm_prime_transfer_acquire(uint64_t token, int lease_fd)
         0);
     lpr_destroy_tty_wire_page(page_fd, page);
     if (status == 0) {
-        (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)lease_fd);
+        (void)lpr_close_native_fd_if_open((uint64_t)lease_fd);
     }
     return status;
 }
@@ -1285,33 +1267,33 @@ int64_t lpr_dmabuf_mmap(uint64_t fd, uint64_t address, uint64_t length,
         offset > dmabuf->size || length > dmabuf->size - offset ||
         ((prot & PACHAOS_PROT_WRITE) != 0 && !dmabuf->writable))
         return -LPR_LINUX_EINVAL;
-    int lease_fd = -1;
+    pacha_fd_t lease_fd = -1;
     if (dmabuf->token == 0) {
         struct pacha_fd_info info;
         lpr_memset(&info, 0, sizeof(info));
         if (!lpr_native_fd_info(
-                (uint64_t)(uint32_t)dmabuf->native.raw, &info) ||
+                (uint64_t)dmabuf->native.raw, &info) ||
             info.kind != PACHA_FD_KIND_VMO ||
             (info.rights & PACHA_FD_RIGHT_DUP) == 0)
             return -LPR_LINUX_EBADF;
         const int64_t duplicate = lpr_pacha_syscall4(
             PACHA_FD_SYSCALL_DUP,
-            (uint64_t)(uint32_t)dmabuf->native.raw,
+            (uint64_t)dmabuf->native.raw,
             16,
             PACHA_FD_RIGHT_CLOSE,
             PACHA_FD_FLAG_CLOEXEC | PACHA_FD_FLAG_INHERIT);
         if (duplicate < 16)
             return lpr_pacha_status_to_errno(duplicate);
-        lease_fd = (int)duplicate;
+        lease_fd = (pacha_fd_t)duplicate;
         const int64_t mapped = lpr_drm_map_received(
             dmabuf->native.raw, lease_fd,
             address, length, prot, flags, offset);
         if (mapped < 0)
             (void)lpr_close_native_fd_if_open(
-                (uint64_t)(uint32_t)lease_fd);
+                (uint64_t)lease_fd);
         return mapped;
     }
-    int remote_lease_fd = -1;
+    pacha_fd_t remote_lease_fd = -1;
     /* fork retains the mapping, exec replaces it. The new LPR image cannot
      * recover this private mapping registry, so its lease must close on exec. */
     int status = lpr_native_wait_pair_flags(&lease_fd, &remote_lease_fd,
@@ -1322,16 +1304,16 @@ int64_t lpr_dmabuf_mmap(uint64_t fd, uint64_t address, uint64_t length,
     if (status) {
         if (lease_fd >= 16)
             (void)lpr_close_native_fd_if_open(
-                (uint64_t)(uint32_t)lease_fd);
+                (uint64_t)lease_fd);
         if (remote_lease_fd >= 16)
             (void)lpr_close_native_fd_if_open(
-                (uint64_t)(uint32_t)remote_lease_fd);
+                (uint64_t)remote_lease_fd);
         return status;
     }
     const int64_t mapped = lpr_drm_map_received(dmabuf->native.raw,
         lease_fd, address, length, prot, flags, offset);
     if (mapped < 0)
-        (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)lease_fd);
+        (void)lpr_close_native_fd_if_open((uint64_t)lease_fd);
     return mapped;
 }
 
@@ -1364,13 +1346,13 @@ int64_t lpr_dmabuf_ioctl(uint64_t fd, uint64_t request, uint64_t arg)
         !lpr_linux_sync_file_fd_active((uint64_t)(uint32_t)sync->fd))
         return -LPR_LINUX_EBADF;
 
-    const int wait_fd = lpr_sync_file_duplicate_wait(
+    const pacha_fd_t wait_fd = lpr_sync_file_duplicate_wait(
         (uint64_t)(uint32_t)sync->fd);
     if (wait_fd < 0) return wait_fd;
     void *page = 0;
-    const int page_fd = lpr_create_tty_wire_page(&page);
+    const pacha_fd_t page_fd = lpr_create_tty_wire_page(&page);
     if (page_fd < 0) {
-        (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)wait_fd);
+        (void)lpr_close_native_fd_if_open((uint64_t)wait_fd);
         return page_fd;
     }
     gpud_drm_prime_token_request_t *import =
@@ -1387,14 +1369,14 @@ int64_t lpr_dmabuf_ioctl(uint64_t fd, uint64_t request, uint64_t arg)
         wait_fd,
         0);
     lpr_destroy_tty_wire_page(page_fd, page);
-    (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)wait_fd);
+    (void)lpr_close_native_fd_if_open((uint64_t)wait_fd);
     return status;
 }
 
 static int64_t lpr_drm_prime_export(uint64_t drm_handle, uint32_t gem_handle, uint32_t flags)
 {
     void *page = 0;
-    const int page_fd = lpr_create_tty_wire_page(&page);
+    const pacha_fd_t page_fd = lpr_create_tty_wire_page(&page);
     if (page_fd < 0) return page_fd;
     gpud_drm_prime_export_request_t *request = (gpud_drm_prime_export_request_t *)lpr_gpud_drm_payload(page);
     lpr_memset(request, 0, sizeof(*request));
@@ -1402,7 +1384,7 @@ static int64_t lpr_drm_prime_export(uint64_t drm_handle, uint32_t gem_handle, ui
     request->gem_handle = gem_handle;
     request->flags = flags;
     uint64_t token = 0;
-    int received[2] = {-1, -1};
+    pacha_fd_t received[2] = {-1, -1};
     uint32_t received_count = 0;
     int64_t status = lpr_gpud_drm_call_transfers_many(
         GPUD_DRM_OP_PRIME_EXPORT, page_fd, page, sizeof(*request),
@@ -1411,11 +1393,11 @@ static int64_t lpr_drm_prime_export(uint64_t drm_handle, uint32_t gem_handle, ui
     if (status != 0) return status;
     struct pacha_fd_info info;
     struct pacha_fd_info lease;
-    const int native_fd = received[0];
+    const pacha_fd_t native_fd = received[0];
     const uint64_t view_rights = PACHA_FD_RIGHT_DUP |
         PACHA_FD_RIGHT_TRANSFER | PACHA_FD_RIGHT_CLOSE |
         PACHA_FD_RIGHT_MAP_READ | PACHA_FD_RIGHT_MAP_WRITE;
-    if (received_count != 2 || native_fd < 16 || token == 0 || !lpr_native_fd_info((uint64_t)(uint32_t)native_fd, &info) ||
+    if (received_count != 2 || native_fd < 16 || token == 0 || !lpr_native_fd_info((uint64_t)native_fd, &info) ||
         info.kind != PACHA_FD_KIND_VMO || !info.size || (info.size & 4095u) ||
         info.rights != view_rights || info.flags != PACHA_FD_FLAG_CLOEXEC ||
         !lpr_native_fd_info((uint64_t)(uint32_t)received[1], &lease) ||
@@ -1430,24 +1412,24 @@ static int64_t lpr_drm_prime_export(uint64_t drm_handle, uint32_t gem_handle, ui
         ((flags & GPUD_DRM_CLOEXEC) != 0 ? LPR_LINUX_O_CLOEXEC : 0);
     const int linux_fd = lpr_dmabuf_install(native_fd, received[1], token, info.size, linux_flags);
     if (linux_fd < 0) {
-        (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)native_fd);
+        (void)lpr_close_native_fd_if_open((uint64_t)native_fd);
         (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)received[1]);
     }
     return linux_fd;
 }
 
-static int64_t lpr_drm_prime_import(uint64_t drm_handle, uint64_t prime_fd, uint32_t flags)
+static int64_t lpr_drm_prime_import(uint64_t drm_handle, uint64_t prime_fd, uint32_t flags, unsigned *wait_not_ready __attribute__((unused)))
 {
     lpr_dmabuf_backend_t *dmabuf = lpr_dmabuf_backend(prime_fd);
     if (flags != 0) return -LPR_LINUX_EINVAL;
-    int import_vmo_fd = -1;
+    pacha_fd_t import_vmo_fd = -1;
     uint64_t import_size = 0;
     if (dmabuf == 0) {
         if (!lpr_linux_filed_fd_active(prime_fd)) return -LPR_LINUX_EBADF;
         lpr_linux_stat_t st;
         lpr_memset(&st, 0, sizeof(st));
         const int64_t stat_status = lpr_linux_fstat(
-            prime_fd, (uint64_t)(uintptr_t)&st);
+            prime_fd, (uint64_t)(uintptr_t)&st, wait_not_ready);
         if (stat_status != 0) return stat_status;
         if (st.st_size <= 0 || (uint64_t)st.st_size > 256u * 1024u * 1024u) {
             return -LPR_LINUX_EINVAL;
@@ -1461,10 +1443,10 @@ static int64_t lpr_drm_prime_import(uint64_t drm_handle, uint64_t prime_fd, uint
             (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)shared_vmo_fd);
             return -LPR_LINUX_EIO;
         }
-        import_vmo_fd = (int)(uint32_t)shared_vmo_fd;
+        import_vmo_fd = (pacha_fd_t)shared_vmo_fd;
     }
     void *page = 0;
-    const int page_fd = lpr_create_tty_wire_page(&page);
+    const pacha_fd_t page_fd = lpr_create_tty_wire_page(&page);
     if (page_fd < 0) {
         if (import_vmo_fd >= 16) (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)import_vmo_fd);
         return page_fd;
@@ -1486,7 +1468,7 @@ static int64_t lpr_drm_prime_import(uint64_t drm_handle, uint64_t prime_fd, uint
         (status != 0 ? status : -LPR_LINUX_EIO);
 }
 
-static int64_t lpr_udmabuf_create(uint64_t drm_handle, uint64_t arg)
+static int64_t lpr_udmabuf_create(uint64_t drm_handle, uint64_t arg, unsigned *wait_not_ready __attribute__((unused)))
 {
     (void)drm_handle;
     if (arg == 0) return -LPR_LINUX_EFAULT;
@@ -1498,7 +1480,7 @@ static int64_t lpr_udmabuf_create(uint64_t drm_handle, uint64_t arg)
     lpr_linux_stat_t st;
     lpr_memset(&st, 0, sizeof(st));
     const int64_t stat_status = lpr_linux_fstat(
-        create->memfd, (uint64_t)(uintptr_t)&st);
+        create->memfd, (uint64_t)(uintptr_t)&st, wait_not_ready);
     if (stat_status != 0) return stat_status;
     if (st.st_size <= 0 || create->size > (uint64_t)st.st_size) return -LPR_LINUX_EINVAL;
     uint64_t file_size = 0;
@@ -1506,14 +1488,14 @@ static int64_t lpr_udmabuf_create(uint64_t drm_handle, uint64_t arg)
         create->memfd, create->offset, create->size, 1, 0, &file_size);
     if (native_fd < 16) return native_fd;
     if (file_size < create->size) {
-        (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)native_fd);
+        (void)lpr_close_native_fd_if_open((uint64_t)native_fd);
         return -LPR_LINUX_EIO;
     }
     const uint64_t linux_flags = LPR_LINUX_O_RDWR |
         ((create->flags & 1u) != 0 ? LPR_LINUX_O_CLOEXEC : 0);
-    const int linux_fd = lpr_dmabuf_install((int)native_fd, -1, 0, create->size, linux_flags);
+    const int linux_fd = lpr_dmabuf_install((pacha_fd_t)native_fd, -1, 0, create->size, linux_flags);
     if (linux_fd < 0) {
-        (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)native_fd);
+        (void)lpr_close_native_fd_if_open((uint64_t)native_fd);
     }
     return linux_fd;
 }
@@ -1540,7 +1522,7 @@ static char *lpr_drm_diag_uint(char *out, const char *end, uint64_t value,
 
 static int lpr_drm_cs_reject(const char *reason,
     const gpud_drm_amdgpu_cs_t *user, uint32_t chunk_id,
-    uint32_t length_dw, int error)
+    uint32_t length_dw, int error, unsigned *wait_not_ready __attribute__((unused)))
 {
     char line[240];
     char *out = line;
@@ -1563,13 +1545,13 @@ static int lpr_drm_cs_reject(const char *reason,
     if (out < end) *out++ = '\n';
     /* The test client's stderr is redirected into a RAM transcript. Early
      * LPR rejection cannot reach gpud, so it needs its own userland record. */
-    (void)lpr_linux_write(2, (uintptr_t)line, (uint64_t)(out - line));
+    (void)lpr_linux_write(2, (uintptr_t)line, (uint64_t)(out - line), wait_not_ready);
     return error;
 }
 
 static int lpr_drm_prepare_amdgpu_cs(uint64_t arg, int reusable_aux,
-    gpud_drm_ioctl_request_t *request, int *aux_fd,
-    void **aux_mapping, uint64_t *aux_map_size)
+    gpud_drm_ioctl_request_t *request, pacha_fd_t *aux_fd,
+    void **aux_mapping, uint64_t *aux_map_size, unsigned *wait_not_ready __attribute__((unused)))
 {
     gpud_drm_amdgpu_cs_t user = {0};
     gpud_drm_amdgpu_cs_wire_t wire = {0};
@@ -1587,27 +1569,27 @@ static int lpr_drm_prepare_amdgpu_cs(uint64_t arg, int reusable_aux,
         KB2_GPU_DRM_AMDGPU_RECORD_CS_CHUNK_TIMELINE_SIGNAL,
         KB2_GPU_DRM_AMDGPU_RECORD_CS_CHUNK_GFX_SHADOW};
     if (!arg || !request || !aux_fd || !aux_mapping || !aux_map_size)
-        return lpr_drm_cs_reject("null-argument", NULL, 0, 0, -LPR_LINUX_EFAULT);
+        return lpr_drm_cs_reject("null-argument", NULL, 0, 0, -LPR_LINUX_EFAULT, wait_not_ready);
     lpr_memcpy(&user, (const void *)(uintptr_t)arg, sizeof(user));
     if (!user.ctx_id || !user.chunks || user.flags || !user.num_chunks ||
         user.num_chunks > KB2_AMDGPU_CS_PARTS ||
         user.chunks > UINT64_MAX - user.num_chunks * sizeof(uint64_t))
-        return lpr_drm_cs_reject("header-shape", &user, 0, 0, -LPR_LINUX_EINVAL);
+        return lpr_drm_cs_reject("header-shape", &user, 0, 0, -LPR_LINUX_EINVAL, wait_not_ready);
     for (uint32_t i = 0; i < user.num_chunks; ++i) {
         uint64_t pointer;
         gpud_drm_amdgpu_cs_chunk_t chunk;
         lpr_memcpy(&pointer, (const void *)(uintptr_t)(user.chunks + i * 8), 8);
         if (!pointer || pointer > UINT64_MAX - sizeof(chunk))
-            return lpr_drm_cs_reject("chunk-pointer", &user, 0, 0, -LPR_LINUX_EFAULT);
+            return lpr_drm_cs_reject("chunk-pointer", &user, 0, 0, -LPR_LINUX_EFAULT, wait_not_ready);
         lpr_memcpy(&chunk, (const void *)(uintptr_t)pointer, sizeof(chunk));
         if (!chunk.chunk_id || chunk.chunk_id >= sizeof(records)/sizeof(records[0]))
             return lpr_drm_cs_reject("unsupported-chunk", &user, chunk.chunk_id,
-                chunk.length_dw, -LPR_LINUX_EOPNOTSUPP);
+                chunk.length_dw, -LPR_LINUX_EOPNOTSUPP, wait_not_ready);
         if (!chunk.chunk_data || !chunk.length_dw ||
             chunk.length_dw > KB2_AMDGPU_CS_BYTES / 4 ||
             chunk.chunk_data > UINT64_MAX - (uint64_t)chunk.length_dw * 4)
             return lpr_drm_cs_reject("chunk-range", &user, chunk.chunk_id,
-                chunk.length_dw, -LPR_LINUX_EINVAL);
+                chunk.length_dw, -LPR_LINUX_EINVAL, wait_not_ready);
         gpud_drm_amdgpu_cs_part_t *p = &wire.parts[i];
         p->record = records[chunk.chunk_id];
         p->offset = total;
@@ -1616,7 +1598,7 @@ static int lpr_drm_prepare_amdgpu_cs(uint64_t arg, int reusable_aux,
         if (chunk.chunk_id == 6) {
             gpud_drm_amdgpu_bo_list_in_t list;
             if (p->bytes != sizeof(list) || ++bos > 1 || user.bo_list_handle)
-                return lpr_drm_cs_reject("bo-list-shape", &user, 6, chunk.length_dw, -LPR_LINUX_EINVAL);
+                return lpr_drm_cs_reject("bo-list-shape", &user, 6, chunk.length_dw, -LPR_LINUX_EINVAL, wait_not_ready);
             lpr_memcpy(&list, (const void *)(uintptr_t)chunk.chunk_data, sizeof(list));
             /* CS BO_HANDLES ignores operation/list_handle, unlike BO_LIST.
              * Mesa intentionally poisons those unused fields with ~0. */
@@ -1624,25 +1606,25 @@ static int lpr_drm_prepare_amdgpu_cs(uint64_t arg, int reusable_aux,
                 list.bo_info_size != sizeof(gpud_drm_amdgpu_bo_entry_t) ||
                 !list.bo_info_ptr || list.bo_info_ptr >
                 UINT64_MAX - (uint64_t)list.bo_number * list.bo_info_size)
-                return lpr_drm_cs_reject("bo-list-range", &user, 6, chunk.length_dw, -LPR_LINUX_EINVAL);
+                return lpr_drm_cs_reject("bo-list-range", &user, 6, chunk.length_dw, -LPR_LINUX_EINVAL, wait_not_ready);
             p->bytes = list.bo_number * list.bo_info_size;
             sources[i] = list.bo_info_ptr;
         }
         uint32_t size = kb2_amdgpu_cs_element_size(p->record);
         if (!size || p->bytes % size)
             return lpr_drm_cs_reject("chunk-element-size", &user, chunk.chunk_id,
-                chunk.length_dw, -LPR_LINUX_EINVAL);
+                chunk.length_dw, -LPR_LINUX_EINVAL, wait_not_ready);
         p->count = p->bytes / size;
         struct kb2_amdgpu_cs_part shape = {p->record, p->count, p->offset, p->bytes};
         if (!kb2_amdgpu_cs_part_valid(&shape))
             return lpr_drm_cs_reject("chunk-capacity", &user, chunk.chunk_id,
-                chunk.length_dw, -LPR_LINUX_EINVAL);
+                chunk.length_dw, -LPR_LINUX_EINVAL, wait_not_ready);
         total += p->bytes;
         ibs += chunk.chunk_id == 1;
     }
-    if (!ibs) return lpr_drm_cs_reject("missing-ib", &user, 0, 0, -LPR_LINUX_EINVAL);
+    if (!ibs) return lpr_drm_cs_reject("missing-ib", &user, 0, 0, -LPR_LINUX_EINVAL, wait_not_ready);
     int result = lpr_drm_aux_create(total, reusable_aux, aux_fd, aux_mapping, aux_map_size);
-    if (result) return lpr_drm_cs_reject("aux-allocation", &user, 0, 0, result);
+    if (result) return lpr_drm_cs_reject("aux-allocation", &user, 0, 0, result, wait_not_ready);
     for (uint32_t i = 0; i < user.num_chunks; ++i) {
         const gpud_drm_amdgpu_cs_part_t *p = &wire.parts[i];
         uint8_t *dst = (uint8_t *)*aux_mapping + p->offset;
@@ -1652,7 +1634,7 @@ static int lpr_drm_prepare_amdgpu_cs(uint64_t arg, int reusable_aux,
             if (ib.pad || !ib.va_start || !ib.ib_bytes) {
                 lpr_drm_aux_destroy(*aux_fd, *aux_mapping, *aux_map_size);
                 *aux_fd = -1; *aux_mapping = 0; *aux_map_size = 0;
-                return lpr_drm_cs_reject("ib-shape", &user, 1, 8, -LPR_LINUX_EINVAL);
+                return lpr_drm_cs_reject("ib-shape", &user, 1, 8, -LPR_LINUX_EINVAL, wait_not_ready);
             }
             lpr_memset(dst, 0, p->bytes);
             lpr_memcpy(dst, &ib.flags, 4); lpr_memcpy(dst + 4, &ib.ip_type, 4);
@@ -1672,7 +1654,7 @@ static int lpr_drm_prepare_amdgpu_cs(uint64_t arg, int reusable_aux,
 
 static int lpr_kms_query_prepare(gpud_drm_ioctl_request_t *request,
     const struct gpud_kms_query_shape *shape, const unsigned char *snapshot,
-    int reusable_aux, int *aux_fd, void **aux_mapping, uint64_t *aux_map_size)
+    int reusable_aux, pacha_fd_t *aux_fd, void **aux_mapping, uint64_t *aux_map_size)
 {
     uint64_t bytes = 0;
     int large = 0;
@@ -1774,7 +1756,7 @@ static int lpr_kms_query_reply(const gpud_drm_ioctl_request_t *request,
 
 static int lpr_drm_prepare_amdgpu_gem_op(uint32_t command, uint64_t arg,
     int reusable_aux, gpud_drm_ioctl_request_t *request, uint64_t *output_pointer,
-    int *aux_fd, void **aux_mapping, uint64_t *aux_map_size)
+    pacha_fd_t *aux_fd, void **aux_mapping, uint64_t *aux_map_size)
 {
     gpud_drm_amdgpu_gem_op_t wire = {0};
     const uint32_t native_size = command == GPUD_DRM_IOCTL_AMDGPU_GEM_OP ? 16 : 24;
@@ -1801,7 +1783,7 @@ static int lpr_drm_prepare_amdgpu_gem_op(uint32_t command, uint64_t arg,
     return 0;
 }
 
-int64_t lpr_drm_ioctl(uint64_t fd, uint64_t request, uint64_t arg)
+int64_t lpr_drm_ioctl(uint64_t fd, uint64_t request, uint64_t arg, unsigned *wait_not_ready __attribute__((unused)))
 {
 #if defined(LPR_DRM_STARTUP_PROFILE) && LPR_DRM_STARTUP_PROFILE
     const uint64_t profile_start = pacha_trace_read_tsc();
@@ -1814,7 +1796,7 @@ int64_t lpr_drm_ioctl(uint64_t fd, uint64_t request, uint64_t arg)
     }
     if (drm->node_kind == LPR_DRM_NODE_UDMABUF) {
         return command == LPR_UDMABUF_CREATE ?
-            lpr_udmabuf_create(drm->handle, arg) : -LPR_LINUX_ENOTTY;
+            lpr_udmabuf_create(drm->handle, arg, wait_not_ready) : -LPR_LINUX_ENOTTY;
     }
     if (command == GPUD_DRM_IOCTL_PRIME_HANDLE_TO_FD) {
         gpud_drm_prime_handle_t *prime = (gpud_drm_prime_handle_t *)(uintptr_t)arg;
@@ -1826,7 +1808,7 @@ int64_t lpr_drm_ioctl(uint64_t fd, uint64_t request, uint64_t arg)
         gpud_drm_prime_handle_t *prime = (gpud_drm_prime_handle_t *)(uintptr_t)arg;
         if (prime->fd < 0) return -LPR_LINUX_EBADF;
         const int64_t gem_handle = lpr_drm_prime_import(
-            drm->handle, (uint64_t)(uint32_t)prime->fd, prime->flags);
+            drm->handle, (uint64_t)(uint32_t)prime->fd, prime->flags, wait_not_ready);
         if (gem_handle >= 0) prime->handle = (uint32_t)gem_handle;
         return gem_handle >= 0 ? 0 : gem_handle;
     }
@@ -1838,7 +1820,7 @@ int64_t lpr_drm_ioctl(uint64_t fd, uint64_t request, uint64_t arg)
         return -LPR_LINUX_EOPNOTSUPP;
     }
     void *page = 0;
-    const int page_fd = lpr_create_tty_wire_page(&page);
+    const pacha_fd_t page_fd = lpr_create_tty_wire_page(&page);
     if (page_fd < 0) {
         return page_fd;
     }
@@ -1854,12 +1836,12 @@ int64_t lpr_drm_ioctl(uint64_t fd, uint64_t request, uint64_t arg)
     /* Linux ioctl commands are unsigned 32-bit values.  musl's int
      * parameter may arrive sign-extended in the syscall register. */
     ioctl->request = command;
-    int aux_fd = -1;
+    pacha_fd_t aux_fd = -1;
     void *aux_mapping = 0;
     uint64_t aux_map_size = 0;
-    int input_wait_fd = -1;
-    int output_wait_fd = -1;
-    int output_notify_fd = -1;
+    pacha_fd_t input_wait_fd = -1;
+    pacha_fd_t output_wait_fd = -1;
+    pacha_fd_t output_notify_fd = -1;
     int output_sync_fd = -1;
     uint64_t event_token = 0;
     uint64_t gamma_pointer[3] = {0};
@@ -2209,7 +2191,7 @@ int64_t lpr_drm_ioctl(uint64_t fd, uint64_t request, uint64_t arg)
             if (cookie_status != 0) {
                 if (input_wait_fd >= 16) {
                     (void)lpr_close_native_fd_if_open(
-                        (uint64_t)(uint32_t)input_wait_fd);
+                        (uint64_t)input_wait_fd);
                 }
                 lpr_destroy_tty_wire_page(page_fd, page);
                 return cookie_status;
@@ -2269,7 +2251,7 @@ int64_t lpr_drm_ioctl(uint64_t fd, uint64_t request, uint64_t arg)
         output_wait_fd = -1;
         if (installed < 0) {
             (void)lpr_close_native_fd_if_open(
-                (uint64_t)(uint32_t)output_notify_fd);
+                (uint64_t)output_notify_fd);
             lpr_destroy_tty_wire_page(page_fd, page);
             return installed;
         }
@@ -2284,7 +2266,7 @@ int64_t lpr_drm_ioctl(uint64_t fd, uint64_t request, uint64_t arg)
         wire_kind = LPR_DRM_WIRE_SYNCOBJ_HANDLE_TO_FD;
     } else if (command == GPUD_DRM_IOCTL_AMDGPU_CS) {
         const int cs_status = lpr_drm_prepare_amdgpu_cs(arg,
-            reusable_aux, ioctl, &aux_fd, &aux_mapping, &aux_map_size);
+            reusable_aux, ioctl, &aux_fd, &aux_mapping, &aux_map_size, wait_not_ready);
         if (cs_status) {
             lpr_drm_aux_destroy(aux_fd, aux_mapping, aux_map_size);
             lpr_destroy_tty_wire_page(page_fd, page);
@@ -2310,13 +2292,13 @@ int64_t lpr_drm_ioctl(uint64_t fd, uint64_t request, uint64_t arg)
         int prepared = lpr_amdgpu_info_prepare(&wire);
         if (prepared) {
             lpr_destroy_tty_wire_page(page_fd, page);
-            return amdgpu_info_failure(wire.query, amdgpu_info_capacity, "validate", prepared);
+            return amdgpu_info_failure(wire.query, amdgpu_info_capacity, "validate", prepared, wait_not_ready);
         }
         const int aux_status = lpr_drm_aux_create(wire.return_size,
             reusable_aux, &aux_fd, &aux_mapping, &aux_map_size);
         if (aux_status) {
             lpr_destroy_tty_wire_page(page_fd, page);
-            return amdgpu_info_failure(wire.query, amdgpu_info_capacity, "aux-map", aux_status);
+            return amdgpu_info_failure(wire.query, amdgpu_info_capacity, "aux-map", aux_status, wait_not_ready);
         }
         amdgpu_info_pointer = wire.return_pointer;
         wire.return_pointer = 0;
@@ -2451,7 +2433,7 @@ int64_t lpr_drm_ioctl(uint64_t fd, uint64_t request, uint64_t arg)
             if (pair_status != 0) {
                 if (input_wait_fd >= 16)
                     (void)lpr_close_native_fd_if_open(
-                        (uint64_t)(uint32_t)input_wait_fd);
+                        (uint64_t)input_wait_fd);
                 lpr_drm_aux_destroy(aux_fd, aux_mapping, aux_map_size);
                 lpr_destroy_tty_wire_page(page_fd, page);
                 return pair_status;
@@ -2461,11 +2443,11 @@ int64_t lpr_drm_ioctl(uint64_t fd, uint64_t request, uint64_t arg)
             output_wait_fd = -1;
             if (installed < 0) {
                 (void)lpr_close_native_fd_if_open(
-                    (uint64_t)(uint32_t)output_notify_fd);
+                    (uint64_t)output_notify_fd);
                 output_notify_fd = -1;
                 if (input_wait_fd >= 16)
                     (void)lpr_close_native_fd_if_open(
-                        (uint64_t)(uint32_t)input_wait_fd);
+                        (uint64_t)input_wait_fd);
                 lpr_drm_aux_destroy(aux_fd, aux_mapping, aux_map_size);
                 lpr_destroy_tty_wire_page(page_fd, page);
                 return installed;
@@ -2497,7 +2479,7 @@ int64_t lpr_drm_ioctl(uint64_t fd, uint64_t request, uint64_t arg)
         ioctl->data_size = size;
         lpr_memcpy(ioctl->data, (const void *)(uintptr_t)arg, size);
     }
-    int transfer_fds[3];
+    pacha_fd_t transfer_fds[3];
     uint8_t temporary_vmos[3];
     uint32_t transfer_count = 0;
     if (aux_fd >= 16) {
@@ -2537,11 +2519,11 @@ int64_t lpr_drm_ioctl(uint64_t fd, uint64_t request, uint64_t arg)
         event_token = 0;
     }
     if (input_wait_fd >= 16) {
-        (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)input_wait_fd);
+        (void)lpr_close_native_fd_if_open((uint64_t)input_wait_fd);
         input_wait_fd = -1;
     }
     if (output_notify_fd >= 16) {
-        (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)output_notify_fd);
+        (void)lpr_close_native_fd_if_open((uint64_t)output_notify_fd);
         output_notify_fd = -1;
     }
     if (wire_kind == LPR_DRM_WIRE_SYNCOBJ_HANDLE_TO_FD) {
@@ -2564,7 +2546,7 @@ int64_t lpr_drm_ioctl(uint64_t fd, uint64_t request, uint64_t arg)
         }
     }
     if (status != 0 && wire_kind == LPR_DRM_WIRE_AMDGPU_INFO)
-        (void)amdgpu_info_failure(amdgpu_info_query, amdgpu_info_capacity, "rpc", status);
+        (void)amdgpu_info_failure(amdgpu_info_query, amdgpu_info_capacity, "rpc", status, wait_not_ready);
     if (status == 0 && wire_kind == LPR_DRM_WIRE_VERSION) {
         lpr_drm_version_t *version = (lpr_drm_version_t *)(uintptr_t)arg;
         const gpud_drm_version_wire_t *wire = (const gpud_drm_version_wire_t *)ioctl->data;
@@ -2801,7 +2783,7 @@ int64_t lpr_drm_mmap(
         return -LPR_LINUX_EBADF;
     }
     void *page = 0;
-    const int page_fd = lpr_create_tty_wire_page(&page);
+    const pacha_fd_t page_fd = lpr_create_tty_wire_page(&page);
     if (page_fd < 0) {
         return page_fd;
     }
@@ -2812,7 +2794,7 @@ int64_t lpr_drm_mmap(
     mmap->prot = pacha_prot;
     mmap->flags = pacha_flags;
     mmap->offset = offset;
-    int received[2] = {-1, -1};
+    pacha_fd_t received[2] = {-1, -1};
     uint32_t received_count = 0;
     uint64_t mapping_length = 0;
     const int64_t status = lpr_gpud_drm_call_transfers_many(
@@ -2870,10 +2852,7 @@ static int64_t lpr_drm_drain_one_event_hint(const lpr_drm_backend_t *drm)
 {
     struct pacha_ipc_msg message;
     lpr_memset(&message, 0, sizeof(message));
-    const int64_t status = lpr_pacha_syscall2(
-        PACHAOS_SYSCALL_IPC_RECV,
-        (uint64_t)(uint32_t)drm->wait_fd.raw,
-        (uint64_t)(uintptr_t)&message);
+    const int64_t status = lpr_ipc_message(PACHAOS_SYSCALL_IPC_RECV, (uint64_t)drm->wait_fd.raw, 0, (uint64_t)(uintptr_t)((uint64_t)(uintptr_t)&message), 0, 0, 0);
     if (status == 0)
         return message.word0 || message.word1 || message.word2 ||
             message.word3 || message.fd_count ? -LPR_LINUX_EIO : 0;
@@ -2885,7 +2864,7 @@ static int64_t lpr_drm_drain_one_event_hint(const lpr_drm_backend_t *drm)
     return lpr_pacha_status_to_errno(status);
 }
 
-int64_t lpr_drm_read_events(uint64_t fd, uint64_t buf, uint64_t count)
+int64_t lpr_drm_read_events(uint64_t fd, uint64_t buf, uint64_t count, unsigned *wait_not_ready __attribute__((unused)))
 {
     lpr_drm_backend_t *drm = lpr_drm_backend(fd);
     if (drm == 0) return -LPR_LINUX_EBADF;
@@ -2899,7 +2878,7 @@ int64_t lpr_drm_read_events(uint64_t fd, uint64_t buf, uint64_t count)
         const int64_t hint_status = lpr_drm_drain_one_event_hint(drm);
         if (hint_status != 0) return hint_status;
         void *page = 0;
-        const int page_fd = lpr_create_tty_wire_page(&page);
+        const pacha_fd_t page_fd = lpr_create_tty_wire_page(&page);
         if (page_fd < 0) return page_fd;
         gpud_drm_read_request_t *read =
             (gpud_drm_read_request_t *)lpr_gpud_drm_payload(page);
@@ -2964,12 +2943,12 @@ int64_t lpr_drm_read_events(uint64_t fd, uint64_t buf, uint64_t count)
         if (wait_status == 0)
             wait_status = lpr_wait_deadline_init(&deadline, -1);
         if (wait_status == 0)
-            wait_status = lpr_wait_graph_block(&graph, &deadline);
+            wait_status = lpr_wait_graph_block(&graph, &deadline, wait_not_ready);
         if (wait_status != 0) return wait_status;
     }
 }
 
-int lpr_drm_native_wait_fd(uint64_t fd)
+pacha_fd_t lpr_drm_native_wait_fd(uint64_t fd)
 {
     lpr_drm_backend_t *drm = lpr_drm_backend(fd);
     return drm != 0 ? drm->wait_fd.raw : -1;

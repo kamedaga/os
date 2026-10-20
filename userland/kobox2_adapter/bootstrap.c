@@ -39,7 +39,7 @@ int ph_bootstrap_sender_init(struct ph_bootstrap_sender *sender, uint64_t genera
         !counts_valid(artifact_count, resource_count)) return -EINVAL;
     for (size_t i = 0; i < 2 + artifact_count + resource_count; ++i) {
         const struct pacha_ipc_fd *cap = &items[i].capability;
-        if (cap->fd < 16 || cap->fd >= PACHA_FD_TABLE_LIMIT ||
+        if (cap->fd < 16 || cap->fd >= PACHA_THREAD_SELF_FD ||
             !item_size_valid(i, artifact_count, items[i].size)) return -EINVAL;
         /* Descriptors are borrowed and cannot be moved by this transaction. */
         if (cap->transfer_flags || cap->flags != PACHA_FD_FLAG_CLOEXEC) return -EINVAL;

@@ -6,7 +6,7 @@
 
 struct lpr_install_device_state {
     struct installer_disk_port_page *page;
-    int page_fd;
+    pacha_fd_t page_fd;
     uint64_t sequence, bytes, writable_first, writable_end;
 };
 
@@ -27,8 +27,8 @@ static void block_lock(void) {
             __ATOMIC_ACQUIRE) == 0u) return;
     while (__atomic_exchange_n(&lpr_block_lock_word, 2u,
             __ATOMIC_ACQUIRE) != 0u)
-        (void)lpr_pacha_syscall3(PACHA_RUNTIME_SYSCALL_FUTEX_WAIT,
-            (uint64_t)(uintptr_t)&lpr_block_lock_word, 2u, 0);
+        (void)lpr_pacha_syscall4(PACHA_RUNTIME_SYSCALL_FUTEX_WAIT,
+            (uint64_t)(uintptr_t)&lpr_block_lock_word, 2u, 0, PACHA_WAIT_UNINTERRUPTIBLE);
 }
 
 static void block_unlock(void) {
@@ -49,8 +49,7 @@ static int64_t send_request(unsigned kind, uint32_t operation) {
     page->operation = operation;
     const struct pacha_ipc_msg request = {.word0 = operation,
         .word1 = sequence};
-    int64_t status = lpr_pacha_syscall2(PACHAOS_SYSCALL_IPC_SEND,
-        endpoint, (uint64_t)(uintptr_t)&request);
+    int64_t status = lpr_ipc_message(PACHAOS_SYSCALL_IPC_SEND, endpoint, (uint64_t)(uintptr_t)((uint64_t)(uintptr_t)&request), 0, 0, 0, 0);
     if (status) return lpr_pacha_status_to_errno(status);
     struct pacha_ipc_fd received[1] = {0};
     struct pacha_ipc_msg reply = {.fds = received, .fd_capacity = 1};
@@ -98,8 +97,7 @@ static int64_t ensure_attached(unsigned kind) {
     const struct pacha_ipc_msg request = {
         .word0 = INSTALLER_DISK_PORT_ATTACH, .word1 = sequence,
         .fds = &sent, .fd_count = 1};
-    int64_t status = lpr_pacha_syscall2(PACHAOS_SYSCALL_IPC_SEND,
-        endpoint, (uint64_t)(uintptr_t)&request);
+    int64_t status = lpr_ipc_message(PACHAOS_SYSCALL_IPC_SEND, endpoint, (uint64_t)(uintptr_t)((uint64_t)(uintptr_t)&request), 0, 0, 0, 0);
     if (!status) {
         struct pacha_ipc_msg reply = {0};
         status = lpr_native_ipc_recv_wait(endpoint, &reply);
@@ -116,7 +114,7 @@ static int64_t ensure_attached(unsigned kind) {
         return status;
     }
     state->page = page;
-    state->page_fd = (int)fd;
+    state->page_fd = (pacha_fd_t)fd;
     page->offset = 0;
     page->length = 0;
     status = send_request(kind, INSTALLER_DISK_PORT_INFO);

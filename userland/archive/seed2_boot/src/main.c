@@ -1,3 +1,4 @@
+#error "Archived syscall ABI is unsupported; migrate to current shared ABI before enabling this target"
 #include "exec_elf.h"
 
 typedef unsigned char u8;

@@ -40,6 +40,11 @@ pub fn kernelStaticStorageEndAddr() usize {
     return @max(lapic.kernelStaticStorageEndAddr(), @max(@intFromPtr(&programmed_deadline_ns) + @sizeOf(u64), @max(@intFromPtr(&waiter_deadline_ns) + @sizeOf(u64), @intFromPtr(&contention_retry_ns) + @sizeOf(u64))));
 }
 
+/// The last published waiter deadline (0: none), for consistency checks.
+pub fn publishedWaiterDeadline() u64 {
+    return @atomicLoad(u64, &waiter_deadline_ns, .acquire);
+}
+
 pub fn publish(deadline: ?u64) bool {
     const next = deadline orelse 0;
     return @atomicRmw(u64, &waiter_deadline_ns, .Xchg, next, .release) != next;

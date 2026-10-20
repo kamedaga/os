@@ -16,7 +16,7 @@ static int status(long result) {
 }
 
 static int valid_fd(long fd) {
-    return fd >= 16 && fd < PACHA_FD_TABLE_LIMIT;
+    return fd >= 16 && fd < PACHA_THREAD_SELF_FD;
 }
 
 static int unexpected_result(long result) {
@@ -66,7 +66,7 @@ static int validate_request(const struct gpud_launch_request *request,
     return 0;
 }
 
-static int close_fd(int *fd) {
+static int close_fd(pacha_fd_t *fd) {
     if (!*fd) return 0;
     int result = status(pacha_syscall1(PACHA_FD_SYSCALL_CLOSE, (uint64_t)*fd));
     if (!result) *fd = 0;
@@ -98,7 +98,7 @@ static int copy_mapping(struct gpud_native_launch *launch, const void *bytes,
     if (protection & PACHA_PROT_EXEC) rights |= PACHA_FD_RIGHT_MAP_EXEC;
     long fd = pacha_syscall3(PACHA_FD_SYSCALL_VMO_CREATE, size, rights, 0);
     if (!valid_fd(fd)) return unexpected_result(fd);
-    launch->scratch_fd = (int)fd;
+    launch->scratch_fd = (pacha_fd_t)fd;
     long view = pacha_syscall6(PACHA_VM_SYSCALL_MMAP, (uint64_t)fd, 0, size,
         PACHA_PROT_READ | PACHA_PROT_WRITE, PACHA_MMAP_SHARED, 0);
     if (view < GPUD_LAUNCH_PAGE) return unexpected_result(view);

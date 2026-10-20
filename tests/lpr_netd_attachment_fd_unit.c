@@ -1,3 +1,4 @@
+#include "lpr_ipc_mock.h"
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
@@ -35,7 +36,7 @@ int64_t lpr_pacha_syscall3(uint64_t nr, uint64_t raw, uint64_t rights, uint64_t 
     pair[0] = 100; pair[1] = 101;
     return 0;
 }
-int64_t lpr_pacha_syscall2(uint64_t nr, uint64_t fd, uint64_t raw)
+static int64_t fixture_prepare_request(uint64_t nr, uint64_t fd, uint64_t raw)
 {
     assert(nr == PACHAOS_SYSCALL_IPC_CALL && fd == LPR_NETD_ENDPOINT_FD);
     const struct pacha_ipc_msg *request = (void *)(uintptr_t)raw;
@@ -50,10 +51,10 @@ int64_t lpr_pacha_syscall2(uint64_t nr, uint64_t fd, uint64_t raw)
     if (moved) foreign_alive = 1;
     return 90;
 }
-int64_t lpr_pacha_syscall4(uint64_t nr, uint64_t fd, uint64_t raw, uint64_t timeout, uint64_t flags)
+static int64_t fixture_finish_request(uint64_t nr, uint64_t fd, uint64_t raw, uint64_t timeout, uint64_t flags)
 {
     assert(nr == PACHAOS_SYSCALL_IPC_RECV_WAIT && fd == 90);
-    assert(timeout == UINT64_MAX && flags == 0);
+    assert(timeout == UINT64_MAX && flags == PACHA_WAIT_UNINTERRUPTIBLE);
     struct pacha_ipc_msg *reply = (void *)(uintptr_t)raw;
     reply->word0 = PACHA_SERVICE_REPLY_MAGIC;
     reply->word1 = (uint64_t)(int64_t)server_error;
@@ -74,7 +75,7 @@ static int scenario(int send_error, int reply_error)
     const int expected_error = send_error ? send_error : reply_error;
     if (status != expected_error || foreign_closes != 0 || sender_closes != 1 ||
         lease_closes != (unsigned)(expected_error != 0) ||
-        reply_closes != (unsigned)(send_error == 0) ||
+        reply_closes != 0 ||
         (!expected_error && (slot->lease_fd != 100 || slot->attachment_id != 42)))
     {
         fprintf(stderr, "FAIL: send=%d reply=%d status=%lld foreign_closes=%u sender_closes=%u lease_closes=%u\n",
@@ -91,4 +92,32 @@ int main(void)
     if (!ok) return 1;
     puts("LPR_NETD_ATTACHMENT_FD_UNIT=OK");
     return 0;
+}
+
+/* Request preparation and reply rendering are fixture phases within one
+ * synchronous syscall. Their transaction tags never become caller FDs. */
+int64_t lpr_pacha_syscall2(uint64_t nr, uint64_t a, uint64_t b)
+{
+    assert(nr != PACHAOS_SYSCALL_IPC_CALL);
+    return fixture_prepare_request(nr, a, b);
+}
+int64_t lpr_pacha_syscall4(uint64_t nr, uint64_t a, uint64_t b, uint64_t c, uint64_t d)
+{
+    return fixture_finish_request(nr, a, b, c, d);
+}
+int64_t lpr_ipc_message(uint64_t nr, uint64_t endpoint,
+    uint64_t request, uint64_t reply, uint64_t timeout, uint64_t flags, int *sent)
+{
+    if (nr != PACHA_IPC_SYSCALL_CALL) return test_lpr_ipc_noncall(nr, endpoint, request, reply, timeout, flags, sent);
+
+    assert(nr == PACHAOS_SYSCALL_IPC_CALL && request && reply);
+    assert(timeout == UINT64_MAX && flags == PACHA_WAIT_UNINTERRUPTIBLE);
+    *sent = 0;
+    int64_t transaction = fixture_prepare_request(nr, endpoint, request);
+    if (transaction < 16) return transaction;
+    *sent = 1;
+    int64_t status = fixture_finish_request(PACHAOS_SYSCALL_IPC_RECV_WAIT,
+        (uint64_t)transaction, reply, timeout, flags);
+
+    return status;
 }

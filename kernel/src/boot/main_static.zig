@@ -64,7 +64,7 @@ pub const debug_skip_exit_boot_services = false;
 pub const debug_skip_cr3_switch = false;
 pub const debug_trigger_page_fault_test = false;
 pub const user_process_count: usize = kernel.process_count;
-pub const user_thread_count: usize = scheduler.maxThreadSlots;
+pub const user_thread_count: usize = scheduler.threadIdValueCount;
 pub const UserAddressSpace = address_space.UserAddressSpace;
 pub const UserAddressSpaceTable = address_space.UserAddressSpaceTable;
 

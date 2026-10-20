@@ -1,3 +1,4 @@
+#include <pacha/abi.h>
 #pragma once
 
 #include <pacha/ipc.h>
@@ -20,6 +21,7 @@ typedef struct lpr_wait_deadline {
 } lpr_wait_deadline_t;
 
 typedef struct lpr_wait_graph {
+    unsigned native_not_ready; /* result of this block invocation */
     struct pacha_pollfd leaves[LPR_WAIT_GRAPH_MAX_LEAVES];
     uint32_t logical_fds[LPR_WAIT_GRAPH_MAX_LEAVES];
     uint8_t drain_modes[LPR_WAIT_GRAPH_MAX_LEAVES];
@@ -41,16 +43,16 @@ int64_t lpr_wait_graph_add_unix_sequence(lpr_wait_graph_t *graph, uint32_t fd,
     uint32_t events, uint32_t ignore_ready, const struct unix_poll_sequence *sequence);
 int64_t lpr_wait_graph_add_native(
     lpr_wait_graph_t *graph,
-    int native_fd,
+    pacha_fd_t native_fd,
     uint64_t events);
 int64_t lpr_wait_graph_add_native_min(
     lpr_wait_graph_t *graph,
-    int native_fd,
+    pacha_fd_t native_fd,
     uint64_t events,
     uint64_t min_write_bytes);
 int64_t lpr_wait_graph_add_control(
     lpr_wait_graph_t *graph,
-    int native_fd);
+    pacha_fd_t native_fd);
 int64_t lpr_wait_graph_add_fd(
     lpr_wait_graph_t *graph,
     uint64_t fd,
@@ -66,4 +68,4 @@ int64_t lpr_wait_deadline_expired(
     int *out_expired);
 int64_t lpr_wait_graph_block(
     lpr_wait_graph_t *graph,
-    const lpr_wait_deadline_t *deadline);
+    const lpr_wait_deadline_t *deadline, unsigned *wait_not_ready __attribute__((unused)));

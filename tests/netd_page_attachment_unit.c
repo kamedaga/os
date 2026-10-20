@@ -30,14 +30,14 @@ static unsigned free_fds(void)
     return count;
 }
 
-int pacha_fd_close(int fd)
+int pacha_fd_close(pacha_fd_t fd)
 {
     assert(fd >= 16 && fd < 256 && fd_kind[fd] != 0);
     fd_kind[fd] = 0;
     return 0;
 }
 
-int pacha_fd_get_info(int fd, struct pacha_fd_info *out)
+int pacha_fd_get_info(pacha_fd_t fd, struct pacha_fd_info *out)
 {
     assert(fd >= 16 && fd < 256 && fd_kind[fd] != 0);
     memset(out, 0, sizeof(*out));
@@ -47,7 +47,7 @@ int pacha_fd_get_info(int fd, struct pacha_fd_info *out)
     return 0;
 }
 
-void *pacha_mmap(int fd, uint64_t size, uint64_t prot,
+void *pacha_mmap(pacha_fd_t fd, uint64_t size, uint64_t prot,
     uint64_t flags, uint64_t offset)
 {
     assert(fd_kind[fd] == PACHA_FD_KIND_VMO);
@@ -73,23 +73,21 @@ int pacha_munmap(void *addr, uint64_t size)
 int main(void)
 {
     /* At the observed desktop load, retaining 36 page descriptors leaves
-     * only one free slot. A fork DUP needs two slots (lease plus reply). */
+     * only one free slot. A fork DUP needs one explicit lease slot. */
     for (unsigned i = 0; i < 167; ++i)
         assert(install_fd(PACHA_FD_KIND_CHANNEL) >= 16);
     for (unsigned i = 0; i < 36; ++i) {
-        assert(free_fds() >= 3);
+        assert(free_fds() >= 2);
         const int page_fd = install_fd(PACHA_FD_KIND_VMO);
         const int lease_fd = install_fd(PACHA_FD_KIND_CHANNEL);
-        const int reply_fd = install_fd(PACHA_FD_KIND_REPLY);
         uint64_t id = 0;
         assert(netd_page_attachment_add(page_fd, lease_fd, &id) == 0);
-        assert(pacha_fd_close(reply_fd) == 0);
         struct netd_page_attachment *attachment = netd_page_attachment_find(id);
         assert(attachment != NULL);
         ((unsigned char *)attachment->page)[0] = (unsigned char)i;
     }
-    if (free_fds() < 2) {
-        fprintf(stderr, "FAIL: fork DUP cannot enter netd: free=%u required=2\n",
+    if (free_fds() < 1) {
+        fprintf(stderr, "FAIL: fork DUP cannot enter netd: free=%u required=1\n",
             free_fds());
         return 1;
     }

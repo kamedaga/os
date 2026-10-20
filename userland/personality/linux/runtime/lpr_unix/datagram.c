@@ -23,7 +23,7 @@ static int unlocked(void *opaque)
  * receiving does not parse any length/ticket supplied by a writable header. */
 int64_t lpr_unix_dgram_io(const lpr_fd_pin_t *pin, const lpr_linux_iovec_t *vectors,
     unsigned count, uint64_t length, int writing, uint64_t flags,
-    uint32_t *message_flags, struct lpr_unix_ancillary *ancillary)
+    uint32_t *message_flags, struct lpr_unix_ancillary *ancillary, unsigned *wait_not_ready __attribute__((unused)))
 {
     struct lpr_unix_socket *socket = pin->state;
     UP_BEGIN(total, UP_IO, socket->type * 2 + writing, UP_TOTAL);
@@ -183,14 +183,14 @@ int64_t lpr_unix_dgram_io(const lpr_fd_pin_t *pin, const lpr_linux_iovec_t *vect
             result = lpr_unix_waiter_wait(&context->waiter,
                 writing ? &mapping->tx->waiters : &mapping->rx->waiters,
                 &mapping->tx->changes, &mapping->rx->changes, unlocked,
-                writing ? (void *)&mapping->tx->owner : (void *)&mapping->rx->owner, &deadline);
+                writing ? (void *)&mapping->tx->owner : (void *)&mapping->rx->owner, &deadline, wait_not_ready);
         } else {
             /* The broker notifies every source when destination budget opens.
              * Nothing drains the notification queue after this attempt. */
             lpr_wait_graph_t graph;
             lpr_wait_graph_init(&graph);
             result = lpr_unix_waiter_add_graph(&context->waiter, &graph);
-            if (!result) result = lpr_wait_graph_block(&graph, &deadline);
+            if (!result) result = lpr_wait_graph_block(&graph, &deadline, wait_not_ready);
         }
         if (result) break;
     }

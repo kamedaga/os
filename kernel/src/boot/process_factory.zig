@@ -22,18 +22,7 @@ pub const CreatedUserProcess = struct {
     thread_slot: usize,
 };
 
-pub const DynamicUserProcess = struct {
-    principal: kernel.PrincipalId,
-    process: CreatedUserProcess,
-};
-
-pub const SuspendedUserProcess = struct {
-    principal: kernel.PrincipalId,
-    thread_slot: usize,
-};
-
 pub const CreateUserProcessError = error{CreateFailed};
-pub const CreateDynamicUserProcessError = error{ CreateFailed, NoFreeProcess };
 
 // ---------------------------------------------------------------------------
 // Initial trap frame
@@ -63,7 +52,10 @@ const at_secure: u64 = 23;
 const at_random: u64 = 25;
 const at_execfn: u64 = 31;
 
-const user_stack_bytes: usize = 4096;
+// Only the top physical page contains argv0/auxv. The remaining bootstrap
+// stack pages are mapped separately by mapAdditionalInitialStackPagesOrHalt;
+// this staging slice is not the stack capacity or a userland growth limit.
+const initial_stack_payload_page_bytes: usize = 4096;
 
 fn stackVaFromOffset(offset: usize) u64 {
     return boot_static.user_stack_page_va + @as(u64, @intCast(offset));
@@ -86,11 +78,11 @@ pub fn installInitialUserStackOrHalt(
     if ((user_stack_paddr & 0xFFF) != 0) halt.haltWithMessage("initial user stack paddr unaligned");
     if (argv0.len == 0 or argv0.len >= 128) halt.haltWithMessage("initial user argv0 invalid");
 
-    const stack_ptr: [*]u8 = @ptrFromInt(user_stack_paddr);
-    const stack = stack_ptr[0..user_stack_bytes];
+    const stack = @import("../arch/x86_64/physical_layout.zig").identitySlice(u8, .fromInt(user_stack_paddr), initial_stack_payload_page_bytes) orelse
+        halt.haltWithMessage("initial user stack physical range inaccessible");
     @memset(stack, 0);
 
-    var cursor: usize = user_stack_bytes;
+    var cursor: usize = initial_stack_payload_page_bytes;
     var random_seed = [_]u8{0} ** 16;
     state.fillRandomBytes(principal, random_seed[0..]);
     const random_va = pushStackBytes(stack, &cursor, random_seed[0..]);
@@ -141,12 +133,6 @@ pub fn installInitialUserStackOrHalt(
     }
 
     return stackVaFromOffset(cursor);
-}
-
-fn releaseStaleThreadSlot(principal: kernel.PrincipalId) void {
-    if (scheduler.threadForPrincipal(principal)) |thread_slot| {
-        _ = scheduler.releaseThread(thread_slot);
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -237,53 +223,6 @@ pub fn createUserProcess(
     user_spaces: *boot_static.UserAddressSpaceTable,
 ) CreatedUserProcess {
     return tryCreateUserProcess(state, principal, role_label, free_list, user_spaces) catch halt.haltLoop();
-}
-
-pub fn tryCreateDynamicUserProcess(
-    state: *kernel.KernelState,
-    role_label: []const u8,
-    free_list: *kernel.FreePageList,
-    user_spaces: *boot_static.UserAddressSpaceTable,
-) CreateDynamicUserProcessError!DynamicUserProcess {
-    const principal = state.createProcessDescriptorWithUserAddressSpaceChecked(
-        role_label,
-        free_list,
-        user_spaces,
-        scheduler.principalSlotReusable,
-    ) orelse return error.NoFreeProcess;
-    releaseStaleThreadSlot(principal);
-    const process = tryCreateUserProcess(state, principal, role_label, free_list, user_spaces) catch return error.CreateFailed;
-    return .{
-        .principal = principal,
-        .process = process,
-    };
-}
-
-pub fn tryCreateSuspendedUserProcess(
-    state: *kernel.KernelState,
-    role_label: []const u8,
-    free_list: *kernel.FreePageList,
-    user_spaces: *boot_static.UserAddressSpaceTable,
-) CreateDynamicUserProcessError!SuspendedUserProcess {
-    const principal = state.createProcessDescriptorWithUserAddressSpaceChecked(
-        role_label,
-        free_list,
-        user_spaces,
-        scheduler.principalSlotReusable,
-    ) orelse return error.NoFreeProcess;
-    releaseStaleThreadSlot(principal);
-    if (!user_vm.buildEmptyUserAddressSpace(principal)) {
-        _ = state.removeProcessDescriptor(principal);
-        return error.CreateFailed;
-    }
-    const thread_slot = scheduler.allocateSuspendedThread(principal, user_spaces, buildInitialUserTrapFrame(), free_list) orelse {
-        _ = state.removeProcessDescriptor(principal);
-        return error.CreateFailed;
-    };
-    return .{
-        .principal = principal,
-        .thread_slot = thread_slot,
-    };
 }
 
 // ---------------------------------------------------------------------------
@@ -409,18 +348,4 @@ pub fn allocAndMapOwnedPageForProcessOrHalt(
     const page = allocPageForProcessOrHalt(state, principal, role_label, page_label, free_list);
     mapUserPageOrHalt(state, principal, va_start, page, writable, role_label, page_label, free_list);
     return page;
-}
-
-// ---------------------------------------------------------------------------
-// Endpoint installation
-// ---------------------------------------------------------------------------
-
-pub fn installSpawnParentEndpoint(
-    state: *kernel.KernelState,
-    principal: kernel.PrincipalId,
-    parent: kernel.PrincipalId,
-) !void {
-    const endpoint_to_spawn_parent: u64 = 0x14;
-    if (!state.hasActivePrincipal(parent)) return;
-    try state.installEndpoint(principal, endpoint_to_spawn_parent, parent);
 }

@@ -3,7 +3,7 @@
 
 /* Process-local control capability, never an OFD transfer record. */
 struct lpr_unix_client {
-    int fd;
+    pacha_fd_t fd;
     uint64_t session;
     uint64_t process_token;
 };

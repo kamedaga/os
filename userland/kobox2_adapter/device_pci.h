@@ -2,17 +2,18 @@
 #ifndef PACHA_KOBOX_DEVICE_PCI_H
 #define PACHA_KOBOX_DEVICE_PCI_H
 
+#include <pacha/abi.h>
 #include "boot/pci_host.h"
 #include <pacha/capsule.h>
 
 struct ph_pci_mapping {
     uintptr_t address;
     size_t length;
-    int fd;
+    pacha_fd_t fd;
 };
 
 struct ph_pci_config {
-    int device_fd;
+    pacha_fd_t device_fd;
     uint64_t generation;
     /* Local Linux topology, not a hardware address or additional authority.
      * Every config transaction still addresses only device_fd. */

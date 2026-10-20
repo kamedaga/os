@@ -447,3 +447,9 @@ int main(int argc, char **argv) {
     puts("gpud native ELF/launch ownership unit: PASS (not a core boot Gate)");
     return 0;
 }
+
+long pacha_ipc_registers(uint64_t nr, uint64_t fd, uint64_t flags, uint64_t timeout,
+    uint64_t words[4], struct pacha_ipc_extension *extension, int *committed) {
+    (void)nr; (void)fd; (void)flags; (void)timeout; (void)words; (void)extension; (void)committed;
+    abort(); /* This fixture exercises process ownership, never IPC. */
+}

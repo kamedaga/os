@@ -35,7 +35,7 @@ void lpr_wait_graph_init(lpr_wait_graph_t *graph)
 
 static int64_t lpr_wait_graph_add_leaf(
     lpr_wait_graph_t *graph,
-    int native_fd,
+    pacha_fd_t native_fd,
     uint64_t events,
     uint64_t min_write_bytes,
     uint8_t drain_mode,
@@ -43,11 +43,11 @@ static int64_t lpr_wait_graph_add_leaf(
 {
     if (graph == 0 || native_fd < 16) return -LPR_LINUX_EBADF;
     for (uint32_t i = 0; i < graph->leaf_count; ++i) {
-        if (graph->leaves[i].fd != native_fd) continue;
+        if (graph->leaves[i].fd != (uint64_t)native_fd) continue;
         graph->leaves[i].events |= events;
         if ((events & PACHA_FD_EVENT_WRITABLE) != 0 &&
-            min_write_bytes > graph->leaves[i].revents)
-            graph->leaves[i].revents = min_write_bytes;
+            min_write_bytes > graph->leaves[i].min_write_bytes)
+            graph->leaves[i].min_write_bytes = min_write_bytes;
         if (drain_mode > graph->drain_modes[i]) {
             graph->drain_modes[i] = drain_mode;
             graph->logical_fds[i] = logical_fd;
@@ -60,7 +60,7 @@ static int64_t lpr_wait_graph_add_leaf(
     graph->leaves[index] = (struct pacha_pollfd){
         .fd = native_fd,
         .events = events,
-        .revents = (events & PACHA_FD_EVENT_WRITABLE) != 0 ?
+        .min_write_bytes = (events & PACHA_FD_EVENT_WRITABLE) != 0 ?
             min_write_bytes : 0,
     };
     graph->drain_modes[index] = drain_mode;
@@ -70,7 +70,7 @@ static int64_t lpr_wait_graph_add_leaf(
 
 int64_t lpr_wait_graph_add_native(
     lpr_wait_graph_t *graph,
-    int native_fd,
+    pacha_fd_t native_fd,
     uint64_t events)
 {
     return lpr_wait_graph_add_leaf(
@@ -79,7 +79,7 @@ int64_t lpr_wait_graph_add_native(
 
 int64_t lpr_wait_graph_add_native_min(
     lpr_wait_graph_t *graph,
-    int native_fd,
+    pacha_fd_t native_fd,
     uint64_t events,
     uint64_t min_write_bytes)
 {
@@ -94,7 +94,7 @@ int64_t lpr_wait_graph_add_native_min(
 
 int64_t lpr_wait_graph_add_control(
     lpr_wait_graph_t *graph,
-    int native_fd)
+    pacha_fd_t native_fd)
 {
     return lpr_wait_graph_add_leaf(
         graph, native_fd, PACHA_FD_EVENT_READABLE,
@@ -182,14 +182,14 @@ int64_t lpr_wait_graph_add_fd(
     if (lpr_linux_epoll_fd_active(fd))
         return lpr_epoll_add_wait_graph(fd, graph);
     if (lpr_linux_socket_fd_active(fd)) {
-        const int native_fd = lpr_linux_socket_native_wait_fd(fd);
+        const pacha_fd_t native_fd = lpr_linux_socket_native_wait_fd(fd);
 #if defined(LPR_GLYCIN_DIAG) && LPR_GLYCIN_DIAG
         const lpr_socket_backend_t *socket = lpr_socket_backend(fd);
         if (socket != 0 &&
             (socket->reserved0 & LPR_SOCKET_DIAG_DBUS) != 0u)
         {
             lpr_glycin_diag_event(
-                "wait.add.socket", fd, (uint64_t)(uint32_t)native_fd,
+                "wait.add.socket", fd, (uint64_t)native_fd,
                 events, graph->leaf_count);
         }
 #endif
@@ -225,7 +225,7 @@ int64_t lpr_wait_graph_add_fd(
             0, LPR_WAIT_DRAIN_EVENT, (uint32_t)fd);
     }
     if (lpr_linux_eventfd_active(fd)) {
-        const int native_fd = lpr_eventfd_native_wait_fd(fd);
+        const pacha_fd_t native_fd = lpr_eventfd_native_wait_fd(fd);
 #if defined(LPR_GLYCIN_DIAG) && LPR_GLYCIN_DIAG
         if (__atomic_load_n(&lpr_glycin_diag_armed, __ATOMIC_ACQUIRE) != 0u) {
             const lpr_event_backend_t *event = lpr_event_backend(fd);
@@ -363,8 +363,8 @@ static int64_t lpr_wait_graph_block_native(
         if (wait_ns != UINT64_MAX) {
             status = lpr_wait_sleep(wait_ns);
         } else {
-            int local_fd = -1;
-            int remote_fd = -1;
+            pacha_fd_t local_fd = -1;
+            pacha_fd_t remote_fd = -1;
             status = lpr_native_wait_pair(&local_fd, &remote_fd);
             if (status == 0) {
                 struct pacha_pollfd leaf = {
@@ -539,6 +539,7 @@ static int64_t lpr_wait_graph_block_native(
          status == -PACHA_SYSCALL_ERR_NOT_READY ||
          status == -LPR_LINUX_EAGAIN;
     if (retryable_wake) {
+        graph->native_not_ready = 1;
         int timed_out = 0;
         if (wait_ns != UINT64_MAX) {
             uint64_t now_ns = 0;
@@ -555,9 +556,12 @@ static int64_t lpr_wait_graph_block_native(
     return linux_status == -LPR_LINUX_EAGAIN ? 0 : linux_status;
 }
 
-int64_t lpr_wait_graph_block(lpr_wait_graph_t *graph, const lpr_wait_deadline_t *deadline)
+int64_t lpr_wait_graph_block(lpr_wait_graph_t *graph, const lpr_wait_deadline_t *deadline, unsigned *wait_not_ready __attribute__((unused)))
 {
     if (!graph) return -LPR_LINUX_EFAULT;
-    return graph->unix_count ? lpr_unix_poll_block(graph, deadline, lpr_wait_graph_block_native) :
+    graph->native_not_ready = 0;
+    const int64_t result = graph->unix_count ? lpr_unix_poll_block(graph, deadline, lpr_wait_graph_block_native) :
         lpr_wait_graph_block_native(graph, deadline);
+    if (wait_not_ready) *wait_not_ready |= graph->native_not_ready;
+    return result;
 }

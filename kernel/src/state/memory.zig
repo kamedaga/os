@@ -6,12 +6,10 @@ const capsule = types.capsule;
 const initial_process_count = types.initial_process_count;
 const initial_process_capacity = types.initial_process_capacity;
 const process_count = types.process_count;
-const max_process_slots = types.max_process_slots;
+const process_principal_value_count = types.process_principal_value_count;
 const initial_thread_capacity = types.initial_thread_capacity;
-const max_thread_slots = types.max_thread_slots;
-const device_count = types.device_count;
+const thread_id_value_count = types.thread_id_value_count;
 const device_principal_raw = types.device_principal_raw;
-const principal_count = types.principal_count;
 const PrincipalRaw = types.PrincipalRaw;
 const PrincipalId = types.PrincipalId;
 const CapsuleKind = types.CapsuleKind;
@@ -21,8 +19,6 @@ const CapsuleSnapshot = types.CapsuleSnapshot;
 const CapsuleDmaDirection = types.CapsuleDmaDirection;
 const CapsuleIrqKind = types.CapsuleIrqKind;
 const MapProt = types.MapProt;
-const EndpointRoute = types.EndpointRoute;
-const Region = types.Region;
 const ProcessDescriptor = types.ProcessDescriptor;
 const ProcessStatus = types.ProcessStatus;
 const DebugProcessLifecycleReason = types.DebugProcessLifecycleReason;
@@ -31,8 +27,6 @@ const DmaDeviceId = types.DmaDeviceId;
 const invalid_dma_device_id = types.invalid_dma_device_id;
 const Fd = types.Fd;
 const fd_table_entries = types.fd_table_entries;
-const max_fd_objects = types.max_fd_objects;
-const max_pipes = types.max_pipes;
 const pipe_buffer_bytes = types.pipe_buffer_bytes;
 const fd_known_flags_mask = types.fd_known_flags_mask;
 const fd_known_rights_mask = types.fd_known_rights_mask;
@@ -62,12 +56,8 @@ const FdEntry = types.FdEntry;
 const FdInfo = types.FdInfo;
 const FdTable = types.FdTable;
 const FdTransferMode = types.FdTransferMode;
-const max_ipc_endpoints = types.max_ipc_endpoints;
-const max_ipc_channels = types.max_ipc_channels;
-const max_ipc_replies = types.max_ipc_replies;
 const max_ipc_queue_messages = types.max_ipc_queue_messages;
 const max_ipc_message_fds = types.max_ipc_message_fds;
-const max_ipc_waiters = types.max_ipc_waiters;
 const IpcEndpointRef = types.IpcEndpointRef;
 const IpcChannelRef = types.IpcChannelRef;
 const IpcChannelHandle = types.IpcChannelHandle;
@@ -76,8 +66,6 @@ const IpcWaitKey = types.IpcWaitKey;
 const IpcWaiter = types.IpcWaiter;
 const ThreadWakeTarget = types.ThreadWakeTarget;
 const TaskFdWaiter = types.TaskFdWaiter;
-const max_task_fd_waiters = types.max_task_fd_waiters;
-const max_ipc_object_waiters = types.max_ipc_object_waiters;
 const PipeSlot = types.PipeSlot;
 const IpcWaitList = types.IpcWaitList;
 const IpcTransferredFd = types.IpcTransferredFd;
@@ -91,8 +79,6 @@ const IpcSendMessage = types.IpcSendMessage;
 const IpcRecvFd = types.IpcRecvFd;
 const IpcRecvResult = types.IpcRecvResult;
 const native_page_size = types.native_page_size;
-const max_native_vmos = types.max_native_vmos;
-const max_vmas_per_process = types.max_vmas_per_process;
 const NativeVmoKind = types.NativeVmoKind;
 const NativeVmoRef = types.NativeVmoRef;
 const NativeCowTableRef = types.NativeCowTableRef;
@@ -103,18 +89,10 @@ const MmapFlags = types.MmapFlags;
 const VmaEntry = types.VmaEntry;
 const VmaTable = types.VmaTable;
 const NativeVmaFaultMapping = types.NativeVmaFaultMapping;
-const EndpointTable = types.EndpointTable;
-const PublishedEndpointTable = types.PublishedEndpointTable;
-const max_vmo_backing_pages = types.max_vmo_backing_pages;
-const max_vmo_backing_store_pages = types.max_vmo_backing_store_pages;
 const RegionFreeRange = types.RegionFreeRange;
 const FreePageList = types.FreePageList;
 const PageCapability = types.PageCapability;
-const empty_vmo_backing_page_store = types.empty_vmo_backing_page_store;
-const vmo_backing_page_store = types.vmo_backing_page_store;
 const empty_process_descriptors_extra = types.empty_process_descriptors_extra;
-const empty_endpoint_tables_extra = types.empty_endpoint_tables_extra;
-const empty_fd_tables_extra = types.empty_fd_tables_extra;
 const empty_vma_tables_extra = types.empty_vma_tables_extra;
 const processPrincipalFromIndex = types.processPrincipalFromIndex;
 const processIndexFromPrincipal = types.processIndexFromPrincipal;
@@ -134,25 +112,72 @@ const kernelStaticStorageEndAddr = types.kernelStaticStorageEndAddr;
 const runtimeStorageBytes = types.runtimeStorageBytes;
 const initRuntimeStorage = types.initRuntimeStorage;
 
-pub fn resetStorageInPlace(self: anytype) void {
+// Construction only: self is fresh storage, never a live owner. Reading its
+// owner before initialization would itself be undefined behavior. Do not
+// expose a reset alias: wiping a live owner loses published/retired/pending
+// extents without either borrower exclusion or PMM return.
+fn initializeStorageInPlace(self: anytype) void {
     @memset(std.mem.asBytes(self), 0);
+    inline for (.{ "fd_objects", "pipes", "native_vmos", "ipc_endpoints", "ipc_channels", "ipc_replies", "task_fd_waiters", "fd_wait_groups", "fd_wait_group_links", "fd_wait_group_thread_counts", "irq_publish_slots" }) |name| @field(self, name) = .{};
+    self.fd_process_capacity = types.process_count;
+    self.process_timers = .{};
+    // Force the first lock release to publish the (empty) timer deadline.
+    self.timer_deadline_dirty = true;
     self.process_descriptors_extra = empty_process_descriptors_extra[0..];
-    self.endpoint_tables_extra = empty_endpoint_tables_extra[0..];
-    self.fd_tables_extra = empty_fd_tables_extra[0..];
-    self.vma_tables_extra = empty_vma_tables_extra[0..];
+    self.fd_tables_extra = .{};
+    self.vma_tables_extra = &.{};
     self.process_capacity = process_count;
+    for (&self.vma_tables) |*table| table.* = .{};
+    for (&self.fd_tables) |*table| table.* = .{};
     self.aslr_secret = 0x6a09_e667_f3bc_c909;
     self.aslr_sequence = 1;
 
-    for (&self.fd_objects) |*slot| slot.generation = 1;
-    for (&self.pipes) |*slot| slot.generation = 1;
-    for (&self.native_vmos) |*slot| slot.generation = 1;
-    self.native_cow_table_initial = .{};
-    self.native_cow_table_overflow_head = null;
-    self.native_cow_table_chunk_count = 1;
-    for (&self.ipc_endpoints) |*slot| slot.generation = 1;
-    for (&self.ipc_channels) |*slot| slot.generation = 1;
-    for (&self.ipc_replies) |*slot| slot.generation = 1;
+    {
+        var pool_iter_12 = self.fd_objects.iterator();
+        while (pool_iter_12.next()) |pool_entry_12| {
+            const slot = pool_entry_12.value;
+            slot.generation = 1;
+        }
+    }
+    {
+        var pool_iter_13 = self.pipes.iterator();
+        while (pool_iter_13.next()) |pool_entry_13| {
+            const slot = pool_entry_13.value;
+            slot.generation = 1;
+        }
+    }
+    {
+        var pool_iter_14 = self.native_vmos.iterator();
+        while (pool_iter_14.next()) |pool_entry_14| {
+            const slot = pool_entry_14.value;
+            slot.generation = 1;
+        }
+    }
+    self.native_cow_tables = .{};
+    self.reference_nodes = .{};
+    self.object_reference_slots = .{};
+    self.clock_reference = .{};
+    {
+        var pool_iter_15 = self.ipc_endpoints.iterator();
+        while (pool_iter_15.next()) |pool_entry_15| {
+            const slot = pool_entry_15.value;
+            slot.generation = 1;
+        }
+    }
+    {
+        var pool_iter_16 = self.ipc_channels.iterator();
+        while (pool_iter_16.next()) |pool_entry_16| {
+            const slot = pool_entry_16.value;
+            slot.generation = 1;
+        }
+    }
+    {
+        var pool_iter_17 = self.ipc_replies.iterator();
+        while (pool_iter_17.next()) |pool_entry_17| {
+            const slot = pool_entry_17.value;
+            slot.generation = 1;
+        }
+    }
 }
 
 pub fn pageAlignUp(value: u64) u64 {
@@ -215,48 +240,19 @@ pub fn findRandomizedFreeUserMapVa(
 }
 
 pub fn initPhase1InPlace(self: anytype) void {
-    self.resetStorageInPlace();
-    self.regions[0] = .{
-        .id = 0,
-    };
-    self.region_len = 1;
+    initializeStorageInPlace(self);
     self.initPrincipalState();
 }
 
 pub fn initFromDetectedRegionsInPlace(self: anytype, region_count: usize) KernelError!void {
     if (region_count == 0) return KernelError.EmptyRegionSet;
-    if (region_count > @TypeOf(self.*).max_regions) return KernelError.TooManyRegions;
 
-    self.resetStorageInPlace();
+    initializeStorageInPlace(self);
     if (builtin.is_test) {
         self.initPrincipalState();
     } else {
         self.initDynamicPrincipalState();
     }
-
-    var i: usize = 0;
-    while (i < region_count) : (i += 1) {
-        self.regions[i] = .{
-            .id = i,
-        };
-    }
-    self.region_len = region_count;
-}
-
-pub fn getRegion(self: anytype, region_id: u64) ?*Region {
-    var i: usize = 0;
-    while (i < self.region_len) : (i += 1) {
-        if (self.regions[i].id == region_id) return &self.regions[i];
-    }
-    return null;
-}
-
-pub fn getRegionConst(self: anytype, region_id: u64) ?*const Region {
-    var i: usize = 0;
-    while (i < self.region_len) : (i += 1) {
-        if (self.regions[i].id == region_id) return &self.regions[i];
-    }
-    return null;
 }
 
 pub fn debugWriteField(
@@ -279,9 +275,10 @@ pub fn debugLogMemoryOwnership(
     where: []const u8,
 ) void {
     var active_total: u64 = 0;
+    const process_capacity = self.processCapacitySnapshot();
 
     var pidx: usize = 0;
-    while (pidx < self.process_capacity) : (pidx += 1) {
+    while (pidx < process_capacity) : (pidx += 1) {
         if ((self.processDescriptorSlotConst(pidx) orelse continue).active) active_total += 1;
     }
 
@@ -290,7 +287,7 @@ pub fn debugLogMemoryOwnership(
     const vm_store = vmObjectBackingStoreStats();
     @TypeOf(self.*).debugWriteField(write, print_number, "free_pages", @intCast(free_list.pageCount()));
     @TypeOf(self.*).debugWriteField(write, print_number, "free_ranges", @intCast(free_list.rangeCount()));
-    @TypeOf(self.*).debugWriteField(write, print_number, "process_capacity", @intCast(self.process_capacity));
+    @TypeOf(self.*).debugWriteField(write, print_number, "process_capacity", @intCast(process_capacity));
     @TypeOf(self.*).debugWriteField(write, print_number, "active_processes", active_total);
     @TypeOf(self.*).debugWriteField(write, print_number, "tracked_active", @intCast(self.active_process_count));
     @TypeOf(self.*).debugWriteField(write, print_number, "vm_store_used", vm_store.used_entries);
@@ -299,7 +296,7 @@ pub fn debugLogMemoryOwnership(
     write("\n");
 
     pidx = 0;
-    while (pidx < self.process_capacity) : (pidx += 1) {
+    while (pidx < process_capacity) : (pidx += 1) {
         const desc = self.processDescriptorSlotConst(pidx) orelse continue;
         if (!desc.active) continue;
 
@@ -316,11 +313,16 @@ pub fn allocPhysicalPage(
     self: anytype,
     free_list: *FreePageList,
 ) KernelError!PageCapability {
-    const paddr = free_list.popFrontAtOrAbove(@TypeOf(self.*).low_memory_limit) catch |err| switch (err) {
-        KernelError.OutOfFreePages => try free_list.popFrontBelow(@TypeOf(self.*).low_memory_limit),
-        else => return err,
+    const paddr = try free_list.popPagePreferred(&.{
+        .{ .minimum = @TypeOf(self.*).low_memory_limit, .limit = std.math.maxInt(u64) },
+        .{ .minimum = 0, .limit = @TypeOf(self.*).low_memory_limit },
+    });
+    // Intrusive PMM needs no return metadata allocation. DMA-held PFNs
+    // remain in the common retention ledger until device drain is proved.
+    errdefer free_list.appendPage(paddr) catch |err| switch (err) {
+        error.PageQuarantined => {},
+        else => @panic("invalid PMM return"),
     };
-    errdefer free_list.appendPage(0, paddr) catch {};
     try self.zeroAllocatedPage(paddr);
     return .{ .paddr = paddr };
 }
@@ -330,17 +332,39 @@ pub fn allocLowPhysicalPage(
     free_list: *FreePageList,
 ) KernelError!PageCapability {
     const paddr = try free_list.popFrontBelow(@TypeOf(self.*).low_memory_limit);
-    errdefer free_list.appendPage(0, paddr) catch {};
+    errdefer free_list.appendPage(paddr) catch |err| switch (err) {
+        error.PageQuarantined => {},
+        else => @panic("invalid PMM return"),
+    };
     try self.zeroAllocatedPage(paddr);
     return .{ .paddr = paddr };
 }
 
 pub fn zeroAllocatedPage(self: anytype, paddr: u64) KernelError!void {
-    if (builtin.is_test) return;
     if (self.zero_physical_page_hook) |hook| {
         if (!hook(paddr)) return KernelError.InvalidState;
         return;
     }
-    const page_bytes: [*]u8 = @ptrFromInt(paddr);
+    // Host fixtures may inject the same zeroing failure without dereferencing RAM.
+    if (builtin.is_test) return;
+    const page_bytes = @import("../arch/x86_64/physical_layout.zig").identitySlice(u8, .fromInt(paddr), 4096) orelse return KernelError.InvalidState;
     @memset(page_bytes[0..4096], 0);
+}
+
+/// KernelState remains held through reserve/use/rollback. The transaction is
+/// invocation-local, but rejected workspace returns need an address-stable
+/// owner and allocator context (the global PMM) after this invocation ends.
+pub fn beginInvocationStorage(self: anytype, free_list: *FreePageList) @import("../memory/owned_storage.zig").Transaction {
+    self.retryInvocationStorage();
+    const allocator = if (builtin.is_test)
+        self.invocation_test_allocator orelse (if (comptime @import("../lock_profile.zig").enabled) @import("../memory/identity_allocator.zig").allocatorFor(free_list, .invocation) else @import("../memory/identity_allocator.zig").allocator(free_list))
+    else
+        (if (comptime @import("../lock_profile.zig").enabled) @import("../memory/identity_allocator.zig").allocatorFor(free_list, .invocation) else @import("../memory/identity_allocator.zig").allocator(free_list));
+    return @import("../memory/owned_storage.zig").Transaction.init(&self.descriptor_storage, allocator);
+}
+
+/// One finite pass under KernelState; never retry-spin on a full PMM table.
+pub fn retryInvocationStorage(self: anytype) void {
+    if (self.descriptor_storage.pending != null)
+        self.descriptor_storage.retryUnpublished() catch @panic("moved invocation storage owner");
 }

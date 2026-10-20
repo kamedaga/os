@@ -55,7 +55,7 @@ __attribute__((noreturn)) void main(void)
         PACHA_FD_RIGHT_TRANSFER | PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_SHARE |
         PACHA_FD_RIGHT_MAP_READ | PACHA_FD_RIGHT_MAP_WRITE;
     const uint64_t fd = call(PACHA_FD_SYSCALL_VMO_CREATE, 12288, rights, 0, 0, 0, 0);
-    CHECK(fd >= 16 && fd < PACHA_FD_TABLE_LIMIT);
+    CHECK(fd >= 16 && fd < PACHA_THREAD_SELF_FD);
     refs(fd, 1, 1);
     const uint64_t owner = call(PACHA_VM_SYSCALL_MMAP, fd, 0, 12288,
         PACHA_PROT_READ | PACHA_PROT_WRITE, PACHA_MMAP_SHARED, 0);
@@ -64,7 +64,7 @@ __attribute__((noreturn)) void main(void)
     refs(fd, 1, 2);
     const uint64_t dup = call(PACHA_FD_SYSCALL_DUP, fd, 16,
         rights & ~PACHA_FD_RIGHT_INSPECT, 0, 0, 0);
-    CHECK(dup >= 16 && dup < PACHA_FD_TABLE_LIMIT);
+    CHECK(dup >= 16 && dup < PACHA_THREAD_SELF_FD);
     refs(dup, 0, 0);
     refs(fd, 2, 2);
     const uint64_t borrower = call(PACHA_VM_SYSCALL_MMAP, dup, 0, 12288,
@@ -80,12 +80,12 @@ __attribute__((noreturn)) void main(void)
     refs(fd, 1, 2);
     const uint64_t endpoint = call(PACHA_IPC_SYSCALL_ENDPOINT_CREATE,
         PACHA_FD_RIGHT_SEND | PACHA_FD_RIGHT_RECV | PACHA_FD_RIGHT_CLOSE, 0, 0, 0, 0, 0);
-    CHECK(endpoint >= 16 && endpoint < PACHA_FD_TABLE_LIMIT);
+    CHECK(endpoint >= 16 && endpoint < PACHA_THREAD_SELF_FD);
     struct pacha_ipc_fd transferred = { .fd = fd, .rights = PACHA_FD_RIGHT_CLOSE };
     struct pacha_ipc_msg msg = { .fds = &transferred, .fd_count = 1, .fd_capacity = 1 };
-    CHECK(call(PACHA_IPC_SYSCALL_SEND, endpoint, (uintptr_t)&msg, 0, 0, 0, 0) == 0);
+    CHECK(pacha_ipc_message_syscall(PACHA_IPC_SYSCALL_SEND, endpoint, (struct pacha_ipc_msg *)(uintptr_t)((uintptr_t)&msg), 0, 0, 0, 0) == 0);
     refs(fd, 2, 2);
-    CHECK(call(PACHA_IPC_SYSCALL_RECV, endpoint, (uintptr_t)&msg, 0, 0, 0, 0) == 0);
+    CHECK(pacha_ipc_message_syscall(PACHA_IPC_SYSCALL_RECV, endpoint, 0, (struct pacha_ipc_msg *)(uintptr_t)((uintptr_t)&msg), 0, 0, 0) == 0);
     CHECK(msg.fd_count == 1 && transferred.fd != fd);
     refs(fd, 2, 2);
     close_fd(transferred.fd);
@@ -94,7 +94,7 @@ __attribute__((noreturn)) void main(void)
     const uint64_t index = 0;
     const uint64_t view = call(PACHA_FD_SYSCALL_VMO_CREATE_PAGE_VIEW,
         fd, (uintptr_t)&index, 1, PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_MAP_READ, 0, 0);
-    CHECK(view >= 16 && view < PACHA_FD_TABLE_LIMIT);
+    CHECK(view >= 16 && view < PACHA_THREAD_SELF_FD);
     refs(fd, 1, 3);
     const uint64_t view_map = call(PACHA_VM_SYSCALL_MMAP, view, 0, 4096,
         PACHA_PROT_READ, PACHA_MMAP_SHARED, 0);

@@ -74,24 +74,13 @@ def kernel_snapshot(label):
     snapshot = dict(host_monotonic=time.monotonic())
     names = ('ipc_perf_counters',) if ipc_elf else (
         'smp_perf_counters', 'munmap_perf_counters', 'vmo_perf_counters')
-    if not ipc_elf and re.search(r'^[0-9a-f]+ B ipc_perf_counters$', symbols, re.M):
+    if not ipc_elf and re.search(r'^[0-9a-f]+ [BD] ipc_perf_counters$', symbols, re.M):
         names += ('ipc_perf_counters',)
+    from kernel_lock_profile import read_counter_rows
     for name in names:
-        symbol = re.search(r'^([0-9a-f]+) B '+name+r'$', symbols, re.M)
-        assert symbol, 'missing diagnostic symbol: '+name
-        physical = int(symbol[1],16)-bases['Virtual']+bases['Physical']
-        path = out/(label+'-'+name+'.bin')
-        qmp.execute('pmemsave', dict(val=physical, size=64*16*8, filename=str(path)))
-        words = struct.unpack('<1024Q', path.read_bytes())
-        snapshot[name] = [sum(words[cpu*16+i] for cpu in range(64)) for i in range(16)]
-    symbol = re.search(r'^([0-9a-f]+) B ipc_syscall_counts$', symbols, re.M)
-    if symbol:
-        physical = int(symbol[1],16)-bases['Virtual']+bases['Physical']
-        path = out/(label+'-ipc-syscall-counts.bin')
-        qmp.execute('pmemsave', dict(val=physical, size=64*256*8, filename=str(path)))
-        words = struct.unpack('<16384Q', path.read_bytes())
-        snapshot['native_syscall_counts'] = [
-            sum(words[cpu*256+i] for cpu in range(64)) for i in range(256)]
+        snapshot[name] = read_counter_rows(elf,qmp,bases,out,name,16,label)
+    if re.search(r'^[0-9a-f]+ [BD] ipc_syscall_counts$',symbols,re.M):
+        snapshot['native_syscall_counts'] = read_counter_rows(elf,qmp,bases,out,'ipc_syscall_counts',256,label)
     if ipc_elf:
         (out/(label+'-counters.json')).write_text(json.dumps(snapshot, indent=2))
         return

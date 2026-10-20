@@ -1,3 +1,6 @@
+/// Internal waits finish before signal delivery; teardown is never deferred.
+pub const wait_uninterruptible: u64 = 1 << 1;
+
 pub const syscall_runtime_first: u64 = 26;
 pub const syscall_getpid: u64 = 26;
 pub const syscall_gettid: u64 = 27;
@@ -14,9 +17,10 @@ pub const syscall_clock_getres: u64 = 31;
 pub const syscall_clock_page_open: u64 = 32;
 pub const syscall_yield: u64 = 33;
 pub const syscall_nanosleep: u64 = 34;
+// FUTEX_WAIT: RDI=key, RSI=expected, RDX=ticks, R10=wait flags.
 pub const syscall_futex_wait: u64 = 35;
 pub const syscall_futex_wake: u64 = 36;
-// FUTEX_WAKE_WAIT: RDI=wake key, RSI=wait key, R10=expected u32, R8=ticks.
+// FUTEX_WAKE_WAIT: RDI=wake key, RSI=wait key, R10=expected u32, R8=ticks, R9=wait flags.
 // RAX is wait status; RDX is committed wake count (0/1), or UINT64_MAX
 // when wake was unperformed/failed. A completed wake must not be retried.
 pub const syscall_futex_wake_wait: u64 = 37;

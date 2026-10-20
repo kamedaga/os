@@ -2,6 +2,7 @@
 #ifndef PACHA_KOBOX_DEVICE_DMA_H
 #define PACHA_KOBOX_DEVICE_DMA_H
 
+#include <pacha/abi.h>
 #include "boot/dma_host.h"
 #include <stdatomic.h>
 
@@ -9,7 +10,7 @@ struct ph_dma_mapping {
     uint64_t iova;
     uint64_t ram_offset; /* Valid for direct RAM mappings (view == NULL). */
     size_t length;
-    int fd;
+    pacha_fd_t fd;
     void *view;
 #if defined(PH_DMA_PROFILE) && PH_DMA_PROFILE
     unsigned int profile_direction;
@@ -17,11 +18,11 @@ struct ph_dma_mapping {
 };
 
 struct ph_dma_config {
-    int device_fd;
+    pacha_fd_t device_fd;
     uint64_t native_device;
     uint64_t generation;
     void *ram;
-    int ram_fd;
+    pacha_fd_t ram_fd;
     size_t ram_length;
     /* Populated from the device capsule query by ph_dma_init, not input policy. */
     uint64_t aperture_start;

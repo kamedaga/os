@@ -19,12 +19,9 @@ static int identity_call(int endpoint, int page_fd, void *page, unsigned op,
             PACHA_FD_RIGHT_WAIT | PACHA_FD_RIGHT_POLL };
     struct pacha_ipc_msg request = { .word0 = header->magic, .word3 = sequence,
         .fds = caps, .fd_count = lease_fd >= 16 ? 2 : 1 };
-    int reply_fd = pacha_ipc_call(endpoint, &request);
-    if (reply_fd < 16) return -1000;
     struct pacha_ipc_fd incoming[PACHA_IPC_MAX_TRANSFER_FDS] = {{0}};
     struct pacha_ipc_msg reply = { .fds = incoming, .fd_capacity = PACHA_IPC_MAX_TRANSFER_FDS };
-    int status = pacha_ipc_recv_wait(reply_fd, &reply, UINT64_MAX);
-    (void)pacha_fd_close(reply_fd);
+    int status = pacha_ipc_call(endpoint, &request, &reply, UINT64_MAX, NULL);
     if (status) return -1001;
     status = reply.word0 == PACHA_SERVICE_REPLY_MAGIC && reply.word3 == sequence &&
         header->magic == PACHA_SERVICE_REPLY_MAGIC && header->request_id == sequence ?
@@ -92,11 +89,8 @@ static int filed_identity_native(void)
     io.handle = duplicate;
     ID_CHECK(identity_call(root, page_fd, page, FILED_OP_VFS_PREAD, &io, sizeof(io), -1, NULL, NULL) == -9);
     struct pacha_ipc_msg adopt = { .word0 = FILED_LEASE_MAGIC, .word1 = duplicate, .word2 = root_id, .word3 = 1 };
-    int reply_fd = pacha_ipc_call(lease.a, &adopt);
-    ID_CHECK(reply_fd >= 16);
     struct pacha_ipc_msg response = {0};
-    int replied = pacha_ipc_recv_wait(reply_fd, &response, UINT64_MAX);
-    (void)pacha_fd_close(reply_fd);
+    int replied = pacha_ipc_call(lease.a, &adopt, &response, UINT64_MAX, NULL);
     ID_CHECK(replied == 0 && response.word0 == FILED_LEASE_MAGIC && response.word1 == 0);
     ID_CHECK(identity_call(root, page_fd, page, FILED_OP_VFS_PREAD, &io, sizeof(io), -1, &ignored, NULL) == 0 && ignored == 16);
     ID_CHECK(identity_call(root, page_fd, page, FILED_OP_VFS_PWRITE, &io, sizeof(io), -1, NULL, NULL) == -13);

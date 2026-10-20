@@ -25,7 +25,7 @@ static void send_one(void *raw, uint64_t token)
         cache->entries[entry].notification = 0;
         cache->entries[entry].fd = 0;
         cache->entries[entry].sent_token = 0;
-        int fd = -1;
+        pacha_fd_t fd = -1;
         status = platform->resolve(platform->context, context->socket, id, &fd);
         if (status == 0 && fd >= 16) {
             cache->entries[entry].notification = id;

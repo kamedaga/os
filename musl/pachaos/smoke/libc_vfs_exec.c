@@ -201,15 +201,8 @@ static long raw_fs_call(kb2_fs_request_t *r,const char *path,const char *second,
     struct __pachaos_ipc_fd received[2]={{0}};
     struct __pachaos_ipc_msg reply={.fds=received,.fd_capacity=2};
     if (!status) {
-        long reply_fd=__pachaos_raw2(PACHAOS_SYSCALL_IPC_CALL,SMOKE_FILED_ENDPOINT,(long)&request);
-        if (reply_fd<16) status=-EIO;
-        else {
-            do {
-                status=__pachaos_raw4(PACHAOS_SYSCALL_IPC_RECV_WAIT,reply_fd,(long)&reply,-1,0);
-            } while (status==2);
-            (void)__pachaos_raw1(PACHAOS_SYSCALL_FD_CLOSE,reply_fd);
-            if (status>0) status=-EIO;
-        }
+        status=__pachaos_ipc_message(PACHAOS_SYSCALL_IPC_CALL, SMOKE_FILED_ENDPOINT, (struct __pachaos_ipc_msg *)(uintptr_t)((long)&request), (struct __pachaos_ipc_msg *)(uintptr_t)((long)&reply), -1, PACHAOS_WAIT_UNINTERRUPTIBLE, 0);
+        if (status>0) status=-EIO;
     }
     if (!status && (reply.word0!=r->opcode || reply.word3!=r->sequence ||
         reply.word2<KB2_FILESYSTEM_RESPONSE_SIZE || reply.word2>response_size ||
@@ -390,8 +383,8 @@ static int run_ipc_microbench(void)
     do {
         struct __pachaos_ipc_msg sent={.word0=UINT64_C(0x49504342454e4348),.word1=iterations};
         struct __pachaos_ipc_msg reply={0};
-        status=__pachaos_raw2(PACHAOS_SYSCALL_IPC_SEND,(long)pair[0],(long)&sent);
-        if (!status) status=__pachaos_raw2(PACHAOS_SYSCALL_IPC_RECV,(long)pair[1],(long)&reply);
+        status=__pachaos_ipc_message(PACHAOS_SYSCALL_IPC_SEND, (long)pair[0], (struct __pachaos_ipc_msg *)(uintptr_t)((long)&sent), 0, 0, 0, 0);
+        if (!status) status=__pachaos_ipc_message(PACHAOS_SYSCALL_IPC_RECV, (long)pair[1], 0, (struct __pachaos_ipc_msg *)(uintptr_t)((long)&reply), 0, 0, 0);
         if (!status && (reply.word0!=sent.word0 || reply.word1!=sent.word1)) status=-EPROTO;
         ++iterations; t1=now_ns();
     } while (!status && !bench_done(t0,t1,iterations));

@@ -1,4 +1,7 @@
+const lock_diagnostics = @import("../sync/lock_diagnostics.zig");
 const std = @import("std");
+const builtin = @import("builtin");
+const addresses = @import("addresses.zig");
 const pt_storage = @import("pt_storage.zig");
 const address_space = @import("address_space.zig");
 const kernel = @import("../kernel.zig");
@@ -10,6 +13,7 @@ pub const UserAddressSpaceTable = address_space.UserAddressSpaceTable;
 
 pub const Hooks = struct {
     pt_allocator: ?pt_storage.Allocator = null,
+    retire_user_tlb_for_principal: ?*const fn (kernel.PrincipalId) void = null,
     user_spaces: *UserAddressSpaceTable,
     four_gib: u64,
     physical_map_limit: u64,
@@ -29,14 +33,23 @@ pub const Hooks = struct {
     page_nx: u64,
     flush_user_tlb_for_principal_va: *const fn (principal: kernel.PrincipalId, va: u64) void,
     flush_user_tlb_for_principal_range: *const fn (principal: kernel.PrincipalId, va: u64, size_bytes: usize) void,
-    kernel_pointer_paddr: *const fn (addr: usize) ?u64,
+    kernel_pointer_paddr: *const fn (addresses.KernelVirtualAddress) ?addresses.PhysicalAddress,
+    // Page-table borrowing is distinct from virtual-to-physical translation.
+    // Callers retain the table lifetime; this hook checks mapping/alignment.
     seed_user_pml4_with_kernel: *const fn ([]u64) void,
-    seed_user_pdp_with_kernel_identity: *const fn ([]u64) void,
-    seed_user_pd_with_kernel_identity: *const fn ([]u64) void,
 };
 
 var hooks: ?Hooks = null;
-// Published identity tables need enduring ownership records, not just a
+
+// PTE/CR3 encoding is the raw-integer boundary, not the pointer conversion
+// boundary. Only an actual kernel page-table pointer enters this translation.
+fn tablePaddr(h: anytype, pointer: anytype) ?u64 {
+    if (@typeInfo(@TypeOf(pointer)).pointer.child != [512]u64)
+        @compileError("page-table translation requires a kernel table pointer");
+    const physical = h.kernel_pointer_paddr(addresses.KernelVirtualAddress.fromPointer(pointer)) orelse return null;
+    return physical.toInt();
+}
+// Published direct-map tables need enduring ownership records, not just a
 // retained-free-page list, so future writers can reject unknown PDE pointers.
 // The outer state/all-VM locks serialize this store with policy publication.
 var kernel_ram_split_store: pt_storage.Store = .{};
@@ -54,34 +67,73 @@ fn interruptsEnabled() bool {
 }
 
 fn waitWithInterruptWindow() void {
+    if (builtin.is_test) {
+        std.atomic.spinLoopHint();
+        return;
+    }
     asm volatile ("sti; pause; cli" ::: .{ .memory = true });
 }
 
-fn lockState(state: *AddressSpaceLockState) void {
+fn lockState(state: *AddressSpaceLockState, key: lock_diagnostics.order.Key) void {
+    var diagnostic_if = lock_diagnostics.maskInterrupts();
+    const recursive = lock_diagnostics.recursive(&state.diagnostic_record);
     const cpu = scheduler.currentCpu();
     if (@atomicLoad(u8, &state.value, .acquire) != 0 and state.owner_cpu == cpu) {
+        if (comptime lock_diagnostics.enabled) {
+            if (!recursive or state.depth == 0) lock_diagnostics.failure(error.InvalidRecursion);
+            if (state.depth == std.math.maxInt(u32)) lock_diagnostics.failure(error.DepthOverflow);
+        }
         state.depth +%= 1;
+        lock_diagnostics.restoreInterrupts(diagnostic_if);
         return;
     }
+    if (comptime lock_diagnostics.enabled) {
+        if (recursive) lock_diagnostics.failure(error.InvalidRecursion);
+    }
     while (true) {
+        lock_diagnostics.beforeAcquire(&state.diagnostic_record, key);
         if (@cmpxchgWeak(u8, &state.value, 0, 1, .acquire, .monotonic) == null) {
             state.owner_cpu = cpu;
             state.depth = 1;
+            lock_diagnostics.acquired(&state.diagnostic_record, key);
+            lock_diagnostics.restoreInterrupts(diagnostic_if);
             return;
         }
+        lock_diagnostics.restoreInterrupts(diagnostic_if);
         while (@atomicLoad(u8, &state.value, .monotonic) != 0) {
             const restore_interrupts = interruptsEnabled();
             waitWithInterruptWindow();
-            if (restore_interrupts) asm volatile ("sti" ::: .{ .memory = true });
+            if (!builtin.is_test and restore_interrupts) asm volatile ("sti" ::: .{ .memory = true });
         }
+        diagnostic_if = lock_diagnostics.maskInterrupts();
     }
 }
 
 fn unlockState(state: *AddressSpaceLockState) void {
+    // Preserve the off-build IR shape as well as the recursive semantics.
+    if (comptime !lock_diagnostics.enabled) {
+        if (state.depth > 1) {
+            state.depth -= 1;
+            return;
+        }
+        state.owner_cpu = std.math.maxInt(usize);
+        state.depth = 0;
+        @atomicStore(u8, &state.value, 0, .release);
+        return;
+    }
+
+    const diagnostic_if = lock_diagnostics.maskInterrupts();
+    defer lock_diagnostics.restoreInterrupts(diagnostic_if);
+    lock_diagnostics.assertOwned(&state.diagnostic_record);
+    if (comptime lock_diagnostics.enabled) {
+        if (state.depth == 0) lock_diagnostics.failure(error.DepthUnderflow);
+        if (state.owner_cpu != scheduler.currentCpu()) lock_diagnostics.failure(error.WrongContext);
+    }
     if (state.depth > 1) {
         state.depth -= 1;
         return;
     }
+    lock_diagnostics.releasing(&state.diagnostic_record);
     state.owner_cpu = std.math.maxInt(usize);
     state.depth = 0;
     @atomicStore(u8, &state.value, 0, .release);
@@ -94,14 +146,23 @@ fn unlockState(state: *AddressSpaceLockState) void {
 var shared_vm_object_lock: AddressSpaceLockState = .{};
 
 pub fn lockAddressSpace(principal: kernel.PrincipalId) bool {
-    const space = getUserSpace(principal) orelse return false;
-    lockState(&space.lock_state);
+    const h = hooks orelse return false;
+    const space = h.user_spaces.borrow(processIndex(principal) orelse return false) orelse return false;
+    lockState(&space.lock_state, .{ .class = .address_space, .order = if (lock_diagnostics.enabled) processIndex(principal).? else 0 });
+    // A retirement may have won while this borrower waited for A. It must
+    // finish its loan without installing mappings into the withdrawn tree.
+    if (space.retiring) {
+        unlockState(&space.lock_state);
+        h.user_spaces.endBorrow(space);
+        return false;
+    }
     return true;
 }
 
 pub fn unlockAddressSpace(principal: kernel.PrincipalId) void {
     const space = getUserSpace(principal) orelse return;
     unlockState(&space.lock_state);
+    hooks.?.user_spaces.endBorrow(space);
 }
 
 pub fn lockAddressSpacePair(first: kernel.PrincipalId, second: kernel.PrincipalId) bool {
@@ -136,8 +197,8 @@ pub fn lockAllAddressSpaces() void {
     const capacity = h.user_spaces.capacity();
     var index: usize = 0;
     while (index < capacity) : (index += 1) {
-        const space = h.user_spaces.get(index) orelse continue;
-        lockState(&space.lock_state);
+        const space = h.user_spaces.borrow(index) orelse continue;
+        lockState(&space.lock_state, .{ .class = .address_space, .order = index });
     }
 }
 
@@ -147,12 +208,14 @@ pub fn unlockAllAddressSpaces() void {
     while (index != 0) {
         index -= 1;
         const space = h.user_spaces.get(index) orelse continue;
+        if (space.retiring) continue;
         unlockState(&space.lock_state);
+        h.user_spaces.endBorrow(space);
     }
 }
 
 pub fn lockSharedVmObjects() void {
-    lockState(&shared_vm_object_lock);
+    lockState(&shared_vm_object_lock, .{ .class = .shared_vm });
 }
 
 pub fn unlockSharedVmObjects() void {
@@ -160,6 +223,8 @@ pub fn unlockSharedVmObjects() void {
 }
 
 pub fn lockVmTransaction(principal: kernel.PrincipalId) bool {
+    const stage_sample = if (comptime @import("../lock_profile.zig").enabled) @import("../lock_profile.zig").stageBegin() else {};
+    defer if (comptime @import("../lock_profile.zig").enabled) @import("../lock_profile.zig").stageEnd(.vm_wait, stage_sample);
     if (!lockAddressSpace(principal)) return false;
     lockSharedVmObjects();
     return true;
@@ -171,6 +236,8 @@ pub fn unlockVmTransaction(principal: kernel.PrincipalId) void {
 }
 
 pub fn lockVmTransactionPair(first: kernel.PrincipalId, second: kernel.PrincipalId) bool {
+    const stage_sample = if (comptime @import("../lock_profile.zig").enabled) @import("../lock_profile.zig").stageBegin() else {};
+    defer if (comptime @import("../lock_profile.zig").enabled) @import("../lock_profile.zig").stageEnd(.vm_wait, stage_sample);
     if (!lockAddressSpacePair(first, second)) return false;
     lockSharedVmObjects();
     return true;
@@ -205,11 +272,15 @@ pub fn kernelStaticStorageEndAddr() usize {
 }
 
 pub fn init(new_hooks: Hooks) void {
-    hooks = new_hooks;
+    // Boot installs this configuration before AP/runtime readers start. A
+    // const borrow of it is safe only while no writer can replace the value.
+    // Host fixtures may reinstall between serial tests, never during a borrow.
+    configureHooks(new_hooks, builtin.is_test) catch @panic("VM Hooks already initialized");
 }
 
-pub fn updateUserSpaces(user_spaces: *UserAddressSpaceTable) void {
-    if (hooks) |*h| h.user_spaces = user_spaces;
+fn configureHooks(new_hooks: Hooks, comptime allow_fixture_replacement: bool) error{AlreadyInitialized}!void {
+    if (!allow_fixture_replacement and hooks != null) return error.AlreadyInitialized;
+    hooks = new_hooks;
 }
 
 pub fn getUserSpace(principal: kernel.PrincipalId) ?*UserAddressSpace {
@@ -218,32 +289,100 @@ pub fn getUserSpace(principal: kernel.PrincipalId) ?*UserAddressSpace {
     return h.user_spaces.get(idx);
 }
 
+pub const IpcPinTestSupport = if (builtin.is_test) struct {
+    pub var table: ?*UserAddressSpaceTable = null;
+} else struct {};
+
+fn ipcPinTable() ?*UserAddressSpaceTable {
+    if (comptime builtin.is_test) return IpcPinTestSupport.table;
+    return if (hooks) |h| h.user_spaces else null;
+}
+
+// Lifecycle holds AD and closes admission before checking CPU quiescence.
+// Dedicated cross-AS handoffs retain these pins through commit, so CR3
+// storage cannot be recycled while an admitted switch still references it.
+pub fn ipcAddressSpacePinsEnded(principal: kernel.PrincipalId) bool {
+    const table = ipcPinTable() orelse return true;
+    const index = processIndex(principal) orelse return true;
+    return table.fastPinsEnded(index);
+}
+
 pub fn clearUserAddressSpace(principal: kernel.PrincipalId) void {
     if (!lockAddressSpace(principal)) return;
     defer unlockAddressSpace(principal);
     const h = hooks orelse return;
     const space = getUserSpace(principal) orelse return;
 
-    detachAndReleaseUserPtStorage(h, space, principal);
+    detachAndReleaseUserPtStorage(h, space, principal, null);
     resetUserAddressSpaceStorage(space);
 }
 
-fn detachAndReleaseUserPtStorage(h: Hooks, space: *UserAddressSpace, principal: kernel.PrincipalId) void {
+/// Final lifecycle only (not exec reset): K and A remain held and the old
+/// tree has already completed its existing all-CPU shootdown in clear.
+pub fn retireUserAddressSpace(principal: kernel.PrincipalId) void {
+    const h = hooks orelse return;
+    const index = processIndex(principal) orelse return;
+    const space = h.user_spaces.get(index) orelse return;
+    std.debug.assert(space.cr3 == 0);
+    h.user_spaces.retire(index);
+}
+
+fn reservationStorageReturned(table: *UserAddressSpace.ReservationTable) bool {
+    table.deinit();
+    inline for (.{ &table.directory_owner, &table.metadata_owner, &table.body_owner }) |owner| {
+        if (owner.pending != null or owner.retired != null or owner.published != null) return false;
+    }
+    return true;
+}
+
+/// K only, after handler AS/shared-VM defers. No wait: current exits and
+/// refused returns remain retired for a subsequent syscall after switching.
+pub fn retryRetiredAddressSpaces() void {
+    const h = hooks orelse return;
+    if (h.user_spaces.retired_head == null and h.user_spaces.body_storage.retired == null) return;
+    var retired = h.user_spaces.retired_head;
+    while (retired) |space| {
+        retired = space.retired_next;
+        const principal: kernel.PrincipalId = @enumFromInt(space.directory_index);
+        if (!scheduler.addressSpaceUsersEnded(principal) or !h.user_spaces.loansEnded(space)) continue;
+        // Publication is closed and all A loans (including waiters and
+        // recursion) ended. clear already detached and ACKed this CR3 once;
+        // retries only return storage, never issue another shootdown.
+        space.pt_store.freeDetached();
+        space.pd_store.freeDetached();
+        space.pdp_store.freeDetached();
+        space.scratch_store.freeDetached();
+        const reservations_done = reservationStorageReturned(&space.reservations);
+        const draft_done = reservationStorageReturned(&space.reservation_draft);
+        if (!reservations_done or !draft_done or space.pt_store.chunks != null or
+            space.pd_store.chunks != null or space.pdp_store.chunks != null or space.scratch_store.chunks != null) continue;
+        h.user_spaces.reclaimRetiredBody(space);
+    }
+    h.user_spaces.body_storage.reclaimRetiredAfterBorrowExclusion() catch unreachable;
+}
+
+fn detachAndReleaseUserPtStorage(h: Hooks, space: *UserAddressSpace, principal: kernel.PrincipalId, keep_pdp: ?usize) void {
     // A process slot reuses both its page-table storage and its PCID.  Make
     // the old user tree unreachable before flushing that PCID on every CPU;
     // otherwise a later occupant can execute a cached translation after the
     // old VMO page has already been returned to the physical free list.
+    // clearUserAddressSpace resets cr3 only AFTER this synchronous retirement.
+    // Exec clears the staged AS before moving its VMAs; later cleanup sees zero
+    // and must not issue a second shootdown for the already retired context.
     if (space.cr3 != 0) {
         // Keep the kernel half present: the shootdown implementation briefly
         // loads this CR3 while handling an IPI in kernel mode.
         @memset(space.pml4[0..256], 0);
-        h.flush_user_tlb_for_principal_range(
-            principal,
-            h.user_low_va,
-            @intCast(h.user_top_va - h.user_low_va),
-        );
+        if (h.retire_user_tlb_for_principal) |retire| retire(principal) else h.flush_user_tlb_for_principal_range(principal, h.user_low_va, @intCast(h.user_top_va - h.user_low_va));
     }
-    if (h.pt_allocator) |allocator| space.pt_store.freeDetached(allocator);
+    space.pt_store.freeDetached();
+    space.pd_store.freeDetached();
+    var it = space.pdp_store.iterator();
+    while (it.next()) |slot| {
+        if (keep_pdp != slot) space.pdp_store.releasePageDetached(slot);
+    }
+    space.pdp_store.reclaimEmptyBanks();
+    space.scratch_store.freeDetached();
 }
 
 pub fn currentUserSpace() *UserAddressSpace {
@@ -262,11 +401,11 @@ const UserPageIndex = struct {
     pt: usize,
 };
 
-fn userPageIndexForVa(h: Hooks, va: u64) ?UserPageIndex {
+fn userPageIndexForVa(h: anytype, va: u64) ?UserPageIndex {
     return userPageIndexForVaWithLowPageZero(h, va, false);
 }
 
-fn userPageIndexForVaWithLowPageZero(h: Hooks, va: u64, allow_low_page_zero: bool) ?UserPageIndex {
+fn userPageIndexForVaWithLowPageZero(h: anytype, va: u64, allow_low_page_zero: bool) ?UserPageIndex {
     const pml4_index: usize = @intCast((va >> 39) & 0x1FF);
     if (va < h.user_low_va and !(allow_low_page_zero and va < 4096)) return null;
     if (va >= h.user_top_va) return null;
@@ -316,9 +455,32 @@ pub fn lookupUserMappedPaddrForAccessWithAddressSpaceLocked(
     write_access: bool,
     instruction_fetch: bool,
 ) ?u64 {
-    const h = hooks orelse return null;
+    const physical = lookupUserPhysicalPageWithAddressSpaceLocked(
+        principal,
+        .fromInt(va),
+        write_access,
+        instruction_fetch,
+    ) orelse return null;
+    return physical.toInt();
+}
+
+/// A page-base borrow under the caller's AS lock, not an owned page or a
+/// durable permission token. Copy callers separately add the VA's offset and
+/// keep exclusion through COW resolution, cache selection, and actual access.
+pub fn lookupUserPhysicalPageWithAddressSpaceLocked(
+    principal: kernel.PrincipalId,
+    address: addresses.UserVirtualAddress,
+    write_access: bool,
+    instruction_fetch: bool,
+) ?addresses.PhysicalAddress {
+    const profile = @import("../lock_profile.zig");
+    const profile_start = profile.copyTimestamp();
+    defer profile.copyEnd(.page_walk, profile_start);
+    // Configuration is boot-owned and immutable for runtime readers. Borrow
+    // it instead of copying every callback/constant for each page lookup.
+    const h: *const Hooks = if (hooks) |*configured| configured else return null;
     const space = getUserSpace(principal) orelse return null;
-    const index = userPageIndexForVa(h, va) orelse return null;
+    const index = userPageIndexForVa(h, address.toInt()) orelse return null;
     const slot = findUserPtSlotForPd(space, index.pml4, index.pdp, index.pd) orelse return null;
     const entry = space.ptPage(slot).*[index.pt];
     if ((entry & h.page_present) == 0 or (entry & h.page_user) == 0) return null;
@@ -326,19 +488,11 @@ pub fn lookupUserMappedPaddrForAccessWithAddressSpaceLocked(
     if (paddr == 0) return null;
     if (write_access and (entry & h.page_rw) == 0) return null;
     if (instruction_fetch and (entry & h.page_nx) != 0) return null;
-    return paddr;
+    return .fromInt(paddr);
 }
 
 pub fn resetUserReservations(space: *UserAddressSpace) void {
-    var index: usize = 0;
-    while (index < UserAddressSpace.max_reservations) : (index += 1) {
-        space.reservations[index].base_va = 0;
-        space.reservations[index].page_count = 0;
-        space.reservations[index].generation = 0;
-        space.reservations[index].kind = .none;
-        space.reservations[index].writable = false;
-        space.reservations[index].active = false;
-    }
+    space.reservations.deinit();
     space.reservation_generation = 0;
     space.next_dynamic_map_page = 0;
 }
@@ -351,54 +505,61 @@ pub fn resetUserAddressSpaceStorage(space: *UserAddressSpace) void {
     address_space.resetUserAddressSpaceStorage(space);
 }
 
-fn resetUserPageTablesPreserveReservations(space: *UserAddressSpace, principal: kernel.PrincipalId) bool {
-    const h = hooks orelse return false;
-    // Validate every fallible physical-address dependency before destroying
-    // the live tables.  Exec must be able to return an error with its old
-    // address space intact.
-    const user_pml4_pa: u64 = h.kernel_pointer_paddr(@intFromPtr(&space.pml4)) orelse return false;
-    if (user_pml4_pa >= h.physical_map_limit) return false;
-    const first_pdp_pa: u64 = h.kernel_pointer_paddr(@intFromPtr(&space.pdp_pages[0])) orelse return false;
-    if (first_pdp_pa >= h.physical_map_limit) return false;
-
-    detachAndReleaseUserPtStorage(h, space, principal);
-    @memset(space.pml4[0..], 0);
-    h.seed_user_pml4_with_kernel(space.pml4[0..]);
-    var pdp_slot_init: usize = 0;
-    while (pdp_slot_init < UserAddressSpace.max_dynamic_pdp_pages) : (pdp_slot_init += 1) {
-        space.pdp_page_pml4_index[pdp_slot_init] = UserAddressSpace.no_pd_index;
-        @memset(space.pdp_pages[pdp_slot_init][0..], 0);
-    }
-    var pd_slot_init: usize = 0;
-    while (pd_slot_init < UserAddressSpace.max_dynamic_pd_pages) : (pd_slot_init += 1) {
-        space.pd_page_pml4_index[pd_slot_init] = UserAddressSpace.no_pd_index;
-        space.pd_page_pdp_index[pd_slot_init] = UserAddressSpace.no_pd_index;
-        @memset(space.pd_pages[pd_slot_init][0..], 0);
-    }
+fn resetUserPageTablesPreserveReservations(space: *UserAddressSpace, principal: kernel.PrincipalId) error{ OutOfFreePages, InvalidState }!void {
+    const h = hooks orelse return error.InvalidState;
+    const user_pml4_pa = tablePaddr(h, &space.pml4) orelse return error.InvalidState;
+    if (user_pml4_pa >= h.physical_map_limit) return error.InvalidState;
+    // Exec must have its new empty PDP and validated addresses BEFORE removing
+    // the old tree. Keep this unpublished grant out of the old-tree teardown.
+    const slot = space.pdp_store.firstFreeSlot() orelse return error.OutOfFreePages;
+    const page = try space.pdp_store.ensurePageChecked(slot, h.pt_allocator orelse return error.InvalidState);
+    var installed = false;
+    defer if (!installed) {
+        space.pdp_store.releasePageDetached(slot);
+        space.pdp_store.reclaimEmptyBanks();
+    };
+    const physical = tablePaddr(h, page) orelse return error.InvalidState;
+    if (physical >= h.physical_map_limit) return error.InvalidState;
+    detachAndReleaseUserPtStorage(h, space, principal, slot);
+    @memset(&space.pml4, 0);
+    h.seed_user_pml4_with_kernel(&space.pml4);
+    space.pdp_store.resetDetachedContents();
+    space.pd_store.resetDetachedContents();
     space.pt_store.resetDetachedContents();
-    space.pdp_page_used_len = 0;
+    space.pdpPml4Index(slot).* = 0;
+    space.pdp_page_used_len = slot + 1;
     space.pd_page_used_len = 0;
     space.pt_page_used_len = 0;
-    // All fallible address validation preceded detachment. Rebuild this one
-    // inline parent directly, using its already validated physical address.
-    h.seed_user_pdp_with_kernel_identity(space.pdp_pages[0][0..]);
-    space.pdp_page_pml4_index[0] = 0;
-    space.pdp_page_used_len = 1;
-    space.pml4[0] = first_pdp_pa | h.page_present | h.page_rw | h.page_user;
+    space.pml4[0] = physical | h.page_present | h.page_rw | h.page_user;
     space.cr3 = user_pml4_pa;
-    return true;
+    installed = true;
 }
 
-pub fn cloneAddressSpaceMetadataForFork(from: kernel.PrincipalId, to: kernel.PrincipalId) bool {
-    if (!lockAddressSpacePair(from, to)) return false;
+pub fn cloneAddressSpaceMetadataForFork(from: kernel.PrincipalId, to: kernel.PrincipalId) error{ OutOfFreePages, InvalidState }!void {
+    const stage_sample = if (comptime @import("../lock_profile.zig").enabled) @import("../lock_profile.zig").stageBegin() else {};
+    defer if (comptime @import("../lock_profile.zig").enabled) @import("../lock_profile.zig").stageEnd(.pt_prepare, stage_sample);
+    if (!lockAddressSpacePair(from, to)) return error.InvalidState;
     defer unlockAddressSpacePair(from, to);
-    const source = getUserSpace(from) orelse return false;
-    const dest = getUserSpace(to) orelse return false;
-    if (!resetUserPageTablesPreserveReservations(dest, to)) return false;
-    dest.reservations = source.reservations;
+    const source = getUserSpace(from) orelse return error.InvalidState;
+    const dest = getUserSpace(to) orelse return error.InvalidState;
+    // Build the complete unpublished copy before touching destination PTEs.
+    // A persistent draft owns even rejected rollback returns across retries.
+    dest.reservation_draft.deinit();
+    defer dest.reservation_draft.deinit();
+    const allocator = (hooks orelse return error.InvalidState).pt_allocator orelse return error.InvalidState;
+    var records = source.reservations.iterator();
+    while (records.next()) |record| {
+        const copy = dest.reservation_draft.allocate(allocator, null, std.math.maxInt(u32)) catch |err| return switch (err) {
+            error.OutOfMemory, error.IndexExhausted => error.OutOfFreePages,
+            else => error.InvalidState,
+        };
+        copy.value.* = record.value.*;
+    }
+    try resetUserPageTablesPreserveReservations(dest, to);
+    dest.reservations.deinit();
+    dest.reservations.takeFrom(&dest.reservation_draft);
     dest.reservation_generation = source.reservation_generation;
     dest.next_dynamic_map_page = source.next_dynamic_map_page;
-    return true;
 }
 
 pub fn presentUserPagePaddr(principal: kernel.PrincipalId, va: u64) ?u64 {
@@ -457,7 +618,7 @@ fn reservationEndPage(base_va: u64, page_count: u64) ?u64 {
     if ((base_va & 0xFFF) != 0) return null;
     const base_page = base_va >> 12;
     const end_page, const overflow = @addWithOverflow(base_page, page_count);
-    if (overflow != 0) return null;
+    if (overflow != 0 or end_page > (std.math.maxInt(u64) >> 12)) return null;
     return end_page;
 }
 
@@ -473,150 +634,109 @@ fn reservationStartPage(reservation: *const UserAddressSpace.Reservation) u64 {
     return reservation.base_va >> 12;
 }
 
-fn tryMergeUserReservation(
-    space: *UserAddressSpace,
-    base_va: u64,
-    page_count: u64,
-    kind: UserAddressSpace.ReservationKind,
-    writable: bool,
-) bool {
-    const new_start_page = base_va >> 12;
-    const new_end_page = reservationEndPage(base_va, page_count) orelse return false;
-    var merge_index: ?usize = null;
-
-    var index: usize = 0;
-    while (index < UserAddressSpace.max_reservations) : (index += 1) {
-        const reservation = &space.reservations[index];
-        if (!reservation.active or reservation.kind != kind or reservation.writable != writable) continue;
-        const record_start_page = reservationStartPage(reservation);
-        const record_end_page = record_start_page + reservation.page_count;
-        if (record_end_page == new_start_page or new_end_page == record_start_page) {
-            merge_index = index;
-            break;
-        }
-    }
-
-    const target_index = merge_index orelse return false;
-    var target = &space.reservations[target_index];
-    var merged_start_page = @min(new_start_page, reservationStartPage(target));
-    var merged_end_page = @max(new_end_page, reservationStartPage(target) + target.page_count);
-
-    while (true) {
-        const merged_count = merged_end_page - merged_start_page;
-        if (merged_count == 0 or merged_count > @import("std").math.maxInt(u32)) return false;
-
-        target.base_va = merged_start_page << 12;
-        target.page_count = @intCast(merged_count);
-
-        var absorbed = false;
-        index = 0;
-        while (index < UserAddressSpace.max_reservations) : (index += 1) {
-            if (index == target_index) continue;
-            const candidate = &space.reservations[index];
-            if (!candidate.active or candidate.kind != kind or candidate.writable != writable) continue;
-            const candidate_start_page = reservationStartPage(candidate);
-            const candidate_end_page = candidate_start_page + candidate.page_count;
-            if (candidate_end_page != merged_start_page and merged_end_page != candidate_start_page) continue;
-
-            merged_start_page = @min(merged_start_page, candidate_start_page);
-            merged_end_page = @max(merged_end_page, candidate_end_page);
-            candidate.* = .{};
-            absorbed = true;
-            break;
-        }
-        if (!absorbed) return true;
-    }
+fn releaseReservation(space: *UserAddressSpace, record: *UserAddressSpace.Reservation) void {
+    const index = UserAddressSpace.ReservationTable.indexOf(record);
+    space.reservations.release(.{ .index = index, .generation = space.reservations.generation(index).? }) catch unreachable;
 }
 
-pub fn reserveUserMapping(
-    principal: kernel.PrincipalId,
-    base_va: u64,
-    page_count: u64,
-    kind: UserAddressSpace.ReservationKind,
-    writable: bool,
-) bool {
+fn prepareReservationSlots(space: *UserAddressSpace, count: usize) bool {
+    const allocator = (hooks orelse return false).pt_allocator orelse return count == 0;
+    // Bodies stay prepared until reset: a caller can reserve several slots
+    // before a compound unmap/move commit without allocation during commit.
+    while (space.reservations.preparedFreeCount(count) < count) {
+        const index = std.math.cast(u32, space.reservations.capacity) orelse return false;
+        space.reservations.prepareIndex(index, allocator) catch return false;
+    }
+    return true;
+}
+
+pub fn prepareUserReservationSlots(principal: kernel.PrincipalId, count: usize) bool {
+    const stage_sample = if (comptime @import("../lock_profile.zig").enabled) @import("../lock_profile.zig").stageBegin() else {};
+    defer if (comptime @import("../lock_profile.zig").enabled) @import("../lock_profile.zig").stageEnd(.prepare, stage_sample);
+    if (!lockAddressSpace(principal)) return false;
+    defer unlockAddressSpace(principal);
+    return prepareReservationSlots(getUserSpace(principal) orelse return false, count);
+}
+
+fn tryMergeUserReservation(space: *UserAddressSpace, base_va: u64, page_count: u64, kind: UserAddressSpace.ReservationKind, writable: bool) bool {
+    const start = base_va >> 12;
+    const end = reservationEndPage(base_va, page_count) orelse return false;
+    var records = space.reservations.iterator();
+    while (records.next()) |record| {
+        const target = record.value;
+        if (target.kind != kind or target.writable != writable) continue;
+        const target_end = reservationEndPage(target.base_va, target.page_count) orelse unreachable;
+        if (target_end != start and end != reservationStartPage(target)) continue;
+        var merged_start = @min(start, reservationStartPage(target));
+        var merged_end = @max(end, target_end);
+        // All records have checked address-representable endpoints. Union of
+        // adjacent records needs no allocation and cannot overflow its count.
+        while (true) {
+            var absorbed = false;
+            var candidates = space.reservations.iterator();
+            while (candidates.next()) |candidate| {
+                const value = candidate.value;
+                if (value == target or value.kind != kind or value.writable != writable) continue;
+                const candidate_start = reservationStartPage(value);
+                const candidate_end = reservationEndPage(value.base_va, value.page_count) orelse unreachable;
+                if (candidate_end != merged_start and merged_end != candidate_start) continue;
+                merged_start = @min(merged_start, candidate_start);
+                merged_end = @max(merged_end, candidate_end);
+                releaseReservation(space, value);
+                absorbed = true;
+                break;
+            }
+            if (!absorbed) break;
+        }
+        target.base_va = merged_start << 12;
+        target.page_count = merged_end - merged_start;
+        return true;
+    }
+    return false;
+}
+
+pub fn reserveUserMapping(principal: kernel.PrincipalId, base_va: u64, page_count: u64, kind: UserAddressSpace.ReservationKind, writable: bool) bool {
     if (kind == .none) return false;
-    if (page_count > @import("std").math.maxInt(u32)) return false;
     const space = getUserSpace(principal) orelse return false;
     _ = reservationEndPage(base_va, page_count) orelse return false;
-    for (&space.reservations) |*reservation| {
-        if (!reservation.active) continue;
-        if (!reservationOverlaps(base_va, page_count, reservation.base_va, reservation.page_count)) continue;
-        return false;
+    var records = space.reservations.iterator();
+    while (records.next()) |record| {
+        if (reservationOverlaps(base_va, page_count, record.value.base_va, record.value.page_count)) return false;
     }
     if (tryMergeUserReservation(space, base_va, page_count, kind, writable)) return true;
-    for (&space.reservations) |*reservation| {
-        if (reservation.active) continue;
-        space.reservation_generation +%= 1;
-        reservation.* = .{
-            .base_va = base_va,
-            .page_count = @intCast(page_count),
-            .generation = space.reservation_generation,
-            .kind = kind,
-            .writable = writable,
-            .active = true,
-        };
-        return true;
-    }
-    return false;
-}
-
-fn releaseReservationRecord(
-    space: *UserAddressSpace,
-    index: usize,
-    release_start_page: u64,
-    release_end_page: u64,
-) bool {
-    const reservation = &space.reservations[index];
-    const record_start_page = reservation.base_va >> 12;
-    const record_end_page = record_start_page + reservation.page_count;
-    if (release_start_page <= record_start_page and release_end_page >= record_end_page) {
-        reservation.* = .{};
-        return true;
-    }
-    if (release_start_page <= record_start_page) {
-        reservation.base_va = release_end_page << 12;
-        reservation.page_count = @intCast(record_end_page - release_end_page);
-        return true;
-    }
-    if (release_end_page >= record_end_page) {
-        reservation.page_count = @intCast(release_start_page - record_start_page);
-        return true;
-    }
-
-    const right_count = record_end_page - release_end_page;
-    for (&space.reservations) |*free_record| {
-        if (free_record.active) continue;
-        space.reservation_generation +%= 1;
-        free_record.* = .{
-            .base_va = release_end_page << 12,
-            .page_count = @intCast(right_count),
-            .generation = space.reservation_generation,
-            .kind = reservation.kind,
-            .writable = reservation.writable,
-            .active = true,
-        };
-        reservation.page_count = @intCast(release_start_page - record_start_page);
-        return true;
-    }
-    return false;
+    if (!prepareReservationSlots(space, 1)) return false;
+    const record = space.reservations.allocatePrepared() catch return false;
+    space.reservation_generation +%= 1;
+    record.value.* = .{ .base_va = base_va, .page_count = page_count, .generation = space.reservation_generation, .kind = kind, .writable = writable, .active = true };
+    return true;
 }
 
 pub fn releaseUserMapping(principal: kernel.PrincipalId, base_va: u64, page_count: u64) bool {
     const space = getUserSpace(principal) orelse return false;
-    const release_end_page = reservationEndPage(base_va, page_count) orelse return false;
-    const release_start_page = base_va >> 12;
+    const end = reservationEndPage(base_va, page_count) orelse return false;
+    const start = base_va >> 12;
+    if (!prepareReservationSlots(space, reservationSplitSlotsRequired(space, base_va, page_count * 4096))) return false;
     var changed = false;
-    var index: usize = 0;
-    while (index < UserAddressSpace.max_reservations) : (index += 1) {
-        const reservation = &space.reservations[index];
-        if (!reservation.active) continue;
-        const record_start_page = reservation.base_va >> 12;
-        const record_end_page = record_start_page + reservation.page_count;
-        if (record_start_page >= release_end_page or release_start_page >= record_end_page) continue;
-        const overlap_start = if (release_start_page > record_start_page) release_start_page else record_start_page;
-        const overlap_end = if (release_end_page < record_end_page) release_end_page else record_end_page;
-        if (!releaseReservationRecord(space, index, overlap_start, overlap_end)) return false;
+    var records = space.reservations.iterator();
+    while (records.next()) |record| {
+        const value = record.value;
+        const old_start = reservationStartPage(value);
+        const old_end = reservationEndPage(value.base_va, value.page_count) orelse unreachable;
+        if (old_start >= end or start >= old_end) continue;
+        if (start <= old_start and end >= old_end) {
+            releaseReservation(space, value);
+        } else if (start <= old_start) {
+            value.base_va = end << 12;
+            value.page_count = old_end - end;
+        } else if (end >= old_end) {
+            value.page_count = start - old_start;
+        } else {
+            const right = space.reservations.allocatePrepared() catch unreachable;
+            right.value.* = value.*;
+            right.value.base_va = end << 12;
+            right.value.page_count = old_end - end;
+            value.page_count = start - old_start;
+        }
         changed = true;
     }
     return changed;
@@ -634,7 +754,9 @@ fn userDynamicMapRange(h: Hooks) ?struct { start_page: u64, end_page: u64 } {
 
 fn rangeOverlappingReservationEndPage(space: *const UserAddressSpace, base_va: u64, page_count: u64) ?u64 {
     var skip_to_page: u64 = 0;
-    for (&space.reservations) |*reservation| {
+    var records = space.reservations.iterator();
+    while (records.next()) |record| {
+        const reservation = record.value;
         if (!reservation.active) continue;
         if (!reservationOverlaps(base_va, page_count, reservation.base_va, reservation.page_count)) continue;
         const reservation_end_page = reservationStartPage(reservation) + reservation.page_count;
@@ -649,7 +771,8 @@ fn rangeHasPresentUserMapping(principal: kernel.PrincipalId, base_va: u64, page_
     const bytes = std.math.mul(u64, page_count, 4096) catch return true;
     _ = userRangeEndVa(h, base_va, bytes) orelse return true;
     const end = base_va + bytes;
-    for (0..ptSlotScanLimit(space)) |slot| {
+    var pt_it = space.pt_store.iterator();
+    while (pt_it.next()) |slot| {
         const span = ptSlotIntersection(space, slot, base_va, end) orelse continue;
         for (space.ptPage(slot).*[span.first..span.last]) |entry| {
             if ((entry & (h.page_present | h.page_user)) == (h.page_present | h.page_user)) return true;
@@ -740,36 +863,24 @@ pub fn advanceFreeUserMappingSearch(principal: kernel.PrincipalId, next_va: u64)
 }
 
 fn findUserPtSlotForPd(space: *const UserAddressSpace, pml4_index: usize, pdp_index: usize, pd_index: usize) ?usize {
-    // Valid hardware indices cannot equal a retired descriptor's 0xffff.
-    // Check that once, then reject the common PD mismatch before reading
-    // its other indices; user-copy lookups scan this list under the AS lock.
     if (pml4_index >= 256 or pdp_index >= 512 or pd_index >= 512) return null;
-    const slot_limit = ptSlotScanLimit(space);
-    var slot: usize = 0;
-    while (slot < slot_limit) : (slot += 1) {
-        const entry = space.pt_store.descriptorConst(slot).?;
-        if (entry.pd != pd_index) continue;
-        if (entry.pdp != pdp_index) continue;
-        if (entry.pml4 == pml4_index) return slot;
+    var it = space.pt_store.iterator();
+    while (it.next()) |slot| {
+        const entry = it.current.?;
+        if (entry.pml4 == pml4_index and entry.pdp == pdp_index and entry.pd == pd_index) return slot;
     }
     return null;
 }
 
-fn userPtSlotHasUserMappings(h: Hooks, space: *const UserAddressSpace, slot: usize) bool {
+fn userPtSlotHasEntries(space: *const UserAddressSpace, slot: usize) bool {
     if (slot >= space.ptCapacity()) return true;
-    const pt_page: *const [512]u64 = space.ptPage(slot);
-    var i: usize = 0;
-    while (i < h.page_entries) : (i += 1) {
-        const entry = pt_page[i];
-        if ((entry & h.page_present) != 0 and (entry & h.page_user) != 0) return true;
-    }
-    return false;
+    return !std.mem.allEqual(u64, space.ptPage(slot), 0);
 }
 
 fn detachUserPtSlotIfEmpty(h: Hooks, space: *UserAddressSpace, slot: usize) bool {
     if (slot >= space.ptCapacity()) return false;
     if (space.ptPdIndex(slot).* == UserAddressSpace.no_pd_index) return false;
-    if (userPtSlotHasUserMappings(h, space, slot)) return false;
+    if (userPtSlotHasEntries(space, slot)) return false;
     const pml4_index = space.ptPml4Index(slot).*;
     const pdp_index = space.ptPdpIndex(slot).*;
     const pd_index = space.ptPdIndex(slot).*;
@@ -780,86 +891,83 @@ fn detachUserPtSlotIfEmpty(h: Hooks, space: *UserAddressSpace, slot: usize) bool
         return false;
     }
     if (findUserPdSlotForPdp(space, pml4_index, pdp_index)) |pd_slot| {
-        const pd_page: *[512]u64 = &space.pd_pages[pd_slot];
+        const pd_page: *[512]u64 = space.pdPage(pd_slot);
         const entry = pd_page[pd_index];
-        const pt_pa: u64 = h.kernel_pointer_paddr(@intFromPtr(space.ptPage(slot))) orelse return false;
+        const pt_pa: u64 = tablePaddr(h, space.ptPage(slot)) orelse return false;
         if ((entry & h.page_addr_mask) == pt_pa) {
             pd_page[pd_index] = 0;
+            return true;
         }
     }
-    return true;
+    return false;
 }
 
-fn retireEmptyUserPtSlots(h: Hooks, space: *UserAddressSpace, principal: kernel.PrincipalId, va_start: u64, size_bytes: usize, touched_slots: []u16, leaf_changed: bool) void {
+// All detached descriptors remain assigned across the ACK; the marker is
+// owned by the AS lock and is never an allocator free-slot indication.
+fn retireEmptyUserPtSlots(h: Hooks, space: *UserAddressSpace, principal: kernel.PrincipalId, va_start: u64, size_bytes: usize, touched_slots: []usize, leaf_changed: bool, pre_detached: usize) void {
     const detach_start = perf.timestamp();
-    var retired: usize = 0;
+    var retired: usize = pre_detached;
     for (touched_slots) |slot| {
         if (detachUserPtSlotIfEmpty(h, space, slot)) {
-            touched_slots[retired] = slot;
+            space.pt_store.descriptor(slot).?.retire_pending = true;
             retired += 1;
         }
     }
+    // The range caller supplies its detached count, so a small leaf-only
+    // mutation need not rescan every PT merely to discover no retirements.
+    const pd_count = detachEmptyUserParents(h, space, .pd, va_start, size_bytes);
+    const pdp_count = detachEmptyUserParents(h, space, .pdp, va_start, size_bytes);
     perf.ptRetireElapsed(.detach_cycles, detach_start);
     perf.ptRetireAdd(.retired_pts, retired);
-    // Remove the parent PDE before invalidating paging-structure caches.
-    // No CPU may acquire a new path to a PT after the shootdown and before
-    // that PT's storage is reused for a different virtual address.
-    const pt_bytes = 2 * 1024 * 1024;
-    const flush_start = if (retired != 0) va_start & ~@as(u64, pt_bytes - 1) else va_start;
-    const flush_end = if (retired != 0)
-        (va_start + size_bytes + pt_bytes - 1) & ~@as(u64, pt_bytes - 1)
-    else
-        va_start + size_bytes;
-    // Under the address-space lock, a hole with no leaf change and no PT
-    // retirement has no new translation to revoke. Keep the barrier for
-    // retirement alone too: a cached parent may still reference the old PT.
-    if (leaf_changed or retired != 0) {
+    if (leaf_changed or retired != 0 or pd_count != 0 or pdp_count != 0) {
+        // A removed parent can cover translations outside the changed leaf
+        // range. Full-context invalidation also retires paging-structure caches.
+        const tables = retired != 0 or pd_count != 0 or pdp_count != 0;
         perf.ptRetireAdd(.flush_calls, 1);
-        const flush_start_cycles = perf.timestamp();
-        h.flush_user_tlb_for_principal_range(principal, flush_start, @intCast(flush_end - flush_start));
-        perf.ptRetireElapsed(.flush_cycles, flush_start_cycles);
+        const flush_start = perf.timestamp();
+        h.flush_user_tlb_for_principal_range(principal, if (tables) h.user_low_va else va_start, if (tables) @intCast(h.user_top_va - h.user_low_va) else size_bytes);
+        perf.ptRetireElapsed(.flush_cycles, flush_start);
     }
     const release_start = perf.timestamp();
-    for (touched_slots[0..retired]) |slot| {
-        if (h.pt_allocator) |allocator| space.pt_store.releasePageDetached(slot, allocator);
+    inline for (.{ TableLevel.pt, TableLevel.pd, TableLevel.pdp }) |level| {
+        const count = switch (level) {
+            .pt => retired,
+            .pd => pd_count,
+            .pdp => pdp_count,
+        };
+        const store = levelStore(space, level);
+        var pending = store.iterator();
+        var remaining = count;
+        while (remaining != 0) {
+            const slot = pending.next() orelse break;
+            if (pending.current.?.retire_pending) {
+                // A rejected allocator return retains an ACK-safe page for
+                // reuse; the store clears its coordinates and pending marker.
+                store.releasePageDetached(slot);
+                remaining -= 1;
+            }
+        }
+        std.debug.assert(remaining == 0);
     }
     perf.ptRetireElapsed(.release_cycles, release_start);
 }
 
-// PT storage can grow, but retirement scratch space must remain bounded.
-// All leaf writes precede this scan. The first barrier covers those writes,
-// including the case where no table can be retired.
-fn retireEmptyUserPtRange(h: Hooks, space: *UserAddressSpace, principal: kernel.PrincipalId, start: u64, bytes: usize, leaf_changed: bool, strict_zero: bool) void {
+fn retireEmptyUserPtRange(h: Hooks, space: *UserAddressSpace, principal: kernel.PrincipalId, start: u64, bytes: usize, leaf_changed: bool) void {
     const range_start = perf.timestamp();
     perf.ptRetireAdd(.range_calls, 1);
     defer perf.ptRetireElapsed(.range_total_cycles, range_start);
-    var slots: [64]u16 = undefined;
-    var count: usize = 0;
     var candidates: usize = 0;
-    var pending_leaf = leaf_changed;
-    var scan_start = perf.timestamp();
-    for (0..ptSlotScanLimit(space)) |slot| {
+    var pt_it = space.pt_store.iterator();
+    while (pt_it.next()) |slot| {
         _ = ptSlotIntersection(space, slot, start, start + bytes) orelse continue;
-        if (strict_zero) {
-            if (!std.mem.allEqual(u64, space.ptPage(slot), 0)) continue;
-        } else if (userPtSlotHasUserMappings(h, space, slot)) continue;
-        if (perf.enabled) candidates += 1;
-        slots[count] = @intCast(slot);
-        count += 1;
-        if (count == slots.len) {
-            // Account for selection separately from the helper's nested
-            // detach interval; neither includes its shootdown or PMM return.
-            perf.ptRetireElapsed(.detach_cycles, scan_start);
-            retireEmptyUserPtSlots(h, space, principal, start, bytes, slots[0..count], pending_leaf);
-            scan_start = perf.timestamp();
-            pending_leaf = false;
-            count = 0;
+        if (detachUserPtSlotIfEmpty(h, space, slot)) {
+            space.pt_store.descriptor(slot).?.retire_pending = true;
+            candidates += 1;
         }
     }
-    perf.ptRetireElapsed(.detach_cycles, scan_start);
-    retireEmptyUserPtSlots(h, space, principal, start, bytes, slots[0..count], pending_leaf);
+    retireEmptyUserPtSlots(h, space, principal, start, bytes, &.{}, leaf_changed, candidates);
+    reclaimTableMetadata(space);
     perf.ptRetireAdd(.range_candidate_pts, candidates);
-    if (candidates > slots.len) perf.ptRetireAdd(.range_multi_batch_calls, 1);
 }
 
 /// Only the user-mode fault entry may call this, before starting COW or mapping
@@ -875,19 +983,20 @@ pub fn reclaimEmptyUserPtSlotsForFaultWithAddressSpaceLocked(principal: kernel.P
     if (findUserPtSlotForPd(space, index.pml4, index.pdp, index.pd) != null) return;
     if (space.firstFreePtSlot() != null) return;
 
-    var candidates: [64]u16 = undefined;
+    var candidates: [64]usize = undefined;
     var count: usize = 0;
     var first_va: u64 = std.math.maxInt(u64);
     var end_va: u64 = 0;
-    for (0..space.ptCapacity()) |slot| {
+    var all_end: u64 = 0;
+    var pt_it = space.pt_store.iterator();
+    while (pt_it.next()) |slot| {
         if (space.ptPdIndex(slot).* == UserAddressSpace.no_pd_index) continue;
         const page = space.ptPage(slot);
         const pml4 = space.ptPml4Index(slot).*;
         const pdp = space.ptPdpIndex(slot).*;
         const pd = space.ptPdIndex(slot).*;
         if (pml4 >= 256 or pdp >= h.page_entries or pd >= h.page_entries) continue;
-        // Unlike ordinary VMA retirement, preserve supervisor-only, mixed,
-        // and even nonpresent-but-nonzero entries without exception.
+        // Every reclaim path requires an entirely empty owned table.
         var empty = true;
         for (page) |entry| {
             if (entry != 0) {
@@ -897,191 +1006,160 @@ pub fn reclaimEmptyUserPtSlotsForFaultWithAddressSpaceLocked(principal: kernel.P
         }
         if (!empty) continue;
         const pd_slot = findUserPdSlotForPdp(space, pml4, pdp) orelse continue;
-        const parent = space.pd_pages[pd_slot][pd];
+        const parent = space.pdPage(pd_slot).*[pd];
         if (parent & h.page_present == 0 or parent & h.page_ps != 0) continue;
-        const pt_pa = h.kernel_pointer_paddr(@intFromPtr(page)) orelse continue;
+        const pt_pa = tablePaddr(h, page) orelse continue;
         if (parent & h.page_addr_mask != pt_pa) continue;
         const va = (@as(u64, pml4) << 39) | (@as(u64, pdp) << 30) | (@as(u64, pd) << 21);
+        all_end = @max(all_end, va + (1 << 21));
         first_va = @min(first_va, va);
         end_va = @max(end_va, va + (1 << 21));
         candidates[count] = @intCast(slot);
         count += 1;
-        if (count == candidates.len) break;
+        if (count == candidates.len) {
+            retireEmptyUserPtSlots(h, space, principal, first_va, @intCast(end_va - first_va), candidates[0..count], false, 0);
+            count = 0;
+            first_va = std.math.maxInt(u64);
+            end_va = 0;
+        }
     }
-    if (count == 0) return;
+    if (all_end == 0) return;
     // The synchronous barrier covers every detached PDE, not merely fault_va.
     // Metadata remains assigned until that barrier has completed.
     perf.ptRetireAdd(.fault_reclaim_calls, 1);
-    retireEmptyUserPtSlots(h, space, principal, first_va, @intCast(end_va - first_va), candidates[0..count], false);
-}
-
-fn ptSlotScanLimit(space: *const UserAddressSpace) usize {
-    const used_len = @min(@as(usize, @intCast(space.pt_page_used_len)), space.ptCapacity());
-    return if (used_len == 0) space.ptCapacity() else used_len;
-}
-
-fn pdSlotScanLimit(space: *const UserAddressSpace) usize {
-    const used_len = @min(@as(usize, @intCast(space.pd_page_used_len)), UserAddressSpace.max_dynamic_pd_pages);
-    return if (used_len == 0) UserAddressSpace.max_dynamic_pd_pages else used_len;
-}
-
-fn pdpSlotScanLimit(space: *const UserAddressSpace) usize {
-    const used_len = @min(@as(usize, @intCast(space.pdp_page_used_len)), UserAddressSpace.max_dynamic_pdp_pages);
-    return if (used_len == 0) UserAddressSpace.max_dynamic_pdp_pages else used_len;
+    if (count != 0) retireEmptyUserPtSlots(h, space, principal, first_va, @intCast(end_va - first_va), candidates[0..count], false, 0);
+    reclaimTableMetadata(space);
 }
 
 fn findUserPdpSlotForPml4(space: *const UserAddressSpace, pml4_index: usize) ?usize {
-    const slot_limit = pdpSlotScanLimit(space);
-    var slot: usize = 0;
-    while (slot < slot_limit) : (slot += 1) {
-        if (space.pdp_page_pml4_index[slot] == UserAddressSpace.no_pd_index) continue;
-        if (space.pdp_page_pml4_index[slot] == pml4_index) return slot;
+    if (pml4_index >= 256) return null;
+    var it = space.pdp_store.iterator();
+    while (it.next()) |slot| {
+        const entry = it.current.?;
+        if (entry.pml4 == pml4_index) return slot;
     }
     return null;
 }
 
 fn findUserPdSlotForPdp(space: *const UserAddressSpace, pml4_index: usize, pdp_index: usize) ?usize {
-    const slot_limit = pdSlotScanLimit(space);
-    var slot: usize = 0;
-    while (slot < slot_limit) : (slot += 1) {
-        if (space.pd_page_pml4_index[slot] == UserAddressSpace.no_pd_index) continue;
-        if (space.pd_page_pdp_index[slot] == UserAddressSpace.no_pd_index) continue;
-        if (space.pd_page_pml4_index[slot] != pml4_index) continue;
-        if (space.pd_page_pdp_index[slot] == pdp_index) return slot;
+    if (pml4_index >= 256 or pdp_index >= 512) return null;
+    var it = space.pd_store.iterator();
+    while (it.next()) |slot| {
+        const entry = it.current.?;
+        if (entry.pml4 == pml4_index and entry.pdp == pdp_index) return slot;
     }
     return null;
 }
 
-fn seedPdSlotFromExistingPdp(h: Hooks, space: *UserAddressSpace, slot: usize, pml4_index: usize, pdp_index: usize, existing_pdpe: u64) void {
-    const pd_page: *[512]u64 = &space.pd_pages[slot];
-    @memset(pd_page[0..], 0);
-    if ((existing_pdpe & h.page_present) != 0 and (existing_pdpe & h.page_ps) == 0 and (existing_pdpe & h.page_user) == 0) {
-        const src_pd_addr = existing_pdpe & h.page_addr_mask;
-        if (src_pd_addr != 0 and src_pd_addr < h.physical_map_limit) {
-            const src_pd: *const [512]u64 = @ptrFromInt(src_pd_addr);
-            var copy_index: usize = 0;
-            while (copy_index < h.page_entries) : (copy_index += 1) {
-                pd_page[copy_index] = src_pd[copy_index] & ~h.page_user;
-            }
-            return;
+const TableLevel = enum { pdp, pd, pt };
+const TableLink = struct { parent: *u64, previous: u64, slot: usize, level: TableLevel, physical: u64 };
+fn levelStore(space: *UserAddressSpace, level: TableLevel) *pt_storage.Store {
+    return switch (level) {
+        .pdp => &space.pdp_store,
+        .pd => &space.pd_store,
+        .pt => &space.pt_store,
+    };
+}
+
+// One hardware path has exactly three non-root levels. These are prepared
+// completely before publication, so an OOM never leaves an empty new parent.
+const TablePathPreparation = struct {
+    links: [3]TableLink = undefined,
+    count: usize = 0,
+    committed: bool = false,
+    index: UserPageIndex,
+
+    fn allocate(self: *@This(), h: Hooks, space: *UserAddressSpace, level: TableLevel, parent: *u64) ?usize {
+        // A present parent without an owned descriptor is corruption, not
+        // an inherited kernel seed that may be copied or replaced.
+        if (parent.* & h.page_present != 0) return null;
+        const store = levelStore(space, level);
+        const slot = store.firstFreeSlot() orelse return null;
+        const page = store.ensurePage(slot, h.pt_allocator orelse return null) orelse return null;
+        // Record ownership BEFORE any fallible address validation.
+        self.links[self.count] = .{ .parent = parent, .previous = parent.*, .slot = slot, .level = level, .physical = 0 };
+        self.count += 1;
+        const physical = tablePaddr(h, page) orelse return null;
+        if (physical >= h.physical_map_limit) return null;
+        self.links[self.count - 1].physical = physical;
+        return slot;
+    }
+
+    fn prepare(self: *@This(), h: Hooks, space: *UserAddressSpace, last: TableLevel) ?usize {
+        const index = self.index;
+        const pdp_slot = findUserPdpSlotForPml4(space, index.pml4) orelse blk: {
+            const slot = self.allocate(h, space, .pdp, &space.pml4[index.pml4]) orelse return null;
+            break :blk slot;
+        };
+        if (last == .pdp) return pdp_slot;
+        const pdp = space.pdpPage(pdp_slot);
+        const pd_slot = findUserPdSlotForPdp(space, index.pml4, index.pdp) orelse blk: {
+            const slot = self.allocate(h, space, .pd, &pdp[index.pdp]) orelse return null;
+            @memset(space.pdPage(slot), 0);
+            break :blk slot;
+        };
+        if (last == .pd) return pd_slot;
+        const pd = space.pdPage(pd_slot);
+        const slot = self.allocate(h, space, .pt, &pd[index.pd]) orelse return null;
+        @memset(space.ptPage(slot), 0);
+        return slot;
+    }
+
+    fn publish(self: *@This(), h: Hooks, space: *UserAddressSpace) void {
+        // Publish bottom-up: any newly reachable parent already has initialized
+        // children. No allocation or validation remains after the first store.
+        var remaining = self.count;
+        while (remaining != 0) {
+            remaining -= 1;
+            const link = self.links[remaining];
+            const entry = levelStore(space, link.level).descriptor(link.slot).?;
+            entry.pml4 = @intCast(self.index.pml4);
+            if (link.level != .pdp) entry.pdp = @intCast(self.index.pdp);
+            if (link.level == .pt) entry.pd = @intCast(self.index.pd);
+            link.parent.* = link.physical | h.page_present | h.page_rw | h.page_user;
+            const used = switch (link.level) {
+                .pdp => &space.pdp_page_used_len,
+                .pd => &space.pd_page_used_len,
+                .pt => &space.pt_page_used_len,
+            };
+            used.* = @max(used.*, link.slot + 1); // ensurePage checked the rounded limit.
         }
+        self.committed = true;
     }
-    if (pml4_index == 0 and pdp_index == 0) {
-        h.seed_user_pd_with_kernel_identity(pd_page[0..]);
+
+    fn finish(self: *@This(), space: *UserAddressSpace) void {
+        if (self.committed) return;
+        // Nothing was published: no CPU barrier is needed for this rollback.
+        for (self.links[0..self.count]) |link| levelStore(space, link.level).releasePageDetached(link.slot);
+        reclaimTableMetadata(space);
     }
+};
+
+fn reclaimTableMetadata(space: *UserAddressSpace) void {
+    space.pt_store.reclaimEmptyBanks();
+    space.pd_store.reclaimEmptyBanks();
+    space.pdp_store.reclaimEmptyBanks();
 }
 
 fn ensureUserPdpSlotForPml4(space: *UserAddressSpace, pml4_index: usize) ?usize {
     const h = hooks orelse return null;
     if (pml4_index >= 256) return null;
     if (findUserPdpSlotForPml4(space, pml4_index)) |slot| return slot;
-
-    var slot: usize = 0;
-    while (slot < UserAddressSpace.max_dynamic_pdp_pages and space.pdp_page_pml4_index[slot] != UserAddressSpace.no_pd_index) : (slot += 1) {}
-    if (slot >= UserAddressSpace.max_dynamic_pdp_pages) return null;
-    space.pdp_page_pml4_index[slot] = @intCast(pml4_index);
-    const pdp_page: *[512]u64 = &space.pdp_pages[slot];
-    @memset(pdp_page[0..], 0);
-    if (pml4_index == 0) {
-        h.seed_user_pdp_with_kernel_identity(pdp_page[0..]);
-    }
-    const pdp_pa: u64 = h.kernel_pointer_paddr(@intFromPtr(pdp_page)) orelse return null;
-    if (pdp_pa >= h.physical_map_limit) return null;
-    space.pml4[pml4_index] = pdp_pa | h.page_present | h.page_rw | h.page_user;
-    const next_len = slot + 1;
-    if (next_len > space.pdp_page_used_len) {
-        space.pdp_page_used_len = @intCast(next_len);
-    }
+    var path = TablePathPreparation{ .index = .{ .pml4 = pml4_index, .pdp = 0, .pd = 0, .pt = 0 } };
+    defer path.finish(space);
+    const slot = path.prepare(h, space, .pdp) orelse return null;
+    path.publish(h, space);
     return slot;
-}
-
-fn ensureUserPdSlotForPdp(space: *UserAddressSpace, pml4_index: usize, pdp_index: usize) ?usize {
-    const h = hooks orelse return null;
-    if (pml4_index >= 256) return null;
-    if (pdp_index >= h.page_entries) return null;
-    const pdp_slot = ensureUserPdpSlotForPml4(space, pml4_index) orelse return null;
-    if (findUserPdSlotForPdp(space, pml4_index, pdp_index)) |slot| return slot;
-
-    var slot: usize = 0;
-    while (slot < UserAddressSpace.max_dynamic_pd_pages and space.pd_page_pdp_index[slot] != UserAddressSpace.no_pd_index) : (slot += 1) {}
-    if (slot >= UserAddressSpace.max_dynamic_pd_pages) return null;
-    space.pd_page_pml4_index[slot] = @intCast(pml4_index);
-    space.pd_page_pdp_index[slot] = @intCast(pdp_index);
-    const pdp_page: *[512]u64 = &space.pdp_pages[pdp_slot];
-    const existing_pdpe = pdp_page[pdp_index];
-    seedPdSlotFromExistingPdp(h, space, slot, pml4_index, pdp_index, existing_pdpe);
-    const pd_pa: u64 = h.kernel_pointer_paddr(@intFromPtr(&space.pd_pages[slot])) orelse return null;
-    if (pd_pa >= h.physical_map_limit) return null;
-    pdp_page[pdp_index] = pd_pa | h.page_present | h.page_rw | h.page_user;
-    const next_len = slot + 1;
-    if (next_len > space.pd_page_used_len) {
-        space.pd_page_used_len = @intCast(next_len);
-    }
-    return slot;
-}
-
-fn seedPtSlotFromExistingPd(space: *UserAddressSpace, slot: usize, existing_pde: u64) void {
-    const h = hooks orelse return;
-    const pt_page: *[512]u64 = space.ptPage(slot);
-    @memset(pt_page[0..], 0);
-    if ((existing_pde & h.page_present) == 0) return;
-    if ((existing_pde & h.page_ps) == 0) {
-        if ((existing_pde & h.page_user) != 0) return;
-        const src_pt_addr = existing_pde & h.page_addr_mask;
-        if (src_pt_addr == 0 or src_pt_addr >= h.physical_map_limit) return;
-        const src_pt: *const [512]u64 = @ptrFromInt(src_pt_addr);
-        var copy_index: usize = 0;
-        while (copy_index < h.page_entries) : (copy_index += 1) {
-            pt_page[copy_index] = src_pt[copy_index] & ~h.page_user;
-        }
-        return;
-    }
-
-    const two_mib_mask = ~@as(u64, 0x1F_FFFF);
-    const page_base = existing_pde & h.page_addr_mask & two_mib_mask;
-    // A 2 MiB leaf puts PAT at bit 12, while a 4 KiB leaf puts it at bit 7.
-    // Keep NX too: copying an identity seed must not introduce an executable
-    // or differently cached alias of a device aperture.
-    const large_pat = (existing_pde & (1 << 12)) != 0;
-    const pte_flags = ((existing_pde & (0xFFF | h.page_nx)) & ~h.page_ps & ~h.page_user) |
-        (if (large_pat) @as(u64, 1 << 7) else 0);
-    var pt_index: usize = 0;
-    while (pt_index < h.page_entries) : (pt_index += 1) {
-        const paddr = page_base + @as(u64, @intCast(pt_index)) * 4096;
-        pt_page[pt_index] = paddr | pte_flags;
-    }
 }
 
 pub fn ensureUserPtSlotForPd(space: *UserAddressSpace, pml4_index: usize, pdp_index: usize, pd_index: usize) ?usize {
     const h = hooks orelse return null;
-    if (pml4_index >= 256) return null;
-    if (pdp_index >= h.page_entries) return null;
-    if (pd_index >= h.page_entries) return null;
-    const pd_slot = ensureUserPdSlotForPdp(space, pml4_index, pdp_index) orelse return null;
+    if (pml4_index >= 256 or pdp_index >= h.page_entries or pd_index >= h.page_entries) return null;
     if (findUserPtSlotForPd(space, pml4_index, pdp_index, pd_index)) |slot| return slot;
-
-    const slot = space.firstFreePtSlot() orelse space.ptCapacity();
-    const allocator = h.pt_allocator orelse return null;
-    const page = space.pt_store.ensurePage(slot, allocator) orelse return null;
-    const pt_pa = h.kernel_pointer_paddr(@intFromPtr(page)) orelse {
-        space.pt_store.releasePageDetached(slot, allocator);
-        return null;
-    };
-    if (pt_pa >= h.physical_map_limit) {
-        space.pt_store.releasePageDetached(slot, allocator);
-        return null;
-    }
-    const pd_page: *[512]u64 = &space.pd_pages[pd_slot];
-    const existing_pde = pd_page[pd_index];
-    seedPtSlotFromExistingPd(space, slot, existing_pde);
-    space.ptPml4Index(slot).* = @intCast(pml4_index);
-    space.ptPdpIndex(slot).* = @intCast(pdp_index);
-    space.ptPdIndex(slot).* = @intCast(pd_index);
-    pd_page[pd_index] = pt_pa | h.page_present | h.page_rw | h.page_user;
-    const next_len = slot + 1;
-    if (next_len > space.pt_page_used_len) {
-        space.pt_page_used_len = @intCast(next_len);
-    }
+    var path = TablePathPreparation{ .index = .{ .pml4 = pml4_index, .pdp = pdp_index, .pd = pd_index, .pt = 0 } };
+    defer path.finish(space);
+    const slot = path.prepare(h, space, .pt) orelse return null;
+    path.publish(h, space);
     return slot;
 }
 
@@ -1139,86 +1217,17 @@ pub const MmioCache = enum {
     }
 };
 
-const wc_identity_marker: u64 = 1 << 9;
-
-/// A WC transition can update the shared identity PT without allocating or
-/// modifying an unrelated process PT. Existing private leaves are admitted
-/// only when they already carry the same non-present marker. This check is
-/// deliberately before the kernel PTE mutation and while all VM locks are
-/// held; a private 2 MiB alias cannot be left behind with its old cache type.
-pub fn privateIdentityAliasesCanHide(paddr_start: u64, size_bytes: u64) bool {
-    const h = hooks orelse return false;
-    const x86 = @import("../arch/x86_64/platform.zig");
-    const identity_limit = @import("../arch/x86_64/physical_layout.zig").identity_limit;
-    const end = @min(paddr_start + size_bytes, identity_limit);
-    if (paddr_start >= end) return true;
-    for (0..h.user_spaces.capacity()) |space_index| {
-        const space = h.user_spaces.get(space_index) orelse continue;
-        if (space.cr3 == 0) continue;
-        var page = paddr_start;
-        while (page < end) : (page += 4096) {
-            const pdp_index: usize = @intCast(page >> 30);
-            const pd_index: usize = @intCast((page >> 21) & 511);
-            const pd_slot = findUserPdSlotForPdp(space, 0, pdp_index) orelse continue;
-            const pde = space.pd_pages[pd_slot][pd_index];
-            if ((pde & h.page_present) == 0) continue;
-            if ((pde & h.page_ps) != 0) {
-                // A private large user mapping of unrelated RAM is not an
-                // alias of this PCI physical page.
-                if ((pde & h.page_addr_mask & ~@as(u64, 0x1f_ffff)) ==
-                    (page & ~@as(u64, 0x1f_ffff))) return false;
-                continue;
-            }
-            if (findUserPtSlotForPd(space, 0, pdp_index, pd_index)) |pt_slot| {
-                const pte = space.ptPage(pt_slot).*[(@as(usize, @intCast(page >> 12)) & 511)];
-                if ((pte & h.page_addr_mask) != page) continue;
-                if ((pte & h.page_present) != 0) return false;
-                if ((pte & wc_identity_marker) == 0) continue;
-            } else {
-                const kernel_pde = x86.kernelIdentityPdEntry(page) orelse return false;
-                const ad_bits: u64 = (1 << 5) | (1 << 6);
-                if ((pde & ~ad_bits) != (kernel_pde & ~ad_bits)) return false;
-            }
-        }
-    }
-    return true;
-}
-
-/// A process may split a shared supervisor PT while WC is live. It copies
-/// the marked, non-present leaves. Restore only those exact copied markers;
-/// leave any user mapping that later replaced one untouched.
-pub fn restorePrivateIdentityMarkers(paddr_start: u64, size_bytes: u64) void {
-    const h = hooks orelse return;
-    const x86 = @import("../arch/x86_64/platform.zig");
-    const identity_limit = @import("../arch/x86_64/physical_layout.zig").identity_limit;
-    const end = @min(paddr_start + size_bytes, identity_limit);
-    for (0..h.user_spaces.capacity()) |space_index| {
-        const space = h.user_spaces.get(space_index) orelse continue;
-        if (space.cr3 == 0) continue;
-        var page = paddr_start;
-        while (page < end) : (page += 4096) {
-            if (!x86.wcIdentityPageNeedsRestore(page)) continue;
-            const pdp_index: usize = @intCast(page >> 30);
-            const pd_index: usize = @intCast((page >> 21) & 511);
-            _ = findUserPdSlotForPdp(space, 0, pdp_index) orelse continue;
-            const pt_slot = findUserPtSlotForPd(space, 0, pdp_index, pd_index) orelse continue;
-            const pte = &space.ptPage(pt_slot).*[(@as(usize, @intCast(page >> 12)) & 511)];
-            if ((pte.* & (h.page_present | wc_identity_marker | h.page_addr_mask)) ==
-                (wc_identity_marker | page))
-                pte.* = (pte.* | h.page_present) & ~wc_identity_marker;
-        }
-    }
-}
-
-/// All-CPU TLB invalidation for every active process identity copy. Caller
-/// holds all VM transactions; the kernel CR3 is shot down separately.
-pub fn flushAllUserIdentityContexts(base: u64, bytes: usize) void {
+/// RAM cache changes invalidate actual user mappings in every active AS.
+/// The caller holds all VM transactions; kernel aliases are flushed separately.
+pub fn flushAllUserContexts() void {
     const h = hooks orelse return;
     for (0..h.user_spaces.capacity()) |space_index| {
         const space = h.user_spaces.get(space_index) orelse continue;
         if (space.cr3 == 0) continue;
         const principal = kernel.processPrincipalFromIndex(space_index) orelse continue;
-        h.flush_user_tlb_for_principal_range(principal, base, bytes);
+        // Cache-attribute transitions invalidate aliases at unrelated VAs;
+        // the old dummy page range only worked while all requests were full.
+        h.flush_user_tlb_for_principal_range(principal, h.user_low_va, @intCast(h.user_top_va - h.user_low_va));
     }
 }
 
@@ -1319,40 +1328,36 @@ pub fn mapUserMmioLinearRegionWithProt(principal: kernel.PrincipalId, va_start: 
 /// their old parent entries so a failed BAR admission can undo even a partial
 /// ensureUserPtSlotForPd without consuming any PT/PD/PDP slots.
 const MmioTablePreparation = struct {
-    const Level = enum { pdp, pd, pt };
-    const Link = struct { parent: *u64, previous: u64, slot: usize, level: Level };
-    links: [
-        UserAddressSpace.max_dynamic_pdp_pages + UserAddressSpace.max_dynamic_pd_pages +
-            512 // Bounded transaction journal, not the total PT capacity.
-    ]Link = undefined,
+    // One page is only the journal packing unit, never the transaction limit.
+    const links_per_page = 4096 / @sizeOf(TableLink);
     count: usize = 0,
-    old_pdp_used: u16,
-    old_pd_used: u16,
-    old_pt_used: u16,
+    old_pdp_used: usize,
+    old_pd_used: usize,
+    old_pt_used: usize,
 
-    fn remember(self: *@This(), parent: *u64, slot: usize, level: Level) bool {
-        if (self.count == self.links.len) return false;
-        self.links[self.count] = .{ .parent = parent, .previous = parent.*, .slot = slot, .level = level };
-        self.count += 1;
-        return true;
+    fn linkAt(space: *UserAddressSpace, index: usize) *TableLink {
+        const page = space.scratch_store.descriptor(index / links_per_page).?.page.?;
+        const links: *[links_per_page]TableLink = @ptrCast(page);
+        return &links[index % links_per_page];
     }
 
     fn prepare(self: *@This(), space: *UserAddressSpace, index: UserPageIndex) ?usize {
-        if (findUserPdpSlotForPml4(space, index.pml4) == null) {
-            const slot = std.mem.indexOfScalar(u16, &space.pdp_page_pml4_index, UserAddressSpace.no_pd_index) orelse return null;
-            if (!self.remember(&space.pml4[index.pml4], slot, .pdp)) return null;
+        const h = hooks orelse return null;
+        if (findUserPtSlotForPd(space, index.pml4, index.pdp, index.pd)) |slot| return slot;
+        var path = TablePathPreparation{ .index = index };
+        defer path.finish(space);
+        const slot = path.prepare(h, space, .pt) orelse return null;
+        const end = std.math.add(usize, self.count, path.count) catch return null;
+        // Reserve every journal page before any of this path becomes visible.
+        for (self.count..end) |i| {
+            _ = space.scratch_store.ensurePage(i / links_per_page, h.pt_allocator orelse return null) orelse return null;
         }
-        const pdp = ensureUserPdpSlotForPml4(space, index.pml4) orelse return null;
-        if (findUserPdSlotForPdp(space, index.pml4, index.pdp) == null) {
-            const slot = std.mem.indexOfScalar(u16, &space.pd_page_pdp_index, UserAddressSpace.no_pd_index) orelse return null;
-            if (!self.remember(&space.pdp_pages[pdp][index.pdp], slot, .pd)) return null;
+        for (path.links[0..path.count]) |link| {
+            linkAt(space, self.count).* = link;
+            self.count += 1;
         }
-        const pd = ensureUserPdSlotForPdp(space, index.pml4, index.pdp) orelse return null;
-        if (findUserPtSlotForPd(space, index.pml4, index.pdp, index.pd) == null) {
-            const slot = space.firstFreePtSlot() orelse space.ptCapacity();
-            if (!self.remember(&space.pd_pages[pd][index.pd], slot, .pt)) return null;
-        }
-        return ensureUserPtSlotForPd(space, index.pml4, index.pdp, index.pd);
+        path.publish(h, space);
+        return slot;
     }
 
     fn rollback(self: *@This(), h: Hooks, space: *UserAddressSpace, principal: kernel.PrincipalId) void {
@@ -1360,27 +1365,16 @@ const MmioTablePreparation = struct {
         var remaining = self.count;
         while (remaining != 0) {
             remaining -= 1;
-            const link = self.links[remaining];
+            const link = linkAt(space, remaining).*;
             link.parent.* = link.previous;
         }
-        // Unlink before shootdown; only then may paging storage be returned.
+        // Keep all metadata and pages assigned until every CPU acknowledges.
         h.flush_user_tlb_for_principal_range(principal, h.user_low_va, @intCast(h.user_top_va - h.user_low_va));
-        for (self.links[0..self.count]) |link| {
-            switch (link.level) {
-                .pdp => {
-                    @memset(&space.pdp_pages[link.slot], 0);
-                    space.pdp_page_pml4_index[link.slot] = UserAddressSpace.no_pd_index;
-                },
-                .pd => {
-                    @memset(&space.pd_pages[link.slot], 0);
-                    space.pd_page_pml4_index[link.slot] = UserAddressSpace.no_pd_index;
-                    space.pd_page_pdp_index[link.slot] = UserAddressSpace.no_pd_index;
-                },
-                .pt => {
-                    if (h.pt_allocator) |allocator| space.pt_store.releasePageDetached(link.slot, allocator);
-                },
-            }
+        for (0..self.count) |i| {
+            const link = linkAt(space, i).*;
+            levelStore(space, link.level).releasePageDetached(link.slot);
         }
+        reclaimTableMetadata(space);
         space.pdp_page_used_len = self.old_pdp_used;
         space.pd_page_used_len = self.old_pd_used;
         space.pt_page_used_len = self.old_pt_used;
@@ -1410,25 +1404,17 @@ pub fn mapUserMmioOverlayWithCache(principal: kernel.PrincipalId, va_start: u64,
         .old_pt_used = space.pt_page_used_len,
     };
     var committed = false;
-    defer if (!committed) preparation.rollback(h, space, principal);
+    defer {
+        if (!committed) preparation.rollback(h, space, principal);
+        space.scratch_store.freeDetached();
+    }
 
-    var replaced_identity = false;
     var offset: u64 = 0;
     while (offset < size_bytes) : (offset += 4096) {
         const index = userPageIndexForVa(h, va_start + offset) orelse return false;
         const slot = preparation.prepare(space, index) orelse return false;
         const old = space.ptPage(slot).*[index.pt];
-        if (old & h.page_present != 0) {
-            // The low hosted vmalloc window lies inside the supervisor
-            // identity seed. A proven virgin VMA may replace only that exact
-            // seed, never a user PTE or another supervisor mapping.
-            const identity_flags = h.page_present | h.page_rw;
-            const accessed_dirty: u64 = (1 << 5) | (1 << 6);
-            if ((old & h.page_addr_mask) != va_start + offset or
-                (old & ~(h.page_addr_mask | accessed_dirty)) != identity_flags)
-                return false;
-            replaced_identity = true;
-        }
+        if (old & h.page_present != 0) return false;
     }
     offset = 0;
     while (offset < size_bytes) : (offset += 4096) {
@@ -1437,48 +1423,34 @@ pub fn mapUserMmioOverlayWithCache(principal: kernel.PrincipalId, va_start: u64,
         space.ptPage(slot).*[index.pt] = (paddr_start + offset) | flags;
     }
     committed = true;
-    // Present-to-present changes can retain stale supervisor translations in
-    // this process's CR3, even though the kernel uses a separate CR3. A
-    // synchronous shootdown is required before user execution can resume.
-    if (replaced_identity) h.flush_user_tlb_for_principal_range(principal, va_start, size_bytes);
     return true;
 }
 
-/// Reclaim empty parent tables in the unmapped range. Do not remove tables
-/// containing supervisor seed mappings or another live user's mappings.
-fn retireEmptyMmioParents(h: Hooks, space: *UserAddressSpace, principal: kernel.PrincipalId, start: u64, length: usize) void {
-    var pd_retired: [UserAddressSpace.max_dynamic_pd_pages]u16 = undefined;
-    var pdp_retired: [UserAddressSpace.max_dynamic_pdp_pages]u16 = undefined;
-    var pd_count: usize = 0;
-    var pdp_count: usize = 0;
+/// Detach only: the caller combines both parent levels with its PT batch
+/// before ACK. Descriptors stay assigned, so neither slots nor PFNs can be
+/// reused while a remote CPU still holds the old paging structure.
+fn detachEmptyUserParents(h: Hooks, space: *UserAddressSpace, comptime level: TableLevel, start: u64, length: usize) usize {
     const end = start + length;
-    for (&space.pd_pages, 0..) |*page, slot| {
-        const pml4 = space.pd_page_pml4_index[slot];
-        const pdp = space.pd_page_pdp_index[slot];
-        if (pdp == UserAddressSpace.no_pd_index or pml4 == UserAddressSpace.no_pd_index) continue;
-        const base = (@as(u64, pml4) << 39) | (@as(u64, pdp) << 30);
-        if (base >= end or base + (1 << 30) <= start or !std.mem.allEqual(u64, page, 0)) continue;
-        const parent = findUserPdpSlotForPml4(space, pml4) orelse continue;
-        space.pdp_pages[parent][pdp] = 0;
-        pd_retired[pd_count] = @intCast(slot);
-        pd_count += 1;
+    const store = levelStore(space, level);
+    var count: usize = 0;
+    var it = store.iterator();
+    while (it.next()) |slot| {
+        const entry = it.current.?;
+        if (entry.pml4 == UserAddressSpace.no_pd_index) continue;
+        const shift = if (level == .pd) 30 else 39;
+        const base = (@as(u64, entry.pml4) << 39) | (if (level == .pd) @as(u64, entry.pdp) << 30 else 0);
+        if (base >= end or base + (@as(u64, 1) << shift) <= start or !std.mem.allEqual(u64, entry.page.?, 0)) continue;
+        const parent: *u64 = if (level == .pd) blk: {
+            const pdp = findUserPdpSlotForPml4(space, entry.pml4) orelse continue;
+            break :blk &space.pdpPage(pdp)[entry.pdp];
+        } else &space.pml4[entry.pml4];
+        const pa = tablePaddr(h, entry.page.?) orelse continue;
+        if (parent.* & h.page_addr_mask != pa) continue;
+        parent.* = 0;
+        store.descriptor(slot).?.retire_pending = true;
+        count += 1;
     }
-    for (&space.pdp_pages, 0..) |*page, slot| {
-        const pml4 = space.pdp_page_pml4_index[slot];
-        if (pml4 == UserAddressSpace.no_pd_index) continue;
-        const base = @as(u64, pml4) << 39;
-        if (base >= end or base + (@as(u64, 1) << 39) <= start or !std.mem.allEqual(u64, page, 0)) continue;
-        space.pml4[pml4] = 0;
-        pdp_retired[pdp_count] = @intCast(slot);
-        pdp_count += 1;
-    }
-    if (pd_count == 0 and pdp_count == 0) return;
-    h.flush_user_tlb_for_principal_range(principal, h.user_low_va, @intCast(h.user_top_va - h.user_low_va));
-    for (pd_retired[0..pd_count]) |slot| {
-        space.pd_page_pml4_index[slot] = UserAddressSpace.no_pd_index;
-        space.pd_page_pdp_index[slot] = UserAddressSpace.no_pd_index;
-    }
-    for (pdp_retired[0..pdp_count]) |slot| space.pdp_page_pml4_index[slot] = UserAddressSpace.no_pd_index;
+    return count;
 }
 
 /// Last-close and teardown are idempotent if PTEs have already gone. Validate
@@ -1506,8 +1478,7 @@ pub fn unmapUserMmioOverlay(principal: kernel.PrincipalId, va_start: u64, paddr_
         const pte = &space.ptPage(slot)[index.pt];
         if (pte.* & (h.page_present | h.page_user) == (h.page_present | h.page_user)) pte.* = 0;
     }
-    retireEmptyUserPtRange(h, space, principal, va_start, size_bytes, true, true);
-    retireEmptyMmioParents(h, space, principal, va_start, size_bytes);
+    retireEmptyUserPtRange(h, space, principal, va_start, size_bytes, true);
     return true;
 }
 
@@ -1544,7 +1515,7 @@ fn mapUserLinearRegionWithPteFlags(
         const pt_slot = ensureUserPtSlotForPd(space, index.pml4, index.pdp, index.pd) orelse return false;
         const pt_page: *[512]u64 = space.ptPage(pt_slot);
         const old_entry = pt_page[index.pt];
-        if ((old_entry & h.page_present) != 0 and (old_entry & h.page_user) != 0) return false;
+        if ((old_entry & h.page_present) != 0) return false;
     }
     if (!reserveUserMapping(principal, va_start, page_count_u64, .linear_region, prot.write)) return false;
 
@@ -1561,6 +1532,10 @@ fn mapUserLinearRegionWithPteFlags(
     return true;
 }
 
+fn slicePageAt(pages: []const u64, index: usize) ?u64 {
+    return pages[index];
+}
+
 fn mapTrustedUserPaddrsWithProtInternal(
     principal: kernel.PrincipalId,
     va_start: u64,
@@ -1570,47 +1545,80 @@ fn mapTrustedUserPaddrsWithProtInternal(
     allow_low_page_zero: bool,
     device_cache: ?MmioCache,
 ) bool {
+    return mapUserPageSequence(principal, va_start, paddrs.len, paddrs, slicePageAt, prot, reserve_pages, allow_low_page_zero, device_cache);
+}
+
+/// Caller keeps KernelState and the target VM transaction held. pageAt must
+/// be repeatable and side-effect-free throughout validation, preparation and
+/// publication. A failed lookup is allowed only during preflight; the same
+/// validated sequence cannot change while the caller's exclusion is held.
+pub fn mapTrustedUserPageSequence(principal: kernel.PrincipalId, va_start: u64, count: usize, context: anytype, comptime pageAt: anytype, prot: kernel.MapProt, low_page_zero: bool) bool {
+    if (low_page_zero and (va_start != 0 or count != 1 or !prot.read or prot.write or !prot.exec)) return false;
+    return mapUserPageSequence(principal, va_start, count, context, pageAt, prot, true, low_page_zero, null);
+}
+
+fn mapUserPageSequence(principal: kernel.PrincipalId, va_start: u64, count: usize, context: anytype, comptime pageAt: anytype, prot: kernel.MapProt, reserve_pages: bool, allow_low_page_zero: bool, device_cache: ?MmioCache) bool {
     if (!lockAddressSpace(principal)) return false;
     defer unlockAddressSpace(principal);
     const h = hooks orelse return false;
     const space = getUserSpace(principal) orelse return false;
-    if (paddrs.len == 0) return false;
-    if ((va_start & 0xFFF) != 0) return false;
-
-    const page_count_u64: u64 = @intCast(paddrs.len);
-    const size_u64 = page_count_u64 * 4096;
+    if (count == 0 or (va_start & 0xFFF) != 0) return false;
+    const page_count_u64: u64 = @intCast(count);
+    const size_u64 = std.math.mul(u64, page_count_u64, 4096) catch return false;
     _ = userRangeEndVaWithLowPageZero(h, va_start, size_u64, allow_low_page_zero) orelse return false;
 
-    for (paddrs) |paddr| {
+    // Validate the complete source and every existing private PTE before
+    // allocating tables. No prefix is published if a late PFN/attribute fails.
+    for (0..count) |page_index| {
+        const paddr = pageAt(context, page_index) orelse return false;
         if ((paddr & 0xFFF) != 0 or paddr >= h.physical_map_limit) return false;
         _ = pteFlagsForPhysicalPolicy(h, paddr, prot, device_cache) orelse return false;
-    }
-
-    var page_index: usize = 0;
-    while (page_index < paddrs.len) : (page_index += 1) {
-        const paddr = paddrs[page_index];
-        if ((paddr & 0xFFF) != 0 or paddr >= h.physical_map_limit) return false;
-
         const va = va_start + @as(u64, @intCast(page_index)) * 4096;
         const index = userPageIndexForVaWithLowPageZero(h, va, allow_low_page_zero) orelse return false;
+        if (findUserPtSlotForPd(space, index.pml4, index.pdp, index.pd)) |pt_slot| {
+            const old_entry = space.ptPage(pt_slot)[index.pt];
+            if ((old_entry & h.page_present) != 0) return false;
+        }
+    }
+    // Prepare the entire range before its single reservation/publication.
+    // As before, failed preparation may retain empty table capacity, but never
+    // publishes user leaves or a partial reservation.
+    for (0..count) |page_index| {
+        const va = va_start + @as(u64, @intCast(page_index)) * 4096;
+        const index = userPageIndexForVaWithLowPageZero(h, va, allow_low_page_zero).?;
         const pt_slot = ensureUserPtSlotForPd(space, index.pml4, index.pdp, index.pd) orelse return false;
-        const pt_page: *[512]u64 = space.ptPage(pt_slot);
-        const old_entry = pt_page[index.pt];
-        if ((old_entry & h.page_present) != 0 and (old_entry & h.page_user) != 0) return false;
+        const old_entry = space.ptPage(pt_slot)[index.pt];
+        if ((old_entry & h.page_present) != 0) return false;
     }
     if (reserve_pages and !reserveUserMapping(principal, va_start, page_count_u64, .linear_region, prot.write)) return false;
 
-    page_index = 0;
-    while (page_index < paddrs.len) : (page_index += 1) {
+    // No fallible operation remains: do not reallocate PTs or publish batches.
+    for (0..count) |page_index| {
         const va = va_start + @as(u64, @intCast(page_index)) * 4096;
-        const index = userPageIndexForVaWithLowPageZero(h, va, allow_low_page_zero) orelse return false;
-        const pt_slot = ensureUserPtSlotForPd(space, index.pml4, index.pdp, index.pd) orelse return false;
-        const pt_page: *[512]u64 = space.ptPage(pt_slot);
-        pt_page[index.pt] = paddrs[page_index] | pteFlagsForPhysicalPolicy(h, paddrs[page_index], prot, device_cache).?;
+        const index = userPageIndexForVaWithLowPageZero(h, va, allow_low_page_zero).?;
+        const pt_slot = findUserPtSlotForPd(space, index.pml4, index.pdp, index.pd).?;
+        const paddr = pageAt(context, page_index).?;
+        space.ptPage(pt_slot)[index.pt] = paddr | pteFlagsForPhysicalPolicy(h, paddr, prot, device_cache).?;
     }
-
     return true;
 }
+
+/// A borrowed view of a VMA's initial PFNs, not a VM policy or ownership layer.
+/// K + the target VM transaction keep the VMA, backing and attributes stable.
+pub const InitialVmaPages = struct {
+    state: *const kernel.KernelState,
+    principal: kernel.PrincipalId,
+    base: u64,
+    prot: kernel.MapProt,
+
+    pub fn at(self: @This(), index: usize) ?u64 {
+        const mapping = self.state.nativeVmaInitialMapping(self.principal, self.base + @as(u64, @intCast(index)) * 4096) orelse return null;
+        // The mapper accepts one protection for the whole sequence. Refuse a
+        // heterogeneous source rather than silently applying the first page's.
+        if (!std.meta.eql(mapping.prot, self.prot)) return null;
+        return mapping.paddr;
+    }
+};
 
 pub fn mapTrustedUserPaddrsWithProt(
     principal: kernel.PrincipalId,
@@ -1657,17 +1665,20 @@ pub const UserPtUsage = struct {
 // Failure-only diagnostic. The caller holds the address-space lock; do not
 // scan these tables on successful faults or mistake reserved empty PTs for
 // live mappings. Supervisor-only helper tables are not reclaimable by count.
+// Borrow each PT under that lock: a full aligned table copy would inflate the
+// fault failure path's IST frame even when the diagnostic is not executed.
 pub fn userPtUsage(space: *const UserAddressSpace) UserPtUsage {
     const h = hooks orelse return .{};
     var usage = UserPtUsage{};
-    for (0..space.ptCapacity()) |slot| {
+    var pt_it = space.pt_store.iterator();
+    while (pt_it.next()) |slot| {
         const pd = space.ptPdIndex(slot).*;
         if (pd == UserAddressSpace.no_pd_index) continue;
         usage.used += 1;
         var user: usize = 0;
         var supervisor: usize = 0;
         var nonpresent: usize = 0;
-        for (space.ptPage(slot).*) |entry| {
+        for (space.ptPage(slot)) |entry| {
             if (entry & h.page_present == 0) {
                 if (entry != 0) nonpresent += 1;
                 continue;
@@ -1984,6 +1995,7 @@ pub fn unmapUserLinearRegion(
     const size_u64: u64 = @intCast(size_bytes);
     _ = userRangeEndVa(h, va_start, size_u64) orelse return false;
 
+    if (!prepareReservationSlots(space, reservationSplitSlotsRequired(space, va_start, size_u64))) return false;
     var offset: u64 = 0;
     while (offset < size_u64) : (offset += 4096) {
         const va = va_start + offset;
@@ -2004,7 +2016,7 @@ pub fn unmapUserLinearRegion(
         pt_page[index.pt] = 0;
     }
     if (!releaseUserMapping(principal, va_start, size_u64 / 4096)) return false;
-    retireEmptyUserPtRange(h, space, principal, va_start, size_bytes, true, false);
+    retireEmptyUserPtRange(h, space, principal, va_start, size_bytes, true);
 
     return true;
 }
@@ -2017,24 +2029,23 @@ pub fn unmapPresentUserLinearRegionSplitSlotsRequired(
     va_start: u64,
     size_bytes: usize,
 ) ?usize {
-    return unmapPresentSplitSlotsWithPolicy(principal, va_start, size_bytes, false);
+    return unmapPresentSplitSlotsCommon(principal, va_start, size_bytes);
 }
 
 /// Caller holds the VM transaction and has validated this entire source span
-/// lies in its native VMA. Supervisor seed PTEs in lazy holes remain untouched.
+/// lies in its native VMA. Absent lazy holes require no leaf mutation.
 pub fn unmapPresentVmaSourceSplitSlotsRequired(
     principal: kernel.PrincipalId,
     va_start: u64,
     size_bytes: usize,
 ) ?usize {
-    return unmapPresentSplitSlotsWithPolicy(principal, va_start, size_bytes, true);
+    return unmapPresentSplitSlotsCommon(principal, va_start, size_bytes);
 }
 
-fn unmapPresentSplitSlotsWithPolicy(
+fn unmapPresentSplitSlotsCommon(
     principal: kernel.PrincipalId,
     va_start: u64,
     size_bytes: usize,
-    native_vma_source: bool,
 ) ?usize {
     if (!lockAddressSpace(principal)) return null;
     defer unlockAddressSpace(principal);
@@ -2044,21 +2055,31 @@ fn unmapPresentSplitSlotsWithPolicy(
     const size_u64: u64 = @intCast(size_bytes);
     _ = userRangeEndVa(h, va_start, size_u64) orelse return null;
 
-    for (0..ptSlotScanLimit(space)) |slot| {
-        const span = ptSlotIntersection(space, slot, va_start, va_start + size_u64) orelse continue;
-        for (space.ptPage(slot).*[span.first..span.last]) |entry| {
-            if ((entry & h.page_present) != 0 and (entry & h.page_user) == 0 and !native_vma_source) return null;
-        }
-    }
+    if (!userLeavesOnly(h, space, va_start, va_start + size_u64)) return null;
 
     return reservationSplitSlotsRequired(space, va_start, size_u64);
+}
+
+fn userLeavesOnly(h: Hooks, space: *const UserAddressSpace, start: u64, end: u64) bool {
+    // Empty user trees never inherit supervisor leaves. Refuse corruption
+    // before mutation rather than silently retaining or reclaiming an alias.
+    var it = space.pt_store.iterator();
+    while (it.next()) |slot| {
+        const span = ptSlotIntersection(space, slot, start, end) orelse continue;
+        for (space.ptPage(slot).*[span.first..span.last]) |entry| {
+            if (entry & h.page_present != 0 and entry & h.page_user == 0) return false;
+        }
+    }
+    return true;
 }
 
 fn reservationSplitSlotsRequired(space: *const UserAddressSpace, va_start: u64, size_u64: u64) usize {
     const release_start_page = va_start >> 12;
     const release_end_page = release_start_page + size_u64 / 4096;
     var needs_split_slot = false;
-    for (&space.reservations) |reservation| {
+    var records = space.reservations.iterator();
+    while (records.next()) |record| {
+        const reservation = record.value;
         if (!reservation.active) continue;
         const record_start_page = reservation.base_va >> 12;
         const record_end_page = record_start_page + reservation.page_count;
@@ -2072,9 +2093,8 @@ fn reservationSplitSlotsRequired(space: *const UserAddressSpace, va_start: u64, 
 }
 
 /// The caller holds the VM transaction, MAP_INTO authority, and has rejected
-/// pinned target ranges. Unlike a generic unmap, a remote range may contain
-/// arbitrary lazy holes backed by supervisor seed PTEs. Those are not user
-/// mappings to remove. This preflight and its commit must be used together.
+/// pinned target ranges. This preflight and its commit inspect only allocated
+/// tables, so large absent ranges do not require a page-by-page walk.
 pub fn unmapPresentRemoteUserRegionSplitSlotsRequired(
     principal: kernel.PrincipalId,
     va_start: u64,
@@ -2086,6 +2106,7 @@ pub fn unmapPresentRemoteUserRegionSplitSlotsRequired(
     const space = getUserSpace(principal) orelse return null;
     if (size_bytes == 0 or ((va_start | size_bytes) & 0xfff) != 0) return null;
     _ = userRangeEndVa(h, va_start, @intCast(size_bytes)) orelse return null;
+    if (!userLeavesOnly(h, space, va_start, va_start + size_bytes)) return null;
     return reservationSplitSlotsRequired(space, va_start, @intCast(size_bytes));
 }
 
@@ -2104,9 +2125,12 @@ pub fn unmapPresentRemoteUserRegion(
     const space = getUserSpace(principal) orelse return false;
     if (size_bytes == 0 or ((va_start | size_bytes) & 0xfff) != 0) return false;
     _ = userRangeEndVa(h, va_start, @intCast(size_bytes)) orelse return false;
+    if (!userLeavesOnly(h, space, va_start, va_start + size_bytes)) return false;
+    if (!prepareReservationSlots(space, reservationSplitSlotsRequired(space, va_start, @intCast(size_bytes)))) return false;
     const end = va_start + size_bytes;
 
-    for (0..ptSlotScanLimit(space)) |slot| {
+    var pt_it = space.pt_store.iterator();
+    while (pt_it.next()) |slot| {
         const pml4 = space.ptPml4Index(slot).*;
         const pdp = space.ptPdpIndex(slot).*;
         const pd = space.ptPdIndex(slot).*;
@@ -2124,7 +2148,7 @@ pub fn unmapPresentRemoteUserRegion(
         }
     }
     _ = releaseUserMapping(principal, va_start, @as(u64, @intCast(size_bytes)) / 4096);
-    retireEmptyUserPtRange(h, space, principal, va_start, size_bytes, true, false);
+    retireEmptyUserPtRange(h, space, principal, va_start, size_bytes, true);
     return true;
 }
 
@@ -2132,11 +2156,7 @@ pub fn freeUserReservationSlotCount(principal: kernel.PrincipalId) usize {
     if (!lockAddressSpace(principal)) return 0;
     defer unlockAddressSpace(principal);
     const space = getUserSpace(principal) orelse return 0;
-    var count: usize = 0;
-    for (&space.reservations) |reservation| {
-        if (!reservation.active) count += 1;
-    }
-    return count;
+    return space.reservations.preparedFreeCount(std.math.maxInt(usize));
 }
 
 pub fn unmapPresentUserLinearRegion(
@@ -2144,7 +2164,9 @@ pub fn unmapPresentUserLinearRegion(
     va_start: u64,
     size_bytes: usize,
 ) bool {
-    return unmapPresentWithPolicy(principal, va_start, size_bytes, false);
+    const stage_sample = if (comptime @import("../lock_profile.zig").enabled) @import("../lock_profile.zig").stageBegin() else {};
+    defer if (comptime @import("../lock_profile.zig").enabled) @import("../lock_profile.zig").stageEnd(.commit, stage_sample);
+    return unmapPresentCommon(principal, va_start, size_bytes);
 }
 
 /// Only for a source span validated under the native VMA transaction before
@@ -2154,14 +2176,15 @@ pub fn unmapPresentVmaSource(
     va_start: u64,
     size_bytes: usize,
 ) bool {
-    return unmapPresentWithPolicy(principal, va_start, size_bytes, true);
+    const stage_sample = if (comptime @import("../lock_profile.zig").enabled) @import("../lock_profile.zig").stageBegin() else {};
+    defer if (comptime @import("../lock_profile.zig").enabled) @import("../lock_profile.zig").stageEnd(.commit, stage_sample);
+    return unmapPresentCommon(principal, va_start, size_bytes);
 }
 
-fn unmapPresentWithPolicy(
+fn unmapPresentCommon(
     principal: kernel.PrincipalId,
     va_start: u64,
     size_bytes: usize,
-    native_vma_source: bool,
 ) bool {
     if (!lockAddressSpace(principal)) return false;
     defer unlockAddressSpace(principal);
@@ -2173,18 +2196,11 @@ fn unmapPresentWithPolicy(
     const size_u64: u64 = @intCast(size_bytes);
     _ = userRangeEndVa(h, va_start, size_u64) orelse return false;
 
-    // Validate before mutation; arbitrary fixed targets must not remove any
-    // user page if a supervisor seed page occurs later in the range.
-    if (!native_vma_source) {
-        for (0..ptSlotScanLimit(space)) |slot| {
-            const span = ptSlotIntersection(space, slot, va_start, va_start + size_u64) orelse continue;
-            for (space.ptPage(slot).*[span.first..span.last]) |entry| {
-                if ((entry & h.page_present) != 0 and (entry & h.page_user) == 0) return false;
-            }
-        }
-    }
+    if (!prepareReservationSlots(space, reservationSplitSlotsRequired(space, va_start, @intCast(size_bytes)))) return false;
+    if (!userLeavesOnly(h, space, va_start, va_start + size_u64)) return false;
     var leaf_changed = false;
-    for (0..ptSlotScanLimit(space)) |slot| {
+    var pt_it = space.pt_store.iterator();
+    while (pt_it.next()) |slot| {
         const span = ptSlotIntersection(space, slot, va_start, va_start + size_u64) orelse continue;
         for (space.ptPage(slot).*[span.first..span.last]) |*entry| {
             if ((entry.* & (h.page_present | h.page_user)) == (h.page_present | h.page_user)) {
@@ -2195,7 +2211,7 @@ fn unmapPresentWithPolicy(
     }
 
     _ = releaseUserMapping(principal, va_start, size_u64 / 4096);
-    retireEmptyUserPtRange(h, space, principal, va_start, size_bytes, leaf_changed, false);
+    retireEmptyUserPtRange(h, space, principal, va_start, size_bytes, leaf_changed);
 
     return true;
 }
@@ -2224,7 +2240,9 @@ pub fn invalidatePresentUserLinearRegionPtes(
     const size_u64: u64 = @intCast(size_bytes);
     _ = userRangeEndVa(h, va_start, size_u64) orelse return false;
 
-    for (0..ptSlotScanLimit(space)) |slot| {
+    if (!userLeavesOnly(h, space, va_start, va_start + size_u64)) return false;
+    var pt_it = space.pt_store.iterator();
+    while (pt_it.next()) |slot| {
         const span = ptSlotIntersection(space, slot, va_start, va_start + size_u64) orelse continue;
         for (space.ptPage(slot).*[span.first..span.last]) |*entry| {
             if ((entry.* & (h.page_present | h.page_user)) == (h.page_present | h.page_user)) entry.* = 0;
@@ -2356,9 +2374,10 @@ pub fn unmapUserMappedPaddr(principal: kernel.PrincipalId, paddr: u64) usize {
     if ((paddr & 0xFFF) != 0) return 0;
 
     var removed: usize = 0;
-    const slot_limit = ptSlotScanLimit(space);
-    var slot: usize = 0;
-    while (slot < slot_limit) : (slot += 1) {
+    var first: u64 = std.math.maxInt(u64);
+    var end: u64 = 0;
+    var it = space.pt_store.iterator();
+    while (it.next()) |slot| {
         const pd_index_meta = space.ptPdIndex(slot).*;
         const pml4_index_meta = space.ptPml4Index(slot).*;
         const pdp_index_meta = space.ptPdpIndex(slot).*;
@@ -2381,10 +2400,13 @@ pub fn unmapUserMappedPaddr(principal: kernel.PrincipalId, paddr: u64) usize {
                 (@as(u64, @intCast(pd_index)) << 21) |
                 (@as(u64, @intCast(pt_index)) << 12);
             _ = releaseUserMapping(principal, va, 1);
-            h.flush_user_tlb_for_principal_va(principal, va);
+            first = @min(first, va);
+            end = @max(end, va + 4096);
             removed += 1;
         }
     }
+    // The caller owns the physical page until this synchronous ACK returns.
+    if (removed != 0) h.flush_user_tlb_for_principal_range(principal, first, @intCast(end - first));
     return removed;
 }
 
@@ -2392,9 +2414,8 @@ pub fn collectUserMappedPaddrs(principal: kernel.PrincipalId, out_paddrs: []u64)
     const h = hooks orelse return 0;
     const space = getUserSpace(principal) orelse return 0;
     var count: usize = 0;
-    const slot_limit = ptSlotScanLimit(space);
-    var slot: usize = 0;
-    while (slot < slot_limit) : (slot += 1) {
+    var it = space.pt_store.iterator();
+    while (it.next()) |slot| {
         if (space.ptPml4Index(slot).* == UserAddressSpace.no_pd_index) continue;
         if (space.ptPdpIndex(slot).* == UserAddressSpace.no_pd_index) continue;
         if (space.ptPdIndex(slot).* == UserAddressSpace.no_pd_index) continue;
@@ -2449,34 +2470,79 @@ fn ramCacheParentMatches(actual: u64, expected: u64) bool {
 // Index by the already-validated parent PD slot, not by virtual address.
 // This rejects even two descriptors naming the same PT page/key, while the
 // alias visitor can distinguish tracked leaves from unknown PDEs in O(1).
-const RamCacheTrackedPts = std.StaticBitSet(UserAddressSpace.max_dynamic_pd_pages * 512);
+const RamCacheTrackedPts = struct {
+    store: *pt_storage.Store,
+    allocator: pt_storage.Allocator,
+    const bits_per_page = 4096 * 8;
+    fn reset(self: *@This()) void {
+        self.store.resetDetachedContents();
+    }
+    fn set(self: *@This(), key: usize) !void {
+        const page = self.store.ensurePage(key / bits_per_page, self.allocator) orelse return error.OutOfMemory;
+        page[(key % bits_per_page) / 64] |= @as(u64, 1) << @as(u6, @intCast(key % 64));
+    }
+    fn isSet(self: *const @This(), key: usize) bool {
+        const entry = self.store.descriptorConst(key / bits_per_page) orelse return false;
+        const page = entry.page orelse return false;
+        return page[(key % bits_per_page) / 64] & (@as(u64, 1) << @as(u6, @intCast(key % 64))) != 0;
+    }
+};
 
-fn ramCachePtKey(pd_slot: usize, pd: usize) usize {
-    return pd_slot * 512 + pd;
+fn ramCachePtIsTracked(tracked_pts: *const RamCacheTrackedPts, key: usize) bool {
+    return tracked_pts.isSet(key);
 }
 
-fn validateRamCacheSharedPt(entry: u64, shared: ?u64, page_user: u64) !void {
-    // A PDE without a tracked private PT must be exactly the platform's
-    // shared supervisor pointer; an unknown table could hide a RAM alias.
-    const expected = shared orelse return error.Unsupported;
-    if ((entry & ~@as(u64, (1 << 5) | (1 << 6))) !=
-        (expected & ~@as(u64, (1 << 5) | (1 << 6))) or
-        (entry & page_user) != 0) return error.Unsupported;
+test "MMIO overlay RAM tracked PT membership crosses word and parent boundaries" {
+    const PageAllocator = struct {
+        fn allocate(_: *anyopaque, pages: usize) ?pt_storage.MappedExtent {
+            std.debug.assert(pages == 1);
+            const bytes = std.testing.allocator.alignedAlloc(u8, .fromByteUnits(4096), 4096) catch return null;
+            return .{ .allocation = .{ .physical = .fromInt(@intFromPtr(bytes.ptr)), .pages = 1, .region_id = 83 }, .bytes = bytes };
+        }
+        fn release(_: *anyopaque, grant: pt_storage.PhysicalExtent) bool {
+            std.debug.assert(grant.pages == 1 and grant.region_id == 83);
+            const page: pt_storage.PagePointer = @ptrFromInt(grant.physical.toInt());
+            const bytes: []align(4096) u8 = page;
+            std.testing.allocator.free(bytes);
+            return true;
+        }
+    };
+    var dummy: u8 = 0;
+    const allocator = pt_storage.Allocator{ .context = &dummy, .acquire = PageAllocator.allocate, .release = PageAllocator.release };
+    var store = pt_storage.Store{};
+    defer store.freeDetached();
+    var tracked_pts = RamCacheTrackedPts{ .store = &store, .allocator = allocator };
+    const keys = [_]usize{ 0, 63, 64, 511, 512, 32767, 32768, 65536 };
+    for (keys) |key| {
+        try std.testing.expect(!ramCachePtIsTracked(&tracked_pts, key));
+        try tracked_pts.set(key);
+    }
+    for (0..65538) |key| {
+        const expected = std.mem.indexOfScalar(usize, &keys, key) != null;
+        try std.testing.expectEqual(expected, ramCachePtIsTracked(&tracked_pts, key));
+    }
+}
+
+fn ramCachePtKey(pd_slot: usize, pd: usize) !usize {
+    const base = try std.math.mul(usize, pd_slot, 512);
+    return std.math.add(usize, base, pd);
 }
 
 fn validateRamCacheTopology(h: anytype, space: *const UserAddressSpace, comptime shared: type, tracked_pts: *RamCacheTrackedPts) !void {
-    tracked_pts.* = .initEmpty();
-    const pml4_pa = h.kernel_pointer_paddr(@intFromPtr(&space.pml4)) orelse return error.UnknownTopology;
+    // The caller holds all VM transactions. Borrow both tables and their
+    // parallel indices; copying either array is unnecessary under exclusion.
+    tracked_pts.reset();
+    const pml4_pa = tablePaddr(h, &space.pml4) orelse return error.UnknownTopology;
     // CR3 may carry PCID or PWT/PCD in its low bits, but no unknown high bits.
     if ((space.cr3 & h.page_addr_mask) != pml4_pa or
         (space.cr3 & ~(h.page_addr_mask | @as(u64, 4095))) != 0)
         return error.UnknownTopology;
     const flags = h.page_present | h.page_rw | h.page_user;
-    for (space.pml4, 0..) |entry, index| {
+    for (&space.pml4, 0..) |entry, index| {
         if ((entry & h.page_present) == 0) continue;
         if (index < 256) {
             if (findUserPdpSlotForPml4(space, index)) |slot| {
-                const pa = h.kernel_pointer_paddr(@intFromPtr(&space.pdp_pages[slot])) orelse return error.UnknownTopology;
+                const pa = tablePaddr(h, space.pdpPage(slot)) orelse return error.UnknownTopology;
                 if (!ramCacheParentMatches(entry, pa | flags)) return error.UnknownTopology;
                 continue;
             }
@@ -2484,10 +2550,15 @@ fn validateRamCacheTopology(h: anytype, space: *const UserAddressSpace, comptime
         const expected = shared.ramCacheSharedPml4Entry(index) orelse return error.UnknownTopology;
         if (!ramCacheParentMatches(entry, expected)) return error.UnknownTopology;
     }
-    for (&space.pdp_pages, space.pdp_page_pml4_index, 0..) |*pdp, pml4, slot| {
+    var pdp_it = space.pdp_store.iterator();
+    while (pdp_it.next()) |slot| {
+        const descriptor = space.pdp_store.descriptorConst(slot).?;
+        if (descriptor.page == null) continue;
+        const pdp = descriptor.page.?;
+        const pml4 = descriptor.pml4;
         if (pml4 == UserAddressSpace.no_pd_index) continue;
         if (pml4 >= 256 or findUserPdpSlotForPml4(space, pml4) != slot) return error.UnknownTopology;
-        const pa = h.kernel_pointer_paddr(@intFromPtr(pdp)) orelse return error.UnknownTopology;
+        const pa = tablePaddr(h, pdp) orelse return error.UnknownTopology;
         if (!ramCacheParentMatches(space.pml4[pml4], pa | flags)) return error.UnknownTopology;
         for (pdp, 0..) |entry, index| {
             if ((entry & h.page_present) == 0) continue;
@@ -2495,20 +2566,27 @@ fn validateRamCacheTopology(h: anytype, space: *const UserAddressSpace, comptime
             // mapping cannot be omitted merely because its metadata is absent.
             if ((entry & h.page_ps) != 0) return error.UnknownTopology;
             const expected = if (findUserPdSlotForPdp(space, pml4, index)) |pd_slot| blk: {
-                const pd_pa = h.kernel_pointer_paddr(@intFromPtr(&space.pd_pages[pd_slot])) orelse return error.UnknownTopology;
+                const pd_pa = tablePaddr(h, space.pdPage(pd_slot)) orelse return error.UnknownTopology;
                 break :blk pd_pa | flags;
-            } else shared.ramCacheSharedPdpEntry(pml4, index) orelse return error.UnknownTopology;
+            } else return error.UnknownTopology;
             if (!ramCacheParentMatches(entry, expected)) return error.UnknownTopology;
         }
     }
-    for (&space.pd_pages, space.pd_page_pml4_index, space.pd_page_pdp_index, 0..) |*pd, pml4, pdp, slot| {
+    var pd_it = space.pd_store.iterator();
+    while (pd_it.next()) |slot| {
+        const descriptor = space.pd_store.descriptorConst(slot).?;
+        if (descriptor.page == null) continue;
+        const pd = descriptor.page.?;
+        const pml4 = descriptor.pml4;
+        const pdp = descriptor.pdp;
         if (pml4 == UserAddressSpace.no_pd_index and pdp == UserAddressSpace.no_pd_index) continue;
         if (pml4 >= 256 or pdp >= 512 or findUserPdSlotForPdp(space, pml4, pdp) != slot) return error.UnknownTopology;
         const parent = findUserPdpSlotForPml4(space, pml4) orelse return error.UnknownTopology;
-        const pa = h.kernel_pointer_paddr(@intFromPtr(pd)) orelse return error.UnknownTopology;
-        if (!ramCacheParentMatches(space.pdp_pages[parent][pdp], pa | flags)) return error.UnknownTopology;
+        const pa = tablePaddr(h, pd) orelse return error.UnknownTopology;
+        if (!ramCacheParentMatches(space.pdpPage(parent).*[pdp], pa | flags)) return error.UnknownTopology;
     }
-    for (0..space.ptCapacity()) |slot| {
+    var pt_it = space.pt_store.iterator();
+    while (pt_it.next()) |slot| {
         const pml4 = space.ptPml4Index(slot).*;
         const pdp = space.ptPdpIndex(slot).*;
         const pd = space.ptPdIndex(slot).*;
@@ -2516,17 +2594,32 @@ fn validateRamCacheTopology(h: anytype, space: *const UserAddressSpace, comptime
         if (pml4 >= 256 or pdp >= 512 or pd >= 512)
             return error.UnknownTopology;
         const parent = findUserPdSlotForPdp(space, pml4, pdp) orelse return error.UnknownTopology;
-        const key = ramCachePtKey(parent, pd);
-        if (tracked_pts.isSet(key)) return error.UnknownTopology;
-        tracked_pts.set(key);
-        const pa = h.kernel_pointer_paddr(@intFromPtr(space.ptPage(slot))) orelse return error.UnknownTopology;
-        // Split supervisor identity PTs retain both RO/RW and NX. Requiring
-        // RW here would accept their first split but reject every later edit.
-        const entry = space.pd_pages[parent][pd];
-        const expected = pa | h.page_present |
-            (if ((entry & h.page_user) == 0) entry & (h.page_rw | h.page_nx) else h.page_rw | h.page_user);
+        const key = try ramCachePtKey(parent, pd);
+        if (ramCachePtIsTracked(tracked_pts, key)) return error.UnknownTopology;
+        try tracked_pts.set(key);
+        const pa = tablePaddr(h, space.ptPage(slot)) orelse return error.UnknownTopology;
+        // Every low branch belongs to this AS; supervisor tables are shared
+        // exclusively through PML4[511], never grafted into user parents.
+        const entry = space.pdPage(parent).*[pd];
+        const expected = pa | flags;
         if (!ramCacheParentMatches(entry, expected)) return error.UnknownTopology;
     }
+}
+
+test "VM Hooks reject runtime replacement and permit serial fixture replacement" {
+    // No runtime/parallel borrower exists in this host-only test. Undefined
+    // callbacks are intentionally never invoked: this tests install policy.
+    const previous = hooks;
+    defer hooks = previous;
+    hooks = null;
+    var configuration: Hooks = undefined;
+    configuration.four_gib = 4;
+    try configureHooks(configuration, false);
+    configuration.four_gib = 8;
+    try std.testing.expectError(error.AlreadyInitialized, configureHooks(configuration, false));
+    try std.testing.expectEqual(@as(u64, 4), hooks.?.four_gib);
+    try configureHooks(configuration, true);
+    try std.testing.expectEqual(@as(u64, 8), hooks.?.four_gib);
 }
 
 test "MMIO overlay RAM topology rejects hidden roots and detached tracked parents" {
@@ -2537,9 +2630,9 @@ test "MMIO overlay RAM topology rejects hidden roots and detached tracked parent
         page_user: u64 = 4,
         page_ps: u64 = 128,
         page_nx: u64 = @as(u64, 1) << 63,
-        kernel_pointer_paddr: *const fn (usize) ?u64 = pointer,
-        fn pointer(address: usize) ?u64 {
-            return address;
+        kernel_pointer_paddr: *const fn (addresses.KernelVirtualAddress) ?addresses.PhysicalAddress = pointer,
+        fn pointer(address: addresses.KernelVirtualAddress) ?addresses.PhysicalAddress {
+            return .fromInt(address.toInt());
         }
         pub fn ramCacheSharedPml4Entry(index: usize) ?u64 {
             return if (index == 511) 0x100003 else null;
@@ -2548,31 +2641,55 @@ test "MMIO overlay RAM topology rejects hidden roots and detached tracked parent
             return if (pml4 == 0 and index == 1) 0x200003 else null;
         }
     };
+    const PageAllocator = struct {
+        fn allocate(_: *anyopaque, pages: usize) ?pt_storage.MappedExtent {
+            std.debug.assert(pages == 1);
+            const bytes = std.testing.allocator.alignedAlloc(u8, .fromByteUnits(4096), 4096) catch return null;
+            return .{ .allocation = .{ .physical = .fromInt(@intFromPtr(bytes.ptr)), .pages = 1, .region_id = 83 }, .bytes = bytes };
+        }
+        fn release(_: *anyopaque, grant: pt_storage.PhysicalExtent) bool {
+            std.debug.assert(grant.pages == 1 and grant.region_id == 83);
+            const page: pt_storage.PagePointer = @ptrFromInt(grant.physical.toInt());
+            const bytes: []align(4096) u8 = page;
+            std.testing.allocator.free(bytes);
+            return true;
+        }
+    };
+    var dummy: u8 = 0;
+    const allocator = pt_storage.Allocator{ .context = &dummy, .acquire = PageAllocator.allocate, .release = PageAllocator.release };
     const space = try std.testing.allocator.create(UserAddressSpace);
     defer std.testing.allocator.destroy(space);
     space.* = .{};
     space.cr3 = @intFromPtr(&space.pml4) | 7;
     space.pml4[511] = 0x100023;
-    space.pdp_page_pml4_index[0] = 0;
-    space.pml4[0] = @intFromPtr(&space.pdp_pages[0]) | 7;
-    space.pdp_pages[0][1] = 0x200023;
-    var tracked_pts = RamCacheTrackedPts.initEmpty();
+    _ = space.pdp_store.ensurePage(0, allocator) orelse return error.OutOfMemory;
+    defer space.pdp_store.freeDetached();
+    defer space.pd_store.freeDetached();
+    space.pdpPml4Index(0).* = 0;
+    space.pml4[0] = @intFromPtr(space.pdpPage(0)) | 7;
+    space.pdpPage(0).*[1] = 0;
+    var tracked_pts = RamCacheTrackedPts{ .store = &space.scratch_store, .allocator = allocator };
+    defer space.scratch_store.freeDetached();
     try validateRamCacheTopology(Fake{}, space, Fake, &tracked_pts);
+    space.pdpPage(0).*[1] = 0x200023;
+    try std.testing.expectError(error.UnknownTopology, validateRamCacheTopology(Fake{}, space, Fake, &tracked_pts));
+    space.pdpPage(0).*[1] = 0;
     space.pml4[510] = 0x300003;
     try std.testing.expectError(error.UnknownTopology, validateRamCacheTopology(Fake{}, space, Fake, &tracked_pts));
     space.pml4[510] = 0;
     space.pml4[511] ^= 4;
     try std.testing.expectError(error.UnknownTopology, validateRamCacheTopology(Fake{}, space, Fake, &tracked_pts));
     space.pml4[511] ^= 4;
-    space.pdp_pages[0][2] = 0x400003;
+    space.pdpPage(0).*[2] = 0x400003;
     try std.testing.expectError(error.UnknownTopology, validateRamCacheTopology(Fake{}, space, Fake, &tracked_pts));
-    space.pd_page_pml4_index[0] = 0;
-    space.pd_page_pdp_index[0] = 2;
-    space.pdp_pages[0][2] = @intFromPtr(&space.pd_pages[0]) | 7;
+    _ = space.pd_store.ensurePage(0, allocator) orelse return error.OutOfMemory;
+    space.pdPml4Index(0).* = 0;
+    space.pdPdpIndex(0).* = 2;
+    space.pdpPage(0).*[2] = @intFromPtr(space.pdPage(0)) | 7;
     try validateRamCacheTopology(Fake{}, space, Fake, &tracked_pts);
-    space.pdp_pages[0][2] = 0;
+    space.pdpPage(0).*[2] = 0;
     try std.testing.expectError(error.UnknownTopology, validateRamCacheTopology(Fake{}, space, Fake, &tracked_pts));
-    space.pdp_pages[0][2] = @intFromPtr(&space.pd_pages[0]) | 7;
+    space.pdpPage(0).*[2] = @intFromPtr(space.pdPage(0)) | 7;
     space.cr3 ^= 4096;
     try std.testing.expectError(error.UnknownTopology, validateRamCacheTopology(Fake{}, space, Fake, &tracked_pts));
 }
@@ -2585,9 +2702,9 @@ test "RAM cache PT index proves many parents and rejects duplicate descriptors" 
         page_user: u64 = 4,
         page_ps: u64 = 128,
         page_nx: u64 = @as(u64, 1) << 63,
-        kernel_pointer_paddr: *const fn (usize) ?u64 = pointer,
-        fn pointer(address: usize) ?u64 {
-            return address;
+        kernel_pointer_paddr: *const fn (addresses.KernelVirtualAddress) ?addresses.PhysicalAddress = pointer,
+        fn pointer(address: addresses.KernelVirtualAddress) ?addresses.PhysicalAddress {
+            return .fromInt(address.toInt());
         }
         pub fn ramCacheSharedPml4Entry(index: usize) ?u64 {
             return if (index == 511) 0x100003 else null;
@@ -2597,11 +2714,14 @@ test "RAM cache PT index proves many parents and rejects duplicate descriptors" 
         }
     };
     const PageAllocator = struct {
-        fn allocate(_: *anyopaque) ?pt_storage.PagePointer {
+        fn allocate(_: *anyopaque, pages: usize) ?pt_storage.MappedExtent {
+            std.debug.assert(pages == 1);
             const bytes = std.testing.allocator.alignedAlloc(u8, .fromByteUnits(4096), 4096) catch return null;
-            return @ptrCast(bytes.ptr);
+            return .{ .allocation = .{ .physical = .fromInt(@intFromPtr(bytes.ptr)), .pages = 1, .region_id = 83 }, .bytes = bytes };
         }
-        fn release(_: *anyopaque, page: pt_storage.PagePointer) bool {
+        fn release(_: *anyopaque, grant: pt_storage.PhysicalExtent) bool {
+            std.debug.assert(grant.pages == 1 and grant.region_id == 83);
+            const page: pt_storage.PagePointer = @ptrFromInt(grant.physical.toInt());
             const bytes: []align(4096) u8 = page;
             std.testing.allocator.free(bytes);
             return true;
@@ -2613,18 +2733,22 @@ test "RAM cache PT index proves many parents and rejects duplicate descriptors" 
     var dummy: u8 = 0;
     const allocator = pt_storage.Allocator{
         .context = &dummy,
-        .allocate = PageAllocator.allocate,
+        .acquire = PageAllocator.allocate,
         .release = PageAllocator.release,
     };
-    defer space.pt_store.freeDetached(allocator);
+    defer space.pt_store.freeDetached();
     space.cr3 = @intFromPtr(&space.pml4);
     space.pml4[511] = 0x100003;
-    space.pdp_page_pml4_index[0] = 0;
-    space.pml4[0] = @intFromPtr(&space.pdp_pages[0]) | 7;
+    _ = space.pdp_store.ensurePage(0, allocator) orelse return error.OutOfMemory;
+    defer space.pdp_store.freeDetached();
+    defer space.pd_store.freeDetached();
+    space.pdpPml4Index(0).* = 0;
+    space.pml4[0] = @intFromPtr(space.pdpPage(0)) | 7;
     for (0..2) |pd_slot| {
-        space.pd_page_pml4_index[pd_slot] = 0;
-        space.pd_page_pdp_index[pd_slot] = @intCast(pd_slot + 2);
-        space.pdp_pages[0][pd_slot + 2] = @intFromPtr(&space.pd_pages[pd_slot]) | 7;
+        _ = space.pd_store.ensurePage(pd_slot, allocator) orelse return error.OutOfMemory;
+        space.pdPml4Index(pd_slot).* = 0;
+        space.pdPdpIndex(pd_slot).* = @intCast(pd_slot + 2);
+        space.pdpPage(0).*[pd_slot + 2] = @intFromPtr(space.pdPage(pd_slot)) | 7;
     }
     // Two full descriptor banks exercise the former descriptor-by-descriptor
     // linear search, including distinct parent PD slots.
@@ -2636,13 +2760,14 @@ test "RAM cache PT index proves many parents and rejects duplicate descriptors" 
         descriptor.pml4 = 0;
         descriptor.pdp = @intCast(pd_slot + 2);
         descriptor.pd = @intCast(pd);
-        space.pd_pages[pd_slot][pd] = @intFromPtr(page) | 7;
+        space.pdPage(pd_slot).*[pd] = @intFromPtr(page) | 7;
     }
-    var tracked_pts = RamCacheTrackedPts.initEmpty();
+    var tracked_pts = RamCacheTrackedPts{ .store = &space.scratch_store, .allocator = allocator };
+    defer space.scratch_store.freeDetached();
     try validateRamCacheTopology(Fake{}, space, Fake, &tracked_pts);
-    try std.testing.expect(tracked_pts.isSet(ramCachePtKey(0, 0)));
-    try std.testing.expect(tracked_pts.isSet(ramCachePtKey(1, 63)));
-    try std.testing.expect(!tracked_pts.isSet(ramCachePtKey(0, 64)));
+    try std.testing.expect(tracked_pts.isSet(try ramCachePtKey(0, 0)));
+    try std.testing.expect(tracked_pts.isSet(try ramCachePtKey(1, 63)));
+    try std.testing.expect(!tracked_pts.isSet(try ramCachePtKey(0, 64)));
 
     const duplicate_page = space.pt_store.ensurePage(128, allocator) orelse return error.OutOfMemory;
     const duplicate = space.pt_store.descriptor(128).?;
@@ -2660,15 +2785,10 @@ test "RAM cache PT index proves many parents and rejects duplicate descriptors" 
     duplicate.pdp = UserAddressSpace.no_pd_index;
     duplicate.pd = UserAddressSpace.no_pd_index;
 
-    space.pd_pages[0][0] ^= 4;
+    space.pdPage(0).*[0] ^= 2; // User PDE must retain RW; supervisor PDEs are forbidden.
     try std.testing.expectError(error.UnknownTopology, validateRamCacheTopology(Fake{}, space, Fake, &tracked_pts));
-    space.pd_pages[0][0] ^= 4;
+    space.pdPage(0).*[0] ^= 2; // User PDE must retain RW; supervisor PDEs are forbidden.
     try validateRamCacheTopology(Fake{}, space, Fake, &tracked_pts);
-
-    try validateRamCacheSharedPt(0x300003, 0x300003, 4);
-    try std.testing.expectError(error.Unsupported, validateRamCacheSharedPt(0x300003, null, 4));
-    try std.testing.expectError(error.Unsupported, validateRamCacheSharedPt(0x300007, 0x300003, 4));
-    try std.testing.expectError(error.Unsupported, validateRamCacheSharedPt(0x301003, 0x300003, 4));
 }
 
 fn sortedPagesIntersect(pages: []const u64, base_pa: u64, bytes: u64) bool {
@@ -2684,129 +2804,48 @@ pub fn visitRamCacheProcessAliases(pages: []const u64, context: anytype, comptim
     const paging = @import("ram_cache_paging.zig");
     const platform = @import("../arch/x86_64/platform.zig");
     try paging.validatePages(pages, h.physical_map_limit);
-    var tracked_pts = RamCacheTrackedPts.initEmpty();
     for (0..h.user_spaces.capacity()) |space_index| {
         const space = h.user_spaces.get(space_index) orelse continue;
         if (space.cr3 == 0) continue;
+        var tracked_pts = RamCacheTrackedPts{ .store = &space.scratch_store, .allocator = h.pt_allocator orelse return error.OutOfMemory };
+        defer space.scratch_store.freeDetached();
         try validateRamCacheTopology(h, space, platform, &tracked_pts);
-        for (&space.pdp_pages, space.pdp_page_pml4_index) |*pdp, pml4| {
-            if (pml4 >= 256) continue;
-            for (pdp) |entry| {
-                if ((entry & (h.page_present | h.page_ps)) == (h.page_present | h.page_ps) and
-                    paging.pagesIntersect(pages, entry & h.page_addr_mask & ~@as(u64, 0x3fff_ffff), 1 << 30))
-                    return error.LargeAlias;
-            }
-        }
-        for (&space.pd_pages, space.pd_page_pml4_index, space.pd_page_pdp_index, 0..) |*pd, pml4, pdp, pd_slot| {
+        var pd_it = space.pd_store.iterator();
+        while (pd_it.next()) |pd_slot| {
+            const descriptor = space.pd_store.descriptorConst(pd_slot).?;
+            if (descriptor.page == null) continue;
+            const pd = descriptor.page.?;
+            const pml4 = descriptor.pml4;
+            const pdp = descriptor.pdp;
             if (pml4 >= 256 or pdp >= 512) continue;
             for (pd, 0..) |*directory, index| {
                 const entry = @atomicLoad(u64, directory, .acquire);
                 if ((entry & h.page_present) == 0) continue;
-                const va = (@as(u64, pml4) << 39) | (@as(u64, pdp) << 30) | (@as(u64, @intCast(index)) << 21);
-                if ((entry & h.page_ps) != 0) {
-                    const physical = entry & h.page_addr_mask & ~@as(u64, 0x1f_ffff);
-                    if (!paging.pagesIntersect(pages, physical, 1 << 21)) continue;
-                    if ((entry & h.page_user) != 0) return error.LargeAlias;
-                    if (physical != va) return error.Unsupported;
-                    try paging.IdentitySplit.validateSource(entry, va);
-                    try visit(context, paging.AliasSource{ .identity = .{
-                        .directory = directory,
-                        .base = va,
-                        .private_owner = .{ .space_index = space_index, .pml4 = pml4, .pdp = pdp, .pd = @intCast(index) },
-                    } });
-                } else if (!tracked_pts.isSet(ramCachePtKey(pd_slot, index))) {
-                    try validateRamCacheSharedPt(entry, platform.kernelIdentityPdEntry(va), h.page_user);
-                }
+                // User trees contain only tracked 4 KiB user leaves. A
+                // supervisor or large entry here is corruption, not a seed.
+                if (entry & h.page_ps != 0 or
+                    !ramCachePtIsTracked(&tracked_pts, try ramCachePtKey(pd_slot, index)))
+                    return error.UnknownTopology;
             }
         }
-        for (0..ptSlotScanLimit(space)) |slot| {
+        var pt_it = space.pt_store.iterator();
+        while (pt_it.next()) |slot| {
             const pml4 = space.ptPml4Index(slot).*;
             const pdp = space.ptPdpIndex(slot).*;
             const pd = space.ptPdIndex(slot).*;
             if (pml4 >= 256 or pdp >= 512 or pd >= 512) continue;
-            for (space.ptPage(slot), 0..) |*leaf, pt| {
+            for (space.ptPage(slot)) |*leaf| {
                 const entry = @atomicLoad(u64, leaf, .acquire);
                 if ((entry & h.page_present) == 0) continue;
                 const pa = entry & h.page_addr_mask;
                 if (!paging.pagesIntersect(pages, pa, 4096)) continue;
                 if ((entry & (1 << 8)) != 0) return error.GlobalAlias;
-                if ((entry & h.page_user) != 0) {
-                    if ((entry & h.page_nx) == 0) return error.ExecutableAlias;
-                } else {
-                    const va = (@as(u64, pml4) << 39) | (@as(u64, pdp) << 30) |
-                        (@as(u64, pd) << 21) | (@as(u64, @intCast(pt)) << 12);
-                    if (va != pa) return error.Unsupported;
-                }
+                if (entry & h.page_user == 0) return error.UnknownTopology;
+                if (entry & h.page_nx == 0) return error.ExecutableAlias;
                 try visit(context, paging.AliasSource{ .leaf = leaf });
             }
         }
     }
-}
-
-pub const RamCachePrivateSplit = struct {
-    split: @import("ram_cache_paging.zig").IdentitySplit,
-    space_index: usize,
-    slot: usize,
-    pml4: u16,
-    pdp: u16,
-    pd: u16,
-    published: bool = false,
-    released: bool = false,
-
-    pub fn publish(self: *RamCachePrivateSplit) void {
-        const h = hooks orelse unreachable;
-        const space = h.user_spaces.get(self.space_index) orelse unreachable;
-        std.debug.assert(!self.published and !self.released and space.ptPdIndex(self.slot).* == 512 + self.pd);
-        self.split.publishEquivalent();
-        space.ptPdIndex(self.slot).* = self.pd;
-        const next = self.slot + 1;
-        if (next > space.pt_page_used_len) space.pt_page_used_len = @intCast(next);
-        self.published = true;
-    }
-
-    pub fn releaseReservation(self: *RamCachePrivateSplit) void {
-        // Once linked, normal process PT teardown owns the page. Keeping it
-        // as transaction scratch would leave a dangling PDE after commit.
-        if (self.published or self.released) return;
-        const h = hooks orelse unreachable;
-        const space = h.user_spaces.get(self.space_index) orelse unreachable;
-        space.pt_store.releasePageDetached(self.slot, h.pt_allocator orelse unreachable);
-        self.released = true;
-    }
-};
-
-/// Reserve a process-owned split without modifying its live PDE. A temporary
-/// non-architectural PD index prevents another reservation from reusing this
-/// descriptor. All VM locks remain held until every reservation is published
-/// or released, so ordinary lookup/teardown never observes that marker.
-pub fn reserveRamCachePrivateSplit(source: @import("ram_cache_paging.zig").AliasSource) !RamCachePrivateSplit {
-    const h = hooks orelse return error.Invalid;
-    const identity = switch (source) {
-        .identity => |value| value,
-        else => return error.Invalid,
-    };
-    const owner = identity.private_owner orelse return error.Invalid;
-    if (owner.pml4 >= 256 or owner.pdp >= 512 or owner.pd >= 512) return error.Invalid;
-    const space = h.user_spaces.get(owner.space_index) orelse return error.Invalid;
-    if (space.cr3 == 0) return error.Invalid;
-    const pd_slot = findUserPdSlotForPdp(space, owner.pml4, owner.pdp) orelse return error.Invalid;
-    if (&space.pd_pages[pd_slot][owner.pd] != identity.directory) return error.Invalid;
-    for (0..space.ptCapacity()) |slot| {
-        if (space.ptPml4Index(slot).* == owner.pml4 and space.ptPdpIndex(slot).* == owner.pdp and
-            (space.ptPdIndex(slot).* == owner.pd or space.ptPdIndex(slot).* == 512 + owner.pd))
-            return error.Invalid;
-    }
-    const slot = space.firstFreePtSlot() orelse space.ptCapacity();
-    const allocator = h.pt_allocator orelse return error.Invalid;
-    const page = space.pt_store.ensurePage(slot, allocator) orelse return error.OutOfMemory;
-    errdefer space.pt_store.releasePageDetached(slot, allocator);
-    const pa = h.kernel_pointer_paddr(@intFromPtr(page)) orelse return error.Invalid;
-    if (pa >= h.physical_map_limit) return error.Invalid;
-    const split = try @import("ram_cache_paging.zig").IdentitySplit.prepare(identity.directory, identity.base, page, pa);
-    space.ptPml4Index(slot).* = owner.pml4;
-    space.ptPdpIndex(slot).* = owner.pdp;
-    space.ptPdIndex(slot).* = 512 + owner.pd;
-    return .{ .split = split, .space_index = owner.space_index, .slot = slot, .pml4 = owner.pml4, .pdp = owner.pdp, .pd = owner.pd };
 }
 
 pub const RamCacheKernelSplit = struct {
@@ -2818,7 +2857,7 @@ pub const RamCacheKernelSplit = struct {
     pub fn publish(self: *RamCacheKernelSplit) void {
         std.debug.assert(!self.published and !self.released);
         const descriptor = kernel_ram_split_store.descriptor(self.slot).?;
-        std.debug.assert(descriptor.pd >= 512 and descriptor.pd < 1024);
+        std.debug.assert((descriptor.pd >= 512 and descriptor.pd < 1024) or descriptor.pd == 1536);
         descriptor.pd -= 512;
         self.split.publishEquivalent();
         self.published = true;
@@ -2826,41 +2865,47 @@ pub const RamCacheKernelSplit = struct {
 
     pub fn releaseReservation(self: *RamCacheKernelSplit) void {
         if (self.published or self.released) return;
-        kernel_ram_split_store.releasePageDetached(self.slot, (hooks orelse unreachable).pt_allocator orelse unreachable);
+        kernel_ram_split_store.releasePageDetached(self.slot);
+        kernel_ram_split_store.reclaimEmptyBanks();
         self.released = true;
     }
 };
 
-/// Kernel identity splits persist with the boot page tables, unlike private
-/// process splits. Use dynamically allocated PT pages, not the legacy MMIO
-/// split pool, so the amount of cacheable RAM is not capped by that pool.
+/// Direct-map split pages persist with the kernel root. Their ownership is
+/// recorded in the same dynamic PT store used by the cache transaction.
 pub fn reserveRamCacheKernelSplit(source: @import("ram_cache_paging.zig").AliasSource) !RamCacheKernelSplit {
     const h = hooks orelse return error.Invalid;
     const identity = switch (source) {
         .identity => |value| value,
         else => return error.Invalid,
     };
-    if (identity.private_owner != null) return error.Invalid;
     const paging = @import("ram_cache_paging.zig");
-    try paging.IdentitySplit.validateSource(@atomicLoad(u64, identity.directory, .acquire), identity.base);
+    const direct = @import("../arch/x86_64/direct_map.zig");
+    const va = identity.alias_va orelse return error.Invalid;
+    if (identity.base >= direct.aperture_bytes or va != direct.base + identity.base) return error.Invalid;
+    try paging.IdentitySplit.validateSourceSized(@atomicLoad(u64, identity.directory, .acquire), identity.base, identity.size);
     const allocator = h.pt_allocator orelse return error.Invalid;
-    const pml4: u16 = @intCast((identity.base >> 39) & 511);
-    const pdp: u16 = @intCast((identity.base >> 30) & 511);
-    const pd: u16 = @intCast((identity.base >> 21) & 511);
-    if (identity.base >> 48 != 0) return error.Invalid;
-    var slot = kernel_ram_split_store.capacity();
-    for (0..kernel_ram_split_store.capacity()) |index| {
+    const pml4: u16 = @intCast((va >> 39) & 511);
+    const pdp: u16 = @intCast((va >> 30) & 511);
+    // pd=1024 owns a 1-GiB split's PD; pd=0..511 owns a 2-MiB split's PT.
+    // Adding 512 denotes an unpublished reservation for either level. This
+    // separates the two hardware levels without a second PT store.
+    const pd: u16 = if (identity.size == .huge) 1024 else @intCast((va >> 21) & 511);
+    const slot = kernel_ram_split_store.firstFreeSlot() orelse return error.OutOfMemory;
+    var split_it = kernel_ram_split_store.iterator();
+    while (split_it.next()) |index| {
         const entry = kernel_ram_split_store.descriptor(index).?;
-        if (entry.pml4 == pt_storage.no_index) {
-            if (slot == kernel_ram_split_store.capacity()) slot = index;
-        } else if (entry.pml4 == pml4 and entry.pdp == pdp and
+        if (entry.pml4 == pml4 and entry.pdp == pdp and
             (entry.pd == pd or entry.pd == pd + 512)) return error.Invalid;
     }
     const page = kernel_ram_split_store.ensurePage(slot, allocator) orelse return error.OutOfMemory;
-    errdefer kernel_ram_split_store.releasePageDetached(slot, allocator);
-    const pa = h.kernel_pointer_paddr(@intFromPtr(page)) orelse return error.Invalid;
+    errdefer {
+        kernel_ram_split_store.releasePageDetached(slot);
+        kernel_ram_split_store.reclaimEmptyBanks();
+    }
+    const pa = tablePaddr(h, page) orelse return error.Invalid;
     if (pa >= h.physical_map_limit) return error.Invalid;
-    const split = try paging.IdentitySplit.prepare(identity.directory, identity.base, page, pa);
+    const split = try paging.IdentitySplit.prepareSized(identity.directory, identity.base, identity.size, page, pa);
     const entry = kernel_ram_split_store.descriptor(slot).?;
     entry.pml4 = pml4;
     entry.pdp = pdp;
@@ -2868,24 +2913,26 @@ pub fn reserveRamCacheKernelSplit(source: @import("ram_cache_paging.zig").AliasS
     return .{ .split = split, .slot = slot };
 }
 
-pub fn ramCacheKernelSplitOwns(base: u64, pa: u64) bool {
+pub fn ramCacheKernelAliasSplitOwns(va: u64, size: @import("ram_cache_paging.zig").LeafSize, pa: u64) bool {
     const h = hooks orelse return false;
-    if (base & ((1 << 21) - 1) != 0 or base >> 48 != 0 or pa & 4095 != 0) return false;
-    for (0..kernel_ram_split_store.capacity()) |slot| {
+    if (size == .page or va & (size.bytes() - 1) != 0 or pa & 4095 != 0) return false;
+    const pml4: u16 = @intCast((va >> 39) & 511);
+    const pdp: u16 = @intCast((va >> 30) & 511);
+    const pd: u16 = if (size == .huge) 1024 else @intCast((va >> 21) & 511);
+    var split_it = kernel_ram_split_store.iterator();
+    while (split_it.next()) |slot| {
         const entry = kernel_ram_split_store.descriptorConst(slot).?;
-        if (entry.pml4 >= 512 or entry.pdp >= 512 or entry.pd >= 512) continue;
-        const identity = (@as(u64, entry.pml4) << 39) | (@as(u64, entry.pdp) << 30) | (@as(u64, entry.pd) << 21);
-        if (identity != base) continue;
+        if (entry.pml4 != pml4 or entry.pdp != pdp or entry.pd != pd) continue;
         const page = entry.page orelse return false;
-        return (h.kernel_pointer_paddr(@intFromPtr(page)) orelse return false) == pa;
+        return (tablePaddr(h, page) orelse return false) == pa;
     }
     return false;
 }
 
 pub fn releaseRamCacheKernelSplitsForTest() void {
     if (!@import("builtin").is_test) @compileError("synthetic detached tables only");
-    if (kernel_ram_split_store.bank_count == 0) return;
-    kernel_ram_split_store.freeDetached((hooks orelse unreachable).pt_allocator orelse unreachable);
+    if (kernel_ram_split_store.chunks == null) return;
+    kernel_ram_split_store.freeDetached();
 }
 
 /// Capture every present user alias, not merely the requesting VMO's VA.
@@ -2907,7 +2954,12 @@ pub fn prepareRamCacheUserAliases(pages: []const u64, scratch: []RamCacheUserAli
         if (space.cr3 == 0) continue;
         const principal = kernel.processPrincipalFromIndex(space_index) orelse return error.Invalid;
         const large_flags = h.page_present | h.page_user | h.page_ps;
-        for (&space.pdp_pages, space.pdp_page_pml4_index) |*pdp, pml4| {
+        var pdp_it = space.pdp_store.iterator();
+        while (pdp_it.next()) |pdp_slot| {
+            const descriptor = space.pdp_store.descriptorConst(pdp_slot).?;
+            if (descriptor.page == null) continue;
+            const pdp = descriptor.page.?;
+            const pml4 = descriptor.pml4;
             if (pml4 >= 256) continue;
             for (pdp) |entry| {
                 if ((entry & large_flags) == large_flags and
@@ -2915,7 +2967,12 @@ pub fn prepareRamCacheUserAliases(pages: []const u64, scratch: []RamCacheUserAli
                     return error.LargeAlias;
             }
         }
-        for (&space.pd_pages, space.pd_page_pml4_index) |*pd, pml4| {
+        var pd_it = space.pd_store.iterator();
+        while (pd_it.next()) |pd_slot| {
+            const descriptor = space.pd_store.descriptorConst(pd_slot).?;
+            if (descriptor.page == null) continue;
+            const pd = descriptor.page.?;
+            const pml4 = descriptor.pml4;
             if (pml4 >= 256) continue;
             for (pd) |entry| {
                 if ((entry & large_flags) == large_flags and
@@ -2923,7 +2980,8 @@ pub fn prepareRamCacheUserAliases(pages: []const u64, scratch: []RamCacheUserAli
                     return error.LargeAlias;
             }
         }
-        for (0..ptSlotScanLimit(space)) |slot| {
+        var pt_it = space.pt_store.iterator();
+        while (pt_it.next()) |slot| {
             const pml4 = space.ptPml4Index(slot).*;
             const pdp = space.ptPdpIndex(slot).*;
             const pd = space.ptPdIndex(slot).*;
@@ -2965,7 +3023,26 @@ pub fn withdrawRamCacheUserAliases(aliases: []RamCacheUserAlias) void {
 
 pub fn flushRamCacheUserAliases(aliases: []const RamCacheUserAlias) void {
     const h = hooks orelse unreachable;
-    for (aliases) |alias| h.flush_user_tlb_for_principal_va(alias.principal, alias.va);
+    // Preparation emits all aliases of an AS consecutively. Keep this API
+    // robust to other callers too: one request per distinct owner, even if
+    // aliases are unsorted. No page/table is returned or republished here.
+    for (aliases, 0..) |alias, index| {
+        if (index != 0 and aliases[index - 1].principal == alias.principal) continue;
+        var seen = false;
+        for (aliases[0..index]) |previous| if (previous.principal == alias.principal) {
+            seen = true;
+            break;
+        };
+        if (seen) continue;
+        var first = alias.va;
+        var end = alias.va + 4096;
+        for (aliases[index + 1 ..]) |other| {
+            if (other.principal != alias.principal) continue;
+            first = @min(first, other.va);
+            end = @max(end, other.va + 4096);
+        }
+        h.flush_user_tlb_for_principal_range(alias.principal, first, @intCast(end - first));
+    }
 }
 
 /// Called only after the external all-CPU old-type barrier. Preserve late
@@ -2990,9 +3067,8 @@ pub const MappedUserPageVisitor = *const fn (context: *anyopaque, page: MappedUs
 pub fn forEachUserMappedPage(principal: kernel.PrincipalId, context: *anyopaque, visitor: MappedUserPageVisitor) bool {
     const h = hooks orelse return false;
     const space = getUserSpace(principal) orelse return false;
-    const slot_limit = ptSlotScanLimit(space);
-    var slot: usize = 0;
-    while (slot < slot_limit) : (slot += 1) {
+    var it = space.pt_store.iterator();
+    while (it.next()) |slot| {
         const pd_index_meta = space.ptPdIndex(slot).*;
         const pml4_index_meta = space.ptPml4Index(slot).*;
         const pdp_index_meta = space.ptPdpIndex(slot).*;
@@ -3028,9 +3104,8 @@ pub fn collectUserMappedPages(principal: kernel.PrincipalId, out_pages: []Mapped
     const h = hooks orelse return 0;
     const space = getUserSpace(principal) orelse return 0;
     var count: usize = 0;
-    const slot_limit = ptSlotScanLimit(space);
-    var slot: usize = 0;
-    while (slot < slot_limit) : (slot += 1) {
+    var it = space.pt_store.iterator();
+    while (it.next()) |slot| {
         const pd_index_meta = space.ptPdIndex(slot).*;
         const pml4_index_meta = space.ptPml4Index(slot).*;
         const pdp_index_meta = space.ptPdpIndex(slot).*;
@@ -3077,29 +3152,10 @@ pub fn collectUserMappedPages(principal: kernel.PrincipalId, out_pages: []Mapped
 pub fn buildUserAddressSpace(principal: kernel.PrincipalId, user_page_paddr: u64, user_stack_paddr: u64) bool {
     const h = hooks orelse return false;
     const space = getUserSpace(principal) orelse return false;
-    detachAndReleaseUserPtStorage(h, space, principal);
-    @memset(space.pml4[0..], 0);
-    h.seed_user_pml4_with_kernel(space.pml4[0..]);
-    var pdp_slot_init: usize = 0;
-    while (pdp_slot_init < UserAddressSpace.max_dynamic_pdp_pages) : (pdp_slot_init += 1) {
-        space.pdp_page_pml4_index[pdp_slot_init] = UserAddressSpace.no_pd_index;
-        const pdp_page: *[512]u64 = &space.pdp_pages[pdp_slot_init];
-        @memset(pdp_page[0..], 0);
-    }
-    var pd_slot_init: usize = 0;
-    while (pd_slot_init < UserAddressSpace.max_dynamic_pd_pages) : (pd_slot_init += 1) {
-        space.pd_page_pml4_index[pd_slot_init] = UserAddressSpace.no_pd_index;
-        space.pd_page_pdp_index[pd_slot_init] = UserAddressSpace.no_pd_index;
-        const pd_page: *[512]u64 = &space.pd_pages[pd_slot_init];
-        @memset(pd_page[0..], 0);
-    }
-    space.pt_store.resetDetachedContents();
-    space.pdp_page_used_len = 0;
-    space.pd_page_used_len = 0;
-    space.pt_page_used_len = 0;
+    resetUserPageTablesPreserveReservations(space, principal) catch return false;
     resetUserReservations(space);
 
-    const user_pml4_pa: u64 = h.kernel_pointer_paddr(@intFromPtr(&space.pml4)) orelse return false;
+    const user_pml4_pa: u64 = tablePaddr(h, &space.pml4) orelse return false;
     if (user_pml4_pa >= h.physical_map_limit) return false;
     if (user_page_paddr >= h.four_gib or user_stack_paddr >= h.four_gib) return false;
 
@@ -3125,39 +3181,35 @@ pub fn buildUserAddressSpace(principal: kernel.PrincipalId, user_page_paddr: u64
 }
 
 /// Staging builder with the same unpublished/quiescent ownership as above.
-pub fn buildEmptyUserAddressSpace(principal: kernel.PrincipalId) bool {
-    const h = hooks orelse return false;
-    const space = getUserSpace(principal) orelse return false;
-    detachAndReleaseUserPtStorage(h, space, principal);
-    @memset(space.pml4[0..], 0);
-    h.seed_user_pml4_with_kernel(space.pml4[0..]);
-    var pdp_slot_init: usize = 0;
-    while (pdp_slot_init < UserAddressSpace.max_dynamic_pdp_pages) : (pdp_slot_init += 1) {
-        space.pdp_page_pml4_index[pdp_slot_init] = UserAddressSpace.no_pd_index;
-        const pdp_page: *[512]u64 = &space.pdp_pages[pdp_slot_init];
-        @memset(pdp_page[0..], 0);
-    }
-    var pd_slot_init: usize = 0;
-    while (pd_slot_init < UserAddressSpace.max_dynamic_pd_pages) : (pd_slot_init += 1) {
-        space.pd_page_pml4_index[pd_slot_init] = UserAddressSpace.no_pd_index;
-        space.pd_page_pdp_index[pd_slot_init] = UserAddressSpace.no_pd_index;
-        const pd_page: *[512]u64 = &space.pd_pages[pd_slot_init];
-        @memset(pd_page[0..], 0);
-    }
-    space.pt_store.resetDetachedContents();
-    space.pdp_page_used_len = 0;
-    space.pd_page_used_len = 0;
-    space.pt_page_used_len = 0;
+pub fn buildEmptyUserAddressSpace(principal: kernel.PrincipalId) error{ OutOfFreePages, InvalidState }!void {
+    const stage_sample = if (comptime @import("../lock_profile.zig").enabled) @import("../lock_profile.zig").stageBegin() else {};
+    defer if (comptime @import("../lock_profile.zig").enabled) @import("../lock_profile.zig").stageEnd(.pt_prepare, stage_sample);
+    const space = getUserSpace(principal) orelse return error.InvalidState;
+    try resetUserPageTablesPreserveReservations(space, principal);
     resetUserReservations(space);
-
-    const user_pml4_pa: u64 = h.kernel_pointer_paddr(@intFromPtr(&space.pml4)) orelse return false;
-    if (user_pml4_pa >= h.physical_map_limit) return false;
-
-    _ = ensureUserPdpSlotForPml4(space, 0) orelse return false;
-    space.cr3 = user_pml4_pa;
-    return true;
 }
 
 fn processIndex(principal: kernel.PrincipalId) ?usize {
     return kernel.processIndexFromPrincipal(principal);
+}
+
+test "lock ordering AS shared actual recursion keeps first link and last unlink" {
+    if (!lock_diagnostics.enabled) return;
+    inline for (.{ lock_diagnostics.order.Class.address_space, lock_diagnostics.order.Class.shared_vm }) |class| {
+        var state: AddressSpaceLockState = .{};
+        const key: lock_diagnostics.order.Key = .{ .class = class, .order = 3 };
+        lockState(&state, key);
+        lockState(&state, key);
+        try std.testing.expectEqual(@as(u32, 2), state.depth);
+        try std.testing.expect(lock_diagnostics.testCpu().head == &state.diagnostic_record);
+        try std.testing.expect(state.diagnostic_record.next == null);
+        const irq = lock_diagnostics.enterInterrupt(false);
+        try std.testing.expectError(error.WrongContext, lock_diagnostics.testCpu().recursive(&state.diagnostic_record));
+        irq.end();
+        unlockState(&state);
+        try std.testing.expect(state.diagnostic_record.linked);
+        unlockState(&state);
+        try std.testing.expect(!state.diagnostic_record.linked);
+        lock_diagnostics.assertRootEmpty();
+    }
 }

@@ -121,7 +121,7 @@ int64_t lpr_fs_call_buffers(kb2_fs_request_t *request,
 static int64_t call_impl(kb2_fs_request_t *request, const char *path,
     const char *second_path, const void *data, uint64_t data_bytes,
     void *output, uint64_t output_bytes, kb2_fs_response_t *response,
-    int transfer_fd, int second_transfer_fd, int *returned_fds, uint64_t returned_capacity)
+    pacha_fd_t transfer_fd, pacha_fd_t second_transfer_fd, pacha_fd_t *returned_fds, uint64_t returned_capacity)
 {
     uint64_t first_bytes, second_bytes;
     if (!request || !response || (!data && data_bytes) || (!output && output_bytes))
@@ -251,20 +251,15 @@ static int64_t call_impl(kb2_fs_request_t *request, const char *path,
     }
     lpr_boot_diagnostic_fs_emit("fs.control.call", request->opcode, request->sequence,
         lpr_filed_client_fd, 0, 0);
-    const int64_t reply = lpr_native_ipc_call_wait(lpr_filed_client_fd, &message);
-    lpr_boot_diagnostic_fs_emit("fs.control.called", request->opcode, request->sequence,
-        reply, reply < 16 ? lpr_pacha_status_to_errno(reply) : 0, reply);
-    if (reply < 16) {
-        status = lpr_pacha_status_to_errno(reply);
-        goto release;
-    }
     struct pacha_ipc_msg completion = {.fds = received, .fd_capacity = 3};
-    lpr_boot_diagnostic_fs_emit("fs.control.recv", request->opcode, reply, 0, 0, 0);
-    status = lpr_native_ipc_recv_wait(reply, &completion);
+    lpr_boot_diagnostic_fs_emit("fs.control.wait", request->opcode, request->sequence,
+        lpr_filed_client_fd, 0, 0);
+    status = lpr_native_ipc_call_wait(lpr_filed_client_fd, &message, &completion, NULL);
+    lpr_boot_diagnostic_fs_emit("fs.control.called", request->opcode, request->sequence,
+        lpr_filed_client_fd, status ? lpr_pacha_status_to_errno(status) : 0, status);
     lpr_boot_diagnostic_fs_emit("fs.control.received", completion.word0,
         completion.word3, completion.word2,
         status ? lpr_pacha_status_to_errno(status) : (int64_t)completion.word1, status);
-    (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, reply);
     if (status) {
         status = lpr_pacha_status_to_errno(status);
     } else if (completion.word0 != request->opcode ||
@@ -282,7 +277,7 @@ static int64_t call_impl(kb2_fs_request_t *request, const char *path,
             status = -LPR_LINUX_EIO;
         } else if (status >= 0) {
             for (uint64_t i = 0; i < completion.fd_count; ++i) {
-                returned_fds[i] = (int)received[i].fd;
+                returned_fds[i] = (pacha_fd_t)received[i].fd;
                 received[i].fd = 0;
             }
         }
@@ -302,13 +297,13 @@ release:
 int64_t lpr_fs_call_many(kb2_fs_request_t *request, const char *path,
     const char *second_path, const void *data, uint64_t data_bytes,
     void *output, uint64_t output_bytes, kb2_fs_response_t *response,
-    int transfer_fd, int *returned_fds, uint64_t returned_capacity)
+    pacha_fd_t transfer_fd, pacha_fd_t *returned_fds, uint64_t returned_capacity)
 {
     return call_impl(request, path, second_path, data, data_bytes, output,
         output_bytes, response, transfer_fd, -1, returned_fds, returned_capacity);
 }
 
-int64_t lpr_fs_call_attach(kb2_fs_request_t *request, int vmo, int doorbell,
+int64_t lpr_fs_call_attach(kb2_fs_request_t *request, pacha_fd_t vmo, pacha_fd_t doorbell,
     kb2_fs_response_t *response)
 {
     return call_impl(request, 0, 0, 0, 0, 0, 0, response, vmo, doorbell, 0, 0);
@@ -317,7 +312,7 @@ int64_t lpr_fs_call_attach(kb2_fs_request_t *request, int vmo, int doorbell,
 int64_t lpr_fs_call(kb2_fs_request_t *request, const char *path,
     const char *second_path, const void *data, uint64_t data_bytes,
     void *output, uint64_t output_bytes, kb2_fs_response_t *response,
-    int transfer_fd, int *returned_fd)
+    pacha_fd_t transfer_fd, pacha_fd_t *returned_fd)
 {
     return lpr_fs_call_many(request, path, second_path, data, data_bytes,
         output, output_bytes, response, transfer_fd, returned_fd,

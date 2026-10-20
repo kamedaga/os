@@ -12,7 +12,7 @@ void *lpr_memset(void *p, int v, size_t n) { return memset(p, v, n); }
 #define INACTIVE(name) int name(uint64_t fd) { (void)fd; return 0; }
 INACTIVE(lpr_linux_tty_fd_active)
 int lpr_linux_drm_fd_active(uint64_t fd) { return drm_active && fd == 5; }
-int lpr_drm_native_wait_fd(uint64_t fd) { return fd == 5 ? 41 : -1; }
+pacha_fd_t lpr_drm_native_wait_fd(uint64_t fd) { return fd == 5 ? 41 : -1; }
 INACTIVE(lpr_unix_socket_active)
 INACTIVE(lpr_linux_input_fd_active)
 INACTIVE(lpr_linux_sync_file_fd_active)
@@ -30,10 +30,10 @@ int64_t lpr_pacha_syscall4(uint64_t nr, uint64_t raw, uint64_t count,
 {
     assert(nr == PACHA_FD_SYSCALL_WAIT_MANY && count == 1 && !timeout && !flags);
     struct pacha_pollfd *p = (void *)(uintptr_t)raw;
-    assert(p->fd == 40 && p->revents == LPR_LINUX_PIPE_BUF_BYTES);
+    assert(p->fd == 40 && p->min_write_bytes == LPR_LINUX_PIPE_BUF_BYTES);
     if (native_error) return PACHA_SYSCALL_ERR_INVALID;
     uint64_t ready = input_events;
-    if (space >= p->revents && !peer_closed) ready |= PACHA_FD_EVENT_WRITABLE;
+    if (space >= p->min_write_bytes && !peer_closed) ready |= PACHA_FD_EVENT_WRITABLE;
     if (peer_closed) ready |= PACHA_FD_EVENT_ERROR | PACHA_FD_EVENT_HANGUP;
     p->revents = ready; ++calls;
     return ready ? 1 : PACHA_SYSCALL_ERR_NOT_READY;
@@ -64,14 +64,19 @@ int main(void)
     lpr_wait_graph_init(&graph);
     assert(lpr_wait_graph_add_fd(&graph, 3, 4) == 0);
     assert(graph.leaf_count == 1 && graph.leaves[0].fd == 40);
-    assert(graph.leaves[0].revents == LPR_LINUX_PIPE_BUF_BYTES);
+    assert(graph.leaves[0].min_write_bytes == LPR_LINUX_PIPE_BUF_BYTES);
     lpr_wait_graph_init(&graph);
     assert(lpr_wait_graph_add_fd(&graph, 3, 1) == 0);
-    assert(graph.leaves[0].revents == 0);
+    assert(graph.leaves[0].min_write_bytes == 0);
     /* A specific blocking write still waits for its actual atomic size. */
     lpr_wait_graph_init(&graph);
     assert(lpr_wait_graph_add_native_min(&graph, 40, PACHA_FD_EVENT_WRITABLE, 58) == 0);
-    assert(graph.leaves[0].revents == 58);
+    assert(graph.leaves[0].min_write_bytes == 58);
+    assert(graph.leaves[0].revents == 0);
+    assert(lpr_wait_graph_add_native_min(&graph, 40, PACHA_FD_EVENT_WRITABLE, 12) == 0);
+    assert(graph.leaves[0].min_write_bytes == 58);
+    assert(lpr_wait_graph_add_native_min(&graph, 40, PACHA_FD_EVENT_WRITABLE, 80) == 0);
+    assert(graph.leaf_count == 1 && graph.leaves[0].min_write_bytes == 80);
     drm_active = 1;
     lpr_wait_graph_init(&graph);
     assert(lpr_wait_graph_add_fd(&graph, 5, 1) == 0);
@@ -81,4 +86,10 @@ int main(void)
     assert(graph.relative_deadline_ns == UINT64_MAX);
     puts("LPR_PIPE_POLL_UNIT=OK");
     return 0;
+}
+
+#include "lpr_ipc_mock.h"
+int64_t lpr_ipc_message(uint64_t nr, uint64_t fd, uint64_t send, uint64_t receive,
+    uint64_t timeout, uint64_t flags, int *committed) {
+    return test_lpr_ipc_noncall(nr, fd, send, receive, timeout, flags, committed);
 }

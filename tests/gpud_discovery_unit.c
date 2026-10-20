@@ -17,9 +17,9 @@ static uint64_t identity = UINT64_C(0x50434900002d0000);
 static int failure_at, calls, live, maps, closed_handles, fail_config;
 static char paths[32][160];
 static int nodes;
-int pacha_capsule_query(int fd, struct pacha_capsule_info *out)
+int pacha_capsule_query(pacha_fd_t fd, struct pacha_capsule_info *out)
 { assert(fd == 42); *out = (struct pacha_capsule_info){.kind=PACHA_CAPSULE_KIND_DEVICE, .device=identity}; return 0; }
-int pacha_capsule_pci_config_read(int fd, uint16_t offset, unsigned width, uint32_t *out)
+int pacha_capsule_pci_config_read(pacha_fd_t fd, uint16_t offset, unsigned width, uint32_t *out)
 {
     assert(fd == 42);
     if (fail_config) return -EACCES;
@@ -32,26 +32,17 @@ int pacha_capsule_pci_config_read(int fd, uint16_t offset, unsigned width, uint3
     }
     return 0;
 }
-int pacha_vmo_create(uint64_t size, uint64_t rights, uint32_t flags)
+pacha_fd_t pacha_vmo_create(uint64_t size, uint64_t rights, uint32_t flags)
 { assert(!wire && size >= 4096 && !(size & 4095) && rights && !flags);
   wire = calloc(1, size); assert(wire); wire_bytes = size; ++maps; return 50; }
-void *pacha_mmap(int fd,uint64_t size,uint64_t prot,uint64_t flags,uint64_t offset)
+void *pacha_mmap(pacha_fd_t fd,uint64_t size,uint64_t prot,uint64_t flags,uint64_t offset)
 { assert(fd==50 && size==wire_bytes && prot && flags && !offset); return wire; }
 int pacha_munmap(void *p,uint64_t size)
 { assert(p==wire && size==wire_bytes); --maps; return 0; }
-int pacha_fd_close(int fd)
+int pacha_fd_close(pacha_fd_t fd)
 { assert(fd==50 || fd==51); if(fd==50){free(wire); wire=NULL;} return 0; }
-int pacha_fd_get_info(int fd, struct pacha_fd_info *info)
+int pacha_fd_get_info(pacha_fd_t fd, struct pacha_fd_info *info)
 { (void)fd; (void)info; assert(0); return -EIO; }
-int pacha_ipc_call(int fd, const struct pacha_ipc_msg *req)
-{
-    assert(fd==43 && req->fd_count==1 && req->fds[0].fd==50);
-    request_bytes = req->word1;
-    assert(!kb2_fs_request_decode(wire, request_bytes, request_bytes, &decoded));
-    assert(!kb2_fs_request_validate_paths(wire, request_bytes, &decoded));
-    assert(req->word0 == decoded.opcode && req->word3 == decoded.sequence);
-    return 51;
-}
 static void operate(void)
 {
     kb2_fs_request_t *r = &decoded;
@@ -78,9 +69,15 @@ static void operate(void)
         last_reply.result=-EEXIST;
     else { assert(live<32); strcpy(paths[live++],path); }
 }
-int pacha_ipc_recv_wait(int fd, struct pacha_ipc_msg *reply, uint64_t timeout)
+int pacha_ipc_call(pacha_fd_t fd, const struct pacha_ipc_msg *req, struct pacha_ipc_msg *reply, uint64_t timeout, int *sent)
 {
-    assert(fd==51 && timeout==PACHA_FD_WAIT_FOREVER);
+    assert(fd==43 && req->fd_count==1 && req->fds[0].fd==50);
+    request_bytes = req->word1;
+    assert(!kb2_fs_request_decode(wire, request_bytes, request_bytes, &decoded));
+    assert(!kb2_fs_request_validate_paths(wire, request_bytes, &decoded));
+    assert(req->word0 == decoded.opcode && req->word3 == decoded.sequence);
+    if (sent) *sent = 1;
+    assert(timeout == PACHA_FD_WAIT_FOREVER);
     last_reply=(kb2_fs_response_t){.opcode=decoded.opcode,
         .sequence=decoded.sequence,.generation=decoded.generation};
     if(++calls==failure_at) last_reply.result=-EIO;

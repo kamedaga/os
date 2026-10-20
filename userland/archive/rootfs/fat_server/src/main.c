@@ -1,3 +1,4 @@
+#error "Archived IPC ABI is unsupported; migrate synchronous CALL/reply before enabling this target"
 #include "fs_protocol.h"
 
 #if defined(__clang__)

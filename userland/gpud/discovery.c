@@ -15,7 +15,7 @@ static void add(struct gpud_discovery *d, enum gpud_discovery_kind kind,
     e->dev = dev;
 }
 
-int gpud_discovery_prepare(struct gpud_discovery *d, int device_fd, int primary)
+int gpud_discovery_prepare(struct gpud_discovery *d, pacha_fd_t device_fd, int primary)
 {
     struct pacha_capsule_info cap = {0};
     uint32_t id, sub, revision, header;

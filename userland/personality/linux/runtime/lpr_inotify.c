@@ -137,7 +137,7 @@ static void lpr_inotify_snapshot(
 }
 
 static int64_t lpr_inotify_stat(
-    const lpr_inotify_watch_t *watch, lpr_linux_stat_t *stat)
+    const lpr_inotify_watch_t *watch, lpr_linux_stat_t *stat, unsigned *wait_not_ready __attribute__((unused)))
 {
     const uint64_t flags =
         (watch->mask & LPR_IN_DONT_FOLLOW) != 0 ?
@@ -146,7 +146,7 @@ static int64_t lpr_inotify_stat(
         (uint64_t)(int64_t)LPR_LINUX_AT_FDCWD,
         (uint64_t)(uintptr_t)watch->path,
         (uint64_t)(uintptr_t)stat,
-        flags);
+        flags, wait_not_ready);
 }
 
 static void lpr_inotify_queue(
@@ -180,19 +180,19 @@ static void lpr_inotify_drain_timer(lpr_event_backend_t *event)
     uint64_t expirations = 0;
     (void)lpr_pacha_syscall3(
         PACHAOS_SYSCALL_FD_READ,
-        (uint64_t)(uint32_t)event->wait_fd.raw,
+        (uint64_t)event->wait_fd.raw,
         (uint64_t)(uintptr_t)&expirations,
         sizeof(expirations));
 }
 
-static void lpr_inotify_scan_locked(lpr_inotify_instance_t *instance)
+static void lpr_inotify_scan_locked(lpr_inotify_instance_t *instance, unsigned *wait_not_ready __attribute__((unused)))
 {
     for (uint32_t index = 0; index < LPR_INOTIFY_MAX_WATCHES; index++) {
         lpr_inotify_watch_t *watch = &instance->watches[index];
         if (!watch->active) continue;
         lpr_linux_stat_t current;
         lpr_memset(&current, 0, sizeof(current));
-        const int64_t status = lpr_inotify_stat(watch, &current);
+        const int64_t status = lpr_inotify_stat(watch, &current, wait_not_ready);
         if (status == -LPR_LINUX_ENOENT) {
             lpr_inotify_queue(
                 instance,
@@ -240,11 +240,11 @@ static void lpr_inotify_scan_locked(lpr_inotify_instance_t *instance)
 }
 
 static void lpr_inotify_scan(
-    lpr_inotify_instance_t *instance, lpr_event_backend_t *event)
+    lpr_inotify_instance_t *instance, lpr_event_backend_t *event, unsigned *wait_not_ready __attribute__((unused)))
 {
     lpr_inotify_drain_timer(event);
     lpr_state_lock(&instance->lock_word);
-    lpr_inotify_scan_locked(instance);
+    lpr_inotify_scan_locked(instance, wait_not_ready);
     lpr_state_unlock(&instance->lock_word);
 }
 
@@ -291,7 +291,7 @@ int64_t lpr_linux_inotify_init1(uint64_t flags)
         .flags = (uint32_t)flags,
         .counter = (uint64_t)(uintptr_t)instance,
         .deadline_ns = LPR_INOTIFY_INSTANCE_BYTES,
-        .wait_fd.raw = (int32_t)timer_fd, .notify_fd.raw = -1,
+        .wait_fd.raw = (pacha_fd_t)timer_fd, .notify_fd.raw = -1,
     };
     const int fd = lpr_fd_alloc_state(LPR_FD_OPS_EVENT, flags,
         (uint64_t)(uintptr_t)instance, &record, sizeof(record));
@@ -308,7 +308,7 @@ int64_t lpr_linux_inotify_init1(uint64_t flags)
 }
 
 static int64_t lpr_inotify_add_watch_pinned(
-    lpr_inotify_instance_t *instance, uint64_t path_raw, uint64_t mask_raw)
+    lpr_inotify_instance_t *instance, uint64_t path_raw, uint64_t mask_raw, unsigned *wait_not_ready __attribute__((unused)))
 {
     if (path_raw == 0) return -LPR_LINUX_EFAULT;
     const uint32_t mask = (uint32_t)mask_raw;
@@ -345,7 +345,7 @@ static int64_t lpr_inotify_add_watch_pinned(
     lpr_memcpy(candidate.path, normalized, sizeof(candidate.path));
     lpr_linux_stat_t stat;
     lpr_memset(&stat, 0, sizeof(stat));
-    const int64_t stat_status = lpr_inotify_stat(&candidate, &stat);
+    const int64_t stat_status = lpr_inotify_stat(&candidate, &stat, wait_not_ready);
     if (stat_status != 0) return stat_status;
     if ((mask & LPR_IN_ONLYDIR) != 0 &&
         (stat.st_mode & LPR_LINUX_S_IFMT) != LPR_LINUX_S_IFDIR)
@@ -409,12 +409,12 @@ static int64_t lpr_inotify_rm_watch_pinned(
 
 static int64_t lpr_inotify_read_pinned(
     lpr_inotify_instance_t *instance, lpr_event_backend_t *event,
-    uint64_t buf, uint64_t count)
+    uint64_t buf, uint64_t count, unsigned *wait_not_ready __attribute__((unused)))
 {
     if (buf == 0) return -LPR_LINUX_EFAULT;
     if (count < sizeof(lpr_linux_inotify_event_t)) return -LPR_LINUX_EINVAL;
     for (;;) {
-        lpr_inotify_scan(instance, event);
+        lpr_inotify_scan(instance, event, wait_not_ready);
         lpr_state_lock(&instance->lock_word);
         uint64_t written = 0;
         while (instance->event_count != 0 &&
@@ -446,18 +446,18 @@ static int64_t lpr_inotify_read_pinned(
         int64_t status = lpr_wait_graph_add_native(
             &graph, event->wait_fd.raw, 0x0001u);
         if (status == 0) status = lpr_wait_deadline_init(&deadline, -1);
-        if (status == 0) status = lpr_wait_graph_block(&graph, &deadline);
+        if (status == 0) status = lpr_wait_graph_block(&graph, &deadline, wait_not_ready);
         if (status != 0) return status;
     }
 }
 
-uint32_t lpr_linux_inotify_poll_events(uint64_t fd, uint32_t events)
+uint32_t lpr_linux_inotify_poll_events(uint64_t fd, uint32_t events, unsigned *wait_not_ready __attribute__((unused)))
 {
     lpr_fd_pin_t pin;
     lpr_event_backend_t *event;
     lpr_inotify_instance_t *instance = lpr_inotify_acquire(fd, &pin, &event);
     if (instance == 0) return 0;
-    lpr_inotify_scan(instance, event);
+    lpr_inotify_scan(instance, event, wait_not_ready);
     lpr_state_lock(&instance->lock_word);
     const uint32_t ready = instance->event_count != 0 ?
         events & 0x0001u : 0;
@@ -469,13 +469,13 @@ uint32_t lpr_linux_inotify_poll_events(uint64_t fd, uint32_t events)
 // The OFD pin keeps both the timer and the separately mapped instance alive
 // across close/exit_group. Its own lock cannot protect a pointer obtained
 // before close has unmapped the lock itself.
-int64_t lpr_linux_inotify_add_watch(uint64_t fd, uint64_t path, uint64_t mask)
+int64_t lpr_linux_inotify_add_watch(uint64_t fd, uint64_t path, uint64_t mask, unsigned *wait_not_ready __attribute__((unused)))
 {
     lpr_fd_pin_t pin;
     lpr_event_backend_t *event;
     lpr_inotify_instance_t *instance = lpr_inotify_acquire(fd, &pin, &event);
     if (instance == 0) return -LPR_LINUX_EBADF;
-    const int64_t status = lpr_inotify_add_watch_pinned(instance, path, mask);
+    const int64_t status = lpr_inotify_add_watch_pinned(instance, path, mask, wait_not_ready);
     lpr_fd_unpin(&pin);
     return status;
 }
@@ -491,14 +491,14 @@ int64_t lpr_linux_inotify_rm_watch(uint64_t fd, uint64_t wd)
     return status;
 }
 
-int64_t lpr_linux_inotify_read(uint64_t fd, uint64_t buf, uint64_t count)
+int64_t lpr_linux_inotify_read(uint64_t fd, uint64_t buf, uint64_t count, unsigned *wait_not_ready __attribute__((unused)))
 {
     lpr_fd_pin_t pin;
     lpr_event_backend_t *event;
     lpr_inotify_instance_t *instance = lpr_inotify_acquire(fd, &pin, &event);
     if (instance == 0) return -LPR_LINUX_EBADF;
     const int64_t status = (pin.effective_rights & LPR_FD_RIGHT_READ) != 0 ?
-        lpr_inotify_read_pinned(instance, event, buf, count) : -LPR_LINUX_EBADF;
+        lpr_inotify_read_pinned(instance, event, buf, count, wait_not_ready) : -LPR_LINUX_EBADF;
     lpr_fd_unpin(&pin);
     return status;
 }

@@ -9,14 +9,14 @@
 static struct pacha_fd_info table[256];
 static unsigned closes;
 
-int pacha_fd_get_info(int fd, struct pacha_fd_info *out)
+int pacha_fd_get_info(pacha_fd_t fd, struct pacha_fd_info *out)
 {
     if (fd < 16 || fd >= 256 || !table[fd].kind) return -1;
     *out = table[fd];
     return 0;
 }
 
-int pacha_fd_close(int fd)
+int pacha_fd_close(pacha_fd_t fd)
 {
     assert(fd >= 16 && fd < 256 && table[fd].kind);
     table[fd] = (struct pacha_fd_info){0};

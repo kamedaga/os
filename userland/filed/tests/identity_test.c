@@ -34,7 +34,7 @@ int pacha_ipc_channel_create(struct pacha_ipc_channel_pair *pair,uint64_t rights
     assert(rights&PACHA_FD_RIGHT_RECV);assert(!flags);
     pair->a=100+(int)channels*2;pair->b=pair->a+1;++channels;return 0;
 }
-int pacha_fd_close(int fd)
+int pacha_fd_close(pacha_fd_t fd)
 {
     assert(fd>=100);++closes;return 0;
 }
@@ -59,7 +59,7 @@ int main(void)
         .data={KB2_FILESYSTEM_REQUEST_SIZE,KB2_FILESYSTEM_CREDENTIALS_SIZE},
         .groups={KB2_FILESYSTEM_REQUEST_SIZE+KB2_FILESYSTEM_CREDENTIALS_SIZE,8}};
     filed_runtime_t runtime={.storage_generation=21,.client_sequence=1};
-    int fd=-1;uint64_t id=0;
+    pacha_fd_t fd=-1;uint64_t id=0;
     request.capabilities|=UINT64_C(1)<<40;
     assert(filed_client_create(&runtime,&request,bytes,sizeof(bytes),&fd,&id)==-EINVAL);
     assert(!calls && !channels && runtime.client_sequence==1);

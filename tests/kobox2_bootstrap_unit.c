@@ -9,16 +9,17 @@ static struct ph_ipc_packet queue[PH_BOOTSTRAP_MAX_ITEMS + 1];
 static size_t sent, consumed;
 static int send_error, receive_error, receive_fault;
 static uint64_t wrong_kind, short_size, close_fail;
-static unsigned int closed[PACHA_FD_TABLE_LIMIT];
+enum { former_fd_table_limit = 4096 };
+static unsigned int closed[former_fd_table_limit];
 
 long pacha_syscall1(uint64_t nr, uint64_t fd) {
-    assert(nr == PACHA_FD_SYSCALL_CLOSE && fd >= 16 && fd < PACHA_FD_TABLE_LIMIT);
+    assert(nr == PACHA_FD_SYSCALL_CLOSE && fd >= 16 && fd < former_fd_table_limit);
     ++closed[fd];
     return fd == close_fail ? PACHA_SYSCALL_ERR_MAP : 0;
 }
 
 long pacha_syscall2(uint64_t nr, uint64_t fd, uint64_t address) {
-    assert(nr == PACHA_FD_SYSCALL_GET_INFO && fd >= 16 && fd < PACHA_FD_TABLE_LIMIT);
+    assert(nr == PACHA_FD_SYSCALL_GET_INFO && fd >= 16 && fd < former_fd_table_limit);
     *(struct pacha_fd_info *)(uintptr_t)address = (struct pacha_fd_info){
         .kind = fd == wrong_kind ? PACHA_FD_KIND_EVENT : PACHA_FD_KIND_VMO,
         .size = fd == short_size ? 1 : 4096};

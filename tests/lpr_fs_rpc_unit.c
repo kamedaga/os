@@ -1,3 +1,4 @@
+#include "lpr_ipc_mock.h"
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -96,7 +97,11 @@ static size_t answer(unsigned char *wire, size_t request_size, size_t capacity)
         .result = injected};
     if (route_case && request.opcode == KB2_FILESYSTEM_OP_OPENAT2) {
         ++route_opens;
-        response.result = route_case == 3 ? -LPR_LINUX_EACCES : -LPR_LINUX_ENXIO;
+        assert(request.mask == 0x7ffu);
+        if (route_case >= 4) {
+            response.handle = 432;
+            response.data_length = route_case == 5 ? 0 : KB2_FILESYSTEM_STATX_SIZE;
+        } else response.result = route_case == 3 ? -LPR_LINUX_EACCES : -LPR_LINUX_ENXIO;
     }
     if (route_case && request.opcode == KB2_FILESYSTEM_OP_DEVICE_ROUTE) {
         ++route_probes;
@@ -170,7 +175,7 @@ int64_t lpr_pacha_syscall1(uint64_t nr, uint64_t fd)
     return 0;
 }
 
-int64_t lpr_pacha_syscall2(uint64_t nr, uint64_t a, uint64_t b)
+static int64_t fixture_prepare_request(uint64_t nr, uint64_t a, uint64_t b)
 {
     if (nr == PACHAOS_SYSCALL_LOG) {
         assert(b > 0 && b <= 256 && ((const char *)(uintptr_t)a)[b - 1] == '\n');
@@ -195,11 +200,11 @@ int64_t lpr_pacha_syscall2(uint64_t nr, uint64_t a, uint64_t b)
     return 41;
 }
 
-int64_t lpr_pacha_syscall4(uint64_t nr, uint64_t fd, uint64_t raw,
+static int64_t fixture_finish_request(uint64_t nr, uint64_t fd, uint64_t raw,
     uint64_t timeout, uint64_t flags)
 {
     assert(nr == PACHAOS_SYSCALL_IPC_RECV_WAIT && fd == 41 &&
-        timeout == UINT64_MAX && !flags);
+        timeout == UINT64_MAX && flags == PACHA_WAIT_UNINTERRUPTIBLE);
     struct pacha_ipc_msg *reply = (void *)(uintptr_t)raw;
     struct pacha_ipc_fd *caps = reply->fds;
     assert(reply->fd_capacity == 3);
@@ -362,6 +367,17 @@ static void test_device_routes(void)
     route_case = 3;
     assert(lpr_filed_open_handle_at(LPR_LINUX_AT_FDCWD,"/alias",service_flags,0600,&handle,&kind)==-LPR_LINUX_EACCES);
     assert(route_opens==3 && route_probes==2); /* Other errors do not trigger any probe. */
+    route_case = 4;
+    uint64_t queued = queue_calls, controlled = control_calls;
+    assert(!lpr_filed_open_handle_at(LPR_LINUX_AT_FDCWD,"/regular",0,0,&handle,&kind));
+    assert(handle == 432 && kind == 0);
+    assert(queue_calls == queued + 1 && control_calls == controlled);
+    /* Missing metadata is malformed, not permission to guess the inode
+     * type or issue the old extra FSTAT. Retire the newly opened handle. */
+    route_case = 5;
+    queued = queue_calls;
+    assert(lpr_filed_open_handle_at(LPR_LINUX_AT_FDCWD,"/regular",0,0,&handle,&kind)==-LPR_LINUX_EIO);
+    assert(!handle && queue_calls == queued + 2 && control_calls == controlled);
     route_case = 0;
     uint8_t statx[KB2_FILESYSTEM_STATX_SIZE]={0};
     statx[KB2_FILESYSTEM_STATX_MODE_OFFSET+1]=0x20;
@@ -420,7 +436,7 @@ int main(void)
     assert(!lpr_fs_call(&request, NULL, NULL, NULL, 0, NULL, 0, &response, 77, NULL));
     assert(response.handle == 999);
     request = (kb2_fs_request_t){.opcode = KB2_FILESYSTEM_OP_FILE_VMO, .handle = 42, .length = 123456};
-    int cap = -1; return_capability = 1;
+    pacha_fd_t cap = -1; return_capability = 1;
     assert(lpr_fs_call(&request, NULL, NULL, NULL, 0, NULL, 0, &response, -1, &cap) == 123456);
     assert(cap == 42 && response.result == 123456 && !response.handle);
     return_capability = 0;
@@ -468,6 +484,34 @@ int main(void)
     assert(!log_calls);
 #endif
     assert(!mapping && unmaps == control_calls); /* DATA never allocates a staging VMO. */
-    assert(closes == 2 * control_calls);
+    assert(closes == control_calls);
     puts("LPR_FS_RPC_UNIT_PASS");
+}
+
+/* Request preparation and reply rendering are fixture phases within one
+ * synchronous syscall. Their transaction tags never become caller FDs. */
+int64_t lpr_pacha_syscall2(uint64_t nr, uint64_t a, uint64_t b)
+{
+    assert(nr != PACHAOS_SYSCALL_IPC_CALL);
+    return fixture_prepare_request(nr, a, b);
+}
+int64_t lpr_pacha_syscall4(uint64_t nr, uint64_t a, uint64_t b, uint64_t c, uint64_t d)
+{
+    return fixture_finish_request(nr, a, b, c, d);
+}
+int64_t lpr_ipc_message(uint64_t nr, uint64_t endpoint,
+    uint64_t request, uint64_t reply, uint64_t timeout, uint64_t flags, int *sent)
+{
+    if (nr != PACHA_IPC_SYSCALL_CALL) return test_lpr_ipc_noncall(nr, endpoint, request, reply, timeout, flags, sent);
+
+    assert(nr == PACHAOS_SYSCALL_IPC_CALL && request && reply);
+    assert(timeout == UINT64_MAX && flags == PACHA_WAIT_UNINTERRUPTIBLE);
+    *sent = 0;
+    int64_t transaction = fixture_prepare_request(nr, endpoint, request);
+    if (transaction < 16) return transaction;
+    *sent = 1;
+    int64_t status = fixture_finish_request(PACHAOS_SYSCALL_IPC_RECV_WAIT,
+        (uint64_t)transaction, reply, timeout, flags);
+
+    return status;
 }

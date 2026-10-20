@@ -71,7 +71,7 @@ int lpr_unix_address_copy(const struct unix_address *name, uint64_t address, uin
  * queue intact between the last RPC and WAIT_MANY. Shared transport slots
  * are needed for direct I/O, not for serialized listen/connect operations. */
 static int64_t call_wait(struct lpr_unix_context *context, const lpr_fd_pin_t *pin,
-    struct unix_control *request)
+    struct unix_control *request, unsigned *wait_not_ready __attribute__((unused)))
 {
     struct unix_control original;
     lpr_memcpy(&original, request, sizeof(original));
@@ -107,7 +107,7 @@ static int64_t call_wait(struct lpr_unix_context *context, const lpr_fd_pin_t *p
         lpr_wait_graph_t graph;
         lpr_wait_graph_init(&graph);
         status = lpr_unix_waiter_add_graph(&context->waiter, &graph);
-        if (status == 0) status = lpr_wait_graph_block(&graph, &deadline);
+        if (status == 0) status = lpr_wait_graph_block(&graph, &deadline, wait_not_ready);
         if (status != 0) break;
     }
     if (watched) (void)lpr_unix_waiter_unwatch(&context->waiter, original.socket);
@@ -121,7 +121,7 @@ static int attach(struct lpr_unix_context *context, struct lpr_unix_socket *sock
     return lpr_unix_socket_map(socket);
 }
 
-int64_t lpr_unix_socket_address(uint64_t fd, uint64_t operation, uint64_t address, uint64_t length)
+int64_t lpr_unix_socket_address(uint64_t fd, uint64_t operation, uint64_t address, uint64_t length, unsigned *wait_not_ready __attribute__((unused)))
 {
     UP_BEGIN(total, UP_CONTROL, operation, UP_TOTAL);
     if (operation != UNIX_OP_BIND && operation != UNIX_OP_CONNECT) return -EINVAL;
@@ -147,7 +147,7 @@ int64_t lpr_unix_socket_address(uint64_t fd, uint64_t operation, uint64_t addres
         request.argument = request.address.bytes[0] == '/' ? 0 : lpr_cwd_handle;
         request.transaction = 0777u & ~lpr_linux_umask_value;
     }
-    status = call_wait(context, &pin, &request);
+    status = call_wait(context, &pin, &request, wait_not_ready);
     lpr_unix_diag(operation, socket->socket, status, fd, request.address.kind);
     if (status == 0 && operation == UNIX_OP_CONNECT) status = attach(context, socket);
     lpr_fd_unpin(&pin);
@@ -188,7 +188,7 @@ int64_t lpr_unix_socket_name(uint64_t fd, uint64_t address, uint64_t length, int
     return status;
 }
 
-int64_t lpr_unix_socket_accept(uint64_t fd, uint64_t address, uint64_t length, uint64_t flags)
+int64_t lpr_unix_socket_accept(uint64_t fd, uint64_t address, uint64_t length, uint64_t flags, unsigned *wait_not_ready __attribute__((unused)))
 {
     UP_BEGIN(total, UP_CONTROL, UNIX_OP_ACCEPT, UP_TOTAL);
     if (flags & ~(uint64_t)(UX_NONBLOCK | UX_CLOEXEC)) return -EINVAL;
@@ -208,7 +208,7 @@ int64_t lpr_unix_socket_accept(uint64_t fd, uint64_t address, uint64_t length, u
     socket->receive_timeout_ns = __atomic_load_n(&listener->receive_timeout_ns, __ATOMIC_ACQUIRE);
     struct unix_control request = { .operation = UNIX_OP_ACCEPT,
         .socket = ((struct lpr_unix_socket *)pin.state)->socket };
-    status = call_wait(context, &pin, &request);
+    status = call_wait(context, &pin, &request, wait_not_ready);
     lpr_fd_unpin(&pin);
     if (status != 0) goto fail;
     socket->socket = request.result;

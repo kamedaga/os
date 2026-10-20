@@ -12,7 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-static int endpoint;
+static pacha_fd_t endpoint;
 static unsigned checks;
 /* The native loader/stdio boundary is under test, so progress must use the
  * same raw LOG syscall as pacha_trace, without allocating or calling stdio. */
@@ -184,7 +184,7 @@ int main(int argc,char **argv,char **envp)
         RAW_MARK("[filed-smoke/raw] argv/env invalid\n");return 2;
     }
     RAW_MARK("[filed-smoke/raw] bootstrap begin\n");
-    int fd=pacha_bootstrap_fd_from_argv(argv);
+    pacha_fd_t fd=pacha_bootstrap_fd_from_argv(argv);
     RAW_STATUS("[filed-smoke/raw] bootstrap fd",fd);
     filed_smoke_bootstrap_t bootstrap={0};
     long read_status=fd<16 ? -EBADF : pacha_fd_read(fd,&bootstrap,sizeof(bootstrap));
@@ -194,7 +194,7 @@ int main(int argc,char **argv,char **envp)
         bootstrap.public_endpoint_fd<16 || bootstrap.public_endpoint_fd>INT_MAX) {
         RAW_MARK("[filed-smoke/raw] bootstrap invalid\n");return 1;
     }
-    endpoint=(int)bootstrap.public_endpoint_fd;
+    endpoint=(pacha_fd_t)bootstrap.public_endpoint_fd;
     RAW_STATUS("[filed-smoke/raw] bootstrap endpoint",endpoint);
     int status=smoke()!=0;
     RAW_STATUS("[filed-smoke/raw] main return status",status);

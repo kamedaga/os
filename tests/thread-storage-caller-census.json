@@ -1,0 +1,724 @@
+{
+  "note": "Syntactic review tripwire, not a lifetime proof; inherited_table callers require semantic audit.",
+  "readers": {
+    "detachPrincipalIpcBindings": {
+      "exclusion": "table",
+      "calls": {
+        "threadDirectory": 1
+      }
+    },
+    "ensureThreadBodyLocked": {
+      "exclusion": "inherited_table",
+      "calls": {
+        "threadDirectory": 1
+      }
+    },
+    "reclaimThreadBodies": {
+      "exclusion": "table",
+      "calls": {
+        "threadDirectory": 1
+      }
+    },
+    "advanceThreadSlotGenerationLocked": {
+      "exclusion": "inherited_table",
+      "calls": {
+        "threadDirectory": 1
+      }
+    },
+    "addressSpaceUsersEnded": {
+      "exclusion": "table",
+      "calls": {
+        "threadDirectory": 1,
+        "threadContextLocked": 1
+      }
+    },
+    "threadContextLocked": {
+      "exclusion": "inherited_table",
+      "calls": {
+        "threadDirectory": 1
+      }
+    },
+    "schedulerEntityLocked": {
+      "exclusion": "inherited_table",
+      "calls": {
+        "threadContextLocked": 1
+      }
+    },
+    "verifiedWakeThreadGenerationPreferred": {
+      "exclusion": "inherited_table",
+      "calls": {
+        "threadContextLocked": 1
+      }
+    },
+    "verifiedWakeThread": {
+      "exclusion": "inherited_table",
+      "calls": {
+        "threadContextLocked": 1
+      }
+    },
+    "verifiedBlockThread": {
+      "exclusion": "inherited_table",
+      "calls": {
+        "threadContextLocked": 1
+      }
+    },
+    "migrateRunnableThreadGeneration": {
+      "exclusion": "table",
+      "calls": {
+        "threadContextLocked": 1
+      }
+    },
+    "fillUserEntryForThread": {
+      "exclusion": "inherited_table",
+      "calls": {
+        "threadContextLocked": 1,
+        "getThreadHotStateConst": 1
+      }
+    },
+    "stealRunnableForIdleCpu": {
+      "exclusion": "table",
+      "calls": {
+        "threadContextLocked": 2
+      }
+    },
+    "claimKernelScheduledUserEntry": {
+      "exclusion": "table",
+      "calls": {
+        "threadContextLocked": 1
+      }
+    },
+    "markThreadReadyLocked": {
+      "exclusion": "inherited_table",
+      "calls": {
+        "threadContextLocked": 1
+      }
+    },
+    "matchingThreadLocked": {
+      "exclusion": "inherited_table",
+      "calls": {
+        "threadContextLocked": 1
+      }
+    },
+    "preemptApUserThread": {
+      "exclusion": "table",
+      "calls": {
+        "threadContextLocked": 1
+      }
+    },
+    "threadCapacity": {
+      "exclusion": "leaf",
+      "calls": {
+        "threadDirectory": 1
+      }
+    },
+    "snapshotThreadCapacityAndRetryReturns": {
+      "exclusion": "table",
+      "calls": {
+        "threadDirectory": 1
+      }
+    },
+    "publishThreadGrowthLocked": {
+      "exclusion": "inherited_table",
+      "calls": {
+        "threadDirectory": 1
+      }
+    },
+    "currentClockReadAdmission": {
+      "exclusion": "table",
+      "calls": {
+        "threadContextLocked": 1,
+        "getThreadHotStateConst": 1
+      }
+    },
+    "threadSlotReferencedByCpu": {
+      "exclusion": "inherited_table",
+      "calls": {
+        "threadContextLocked": 1
+      }
+    },
+    "threadSlotReferencedByRemoteCpu": {
+      "exclusion": "inherited_table",
+      "calls": {
+        "threadContextLocked": 1
+      }
+    },
+    "threadAssignedCpuSlot": {
+      "exclusion": "inherited_table",
+      "calls": {
+        "threadContextLocked": 1
+      }
+    },
+    "hasAllocatedThreadLocked": {
+      "exclusion": "inherited_table",
+      "calls": {
+        "threadDirectory": 1
+      }
+    },
+    "apUserThreadCanContinue": {
+      "exclusion": "table",
+      "calls": {
+        "threadDirectory": 1,
+        "threadContextLocked": 1,
+        "getThreadHotStateConst": 1
+      }
+    },
+    "quiesceStoppedCurrentUserThreadWithRegisters": {
+      "exclusion": "table",
+      "calls": {
+        "threadContextLocked": 1
+      }
+    },
+    "threadContextMutable": {
+      "exclusion": "fixture",
+      "calls": {
+        "threadContextLocked": 1
+      }
+    },
+    "getThreadHotState": {
+      "exclusion": "inherited_table",
+      "calls": {
+        "threadDirectory": 1
+      }
+    },
+    "getThreadHotStateConst": {
+      "exclusion": "inherited_table",
+      "calls": {
+        "threadDirectory": 1
+      }
+    },
+    "syncHotStateFromContext": {
+      "exclusion": "inherited_table",
+      "calls": {
+        "threadContextLocked": 1,
+        "getThreadHotState": 1
+      }
+    },
+    "setThreadHotReady": {
+      "exclusion": "inherited_table",
+      "calls": {
+        "threadContextLocked": 1,
+        "getThreadHotState": 1
+      }
+    },
+    "setThreadHotPendingSignalMask": {
+      "exclusion": "inherited_table",
+      "calls": {
+        "getThreadHotState": 1
+      }
+    },
+    "setThreadHotStopped": {
+      "exclusion": "inherited_table",
+      "calls": {
+        "getThreadHotState": 1
+      }
+    },
+    "setThreadHotWaitState": {
+      "exclusion": "inherited_table",
+      "calls": {
+        "threadContextLocked": 1,
+        "getThreadHotState": 1
+      }
+    },
+    "setThreadHotCompletionClaimed": {
+      "exclusion": "inherited_table",
+      "calls": {
+        "threadContextLocked": 1,
+        "getThreadHotState": 1
+      }
+    },
+    "setThreadHotCr3": {
+      "exclusion": "inherited_table",
+      "calls": {
+        "getThreadHotState": 1
+      }
+    },
+    "threadReady": {
+      "exclusion": "table",
+      "calls": {
+        "getThreadHotStateConst": 1
+      }
+    },
+    "debugDumpRunnableState": {
+      "exclusion": "table",
+      "calls": {
+        "threadDirectory": 1,
+        "threadContextLocked": 1,
+        "getThreadHotStateConst": 1
+      }
+    },
+    "initializeThreadContextLocked": {
+      "exclusion": "inherited_table",
+      "calls": {
+        "threadDirectory": 2,
+        "threadContextLocked": 2
+      }
+    },
+    "setBootstrapThreadEntryForCpu": {
+      "exclusion": "table",
+      "calls": {
+        "threadContextLocked": 1
+      }
+    },
+    "threadForPrincipal": {
+      "exclusion": "table",
+      "calls": {
+        "threadDirectory": 1,
+        "threadContextLocked": 1
+      }
+    },
+    "threadOwnedBy": {
+      "exclusion": "table",
+      "calls": {
+        "threadContextLocked": 1
+      }
+    },
+    "threadWakeTargetIsLive": {
+      "exclusion": "table",
+      "calls": {
+        "threadContextLocked": 1
+      }
+    },
+    "reserveCurrentWaitToken": {
+      "exclusion": "table",
+      "calls": {
+        "threadContextLocked": 1
+      }
+    },
+    "cancelCurrentWaitToken": {
+      "exclusion": "table",
+      "calls": {
+        "threadContextLocked": 1
+      }
+    },
+    "waitTokenIsCurrent": {
+      "exclusion": "table",
+      "calls": {
+        "threadContextLocked": 1
+      }
+    },
+    "liveThreadCount": {
+      "exclusion": "table",
+      "calls": {
+        "threadDirectory": 1,
+        "threadContextLocked": 1
+      }
+    },
+    "allocateThreadWithReadyState": {
+      "exclusion": "table",
+      "calls": {
+        "threadContextLocked": 1
+      }
+    },
+    "releaseThreadLocked": {
+      "exclusion": "inherited_table",
+      "calls": {
+        "threadContextLocked": 1
+      }
+    },
+    "activateGenerationLockedWithRegisters": {
+      "exclusion": "inherited_table",
+      "calls": {
+        "threadContextLocked": 1,
+        "getThreadHotStateConst": 1
+      }
+    },
+    "activate": {
+      "exclusion": "table",
+      "calls": {
+        "threadContextLocked": 1
+      }
+    },
+    "applyThreadBasesShadowed": {
+      "exclusion": "fixture",
+      "calls": {
+        "threadContextLocked": 1
+      }
+    },
+    "applyThreadBasesWithRegisters": {
+      "exclusion": "inherited_table",
+      "calls": {
+        "threadContextLocked": 1
+      }
+    },
+    "setThreadBaseWithRegisters": {
+      "exclusion": "inherited_table",
+      "calls": {
+        "threadContextLocked": 1
+      }
+    },
+    "suspendedThreadImage": {
+      "exclusion": "table",
+      "calls": {
+        "threadContextLocked": 1
+      }
+    },
+    "getControlledThreadContext": {
+      "exclusion": "table",
+      "calls": {
+        "threadContextLocked": 1
+      }
+    },
+    "setControlledThreadContext": {
+      "exclusion": "table",
+      "calls": {
+        "threadContextLocked": 1
+      }
+    },
+    "singleThreadExecImage": {
+      "exclusion": "table",
+      "calls": {
+        "threadDirectory": 1,
+        "threadContextLocked": 3,
+        "getThreadHotStateConst": 1
+      }
+    },
+    "installExecContextForCurrentThread": {
+      "exclusion": "table",
+      "calls": {
+        "threadContextLocked": 1
+      }
+    },
+    "saveCurrentThreadContextFromFrameLocked": {
+      "exclusion": "inherited_table",
+      "calls": {
+        "threadContextLocked": 1,
+        "getThreadHotStateConst": 1
+      }
+    },
+    "loadableContextGenerationLocked": {
+      "exclusion": "inherited_table",
+      "calls": {
+        "threadContextLocked": 1
+      }
+    },
+    "loadContextIntoFrame": {
+      "exclusion": "table",
+      "calls": {
+        "threadContextLocked": 1
+      }
+    },
+    "switchToGenerationLockedWithRegisters": {
+      "exclusion": "inherited_table",
+      "calls": {
+        "threadDirectory": 1,
+        "threadContextLocked": 1
+      }
+    },
+    "handoffToReadyThreadGenerationInternal": {
+      "exclusion": "table",
+      "calls": {
+        "threadContextLocked": 2
+      }
+    },
+    "wakeIfWaitingLocked": {
+      "exclusion": "inherited_table",
+      "calls": {
+        "threadContextLocked": 1
+      }
+    },
+    "wakeIfTimerExpiredLocked": {
+      "exclusion": "inherited_table",
+      "calls": {
+        "threadContextLocked": 1
+      }
+    },
+    "wakeIfWaitingGenerationInternal": {
+      "exclusion": "table",
+      "calls": {
+        "threadContextLocked": 1
+      }
+    },
+    "wakeIfWaitingTokenGenerationLocked": {
+      "exclusion": "inherited_table",
+      "calls": {
+        "threadContextLocked": 1
+      }
+    },
+    "tryWakeWaitTransferLocked": {
+      "exclusion": "inherited_table",
+      "calls": {
+        "threadContextLocked": 2
+      }
+    },
+    "tryFusedKeyedWakeLocked": {
+      "exclusion": "inherited_table",
+      "calls": {
+        "threadContextLocked": 2
+      }
+    },
+    "handoffOnlyReadyLocked": {
+      "exclusion": "inherited_table",
+      "calls": {
+        "threadContextLocked": 2
+      }
+    },
+    "rollbackLocalHandoffLocked": {
+      "exclusion": "inherited_table",
+      "calls": {
+        "threadContextLocked": 2
+      }
+    },
+    "claimWaitTokenCompletionLocked": {
+      "exclusion": "inherited_table",
+      "calls": {
+        "threadContextLocked": 1
+      }
+    },
+    "publishClaimedWaitLocked": {
+      "exclusion": "inherited_table",
+      "calls": {
+        "threadContextLocked": 1
+      }
+    },
+    "wakeMailboxWaiter": {
+      "exclusion": "table",
+      "calls": {
+        "threadDirectory": 1,
+        "getThreadHotStateConst": 1
+      }
+    },
+    "deliverSignal": {
+      "exclusion": "table",
+      "calls": {
+        "threadDirectory": 1,
+        "threadContextLocked": 2
+      }
+    },
+    "deliverThreadSignal": {
+      "exclusion": "table",
+      "calls": {
+        "threadContextLocked": 1
+      }
+    },
+    "configureCurrentSignalDelivery": {
+      "exclusion": "table",
+      "calls": {
+        "threadContextLocked": 1
+      }
+    },
+    "setCurrentSignalBlockedMask": {
+      "exclusion": "table",
+      "calls": {
+        "threadContextLocked": 1
+      }
+    },
+    "setCurrentSignalPendingHint": {
+      "exclusion": "table",
+      "calls": {
+        "threadContextLocked": 1
+      }
+    },
+    "claimCurrentSignalForUserReturn": {
+      "exclusion": "table",
+      "calls": {
+        "threadContextLocked": 1
+      }
+    },
+    "restoreClaimedSignal": {
+      "exclusion": "table",
+      "calls": {
+        "threadContextLocked": 1
+      }
+    },
+    "copyCurrentSignalXState": {
+      "exclusion": "table",
+      "calls": {
+        "threadContextLocked": 1
+      }
+    },
+    "restoreCurrentSignalXState": {
+      "exclusion": "table",
+      "calls": {
+        "threadContextLocked": 1
+      }
+    },
+    "configureCurrentFaultDelivery": {
+      "exclusion": "table",
+      "calls": {
+        "threadContextLocked": 1
+      }
+    },
+    "claimCurrentFault": {
+      "exclusion": "table",
+      "calls": {
+        "threadContextLocked": 1
+      }
+    },
+    "completeCurrentFault": {
+      "exclusion": "table",
+      "calls": {
+        "threadContextLocked": 1
+      }
+    },
+    "stopPrincipalThreads": {
+      "exclusion": "table",
+      "calls": {
+        "threadDirectory": 2,
+        "threadContextLocked": 2
+      }
+    },
+    "continuePrincipalThreads": {
+      "exclusion": "table",
+      "calls": {
+        "threadDirectory": 1,
+        "threadContextLocked": 1
+      }
+    },
+    "releasePrincipalThreads": {
+      "exclusion": "table",
+      "calls": {
+        "threadDirectory": 1,
+        "threadContextLocked": 1
+      }
+    },
+    "retryClaimedWaitCompletionLocked": {
+      "exclusion": "inherited_table",
+      "calls": {
+        "threadContextLocked": 1
+      }
+    },
+    "setWakeTickLocked": {
+      "exclusion": "inherited_table",
+      "calls": {
+        "getThreadHotState": 1
+      }
+    },
+    "queueReclaimGroupLocked": {
+      "exclusion": "inherited_table",
+      "calls": {
+        "threadDirectory": 1
+      }
+    },
+    "unqueueReclaimGroupLocked": {
+      "exclusion": "inherited_table",
+      "calls": {
+        "threadDirectory": 1
+      }
+    },
+    "updateGroupLiveLocked": {
+      "exclusion": "inherited_table",
+      "calls": {
+        "threadDirectory": 2
+      }
+    },
+    "blockCurrentThreadPreferred": {
+      "exclusion": "table",
+      "calls": {
+        "threadContextLocked": 1
+      }
+    },
+    "parkApThreadForBlockPreferred": {
+      "exclusion": "table",
+      "calls": {
+        "threadContextLocked": 1
+      }
+    },
+    "verifiedPickThreadForCpuPreferredLocked": {
+      "exclusion": "inherited_table",
+      "calls": {
+        "threadContextLocked": 1
+      }
+    },
+    "tryIpcDirectSwitchLocked": {
+      "exclusion": "inherited_table",
+      "calls": {
+        "threadContextLocked": 1
+      }
+    },
+    "tryIpcCompletedWait": {
+      "exclusion": "table",
+      "calls": {
+        "threadContextLocked": 1
+      }
+    },
+    "stageIpcResult": {
+      "exclusion": "table",
+      "calls": {
+        "threadContextLocked": 1
+      }
+    },
+    "stagePollResult": {
+      "exclusion": "table",
+      "calls": {
+        "threadContextLocked": 1
+      }
+    },
+    "loadableContextLocked": {
+      "exclusion": "inherited_table",
+      "calls": {
+        "getThreadHotStateConst": 1
+      }
+    },
+    "publishDirectWaitStateLocked": {
+      "exclusion": "inherited_table",
+      "calls": {
+        "getThreadHotState": 1
+      }
+    },
+    "switchToNotifyGenerationLockedWithRegisters": {
+      "exclusion": "inherited_table",
+      "calls": {
+        "threadContextLocked": 1
+      }
+    }
+  },
+  "identity_callers": {
+    "kernel/src/syscalls.zig": {
+      "currentThreadGeneration": 4
+    },
+    "kernel/src/scheduler_connection.zig": {
+      "releaseThread": 1,
+      "activate": 1,
+      "loadContextIntoFrame": 1,
+      "wakeIfWaiting": 1,
+      "initializeThreadContext": 1,
+      "threadReady": 1,
+      "threadOwnedBy": 1,
+      "matchingThreadLocked": 19,
+      "markThreadReadyLocked": 2,
+      "releaseThreadLocked": 5,
+      "markThreadReadyGeneration": 1,
+      "releaseThreadGeneration": 1,
+      "setThreadBasesGeneration": 1,
+      "copyCurrentThreadStateToGeneration": 1,
+      "allocateSuspendedThread": 1,
+      "allocateThreadWithReadyState": 3,
+      "releaseCurrentThread": 4,
+      "setCurrentFsBase": 1,
+      "setCurrentGsBase": 1,
+      "currentThreadGeneration": 2,
+      "setCurrentThreadBaseWithRegisters": 3,
+      "setThreadBaseWithRegisters": 2,
+      "threadForPrincipal": 1
+    },
+    "kernel/src/mmio_overlay_test.zig": {
+      "markThreadReadyGeneration": 1,
+      "releaseThreadGeneration": 1,
+      "setThreadBasesGeneration": 1,
+      "copyCurrentThreadStateToGeneration": 1,
+      "allocateSuspendedThread": 1
+    },
+    "kernel/src/boot/entry.zig": {
+      "threadForPrincipal": 1
+    },
+    "kernel/src/syscall/native_ipc.zig": {
+      "currentThreadGeneration": 7
+    },
+    "kernel/src/syscall/process.zig": {
+      "markThreadReadyGeneration": 2,
+      "releaseThreadGeneration": 4,
+      "setThreadBasesGeneration": 2,
+      "copyCurrentThreadStateToGeneration": 1,
+      "allocateSuspendedThread": 2,
+      "setCurrentFsBase": 1,
+      "setCurrentGsBase": 1,
+      "currentThreadGeneration": 1
+    },
+    "kernel/src/syscall/runtime.zig": {
+      "currentThreadGeneration": 5
+    },
+    "kernel/src/syscall/fd.zig": {
+      "currentThreadGeneration": 2
+    }
+  }
+}

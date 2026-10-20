@@ -2,6 +2,7 @@
 #ifndef PACHA_KOBOX_FS_QUEUE_H
 #define PACHA_KOBOX_FS_QUEUE_H
 
+#include <pacha/abi.h>
 #include "lifecycle.h"
 #include "../kobox2_owner/fs_channel.h"
 #include "boot/fs_service.h"
@@ -22,6 +23,10 @@ struct ph_fs_queue_lane {
     void *mapping;
     size_t mapping_bytes;
     int bound, direct;
+    /* The device event index published by the last arm that found the ring
+     * empty, while consumed has not moved since. That arm stays in force. */
+    int armed;
+    uint16_t armed_consumed;
     atomic_int retiring;
     atomic_uint ring_lock;
 };
@@ -33,7 +38,10 @@ struct ph_fs_client_queue {
     struct ph_ipc ipc;
     uint64_t client;
     int release_requested;
-    int watch_fd; /* Only this endpoint number is read by the native helper. */
+    /* The native helper alone receives this endpoint's doorbells, under
+     * watch_lock and only while watch_fd is nonzero (see drain_doorbells). */
+    pacha_fd_t watch_fd;
+    atomic_int doorbell_fault; /* Set by the helper; the owner faults the client. */
 };
 
 struct ph_fs_queue {

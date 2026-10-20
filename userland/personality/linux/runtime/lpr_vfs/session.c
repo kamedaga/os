@@ -15,7 +15,7 @@ struct lpr_fs_session {
     struct ph_fs_channel channel;
     uint64_t metadata_bytes, mapping_bytes;
     void *mapping;
-    int vmo, doorbell, wake_read, wake_write, remote;
+    pacha_fd_t vmo, doorbell, wake_read, wake_write, remote;
     int attached, remote_retired, retirement_failed;
     int temporary;
     uint64_t client;
@@ -62,7 +62,7 @@ static int free_session(struct lpr_fs_session *s, int close_fds)
         s->mapping = 0;
     }
     if (close_fds) {
-        int *fds[] = {&s->vmo, &s->doorbell, &s->wake_read, &s->wake_write, &s->remote};
+        pacha_fd_t *fds[] = {&s->vmo, &s->doorbell, &s->wake_read, &s->wake_write, &s->remote};
         for (unsigned i = 0; i < sizeof(fds) / sizeof(*fds); ++i) {
             if (*fds[i] < 16) continue;
             int64_t status = lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, *fds[i]);
@@ -153,7 +153,7 @@ static int initialize(uint64_t minimum_arena, struct lpr_fs_session **out)
     const int64_t vmo = lpr_pacha_syscall3(PACHAOS_SYSCALL_VMO_CREATE,
         mapping_bytes, rights, PACHA_FD_FLAG_PRIVATE | PACHA_FD_FLAG_CLOEXEC);
     if (vmo < 16) { status = native_error(vmo); goto fail; }
-    s->vmo = (int)vmo;
+    s->vmo = (pacha_fd_t)vmo;
     const int64_t mapping = lpr_pacha_syscall6(PACHAOS_SYSCALL_MMAP, vmo, 0,
         mapping_bytes, PACHAOS_PROT_READ | PACHAOS_PROT_WRITE,
         PACHAOS_MMAP_SHARED, 0);
@@ -210,19 +210,31 @@ fail:
     return (int)status;
 }
 
+/* Threads inside wait_epoch, over every epoch word of this process. A call
+ * publishes its epochs several times (completion, receiver handoff, lease
+ * release, inventory); an unconditional FUTEX_WAKE made each of those a
+ * native syscall even in the usual single-threaded caller with no sleeper. */
+static volatile uint32_t epoch_waiters;
+
 static void wake_epoch(volatile uint32_t *epoch)
 {
-    __atomic_add_fetch(epoch, 1, __ATOMIC_RELEASE);
-    (void)lpr_pacha_syscall2(PACHA_RUNTIME_SYSCALL_FUTEX_WAKE,
-        (uint64_t)(uintptr_t)epoch, UINT32_MAX);
+    /* Both orders are seq_cst and pair with wait_epoch: a waiter whose count
+     * this load misses registered after the increment, so its compare-and-
+     * sleep observes the new epoch and does not sleep. */
+    __atomic_add_fetch(epoch, 1, __ATOMIC_SEQ_CST);
+    if (__atomic_load_n(&epoch_waiters, __ATOMIC_SEQ_CST))
+        (void)lpr_pacha_syscall2(PACHA_RUNTIME_SYSCALL_FUTEX_WAKE,
+            (uint64_t)(uintptr_t)epoch, UINT32_MAX);
 }
 
 static void wait_epoch(volatile uint32_t *epoch, uint32_t expected)
 {
     /* Compare-and-sleep closes the unlock/wakeup gap. An interrupted internal
      * wait only rechecks inventory: a published VFS operation is never replayed. */
-    (void)lpr_pacha_syscall3(PACHA_RUNTIME_SYSCALL_FUTEX_WAIT,
-        (uint64_t)(uintptr_t)epoch, expected, 0);
+    __atomic_add_fetch(&epoch_waiters, 1, __ATOMIC_SEQ_CST);
+    (void)lpr_pacha_syscall4(PACHA_RUNTIME_SYSCALL_FUTEX_WAIT,
+        (uint64_t)(uintptr_t)epoch, expected, 0, PACHA_WAIT_UNINTERRUPTIBLE);
+    __atomic_sub_fetch(&epoch_waiters, 1, __ATOMIC_SEQ_CST);
 }
 
 static void fault_session(struct lpr_fs_session *s)
@@ -235,8 +247,7 @@ static void fault_session(struct lpr_fs_session *s)
             /* Retain a failed-close FD. A queued local hint provides the same
              * persistent readable latch without freeing uncertain inventory. */
             const struct pacha_ipc_msg hint = {.word0 = 1};
-            (void)lpr_pacha_syscall2(PACHAOS_SYSCALL_IPC_SEND, s->wake_write,
-                (uint64_t)(uintptr_t)&hint);
+            (void)lpr_ipc_message(PACHAOS_SYSCALL_IPC_SEND, s->wake_write, (uint64_t)(uintptr_t)((uint64_t)(uintptr_t)&hint), 0, 0, 0, 0);
         }
     }
     wake_epoch(&s->epoch);
@@ -334,7 +345,7 @@ static int wait_endpoint(struct lpr_fs_session *s, uint64_t events)
             {.fd = s->doorbell, .events = events | PACHA_FD_EVENT_HANGUP},
             {.fd = s->wake_read, .events = PACHA_FD_EVENT_READABLE | PACHA_FD_EVENT_HANGUP}};
         int64_t status = lpr_pacha_syscall4(PACHA_FD_SYSCALL_WAIT_MANY,
-            (uint64_t)(uintptr_t)fds, 2, PACHA_FD_WAIT_FOREVER, 0);
+            (uint64_t)(uintptr_t)fds, 2, PACHA_FD_WAIT_FOREVER, PACHA_WAIT_UNINTERRUPTIBLE);
         lpr_fs_diag(30, status, (uint64_t)fds[0].revents | ((uint64_t)fds[1].revents << 32));
         if (fds[1].revents || (fds[0].revents & PACHA_FD_EVENT_HANGUP)) return -LPR_LINUX_EIO;
         if (status > 0 && (fds[0].revents & events)) return 0;
@@ -346,44 +357,66 @@ static int wait_endpoint(struct lpr_fs_session *s, uint64_t events)
 
 static int notify_session(struct lpr_fs_session *s)
 {
-    const struct pacha_ipc_msg message = {.word0 = PH_FS_QUEUE_NOTIFY,
-        .word1 = s->channel.config.generation, .word2 = s->channel.config.channel_id,
-        .word3 = s->channel.queue.available_notification_id};
-    for (;;) {
-        int64_t status = lpr_pacha_syscall2(PACHAOS_SYSCALL_IPC_SEND, s->doorbell,
-            (uint64_t)(uintptr_t)&message);
-        if (status) lpr_fs_diag(31, status, s->doorbell);
-        if (status != PACHA_SYSCALL_ERR_NOT_READY && status != -PACHA_SYSCALL_ERR_NOT_READY)
-            return (int)lpr_pacha_status_to_errno(status);
-        int error = wait_endpoint(s, PACHA_FD_EVENT_WRITABLE);
-        if (error) return error;
-    }
+    /* The doorbell is a kernel notification latch, not a message: the channel
+     * capability already proves the sender and the ring carries the request.
+     * A latch has no queue slot to wait for, so any failure is peer death or
+     * lost authority, never backpressure. */
+    int64_t status = lpr_pacha_syscall1(PACHAOS_SYSCALL_IPC_NOTIFY, s->doorbell);
+    if (status) lpr_fs_diag(31, status, s->doorbell);
+    return status ? (int)lpr_pacha_status_to_errno(status) : 0;
 }
 
 static int receive_session(struct lpr_fs_session *s)
 {
-    struct pacha_ipc_msg message = {0};
+    /* A lone thread parks in NOTIFY_WAIT, the kernel's single receiver slot:
+     * the owner's NOTIFY completes it and hands the CPU straight over. The
+     * local wake FD only lets another thread fault or drop the session while
+     * this one waits; none exists, and this blocked thread cannot create one.
+     * Signals remain pending until the RPC releases its resources. */
+    while (__atomic_load_n(&lpr_state.thread_count, __ATOMIC_ACQUIRE) <= 1u) {
+        if (atomic_load_explicit(&s->channel.channel.faulted, memory_order_acquire))
+            return -LPR_LINUX_EIO;
+        int64_t status = lpr_pacha_syscall3(PACHAOS_SYSCALL_IPC_NOTIFY_WAIT, s->doorbell,
+            PACHA_FD_WAIT_FOREVER, PACHA_WAIT_UNINTERRUPTIBLE);
+        if (!status) return 0;
+        if (status == PACHA_SYSCALL_ERR_NOT_READY || status == -PACHA_SYSCALL_ERR_NOT_READY)
+            continue;
+        lpr_fs_diag(32, status, s->doorbell);
+        /* Peer death, as the WAIT_MANY path reports for HANGUP. */
+        if (status == PACHA_SYSCALL_ERR_CLOSED || status == -PACHA_SYSCALL_ERR_CLOSED)
+            return -LPR_LINUX_EIO;
+        return (int)lpr_pacha_status_to_errno(status);
+    }
     for (;;) {
-        int64_t status = lpr_pacha_syscall2(PACHAOS_SYSCALL_IPC_RECV, s->doorbell,
-            (uint64_t)(uintptr_t)&message);
-        /* Nonblocking RECV reports EMPTY, unlike an interrupted native wait.
-         * Neither result retires the published request or permits replay. */
-        if (status != PACHA_SYSCALL_ERR_EMPTY && status != -PACHA_SYSCALL_ERR_EMPTY &&
-            status != PACHA_SYSCALL_ERR_NOT_READY && status != -PACHA_SYSCALL_ERR_NOT_READY)
-            lpr_fs_diag(32, status, s->doorbell);
-        if (!status) break;
-        if (status != PACHA_SYSCALL_ERR_EMPTY && status != -PACHA_SYSCALL_ERR_EMPTY &&
-            status != PACHA_SYSCALL_ERR_NOT_READY && status != -PACHA_SYSCALL_ERR_NOT_READY)
-            return (int)lpr_pacha_status_to_errno(status);
+        /* Wait first: the caller just armed and found no completion, so the
+         * latch is rarely set yet and a speculative consume would only cost
+         * a native syscall. Readiness is level-triggered, so a latched
+         * notification returns at once. */
         int error = wait_endpoint(s, PACHA_FD_EVENT_READABLE);
         if (error) return error;
+        int64_t status = lpr_pacha_syscall3(PACHAOS_SYSCALL_IPC_NOTIFY_WAIT, s->doorbell, 0, PACHA_WAIT_UNINTERRUPTIBLE);
+        /* A consume racing another reader reports EMPTY, unlike an interrupted
+         * native wait. Neither retires the published request or permits replay. */
+        if (!status) return 0;
+        if (status == PACHA_SYSCALL_ERR_EMPTY || status == -PACHA_SYSCALL_ERR_EMPTY) {
+            /* Readable with no latch can only be a queued message, which a
+             * doorbell never carries. Left unread it would keep WAIT_MANY
+             * ready and spin this loop, so receive it (no capability room)
+             * and fail the session; EMPTY again was a benign race. */
+            struct pacha_ipc_msg message = {0};
+            status = lpr_ipc_message(PACHAOS_SYSCALL_IPC_RECV, s->doorbell, 0, (uint64_t)(uintptr_t)((uint64_t)(uintptr_t)&message), 0, 0, 0);
+            if (status != PACHA_SYSCALL_ERR_EMPTY && status != -PACHA_SYSCALL_ERR_EMPTY) {
+                lpr_fs_diag(32, status ? status : -LPR_LINUX_EIO, s->doorbell);
+                return -LPR_LINUX_EIO;
+            }
+            continue;
+        }
+        if (status != PACHA_SYSCALL_ERR_EMPTY && status != -PACHA_SYSCALL_ERR_EMPTY &&
+            status != PACHA_SYSCALL_ERR_NOT_READY && status != -PACHA_SYSCALL_ERR_NOT_READY) {
+            lpr_fs_diag(32, status, s->doorbell);
+            return (int)lpr_pacha_status_to_errno(status);
+        }
     }
-    if (message.word0 != PH_FS_QUEUE_NOTIFY ||
-        message.word1 != s->channel.config.generation ||
-        message.word2 != s->channel.config.channel_id ||
-        message.word3 != s->channel.queue.used_notification_id || message.fd_count)
-        return -LPR_LINUX_EIO;
-    return 0;
 }
 
 /* queue_lock protects only private ring inventory. Taking a used entry never
@@ -665,6 +698,7 @@ void lpr_fs_session_after_fork_child(void)
 {
     session_lock = 0;
     management_lock = inventory_epoch = 0;
+    epoch_waiters = 0; /* Only this thread survives fork. */
     __atomic_store_n(&terminal, 0, __ATOMIC_RELEASE);
     __atomic_store_n(&reservation_fault, 0, __ATOMIC_RELEASE);
     /* PRIVATE queue capabilities are not inherited. Numeric FD slots may

@@ -8,7 +8,7 @@
 #include <fcntl.h>
 #include <string.h>
 
-static int call(int endpoint, kb2_fs_request_t *request, const char *path,
+static int call(pacha_fd_t endpoint, kb2_fs_request_t *request, const char *path,
     const char *second_path, const void *data, size_t bytes,
     kb2_fs_response_t *response)
 {
@@ -17,7 +17,7 @@ static int call(int endpoint, kb2_fs_request_t *request, const char *path,
     return status ? status : response->result < 0 ? (int)response->result : 0;
 }
 
-static int create(int endpoint, const struct gpud_discovery_entry *e, int *owned)
+static int create(pacha_fd_t endpoint, const struct gpud_discovery_entry *e, int *owned)
 {
     kb2_fs_request_t request = {0};
     kb2_fs_response_t response;
@@ -56,7 +56,7 @@ static int create(int endpoint, const struct gpud_discovery_entry *e, int *owned
     return status ? status : closed;
 }
 
-int gpud_discovery_remove(struct gpud_discovery *d, int filed_fd)
+int gpud_discovery_remove(struct gpud_discovery *d, pacha_fd_t filed_fd)
 {
     if (!d || filed_fd < 16) return -EINVAL;
     int first = 0;
@@ -75,7 +75,7 @@ int gpud_discovery_remove(struct gpud_discovery *d, int filed_fd)
     return first;
 }
 
-int gpud_discovery_publish(struct gpud_discovery *d, int filed_fd)
+int gpud_discovery_publish(struct gpud_discovery *d, pacha_fd_t filed_fd)
 {
     if (!d || !d->count || d->count > 32 || d->published || filed_fd < 16)
         return -EINVAL;

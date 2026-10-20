@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Regression smoke (Phase 6 Step 1): a process-directed signal is delivered to
+# Regression smoke: a process-directed signal is delivered to
 # the registered signal-owner thread (the main/event-loop thread), not to an
 # arbitrary worker that happens to block first.  Green since the owner-preferred
 # deliverSignal fix in kernel/src/scheduler_connection.zig.

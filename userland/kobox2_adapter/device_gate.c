@@ -30,17 +30,17 @@ void ph_device_gate_prepare(const struct kobox_linux_boot_layout *layout) {
     uint64_t count = 0;
     PH_CHECK(pacha_syscall2(PACHA_CAPSULE_SYSCALL_PCI_ENUMERATE,
         UINT64_MAX, (uint64_t)(uintptr_t)&count) == 0);
-    int gpu_fd = -1;
+    pacha_fd_t gpu_fd = -1;
     for (uint64_t i = 0; i < count; ++i) {
         uint64_t words[8] = {0};
         PH_CHECK(pacha_syscall3(PACHA_CAPSULE_SYSCALL_PCI_ENUMERATE,
             i, (uint64_t)(uintptr_t)words, 8) == 8);
         if (words[1] == 0x1af4 && words[2] == 0x1050) {
             PH_CHECK(gpu_fd < 0);
-            gpu_fd = (int)pacha_syscall1(PACHA_CAPSULE_SYSCALL_PCI_CLAIM, i);
+            gpu_fd = (pacha_fd_t)pacha_syscall1(PACHA_CAPSULE_SYSCALL_PCI_CLAIM, i);
         }
     }
-    PH_CHECK(gpu_fd >= 16 && gpu_fd < PACHA_FD_TABLE_LIMIT);
+    PH_CHECK(gpu_fd >= 16 && gpu_fd < PACHA_THREAD_SELF_FD);
     config = (struct ph_device_config){
         .device_fd = gpu_fd, .generation = 1,
         /* Linux topology is local. The native FD still limits every operation

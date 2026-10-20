@@ -2,12 +2,13 @@
 #ifndef PACHA_KOBOX_DEVICE_GRANT_H
 #define PACHA_KOBOX_DEVICE_GRANT_H
 
+#include <pacha/abi.h>
 #include "device_authority.h"
 #include "package.h"
 
 struct ph_device_grant {
     uint64_t generation, object_id, native_device;
-    int fd;
+    pacha_fd_t fd;
 };
 
 /* After complete package verification, before any Linux resource import.

@@ -25,8 +25,8 @@ struct ph_cpu {
     /* Timer programming and expiry publication use a separate lock.
      * Lock order is timer_lock -> owner_lock, never the reverse. */
     atomic_uint timer_lock;
-    int timer_fd;
-    int stop_fd;
+    pacha_fd_t timer_fd;
+    pacha_fd_t stop_fd;
     uint64_t deadline_ns;
     struct ph_task *timer_task;
 #if defined(PH_SCHED_DIAGNOSTIC) && PH_SCHED_DIAGNOSTIC
@@ -565,7 +565,7 @@ static void *diagnostic_watchdog(void *unused) {
     static const char enabled[] = "[PH_SCHED] diagnostic watchdog enabled (native domain only)\n";
     PH_OK(diagnostic_write(enabled, sizeof(enabled) - 1));
     for (;;) {
-        struct pacha_pollfd event = {.fd = (int)timer, .events = PACHA_FD_EVENT_READABLE};
+        struct pacha_pollfd event = {.fd = (pacha_fd_t)timer, .events = PACHA_FD_EVENT_READABLE};
         PH_CHECK(ph_wait_readable(&event, 1) == 1);
         uint64_t expirations, now;
         PH_CHECK(pacha_syscall3(PACHA_FD_SYSCALL_READ, timer,
@@ -596,9 +596,9 @@ void ph_machine_init(struct ph_image *image) {
         atomic_init(&cpu->diagnostic_callbacks, 0);
         atomic_init(&cpu->diagnostic_callback_returns, 0);
 #endif
-        cpu->timer_fd = (int)pacha_syscall6(PACHA_FD_SYSCALL_TIMERFD_CREATE,
+        cpu->timer_fd = (pacha_fd_t)pacha_syscall6(PACHA_FD_SYSCALL_TIMERFD_CREATE,
             PACHA_TIMERFD_CLOCK_MONOTONIC, 0, 0, 0, rights, 0);
-        cpu->stop_fd = (int)pacha_syscall3(PACHA_FD_SYSCALL_EVENTFD_CREATE, 0, rights, 0);
+        cpu->stop_fd = (pacha_fd_t)pacha_syscall3(PACHA_FD_SYSCALL_EVENTFD_CREATE, 0, rights, 0);
         PH_CHECK(cpu->timer_fd >= 16 && cpu->stop_fd >= 16);
         cpu->timer_task = ph_thread_create(timer_entry, (void *)(uintptr_t)i);
     }

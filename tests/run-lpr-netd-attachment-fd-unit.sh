@@ -11,7 +11,7 @@ mkdir -p "$out_dir"
   -I"$repo_root/userland/libipc/include" \
   -I"$repo_root/userland/libpacha/include" \
   -I"$repo_root/userland/personality/include" \
-  -I"$repo_root/musl/pachaos/include" \
+  -I"$repo_root/kobox2/protocol/include" -I"$repo_root/kobox2/protocol/generated/include" -I"$repo_root/userland" -I"$repo_root/musl/pachaos/include" \
   -I"$repo_root/userland/daemons/common/include" \
   -I"$repo_root/userland/filed/include" \
   -I"$repo_root/userland/termd/include" \

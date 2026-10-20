@@ -33,7 +33,7 @@ int64_t lpr_install_stdio_fd_from_tty(uint64_t tty_fd, uint64_t target_fd)
     return lpr_linux_dup2(tty_fd, target_fd, 0);
 }
 
-void lpr_linux_ensure_default_stdio(void)
+void lpr_linux_ensure_default_stdio(unsigned *wait_not_ready __attribute__((unused)))
 {
     if (lpr_default_stdio_checked) {
         return;
@@ -56,7 +56,7 @@ void lpr_linux_ensure_default_stdio(void)
             LPR_MANIFEST_FLAG_STDIO_NOCTTY) != 0)
         open_flags |= LPR_LINUX_O_NOCTTY;
     const int64_t tty_fd = lpr_linux_openat(
-        LPR_LINUX_AT_FDCWD, (uint64_t)(uintptr_t)path, open_flags, 0);
+        LPR_LINUX_AT_FDCWD, (uint64_t)(uintptr_t)path, open_flags, 0, wait_not_ready);
     lpr_boot_diagnostic_emit("stdio.open", open_flags, lpr_process_manifest.flags,
         (uint64_t)tty_fd, tty_fd, 0);
     if (tty_fd < 0) {
@@ -107,7 +107,7 @@ void lpr_linux_ensure_default_stdio(void)
 #endif
 }
 
-int64_t lpr_tty_io(uint64_t op, uint64_t fd, uint64_t buf, uint64_t count)
+int64_t lpr_tty_io(uint64_t op, uint64_t fd, uint64_t buf, uint64_t count, unsigned *wait_not_ready __attribute__((unused)))
 {
     if (!lpr_linux_tty_fd_active(fd)) {
         return -LPR_LINUX_EBADF;
@@ -124,7 +124,7 @@ int64_t lpr_tty_io(uint64_t op, uint64_t fd, uint64_t buf, uint64_t count)
     const uint8_t tty_type = lpr_tty_backend(fd)->reserved0;
     for (;;) {
         void *page = 0;
-        const int page_fd = lpr_create_tty_wire_page(&page);
+        const pacha_fd_t page_fd = lpr_create_tty_wire_page(&page);
         if (page_fd < 0) {
             return page_fd;
         }
@@ -171,7 +171,7 @@ int64_t lpr_tty_io(uint64_t op, uint64_t fd, uint64_t buf, uint64_t count)
         }
         if (lpr_boot_diagnostic_tty_active())
             lpr_boot_diagnostic_emit("tty.wait.enter", fd, wait_events, 0, status, 0);
-        const int64_t wait_status = lpr_tty_wait(fd, wait_events);
+        const int64_t wait_status = lpr_tty_wait(fd, wait_events, wait_not_ready);
         if (lpr_boot_diagnostic_tty_active())
             lpr_boot_diagnostic_emit("tty.wait.return", fd, wait_events, 0, wait_status, 0);
         if (wait_status != 0) {
@@ -190,7 +190,7 @@ int64_t lpr_tty_ioctl(uint64_t fd, uint64_t request, uint64_t arg)
         return lpr_tty_open_peer(fd, arg);
     }
     void *page = 0;
-    const int page_fd = lpr_create_tty_wire_page(&page);
+    const pacha_fd_t page_fd = lpr_create_tty_wire_page(&page);
     if (page_fd < 0) {
         return page_fd;
     }
@@ -277,7 +277,7 @@ int64_t lpr_tty_ioctl(uint64_t fd, uint64_t request, uint64_t arg)
     return status;
 }
 
-int64_t lpr_iov_scalar_io(uint64_t fd, uint64_t iov_raw, uint64_t iov_count, int write)
+int64_t lpr_iov_scalar_io(uint64_t fd, uint64_t iov_raw, uint64_t iov_count, int write, unsigned *wait_not_ready __attribute__((unused)))
 {
     const lpr_linux_iovec_t *iov = (const lpr_linux_iovec_t *)(uintptr_t)iov_raw;
     int64_t total = 0;
@@ -286,8 +286,8 @@ int64_t lpr_iov_scalar_io(uint64_t fd, uint64_t iov_raw, uint64_t iov_count, int
             continue;
         }
         const int64_t n = write ?
-            lpr_linux_write(fd, iov[i].base, iov[i].len) :
-            lpr_linux_read(fd, iov[i].base, iov[i].len);
+            lpr_linux_write(fd, iov[i].base, iov[i].len, wait_not_ready) :
+            lpr_linux_read(fd, iov[i].base, iov[i].len, wait_not_ready);
         if (n < 0) {
             return total != 0 ? total : n;
         }
@@ -308,7 +308,7 @@ uint32_t lpr_linux_tty_poll_events(uint64_t fd, uint32_t events)
         return 0;
     }
     void *page = 0;
-    const int page_fd = lpr_create_tty_wire_page(&page);
+    const pacha_fd_t page_fd = lpr_create_tty_wire_page(&page);
     if (page_fd < 0) {
         return 0;
     }
@@ -335,7 +335,7 @@ uint32_t lpr_linux_tty_poll_events(uint64_t fd, uint32_t events)
     return revents;
 }
 
-int64_t lpr_tty_wait(uint64_t fd, uint32_t events)
+int64_t lpr_tty_wait(uint64_t fd, uint32_t events, unsigned *wait_not_ready __attribute__((unused)))
 {
     lpr_tty_backend_t *tty = lpr_tty_backend(fd);
     if (tty == 0) {
@@ -367,12 +367,12 @@ int64_t lpr_tty_wait(uint64_t fd, uint32_t events)
         lpr_wait_graph_init(&graph);
         status = lpr_wait_graph_add_fd(&graph, fd, events);
         if (status != 0) return status;
-        status = lpr_wait_graph_block(&graph, &deadline);
+        status = lpr_wait_graph_block(&graph, &deadline, wait_not_ready);
         if (status != 0) return status;
     }
 }
 
-int lpr_linux_signal_process_fd(int process_fd, uint32_t signo)
+int lpr_linux_signal_process_fd(pacha_fd_t process_fd, uint32_t signo)
 {
     if (process_fd < 16 || signo == 0 || signo > LPR_LINUX_SIGNAL_MAX) {
         return -LPR_LINUX_EINVAL;
@@ -442,7 +442,7 @@ static int lpr_linux_tty_signal_interrupts_current(int32_t pgrp, uint32_t signo)
 int lpr_linux_pump_tty_signals(void)
 {
     void *page = 0;
-    const int page_fd = lpr_create_tty_wire_page(&page);
+    const pacha_fd_t page_fd = lpr_create_tty_wire_page(&page);
     if (page_fd < 0) {
         return 0;
     }
@@ -467,10 +467,10 @@ int lpr_linux_pump_tty_signals(void)
     return interrupted;
 }
 
-uint32_t lpr_linux_eventfd_poll_events(uint64_t fd, uint32_t events)
+uint32_t lpr_linux_eventfd_poll_events(uint64_t fd, uint32_t events, unsigned *wait_not_ready __attribute__((unused)))
 {
     if (lpr_linux_inotify_active(fd)) {
-        return lpr_linux_inotify_poll_events(fd, events);
+        return lpr_linux_inotify_poll_events(fd, events, wait_not_ready);
     }
     if (lpr_linux_timerfd_active(fd)) {
         return lpr_linux_timerfd_poll_events(fd, events);

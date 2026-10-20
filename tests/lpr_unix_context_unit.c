@@ -152,3 +152,9 @@ int main(void)
     assert(!lock_depth);
     puts("lpr unix context: actual thread lookup/fork reset, lazy session/owner reuse, per-thread isolation, failure and private-cap cleanup passed");
 }
+
+#include "lpr_ipc_mock.h"
+int64_t lpr_ipc_message(uint64_t nr, uint64_t fd, uint64_t send, uint64_t receive,
+    uint64_t timeout, uint64_t flags, int *committed) {
+    return test_lpr_ipc_noncall(nr, fd, send, receive, timeout, flags, committed);
+}

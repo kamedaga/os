@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdint.h>
+#include <pacha/abi.h>
 
 enum {
     LPR_FD_OPS_NONE = 0u,
@@ -41,7 +42,7 @@ enum {
 typedef uint32_t lpr_linux_fd_t;
 
 typedef struct lpr_native_fd {
-    int32_t raw;
+    pacha_fd_t raw;
 } lpr_native_fd_t;
 
 typedef struct lpr_filed_backend {
@@ -274,6 +275,10 @@ typedef struct lpr_fd_table {
     lpr_backend_record_t *backends;
     uint32_t backend_count;
     uint32_t generation;
+    /* Linux admission policy, protected by lock together with FD publication.
+     * Lowering it never invalidates an existing entry or a pinned OFD. */
+    uint64_t nofile_soft;
+    uint64_t nofile_hard;
     lpr_lock_t lock;
 } lpr_fd_table_t;
 
@@ -408,3 +413,9 @@ int lpr_fd_table_compare_ofd(const lpr_fd_table_t *table,
     lpr_linux_fd_t first, lpr_linux_fd_t second);
 uint32_t lpr_fd_table_open_count(const lpr_fd_table_t *table);
 uint32_t lpr_fd_table_live_ofd_count(const lpr_fd_table_t *table);
+
+/* Linux errno results; a null new_limit only snapshots the current policy.
+ * The old value is written only after validating the requested transition. */
+int lpr_fd_table_prlimit(lpr_fd_table_t *table, const uint64_t *new_limit,
+    uint64_t *old_limit);
+uint64_t lpr_fd_table_soft_limit(lpr_fd_table_t *table);

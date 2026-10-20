@@ -7,7 +7,7 @@ static uint64_t description_rights(void)
         PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_MAP_READ | PACHA_FD_RIGHT_MAP_WRITE;
 }
 
-int lpr_device_description_capability_valid(int fd)
+int lpr_device_description_capability_valid(pacha_fd_t fd)
 {
     struct pacha_fd_info info = {0};
     return fd >= 16 && lpr_native_fd_info((uint64_t)(uint32_t)fd, &info) &&
@@ -36,7 +36,7 @@ int lpr_device_description_ensure_locked(lpr_device_backend_t *device)
             LPR_DEVICE_DESCRIPTION_BYTES, description_rights(), 0);
         if (fd < 16) status = fd ? (int)lpr_pacha_status_to_errno(fd) : -LPR_LINUX_EIO;
         else {
-            device->description_fd.raw = (int32_t)fd;
+            device->description_fd.raw = (pacha_fd_t)fd;
             status = lpr_device_description_map(device);
             if (status) {
                 (void)lpr_close_native_fd_if_open((uint64_t)fd);

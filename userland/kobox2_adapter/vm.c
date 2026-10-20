@@ -152,7 +152,7 @@ static int close_space(void *opaque) {
          * tombstone/MM membership until all core bindings are gone. */
         PH_OK(ph_thread_join(space->monitor));
         space->monitor = NULL;
-        int *descriptors[] = {&space->thread_fd, &space->process_fd,
+        pacha_fd_t *descriptors[] = {&space->thread_fd, &space->process_fd,
             &space->kick_fd, &space->event_fd, &space->control_fd};
 
         for (unsigned index = 0; index < sizeof(descriptors) / sizeof(descriptors[0]); ++index) {
@@ -278,13 +278,13 @@ const struct kobox_linux_vm_host_operations ph_vm_ops = {
     .event = next_event,
 };
 
-static int create_event_counter(void) {
+static pacha_fd_t create_event_counter(void) {
     uint64_t rights = PACHA_FD_RIGHT_READ | PACHA_FD_RIGHT_WRITE |
         PACHA_FD_RIGHT_POLL | PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_TRANSFER;
     long fd = pacha_syscall3(PACHA_FD_SYSCALL_EVENTFD_CREATE, 0, rights, 0);
 
     PH_CHECK(fd >= 16);
-    return (int)fd;
+    return (pacha_fd_t)fd;
 }
 
 static void create_ram_grants(struct ph_vm_space *space) {
@@ -304,7 +304,7 @@ static void create_ram_grants(struct ph_vm_space *space) {
             rights, PACHA_FD_FLAG_PRIVATE);
 
         PH_CHECK(fd >= 16);
-        space->ram_grant_fds[protection] = (int)fd;
+        space->ram_grant_fds[protection] = (pacha_fd_t)fd;
     }
 }
 
@@ -375,14 +375,14 @@ struct ph_vm_space *ph_vm_create(const void *file, size_t file_size,
         (uintptr_t)grants, sizeof(grants) / sizeof(grants[0]));
 
     PH_CHECK(process >= 16);
-    space->process_fd = (int)process;
+    space->process_fd = (pacha_fd_t)process;
     uint64_t entry = ph_vm_load_bootstrap(space->process_fd, file, file_size);
     uint64_t control_rights = PACHA_FD_RIGHT_MAP_READ | PACHA_FD_RIGHT_MAP_WRITE |
         PACHA_FD_RIGHT_CLOSE;
     long backing = pacha_syscall3(PACHA_FD_SYSCALL_VMO_CREATE, PH_PAGE_SIZE, control_rights, 0);
 
     PH_CHECK(backing >= 16);
-    space->control_fd = (int)backing;
+    space->control_fd = (pacha_fd_t)backing;
     long alias = pacha_syscall6(PACHA_VM_SYSCALL_MMAP, backing, 0, PH_PAGE_SIZE,
         PACHA_PROT_READ | PACHA_PROT_WRITE, PACHA_MMAP_SHARED, 0);
 
@@ -401,7 +401,7 @@ struct ph_vm_space *ph_vm_create(const void *file, size_t file_size,
     if (thread < 16) {
         ph_fail(__FILE__, __LINE__, thread);
     }
-    space->thread_fd = (int)thread;
+    space->thread_fd = (pacha_fd_t)thread;
     PH_OK(pacha_syscall1(PACHA_THREAD_SYSCALL_START, thread));
     struct pacha_pollfd ready[2] = {
         {.fd = space->event_fd, .events = PACHA_FD_EVENT_READABLE},

@@ -6,7 +6,7 @@
 #include <limits.h>
 #include <string.h>
 
-static int bootstrap_fd(char **argv)
+static pacha_fd_t bootstrap_fd(char **argv)
 {
     if (!argv) return -EINVAL;
     char **p=argv;
@@ -18,7 +18,7 @@ static int bootstrap_fd(char **argv)
     for (unsigned i=0;i<64;++i) {
         if (!aux[2*i]) break;
         if (aux[2*i]==PACHA_AT_BOOTSTRAP_FD)
-            return aux[2*i+1]>=16 && aux[2*i+1]<PACHA_FD_TABLE_LIMIT ?
+            return aux[2*i+1]>=16 && aux[2*i+1]<PACHA_THREAD_SELF_FD ?
                 (int)aux[2*i+1] : -EINVAL;
     }
     return -ENOENT;
@@ -37,7 +37,7 @@ void filed_runtime_init(filed_runtime_t *rt)
 int filed_runtime_bootstrap(filed_runtime_t *rt,char **argv)
 {
     if (!rt) return -EINVAL;
-    int fd=bootstrap_fd(argv);
+    pacha_fd_t fd=bootstrap_fd(argv);
     if (fd<16) return fd;
     rt->bootstrap_fd=fd;
     struct pacha_fd_info info;
@@ -47,14 +47,14 @@ int filed_runtime_bootstrap(filed_runtime_t *rt,char **argv)
     long got=pacha_fd_read(fd,&bootstrap,sizeof(bootstrap));
     if (got!=(long)sizeof(bootstrap) ||
         bootstrap.magic!=STORAGE_FILED_BOOTSTRAP_MAGIC ||
-        bootstrap.control_fd<16 || bootstrap.control_fd>=PACHA_FD_TABLE_LIMIT ||
-        bootstrap.unix_path_fd<16 || bootstrap.unix_path_fd>=PACHA_FD_TABLE_LIMIT ||
-        bootstrap.bootfs_fd<16 || bootstrap.bootfs_fd>=PACHA_FD_TABLE_LIMIT ||
+        bootstrap.control_fd<16 || bootstrap.control_fd>=PACHA_THREAD_SELF_FD ||
+        bootstrap.unix_path_fd<16 || bootstrap.unix_path_fd>=PACHA_THREAD_SELF_FD ||
+        bootstrap.bootfs_fd<16 || bootstrap.bootfs_fd>=PACHA_THREAD_SELF_FD ||
         !bootstrap.bootfs_size) return -EINVAL;
     rt->bootstrap=bootstrap;
-    rt->client_endpoint_fd=(int)bootstrap.control_fd;
-    rt->unix_path_fd=(int)bootstrap.unix_path_fd;
-    return filed_storage_owner_create((int)bootstrap.bootfs_fd,
+    rt->client_endpoint_fd=(pacha_fd_t)bootstrap.control_fd;
+    rt->unix_path_fd=(pacha_fd_t)bootstrap.unix_path_fd;
+    return filed_storage_owner_create((pacha_fd_t)bootstrap.bootfs_fd,
         bootstrap.bootfs_size,&bootstrap,&rt->storage);
 }
 int filed_runtime_mount_root(filed_runtime_t *rt)

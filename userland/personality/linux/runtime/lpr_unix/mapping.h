@@ -15,7 +15,7 @@ struct lpr_unix_mapping {
     const struct unix_rx *outgoing_rx;
     const struct unix_tx *incoming_tx;
     struct unix_rx *incoming_rx;
-    int fds[2];
+    pacha_fd_t fds[2];
 };
 
 /* Fresh/closed output only. ATTACH does not create another broker owner.
@@ -33,7 +33,7 @@ int lpr_unix_mapping_import(const struct unix_attachment *attachment,
 struct lpr_unix_route_mapping {
     struct unix_tx *tx;
     struct unix_rx *rx;
-    int fds[2];
+    pacha_fd_t fds[2];
 };
 int lpr_unix_route_import(const struct pacha_ipc_fd *caps, unsigned count,
     uint64_t generation, int writing, struct lpr_unix_route_mapping *out);

@@ -11,17 +11,17 @@ static struct test_fd descriptors[256];
 static unsigned next_fd=80, next_object, mapped_entries;
 static int duplicate_failure, mapping_failure;
 
-int pacha_vmo_create(uint64_t size,uint64_t rights,uint32_t flags)
+pacha_fd_t pacha_vmo_create(uint64_t size,uint64_t rights,uint32_t flags)
 {
     assert(size && !(size&4095) && !flags && next_object<32 && next_fd<256);
     struct test_object *object=&objects[next_object++];
     *object=(struct test_object){.bytes=malloc((size_t)size),.size=(size_t)size,.refs=1};
     assert(object->bytes);
-    int fd=(int)next_fd++;
+    pacha_fd_t fd=(int)next_fd++;
     descriptors[fd]=(struct test_fd){object,rights};
     return fd;
 }
-void *pacha_mmap(int fd,uint64_t size,uint64_t prot,uint64_t flags,uint64_t offset)
+void *pacha_mmap(pacha_fd_t fd,uint64_t size,uint64_t prot,uint64_t flags,uint64_t offset)
 {
     assert(fd>=80 && (unsigned)fd<next_fd);
     struct test_fd *entry=&descriptors[fd];
@@ -35,7 +35,7 @@ int pacha_munmap(void *bytes,uint64_t size)
 {
     assert(bytes && size);return 0;
 }
-long pacha_fd_fcntl(int fd,uint64_t command,uint64_t minimum,uint64_t rights)
+long pacha_fd_fcntl(pacha_fd_t fd,uint64_t command,uint64_t minimum,uint64_t rights)
 {
     assert(command==PACHA_FD_FCNTL_DUP && minimum==16);
     assert(fd>=80 && (unsigned)fd<next_fd && descriptors[fd].object);
@@ -43,12 +43,12 @@ long pacha_fd_fcntl(int fd,uint64_t command,uint64_t minimum,uint64_t rights)
     assert(!(rights&~descriptors[fd].rights));
     if(duplicate_failure) return duplicate_failure;
     assert(next_fd<256);
-    int copy=(int)next_fd++;
+    pacha_fd_t copy=(int)next_fd++;
     descriptors[copy]=(struct test_fd){descriptors[fd].object,rights};
     ++descriptors[copy].object->refs;
     return copy;
 }
-int pacha_fd_close(int fd)
+int pacha_fd_close(pacha_fd_t fd)
 {
     assert(fd>=80 && (unsigned)fd<next_fd && descriptors[fd].object);
     assert(descriptors[fd].rights&PACHA_FD_RIGHT_CLOSE);
@@ -66,7 +66,7 @@ static uint64_t required_rights(uint64_t prot)
     if(prot&PACHA_PROT_EXEC) rights|=PACHA_FD_RIGHT_MAP_EXEC;
     return rights;
 }
-int pacha_process_map_batch(int process,const struct pacha_process_map_batch_entry *entries,
+int pacha_process_map_batch(pacha_fd_t process,const struct pacha_process_map_batch_entry *entries,
     uint64_t count)
 {
     assert(process==60 && count);
@@ -158,9 +158,9 @@ int main(int argc,char **argv)
     assert(prepare_image(&image,LPR_IMAGE_RUNTIME_BASE_VA,0,1,&batch,&loaded)==-1);
     lpr_exec_pending_map_batch_discard(&batch);duplicate_failure=0;assert_drained();
     /* PROT_NONE references need cleanup rights but no extra mapping authority. */
-    int vmo=-1;unsigned char *mapped=NULL;
+    pacha_fd_t vmo=-1;unsigned char *mapped=NULL;
     assert(!create_segment_vmo(4096,&vmo,&mapped));
-    int no_mapping=(int)pacha_fd_fcntl(vmo,PACHA_FD_FCNTL_DUP,16,PACHA_FD_RIGHT_CLOSE);
+    pacha_fd_t no_mapping=(int)pacha_fd_fcntl(vmo,PACHA_FD_FCNTL_DUP,16,PACHA_FD_RIGHT_CLOSE);
     const struct pacha_process_map_batch_entry rejected={.vmo_fd=(uint64_t)no_mapping,
         .target_va=0x40000000,.size=4096,.prot=PACHA_PROT_READ,
         .flags=PACHA_PROCESS_MAP_PRIVATE};

@@ -1,3 +1,4 @@
+#include <pacha/abi.h>
 #ifndef TERMD_LINUX_TTY_ISLAND_H
 #define TERMD_LINUX_TTY_ISLAND_H
 
@@ -34,7 +35,7 @@ struct termd_linux_tty_island {
     int32_t load_status;
     int32_t init_status;
     uint64_t signal_generation;
-    int wake_irq_fd;
+    pacha_fd_t wake_irq_fd;
     uint32_t reserved1;
     uint64_t wake_irq_count;
     const char *loader_version;
@@ -51,22 +52,22 @@ int termd_linux_tty_island_refresh_ptmx(struct termd_linux_tty_island *island);
 int termd_linux_tty_island_open_ptmx(
     struct termd_linux_tty_island *island,
     uint64_t flags,
-    int notify_fd,
+    pacha_fd_t notify_fd,
     uint64_t *out_handle);
 int termd_linux_tty_island_open_pts(
     struct termd_linux_tty_island *island,
     const termd_open_request_t *request,
-    int notify_fd,
+    pacha_fd_t notify_fd,
     uint64_t *out_handle);
 int termd_linux_tty_island_open_hvc(
     struct termd_linux_tty_island *island,
     const termd_open_request_t *request,
-    int notify_fd,
+    pacha_fd_t notify_fd,
     uint64_t *out_handle);
 int termd_linux_tty_island_open_ctty(
     struct termd_linux_tty_island *island,
     const termd_open_request_t *request,
-    int notify_fd,
+    pacha_fd_t notify_fd,
     uint64_t *out_handle);
 int termd_linux_tty_island_close(struct termd_linux_tty_island *island, uint64_t handle);
 int termd_linux_tty_island_dup(
@@ -76,7 +77,7 @@ int termd_linux_tty_island_dup(
 int termd_linux_tty_island_transfer_dup(
     struct termd_linux_tty_island *island,
     uint64_t handle,
-    int lease_fd,
+    pacha_fd_t lease_fd,
     uint64_t *out_handle);
 int termd_linux_tty_island_ioctl(
     struct termd_linux_tty_island *island,
@@ -84,7 +85,7 @@ int termd_linux_tty_island_ioctl(
 int termd_linux_tty_island_open_peer(
     struct termd_linux_tty_island *island,
     const termd_ioctl_request_t *request,
-    int notify_fd,
+    pacha_fd_t notify_fd,
     uint64_t *out_handle);
 int termd_linux_tty_island_poll(
     struct termd_linux_tty_island *island,
@@ -99,7 +100,7 @@ int termd_linux_tty_island_take_signal(
     struct termd_linux_tty_island *island,
     termd_signal_request_t *request,
     uint64_t *out_result);
-size_t termd_linux_tty_island_collect_wait_sources(int *out_fds, size_t capacity);
+size_t termd_linux_tty_island_collect_wait_sources(pacha_fd_t *out_fds, size_t capacity);
 size_t termd_linux_tty_island_reap_hangups(struct termd_linux_tty_island *island);
 
 #endif

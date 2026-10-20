@@ -57,7 +57,7 @@ int64_t lpr_fs_call_buffers(kb2_fs_request_t *request,
 int64_t lpr_fs_call(kb2_fs_request_t *request, const char *path,
     const char *second, const void *input, uint64_t input_bytes,
     void *output, uint64_t output_bytes, kb2_fs_response_t *reply,
-    int transfer, int *cap)
+    pacha_fd_t transfer, pacha_fd_t *cap)
 {
     assert(!path && !second && transfer == -1 && !cap);
     const struct lpr_fs_buffer in = {input, input_bytes}, out = {output, output_bytes};
@@ -109,4 +109,14 @@ int main(void)
     assert(!memcmp(data, a, sizeof(a)) && !memcmp(data + sizeof(a), b, sizeof(b)));
     puts("LPR_FS_VECTOR_UNIT_PASS");
     return 0;
+}
+
+#include "lpr_ipc_mock.h"
+int64_t lpr_ipc_message(uint64_t nr, uint64_t fd, uint64_t send, uint64_t receive,
+    uint64_t timeout, uint64_t flags, int *committed) {
+    return test_lpr_ipc_noncall(nr, fd, send, receive, timeout, flags, committed);
+}
+
+int64_t lpr_pacha_syscall4(uint64_t nr,uint64_t a,uint64_t b,uint64_t c,uint64_t d) {
+    (void)nr;(void)a;(void)b;(void)c;(void)d;abort();
 }

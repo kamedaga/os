@@ -61,6 +61,21 @@ static uint64_t now_ns(void)
 
 static const char *label;
 static unsigned scale;
+/* Diagnostic mode brackets the unchanged measured loops. The host snapshots
+ * counters while stdin is blocked; the default benchmark never takes this
+ * path. Empty brackets quantify terminal/handshake notification overhead. */
+static int notify_profile;
+static unsigned profile_phase;
+static void profile_boundary(int begin)
+{
+    if (!notify_profile) return;
+    printf("FS_NOTIFY_BOUNDARY fs=%s phase=%u begin=%d\n", label, profile_phase, begin);
+    fflush(stdout);
+    int c;
+    do { c = getchar(); } while (c != '\n' && c != EOF);
+    if (c == EOF) exit(3);
+    if (!begin) profile_phase++;
+}
 
 static void die(const char *phase)
 {
@@ -80,6 +95,7 @@ static void report(const char *phase, uint64_t ops, uint64_t total_ns)
 /* Count only the operation batches, so untimed setup for create/unlink does
  * not inflate their results. Native Linux needs many more batches than LPR. */
 #define TIMED_BEGIN(batch_ops) \
+    profile_boundary(1); \
     uint64_t measured_ops = 0, measured_ns = 0; \
     do { \
         const uint64_t t0 = now_ns();
@@ -87,7 +103,8 @@ static void report(const char *phase, uint64_t ops, uint64_t total_ns)
         measured_ns += now_ns() - t0; \
         measured_ops += (batch_ops); \
     } while (measured_ns < 1000000000ull); \
-    report((phase), measured_ops, measured_ns)
+    report((phase), measured_ops, measured_ns); \
+    profile_boundary(0)
 
 static void path_at_depth(char *out, size_t cap, const char *base, unsigned depth, const char *leaf)
 {
@@ -228,13 +245,14 @@ static void bench_readdir(const char *base, unsigned depth)
 
 int main(int argc, char **argv)
 {
-    if (argc != 4 && (argc != 5 || strcmp(argv[4], "ipc-mmap"))) {
-        fprintf(stderr, "usage: %s LABEL DIR SCALE [ipc-mmap]\n", argv[0]);
+    if (argc != 4 && (argc != 5 || (strcmp(argv[4], "ipc-mmap") && strcmp(argv[4], "notify-profile")))) {
+        fprintf(stderr, "usage: %s LABEL DIR SCALE [ipc-mmap|notify-profile]\n", argv[0]);
         return 2;
     }
     label = argv[1];
     /* Keep the measured loops unchanged while avoiding unrelated mutation
      * phases during transport/snapshot iteration. Default remains full. */
+    notify_profile = argc == 5 && !strcmp(argv[4], "notify-profile");
     const int focused = argc == 5;
     const char *root = argv[2];
     scale = (unsigned)strtoul(argv[3], NULL, 10);
@@ -279,6 +297,8 @@ int main(int argc, char **argv)
     printf("FS_BENCH_START fs=%s scale=%u min_ns=1000000000\n", label, scale);
     fflush(stdout);
 
+    profile_boundary(1);
+    profile_boundary(0);
     const uint64_t meta = 1000ull * scale;
     bench_stat(base, 0, meta);
     if (!focused) {
@@ -366,7 +386,7 @@ int main(int argc, char **argv)
                 die("pwrite_4k");
         TIMED_END("pwrite_4k", ops);
     }
-    if (!focused) {
+    if (!focused || notify_profile) {
         const uint64_t ops = 10ull * scale;
         TIMED_BEGIN(ops)
         for (uint64_t i = 0; i < ops; ++i)

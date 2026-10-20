@@ -1,3 +1,4 @@
+const mmio = @import("memory/mmio.zig");
 const std = @import("std");
 const acpi = @import("acpi_tables.zig");
 const physical_layout = @import("arch/x86_64/physical_layout.zig");
@@ -42,8 +43,8 @@ pub fn diagnostic() Diagnostic {
 
 const RegisterRange = struct { base: u64, bytes: u64 };
 fn registerRange(address: u64) ?RegisterRange {
-    if (address < 0x100000 or address >= physical_layout.identity_limit or
-        register_bytes > physical_layout.identity_limit - address) return null;
+    if (address < 0x100000 or address >= (@as(u64, 1) << 52) or
+        register_bytes > (@as(u64, 1) << 52) - address) return null;
     const base = address & ~(page_size - 1);
     const end = std.mem.alignForward(u64, address + register_bytes, page_size);
     return .{ .base = base, .bytes = end - base };
@@ -81,7 +82,7 @@ pub fn prepareBootMmio(rsdp: u64) bool {
         init_diagnostic.reason = .bsp_cache_unsupported;
         return false;
     }
-    if (!@import("arch/x86_64/platform.zig").mapBootMmioIdentityRange(range.base, range.bytes)) {
+    if (!@import("arch/x86_64/platform.zig").mapBootMmioRange(range.base, range.bytes)) {
         init_diagnostic.reason = .boot_mapping_failed;
         return false;
     }
@@ -119,19 +120,17 @@ pub fn elapsedNs(count: u64, period_fs: u32) u64 {
 }
 
 const Counter = struct {
-    address: u64 = 0,
+    registers: mmio.Borrow = undefined,
     period_fs: u32 = 0,
     origin: u64 = 0,
     epoch_ns: u64 = 0,
 
     fn read(self: *const Counter, offset: u64) u64 {
-        const reg: *volatile u64 = @ptrFromInt(self.address + offset);
-        return reg.*;
+        return self.registers.read(u64, offset);
     }
 
     fn write(self: *const Counter, offset: u64, value: u64) void {
-        const reg: *volatile u64 = @ptrFromInt(self.address + offset);
-        reg.* = value;
+        self.registers.write(u64, offset, value);
     }
 };
 
@@ -153,7 +152,7 @@ pub fn initialize(rsdp: u64, mmio_allowed: *const fn (u64, u64) bool) bool {
         init_diagnostic.reason = .mmio_not_uc;
         return false;
     }
-    var candidate: Counter = .{ .address = address };
+    var candidate: Counter = .{ .registers = (@import("arch/x86_64/platform.zig").kernelMmioBorrow(address, register_bytes) orelse unreachable) };
     const caps = candidate.read(capabilities_offset);
     init_diagnostic.capabilities = caps;
     init_diagnostic.period_fs = @truncate(caps >> 32);
@@ -194,18 +193,18 @@ test "HPET boot mapping bounds only the firmware-declared register pages" {
     const crossing = registerRange(0xfed00c00).?;
     try std.testing.expectEqual(@as(u64, 8192), crossing.bytes);
     try std.testing.expect(registerRange(0) == null);
-    try std.testing.expect(registerRange(physical_layout.identity_limit - 1024) == null);
+    try std.testing.expect(registerRange((@as(u64, 1) << 52) - 1024) == null);
     try std.testing.expect(registerRange(std.math.maxInt(u64)) == null);
 }
 
 pub fn monotonicNs() ?u64 {
-    if (counter.address == 0) return null;
+    if (counter.period_fs == 0) return null;
     const value = counter.read(counter_offset);
     return counter.epoch_ns +| elapsedNs(value -% counter.origin, counter.period_fs);
 }
 
 pub fn resolutionNs() ?u64 {
-    if (counter.address == 0) return null;
+    if (counter.period_fs == 0) return null;
     return (@as(u64, counter.period_fs) + fs_per_ns - 1) / fs_per_ns;
 }
 

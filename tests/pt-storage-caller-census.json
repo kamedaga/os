@@ -1,0 +1,36 @@
+{
+  "scope": "G3-1 paging storage; private A, shared K/all-A/S; coordinates u16, software slots usize",
+  "retirement": {
+    "TablePathPreparation.finish": "unpublished only",
+    "MmioTablePreparation.rollback": "restore parents, full context ACK, return",
+    "retireEmptyUserPtSlots": "detach all PT/PD/PDP, retain assigned retire_pending descriptors through one synchronous full-context ACK, then return all levels",
+    "detachAndReleaseUserPtStorage": "detach user roots, context ACK, return; keep prepared replacement PDP",
+    "RamCacheKernelSplit.releaseReservation": "unpublished only; published split belongs to kernel",
+    "scratch_store": "never hardware published; AS exclusion ends borrowing",
+    "detachEmptyUserParents": "detach only; caller retains assigned metadata until shared batch ACK",
+    "retryRetiredAddressSpaces": "previous clear ACK; publication closed, all CPU/context users and AD loans ended before child and body returns",
+    "MmioWindow": "serial boot ownership; mappings sealed before user dispatch and retained for device/firmware borrow lifetime"
+  },
+  "references": {
+    "kernel/src/arch/x86_64/platform.zig": {
+      "ensurePage": 1
+    },
+    "kernel/src/memory/pt_storage.zig": {
+      "releasePageDetached": 2,
+      "ensurePage": 1,
+      "ensurePageChecked": 2,
+      "reclaimEmptyBanks": 4,
+      "freeDetached": 2
+    },
+    "kernel/src/memory/user_vm.zig": {
+      "freeDetached": 10,
+      "releasePageDetached": 7,
+      "reclaimEmptyBanks": 7,
+      "ensurePageChecked": 1,
+      "ensurePage": 4
+    },
+    "kernel/src/mmio_overlay_test.zig": {
+      "freeDetached": 4
+    }
+  }
+}

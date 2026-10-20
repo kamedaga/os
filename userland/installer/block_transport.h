@@ -1,3 +1,4 @@
+#include <pacha/abi.h>
 /* SPDX-License-Identifier: MIT */
 #ifndef PACHA_INSTALLER_BLOCK_TRANSPORT_H
 #define PACHA_INSTALLER_BLOCK_TRANSPORT_H
@@ -5,8 +6,8 @@
 #include "block_protocol.h"
 
 struct installer_block_source {
-    int channel_fd;
-    int shared_fd;
+    pacha_fd_t channel_fd;
+    pacha_fd_t shared_fd;
     uint64_t resource_id;
     uint64_t generation;
     uint64_t sequence;
@@ -20,7 +21,7 @@ struct installer_block_target {
 };
 
 int installer_block_source_open(struct installer_block_source *source,
-    int channel_fd, uint64_t resource_id);
+    pacha_fd_t channel_fd, uint64_t resource_id);
 void installer_block_source_close(struct installer_block_source *source);
 int installer_block_list(struct installer_block_source *source,
     uint64_t start, kb2_block_disk_t *disks, size_t capacity,

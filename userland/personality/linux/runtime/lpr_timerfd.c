@@ -88,8 +88,8 @@ int64_t lpr_linux_timerfd_create(uint64_t clock_id, uint64_t flags)
     if ((flags & ~(LPR_TIMERFD_CLOEXEC | LPR_TIMERFD_NONBLOCK)) != 0) {
         return -LPR_LINUX_EINVAL;
     }
-    int wait_fd = -1;
-    int notify_fd = -1;
+    pacha_fd_t wait_fd = -1;
+    pacha_fd_t notify_fd = -1;
     const int pair_status = lpr_native_wait_pair(&wait_fd, &notify_fd);
     if (pair_status != 0) return pair_status;
     const lpr_event_backend_t record = {
@@ -100,8 +100,8 @@ int64_t lpr_linux_timerfd_create(uint64_t clock_id, uint64_t flags)
     const int fd = lpr_fd_alloc_state(LPR_FD_OPS_EVENT, flags, 0,
         &record, sizeof(record));
     if (fd < 0) {
-        (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)wait_fd);
-        (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)notify_fd);
+        (void)lpr_close_native_fd_if_open((uint64_t)wait_fd);
+        (void)lpr_close_native_fd_if_open((uint64_t)notify_fd);
         return fd;
     }
     return fd;
@@ -202,7 +202,7 @@ int64_t lpr_timerfd_remaining_ns(uint64_t fd, uint64_t *out_remaining_ns)
     return 0;
 }
 
-int64_t lpr_linux_timerfd_read(uint64_t fd, uint64_t buf, uint64_t count)
+int64_t lpr_linux_timerfd_read(uint64_t fd, uint64_t buf, uint64_t count, unsigned *wait_not_ready __attribute__((unused)))
 {
     if (!lpr_linux_timerfd_active(fd)) {
         return -LPR_LINUX_EBADF;
@@ -234,7 +234,7 @@ int64_t lpr_linux_timerfd_read(uint64_t fd, uint64_t buf, uint64_t count)
         lpr_wait_graph_init(&graph);
         status = lpr_wait_graph_add_fd(&graph, fd, 0x0001u);
         if (status != 0) return status;
-        status = lpr_wait_graph_block(&graph, &deadline);
+        status = lpr_wait_graph_block(&graph, &deadline, wait_not_ready);
         if (status != 0) return status;
     }
 }

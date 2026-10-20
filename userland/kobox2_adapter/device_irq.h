@@ -2,6 +2,7 @@
 #ifndef PACHA_KOBOX_DEVICE_IRQ_H
 #define PACHA_KOBOX_DEVICE_IRQ_H
 
+#include <pacha/abi.h>
 #include "device_irq_queue.h"
 #include <stdatomic.h>
 
@@ -11,7 +12,7 @@
 struct ph_task;
 
 struct ph_irq_config {
-    int device_fd;
+    pacha_fd_t device_fd;
     uint64_t native_device;
     uint64_t generation;
     uint32_t cpu_count;
@@ -19,7 +20,7 @@ struct ph_irq_config {
 };
 
 struct ph_irq_native_route {
-    int fd;
+    pacha_fd_t fd;
     unsigned int retired;
     uint64_t count;
 };
@@ -32,7 +33,7 @@ struct ph_irq {
     struct ph_irq_native_route native[PH_IRQ_ROUTES];
     atomic_uint lock;
     struct ph_task *collector;
-    int control_fd;
+    pacha_fd_t control_fd;
     unsigned int admitted;
     unsigned int stopping;
     uint64_t wait_epoch;

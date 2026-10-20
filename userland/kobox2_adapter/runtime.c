@@ -185,8 +185,8 @@ void ph_wait(atomic_uint *word, unsigned expected) {
     atomic_store_explicit(&task->diagnostic_wait_expected, expected, memory_order_relaxed);
     atomic_store_explicit(&task->diagnostic_wait_word, (uintptr_t)word, memory_order_release);
 #endif
-    long result = pacha_syscall3(PACHA_RUNTIME_SYSCALL_FUTEX_WAIT,
-        (uintptr_t)word, expected, 0);
+    long result = pacha_syscall4(PACHA_RUNTIME_SYSCALL_FUTEX_WAIT,
+        (uintptr_t)word, expected, 0, PACHA_WAIT_UNINTERRUPTIBLE);
     ph_tail_end(2, (uintptr_t)word, tail_begin);
 #if defined(PH_SCHED_DIAGNOSTIC) && PH_SCHED_DIAGNOSTIC
     /* A native notification may perform a nested wait on this same thread. */

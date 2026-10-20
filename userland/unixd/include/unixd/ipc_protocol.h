@@ -193,7 +193,7 @@ struct unix_control {
     /* PREPARE: socket, io.owner, operation, total; optional DGRAM route and
      * claimed credentials (generation=0 means use authenticated credentials).
      * APPEND: ticket, offset, count, items; capability indices address only
-     * attached provider caps, excluding the control page/reply cap.
+     * attached provider caps, excluding the control page.
      * COMMIT: ticket + io write reservation.
      * CLAIM: ticket + io read reservation, offset/count (maximum this batch);
      * returns count/items, total, credentials, result=transport generation.

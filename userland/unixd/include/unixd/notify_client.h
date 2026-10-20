@@ -1,4 +1,5 @@
 #pragma once
+#include <pacha/abi.h>
 #include "unixd/transport.h"
 
 /* Per-updater cache, not shared between threads. It may be discarded at any
@@ -7,7 +8,7 @@
 struct unix_notify_cache {
     struct {
         uint32_t notification;
-        int fd;
+        pacha_fd_t fd;
         uint64_t sent_token, sent_socket;
         const struct unix_wait_bank *sent_bank;
     } entries[UNIX_NOTIFY_CACHE_ENTRIES];
@@ -16,10 +17,10 @@ struct unix_notify_cache {
 
 struct unix_notify_platform {
     void *context;
-    int (*resolve)(void *, uint64_t socket, uint32_t notification, int *fd);
-    int (*send)(void *, int fd, uint64_t token); /* -EAGAIN = already pending */
+    int (*resolve)(void *, uint64_t socket, uint32_t notification, pacha_fd_t *fd);
+    int (*send)(void *, pacha_fd_t fd, uint64_t token); /* -EAGAIN = already pending */
     int (*relay)(void *, uint64_t socket, uint32_t notification);
-    void (*close)(void *, int fd);
+    void (*close)(void *, pacha_fd_t fd);
 };
 
 /* Call after every operation that released a direction lock, including

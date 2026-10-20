@@ -1,3 +1,4 @@
+#include <pacha/abi.h>
 #pragma once
 
 /* Trusted boot configuration. Account resolution and credential authority are
@@ -16,7 +17,7 @@ typedef struct seed0root_linux_service {
     const char *argv[10];
     unsigned inherit_count;
     struct {
-        int source_fd;
+        pacha_fd_t source_fd;
         uint32_t target_fd;
         uint64_t rights;
         uint32_t flags;

@@ -12,7 +12,7 @@
 #include <stdio.h>
 #include <string.h>
 
-static void *termd_map_page(int page_fd)
+static void *termd_map_page(pacha_fd_t page_fd)
 {
     if (page_fd < 16) {
         return 0;
@@ -58,7 +58,7 @@ static uint64_t termd_error_token(
 }
 
 static int termd_send_reply_with_error(
-    int reply_fd,
+    pacha_fd_t reply_fd,
     void *page,
     const pacha_service_envelope_t *request_header,
     uint64_t request_id,
@@ -98,11 +98,14 @@ static int termd_send_reply_with_error(
         .word3 = request_id,
     };
     const int reply_status = pacha_ipc_reply(reply_fd, &reply);
-    (void)pacha_fd_close(reply_fd);
+    if (reply_status) {
+        const struct pacha_ipc_msg failed = {0};
+        (void)pacha_ipc_reply(reply_fd, &failed);
+    }
     return reply_status;
 }
 
-static int termd_send_reply(int reply_fd, uint64_t request_id, int64_t status, uint64_t result)
+static int termd_send_reply(pacha_fd_t reply_fd, uint64_t request_id, int64_t status, uint64_t result)
 {
     if (status < 0) {
         (void)termd_error_token(
@@ -132,14 +135,14 @@ static int termd_send_reply(int reply_fd, uint64_t request_id, int64_t status, u
 static void termd_close_received_fds(
     const struct pacha_ipc_msg *request,
     const struct pacha_ipc_fd *fds,
-    int keep_fd,
-    int keep_fd2)
+    pacha_fd_t keep_fd,
+    pacha_fd_t keep_fd2)
 {
     if (request == 0 || fds == 0) {
         return;
     }
     for (uint64_t i = 0; i < request->fd_count; i++) {
-        const int fd = (int)(uint32_t)fds[i].fd;
+        const pacha_fd_t fd = (pacha_fd_t)fds[i].fd;
         if (fd >= 16 && fd != keep_fd && fd != keep_fd2) {
             (void)pacha_fd_close(fd);
         }
@@ -160,7 +163,7 @@ static int termd_send_tty_signal_to_supervisor(termd_service_t *service, uint32_
         PACHA_FD_RIGHT_CLOSE |
         PACHA_FD_RIGHT_MAP_READ |
         PACHA_FD_RIGHT_MAP_WRITE;
-    const int page_fd = pacha_vmo_create(PACHA_SERVICE_PAGE_BYTES, rights, 0);
+    const pacha_fd_t page_fd = pacha_vmo_create(PACHA_SERVICE_PAGE_BYTES, rights, 0);
     if (page_fd < 16) {
         return page_fd;
     }
@@ -203,16 +206,8 @@ static int termd_send_tty_signal_to_supervisor(termd_service_t *service, uint32_
         .fds = &fd,
         .fd_count = 1,
     };
-    const int reply_fd = pacha_ipc_call(service->signal_supervisor_endpoint_fd, &request);
-    if (reply_fd < 16) {
-        (void)pacha_munmap(page, PACHA_SERVICE_PAGE_BYTES);
-        (void)pacha_fd_close(page_fd);
-        return reply_fd;
-    }
-    struct pacha_ipc_msg reply;
-    memset(&reply, 0, sizeof(reply));
-    const int recv_status = pacha_ipc_recv_wait(reply_fd, &reply, UINT64_MAX);
-    (void)pacha_fd_close(reply_fd);
+    struct pacha_ipc_msg reply = {0};
+    const int recv_status = pacha_ipc_call(service->signal_supervisor_endpoint_fd, &request, &reply, PACHA_FD_WAIT_FOREVER, NULL);
     if (recv_status != 0) {
         (void)pacha_munmap(page, PACHA_SERVICE_PAGE_BYTES);
         (void)pacha_fd_close(page_fd);
@@ -242,16 +237,16 @@ static int termd_dispatch_register_signal_supervisor(
     const struct pacha_ipc_fd *fds,
     const pacha_service_envelope_t *header,
     void *page,
-    int reply_fd)
+    pacha_fd_t reply_fd)
 {
-    int keep_fd = -1;
+    pacha_fd_t keep_fd = -1;
     int64_t status = 0;
     uint64_t result = 0;
     uint64_t error_token = 0;
     if (service == NULL ||
         request == 0 ||
         fds == 0 ||
-        request->fd_count < 3 ||
+        request->fd_count < 2 ||
         fds[1].fd < 16 ||
         fds[1].fd == (uint64_t)(uint32_t)reply_fd)
     {
@@ -270,7 +265,7 @@ static int termd_dispatch_register_signal_supervisor(
         if (service->signal_supervisor_endpoint_fd >= 16) {
             (void)pacha_fd_close(service->signal_supervisor_endpoint_fd);
         }
-        service->signal_supervisor_endpoint_fd = (int)(uint32_t)fds[1].fd;
+        service->signal_supervisor_endpoint_fd = (pacha_fd_t)fds[1].fd;
         keep_fd = service->signal_supervisor_endpoint_fd;
         result = (uint64_t)(uint32_t)service->signal_supervisor_endpoint_fd;
     }
@@ -292,7 +287,7 @@ static int termd_dispatch_tty(
     termd_service_t *service,
     uint64_t op,
     void *payload,
-    int notify_fd,
+    pacha_fd_t notify_fd,
     uint64_t *out_result)
 {
     if (service == NULL || service->tty == NULL || out_result == 0) {
@@ -435,7 +430,7 @@ int termd_service_send_boot_ready(termd_service_t *service, int64_t status, uint
         .word2 = result,
         .word3 = 0,
     };
-    return pacha_ipc_send((int)(uint32_t)service->cfg->ready_channel_fd, &msg);
+    return pacha_ipc_send((pacha_fd_t)service->cfg->ready_channel_fd, &msg);
 }
 
 void termd_service_forward_pending_tty_signals(termd_service_t *service)
@@ -469,17 +464,13 @@ int termd_service_dispatch_request(
     const struct pacha_ipc_msg *request,
     const struct pacha_ipc_fd *fds)
 {
-    if (service == NULL || request == 0 || fds == 0 || request->fd_count == 0) {
+    if (service == NULL || request == 0 || fds == 0) {
         return -1;
     }
-    const int reply_fd = (int)(uint32_t)fds[request->fd_count - 1].fd;
-    if (reply_fd < 16) {
-        termd_close_received_fds(request, fds, -1, -1);
-        return -1;
-    }
+    const pacha_fd_t reply_fd = PACHA_IPC_REPLY_IMPLICIT;
     if (request->word0 != PACHA_SERVICE_REQUEST_MAGIC ||
         request->word3 == 0 ||
-        request->fd_count < 2 ||
+        request->fd_count < 1 ||
         fds[0].fd < 16 ||
         fds[0].fd == (uint64_t)(uint32_t)reply_fd)
     {
@@ -487,7 +478,7 @@ int termd_service_dispatch_request(
         return termd_send_reply(reply_fd, request->word3, TERMD_ERR_INVAL, 0);
     }
 
-    const int page_fd = (int)(uint32_t)fds[0].fd;
+    const pacha_fd_t page_fd = (pacha_fd_t)fds[0].fd;
     void *page = termd_map_page(page_fd);
     if (page == 0) {
         const uint64_t token = termd_error_token(
@@ -567,8 +558,8 @@ int termd_service_dispatch_request(
             TERMD_IOCTL_TIOCGPTPEER;
     const int retains_attachment =
         open_op || peer_open_op || header.op == TERMD_OP_HANDLE_DUP;
-    const int notify_fd = retains_attachment && request->fd_count == 3 && fds[1].fd >= 16 ?
-        (int)(uint32_t)fds[1].fd : -1;
+    const pacha_fd_t notify_fd = retains_attachment && request->fd_count == 2 && fds[1].fd >= 16 ?
+        (pacha_fd_t)fds[1].fd : -1;
     uint64_t result = 0;
     const int status = termd_dispatch_tty(
         service, header.op, payload, notify_fd, &result);

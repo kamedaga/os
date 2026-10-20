@@ -42,7 +42,7 @@ static void log_runtime_event(const struct gpud_boot_config *config,
     if (size <= 0 || (size_t)size >= sizeof(line))
         return;
     if (config->log_endpoint_fd >= 16)
-        (void)pacha_log_emit((int)config->log_endpoint_fd,
+        (void)pacha_log_emit((pacha_fd_t)config->log_endpoint_fd,
             PACHA_LOG_SOURCE_GPUD, line, (size_t)size);
     else
         printf("[gpud] %s\n", line);
@@ -51,7 +51,7 @@ static void log_runtime_event(const struct gpud_boot_config *config,
 /* 0: absent/incomplete, 1: probe, 2: stop. A truncated shell write is not
  * a command. The file lives only in the RAM root and is never an authority
  * to select a PCI function or bypass package/firmware verification. */
-static int manual_control(int filed_fd) {
+static int manual_control(pacha_fd_t filed_fd) {
     struct filed_client_module_image image = {0};
     int error = filed_client_load_module_image_limited(filed_fd,
         GPUD_INSPECT_CONTROL_PATH, "gpu-control", 16, &image);
@@ -67,7 +67,7 @@ static int manual_control(int filed_fd) {
 static int wait_manual_probe(const struct gpud_boot_config *config) {
     log_runtime_event(config, "PCI DRM inspection armed; awaiting RAM command", 0);
     for (;;) {
-        int command = manual_control((int)config->filed_endpoint_fd);
+        int command = manual_control((pacha_fd_t)config->filed_endpoint_fd);
         if (command == 1) {
             log_runtime_event(config, "manual PCI DRM probe requested", 0);
             return 0;
@@ -79,13 +79,13 @@ static int wait_manual_probe(const struct gpud_boot_config *config) {
         /* filed can expose this optional node before the one-shot probe. A
          * caller must get ENODEV, never block on an unserviced endpoint. */
         int rejected = gpud_drm_service_reject_unavailable(
-            (int)config->drm_endpoint_fd);
+            (pacha_fd_t)config->drm_endpoint_fd);
         if (rejected != -EAGAIN && rejected)
             return rejected;
         struct pacha_pollfd events[2] = {
-            {.fd = (int)config->control_channel_fd,
+            {.fd = (pacha_fd_t)config->control_channel_fd,
                 .events = PACHA_FD_EVENT_READABLE | PACHA_FD_EVENT_HANGUP},
-            {.fd = (int)config->drm_endpoint_fd,
+            {.fd = (pacha_fd_t)config->drm_endpoint_fd,
                 .events = PACHA_FD_EVENT_READABLE | PACHA_FD_EVENT_HANGUP},
         };
         long waited = pacha_fd_wait_many(events, 2, 1000);
@@ -101,9 +101,9 @@ static int request_display_release(const struct gpud_boot_config *config) {
     const struct pacha_ipc_msg request = {
         .word0 = GPUD_CONTROL_DISPLAY_RELEASE_MAGIC,
     };
-    int status = pacha_ipc_send((int)config->control_channel_fd, &request);
+    int status = pacha_ipc_send((pacha_fd_t)config->control_channel_fd, &request);
     if (status) return status;
-    struct pacha_pollfd event = {.fd = (int)config->control_channel_fd,
+    struct pacha_pollfd event = {.fd = (pacha_fd_t)config->control_channel_fd,
         .events = PACHA_FD_EVENT_READABLE | PACHA_FD_EVENT_HANGUP};
     /* The owner services this channel from its 20 ms live-console loop.
      * Never start the driver if it cannot attest that GOP stopped writing. */
@@ -113,9 +113,9 @@ static int request_display_release(const struct gpud_boot_config *config) {
     struct pacha_ipc_fd fds[PACHA_IPC_MAX_TRANSFER_FDS];
     struct pacha_ipc_msg reply = {.fds = fds,
         .fd_capacity = PACHA_IPC_MAX_TRANSFER_FDS};
-    status = pacha_ipc_recv((int)config->control_channel_fd, &reply);
+    status = pacha_ipc_recv((pacha_fd_t)config->control_channel_fd, &reply);
     for (size_t i = 0; i < reply.fd_count; ++i)
-        (void)pacha_fd_close((int)fds[i].fd);
+        (void)pacha_fd_close((pacha_fd_t)fds[i].fd);
     if (status) return status;
     if (reply.word0 != GPUD_CONTROL_DISPLAY_RELEASED_MAGIC ||
         reply.word2 || reply.word3 || reply.fd_count)
@@ -130,7 +130,7 @@ static int request_display_release(const struct gpud_boot_config *config) {
 static int refresh_inspection_policy(struct gpud_boot_config *config) {
     struct filed_client_module_image image = {0};
     int error = filed_client_load_module_image_limited(
-        (int)config->filed_endpoint_fd, GPUD_INSPECT_POLICY_PATH,
+        (pacha_fd_t)config->filed_endpoint_fd, GPUD_INSPECT_POLICY_PATH,
         "gpu-probe-policy", 384, &image);
     if (error == -ENOENT) return 0;
     if (error) return error;
@@ -165,7 +165,7 @@ static void log_progress(const struct gpud_boot_config *config,
     if (length <= 0 || (size_t)length >= sizeof(line))
         return;
     if (config->log_endpoint_fd >= 16)
-        (void)pacha_log_emit((int)config->log_endpoint_fd,
+        (void)pacha_log_emit((pacha_fd_t)config->log_endpoint_fd,
             PACHA_LOG_SOURCE_KOBOX2_GPU, line, (size_t)length);
     else
         printf("[gpud] %s\n", line);
@@ -197,7 +197,7 @@ static void log_probe_failure(const struct gpud_boot_config *config,
     if (length <= 0 || (size_t)length >= sizeof(line))
         return;
     if (config->log_endpoint_fd >= 16)
-        (void)pacha_log_emit((int)config->log_endpoint_fd,
+        (void)pacha_log_emit((pacha_fd_t)config->log_endpoint_fd,
             PACHA_LOG_SOURCE_KOBOX2_GPU, line, (size_t)length);
     else
         printf("[gpud] %s\n", line);
@@ -214,7 +214,7 @@ static void controller_deallocate(void *context, void *pointer, size_t size) {
     free(pointer);
 }
 
-static int wait_readable(int fd, int process_fd, uint64_t deadline_ticks) {
+static int wait_readable(pacha_fd_t fd, pacha_fd_t process_fd, uint64_t deadline_ticks) {
     struct pacha_pollfd events[2] = {
         {.fd = fd, .events = PACHA_FD_EVENT_READABLE | PACHA_FD_EVENT_HANGUP},
         {.fd = process_fd, .events = PACHA_FD_EVENT_READABLE | PACHA_FD_EVENT_HANGUP},
@@ -230,8 +230,8 @@ static int wait_readable(int fd, int process_fd, uint64_t deadline_ticks) {
 }
 
 static int wait_service(
-    struct gpud_drm_service *service, int endpoint_fd,
-    int process_fd, int control_fd, uint64_t timeout_ticks) {
+    struct gpud_drm_service *service, pacha_fd_t endpoint_fd,
+    pacha_fd_t process_fd, pacha_fd_t control_fd, uint64_t timeout_ticks) {
     int error = gpud_drm_service_reserve_pollfds(service, 4);
     if (error) return error;
     struct pacha_pollfd *events = service->pollfds;
@@ -277,7 +277,7 @@ static int wait_service(
     return -EIO;
 }
 
-static int wait_process(int process_fd) {
+static int wait_process(pacha_fd_t process_fd) {
     struct pacha_pollfd event = {
         .fd = process_fd,
         .events = PACHA_FD_EVENT_READABLE | PACHA_FD_EVENT_HANGUP,
@@ -286,7 +286,7 @@ static int wait_process(int process_fd) {
     return result > 0 && event.revents ? 0 : -EIO;
 }
 
-static int wait_process_bounded(int process_fd) {
+static int wait_process_bounded(pacha_fd_t process_fd) {
     struct pacha_pollfd event = {.fd = process_fd,
         .events = PACHA_FD_EVENT_READABLE | PACHA_FD_EVENT_HANGUP};
     /* Native wait deadlines are scheduler ticks. A failed module unload
@@ -299,7 +299,7 @@ static int wait_process_bounded(int process_fd) {
 static int send_ready(const struct gpud_boot_config *config, int status) {
     const struct pacha_ipc_msg message = {.word0 = GPUD_BOOT_READY_MAGIC,
         .word1 = (uint64_t)(int64_t)status, .word2 = status ? 0 : 1};
-    return pacha_ipc_send((int)config->ready_channel_fd, &message);
+    return pacha_ipc_send((pacha_fd_t)config->ready_channel_fd, &message);
 }
 
 enum gpud_control_result {
@@ -309,7 +309,7 @@ enum gpud_control_result {
     GPUD_CONTROL_PEER_CLOSED,
 };
 
-static int receive_control(int fd, uint64_t generation) {
+static int receive_control(pacha_fd_t fd, uint64_t generation) {
     if (fd < 16)
         return GPUD_CONTROL_IDLE;
     struct pacha_ipc_fd fds[PACHA_IPC_MAX_TRANSFER_FDS];
@@ -338,7 +338,7 @@ static int receive_control(int fd, uint64_t generation) {
         message.word1 == generation && !message.word2 && !message.word3 &&
         !message.fd_count;
     for (size_t i = 0; i < message.fd_count; ++i)
-        if (pacha_fd_close((int)message.fds[i].fd))
+        if (pacha_fd_close((pacha_fd_t)message.fds[i].fd))
             return -EIO;
     return valid ? (message.word0 == GPUD_CONTROL_STOP_MAGIC ?
         GPUD_CONTROL_STOP : GPUD_CONTROL_FORCE_RESTART) : -EPROTO;
@@ -359,7 +359,7 @@ static int terminate_sandbox(
     }
 }
 
-static int send_restarted(int control_fd, uint64_t generation) {
+static int send_restarted(pacha_fd_t control_fd, uint64_t generation) {
     const struct pacha_ipc_msg message = {
         .word0 = GPUD_CONTROL_RESTARTED_MAGIC,
         .word1 = generation,
@@ -384,7 +384,7 @@ struct gpud_generation {
     struct gpud_native_launch launch;
     struct gpud_process_watch watch;
     struct gpud_lifecycle lifecycle;
-    int gpu_fd;
+    pacha_fd_t gpu_fd;
     unsigned char *gpu_mapping;
     struct gpud_gpu_channel gpu_channel;
     struct gpud_drm_service service;
@@ -647,7 +647,7 @@ static int start_generation(const struct gpud_boot_config *config,
         .extra_blob_count = inspect ? 1 : 0,
         .items = package->items, .artifact_count = package->artifact_count,
         .resource_count = 1,
-        .log_endpoint_fd = inspect ? (int)config->log_endpoint_fd : -1};
+        .log_endpoint_fd = inspect ? (pacha_fd_t)config->log_endpoint_fd : -1};
     struct ph_owner_boot boot = {0};
     kb2_status_t begin_status = ph_owner_boot_begin(&boot, &start);
     if (begin_status != KB2_STATUS_OK) {
@@ -677,7 +677,7 @@ static int start_generation(const struct gpud_boot_config *config,
                 return -EIO;
             if (now.tv_sec - transfer_started.tv_sec >= 180)
                 return -ETIMEDOUT;
-            int command = manual_control((int)config->filed_endpoint_fd);
+            int command = manual_control((pacha_fd_t)config->filed_endpoint_fd);
             if (command == 2)
                 return -ECANCELED;
             if (command < 0)
@@ -722,7 +722,7 @@ static int start_generation(const struct gpud_boot_config *config,
             wait_readable(current->ipc.fd, current->launch.process.fd,
                 inspect ? 1000 : PACHA_FD_WAIT_FOREVER) : -EIO;
         if (inspect && waited == -ETIMEDOUT) {
-            int command = manual_control((int)config->filed_endpoint_fd);
+            int command = manual_control((pacha_fd_t)config->filed_endpoint_fd);
             if (command == 2)
                 return -ECANCELED;
             if (command < 0)
@@ -762,7 +762,7 @@ static int start_generation(const struct gpud_boot_config *config,
     current->service.backend_client = sandbox_config.client_id;
     current->service.profile_kind = inspect ? KB2_GPU_PROFILE_AMDGPU :
         KB2_GPU_PROFILE_VIRGL;
-    current->service.log_endpoint_fd = (int)config->log_endpoint_fd;
+    current->service.log_endpoint_fd = (pacha_fd_t)config->log_endpoint_fd;
     current->service.gpu.ipc = &current->ipc;
     current->service.gpu.channel = &current->gpu_channel;
     current->service.gpu.mapping = current->gpu_mapping;
@@ -773,13 +773,13 @@ static int start_generation(const struct gpud_boot_config *config,
         return error;
     current->service.files.handle_sequence = handle_sequence;
     if ((error = gpud_drm_service_bind(
-            &current->service, (int)config->drm_endpoint_fd)))
+            &current->service, (pacha_fd_t)config->drm_endpoint_fd)))
         return error;
     return 0;
 }
 
 static int serve_generation(
-    struct gpud_generation *current, int filed_fd, int *control_fd, int inspect,
+    struct gpud_generation *current, pacha_fd_t filed_fd, pacha_fd_t *control_fd, int inspect,
     int *forced, int *stop_requested) {
     *forced = 0;
     *stop_requested = 0;
@@ -870,10 +870,10 @@ static int run(const struct gpud_boot_config *config) {
     config = &active;
     if (config->backend == GPUD_BACKEND_VIRTIO) {
         error = gpud_package_open(&package,
-            (int)config->filed_endpoint_fd, (int)config->device_fd);
+            (pacha_fd_t)config->filed_endpoint_fd, (pacha_fd_t)config->device_fd);
     } else {
         error = gpud_package_open_at(&package,
-            (int)config->filed_endpoint_fd, (int)config->device_fd,
+            (pacha_fd_t)config->filed_endpoint_fd, (pacha_fd_t)config->device_fd,
             config->package_root, config->firmware_sha256,
             config->manifest_sha256, config->sandbox_sha256);
     }
@@ -914,7 +914,7 @@ static int run(const struct gpud_boot_config *config) {
         log_runtime_event(config, "GOP display MMIO released", 0);
 
     uint64_t handle_sequence = 0;
-    int control_fd = (int)config->control_channel_fd;
+    pacha_fd_t control_fd = (pacha_fd_t)config->control_channel_fd;
     int notify_restart = 0;
     for (;;) {
         /* One owner serves one generation at a time and retires it fully
@@ -966,7 +966,7 @@ static int run(const struct gpud_boot_config *config) {
             log_runtime_event(config, "sandbox startup failed", error);
             return error;
         }
-        error = gpud_discovery_publish(&discovery, (int)config->filed_endpoint_fd);
+        error = gpud_discovery_publish(&discovery, (pacha_fd_t)config->filed_endpoint_fd);
         if (error) {
             log_runtime_event(config, "DRM discovery publication failed", error);
             (void)stop_generation(controller, &package, &current,
@@ -983,7 +983,7 @@ static int run(const struct gpud_boot_config *config) {
             /* A failed readiness notice must not strand published card0 or
              * leave a physical GPU bus-mastering after its owner exits. */
             int removed = gpud_discovery_remove(&discovery,
-                (int)config->filed_endpoint_fd);
+                (pacha_fd_t)config->filed_endpoint_fd);
             int stopped = stop_generation(controller, &package, &current,
                 &handle_sequence,
                 config->backend == GPUD_BACKEND_PCI_DRM_INSPECT);
@@ -1003,11 +1003,11 @@ static int run(const struct gpud_boot_config *config) {
 
         int forced = 0, stop_requested = 0;
         const int restart_error = serve_generation(
-            &current, (int)config->filed_endpoint_fd, &control_fd,
+            &current, (pacha_fd_t)config->filed_endpoint_fd, &control_fd,
             config->backend == GPUD_BACKEND_PCI_DRM_INSPECT,
             &forced, &stop_requested);
         int discovery_error = gpud_discovery_remove(&discovery,
-            (int)config->filed_endpoint_fd);
+            (pacha_fd_t)config->filed_endpoint_fd);
         if (discovery_error)
             log_runtime_event(config, "DRM discovery removal failed", discovery_error);
         if (stop_requested || config->backend == GPUD_BACKEND_PCI_DRM_INSPECT) {
@@ -1054,7 +1054,7 @@ static int run(const struct gpud_boot_config *config) {
 int main(int argc, char **argv) {
     (void)argc;
     struct gpud_boot_config config = {0};
-    int bootstrap_fd = pacha_bootstrap_fd_from_argv(argv);
+    pacha_fd_t bootstrap_fd = pacha_bootstrap_fd_from_argv(argv);
     if (bootstrap_fd < 16 ||
         pacha_fd_read(bootstrap_fd, &config, sizeof(config)) != (long)sizeof(config) ||
         config.magic != GPUD_BOOT_CONFIG_MAGIC ||

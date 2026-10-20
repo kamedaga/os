@@ -10,6 +10,6 @@ done
 clang -std=c11 -O2 -g -Wall -Wextra -Werror \
   -ffunction-sections -fdata-sections -Wl,--gc-sections \
   -fsanitize=address,undefined -fno-omit-frame-pointer \
-  "${includes[@]}" -Imusl/pachaos/include \
+  "${includes[@]}" -Imusl/pachaos/include -Ikobox2/protocol/include -Ikobox2/protocol/generated/include \
   tests/lpr_futex_protocol_unit.c -o "$out/unit"
 "$out/unit"

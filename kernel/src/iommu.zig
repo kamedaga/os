@@ -1,5 +1,6 @@
 //! Kernel-facing DMA translation boundary. Device drivers see the existing
 //! capsule ABI; the kernel owns translation and the backing-page drain ledger.
+pub const IovaAddress = @import("memory/addresses.zig").IovaAddress;
 const vtd = @import("vtd.zig");
 const amd = @import("amd_iommu.zig");
 const ivrs = @import("acpi_ivrs.zig");
@@ -46,26 +47,26 @@ pub fn deviceIovaWindow(device: types.DmaDeviceId) DeviceIovaWindow {
     return .{ .start = window.start, .size = window.size };
 }
 
-pub fn allocIova(device: types.DmaDeviceId, page_count: usize) ?u64 {
+pub fn allocIova(device: types.DmaDeviceId, page_count: usize) ?IovaAddress {
     if (!isActive()) return null;
-    if (amd.isActive()) return amd.allocIova(device, page_count);
-    return vtd.allocIova(device, page_count);
+    if (amd.isActive()) return .fromInt(amd.allocIova(device, page_count) orelse return null);
+    return .fromInt(vtd.allocIova(device, page_count) orelse return null);
 }
 
-pub fn reserveIova(device: types.DmaDeviceId, iova: u64, page_count: usize) bool {
+pub fn reserveIova(device: types.DmaDeviceId, iova: IovaAddress, page_count: usize) bool {
     if (!isActive()) return false;
     if (amd.isActive()) return amd.reserveIova(device, iova, page_count);
     return vtd.reserveIova(device, iova, page_count);
 }
 
-pub fn freeIova(device: types.DmaDeviceId, iova: u64, page_count: usize) void {
+pub fn freeIova(device: types.DmaDeviceId, iova: IovaAddress, page_count: usize) void {
     if (amd.isActive()) return amd.freeIova(device, iova, page_count);
     vtd.freeIova(device, iova, page_count);
 }
 
 pub fn mapPages(
     device: types.DmaDeviceId,
-    iova: u64,
+    iova: IovaAddress,
     paddrs: []const u64,
     readable: bool,
     writable: bool,
@@ -75,7 +76,7 @@ pub fn mapPages(
     return vtd.mapPages(device, iova, paddrs, readable, writable);
 }
 
-pub fn unmapRangeForDevice(device: types.DmaDeviceId, iova: u64, size: u64) bool {
+pub fn unmapRangeForDevice(device: types.DmaDeviceId, iova: IovaAddress, size: u64) bool {
     if (!isActive()) return false;
     if (amd.isActive()) return amd.unmapRangeForDevice(device, iova, size);
     return vtd.unmapRangeForDevice(device, iova, size);
@@ -94,7 +95,8 @@ pub fn deviceQuarantined(device: types.DmaDeviceId) bool {
 pub fn physicalRangeQuarantined(paddr: u64, page_count: usize) bool {
     // A failed drain retains backing pages even after the FD and process die.
     // This query must remain valid independently of an active DMA mapping.
-    return amd.physicalRangeQuarantined(paddr, page_count) or vtd.physicalRangeQuarantined(paddr, page_count);
+    return @import("memory/dma_retention.zig").contains(paddr, page_count) or
+        amd.physicalRangeQuarantined(paddr, page_count) or vtd.physicalRangeQuarantined(paddr, page_count);
 }
 
 pub fn dmaSnapshotFlags(device: types.DmaDeviceId) u64 {
@@ -109,7 +111,8 @@ test "IOMMU boundary retains DMA backing after a failed drain" {
     const free_list = try allocator.create(types.FreePageList);
     defer allocator.destroy(free_list);
     free_list.* = .{};
-    try free_list.appendContiguousRange(0, @intFromPtr(backing.ptr), 32);
+    try free_list.installRegions(&.{.{ .id = 0, .start = @intFromPtr(backing.ptr), .end = (@intFromPtr(backing.ptr)) + (32) * 4096 }});
+    try free_list.seedContiguousRange(@intFromPtr(backing.ptr), 32);
 
     const device: types.DmaDeviceId = 0x1001;
     try vtd.TestSupport.begin(free_list, device);
@@ -117,14 +120,14 @@ test "IOMMU boundary retains DMA backing after a failed drain" {
     const page = try free_list.popFront();
     const iova: u64 = 0x8000_0000;
     try std.testing.expect(isActive());
-    try std.testing.expect(reserveIova(device, iova, 1));
-    try std.testing.expect(mapPages(device, iova, &.{page}, true, true));
+    try std.testing.expect(reserveIova(device, .fromInt(iova), 1));
+    try std.testing.expect(mapPages(device, .fromInt(iova), &.{page}, true, true));
 
     vtd.TestSupport.failInvalidation(true);
-    try std.testing.expect(!unmapRangeForDevice(device, iova, 4096));
+    try std.testing.expect(!unmapRangeForDevice(device, .fromInt(iova), 4096));
     try std.testing.expect(deviceQuarantined(device));
     try std.testing.expect(physicalRangeQuarantined(page, 1));
-    freeIova(device, iova, 1);
+    freeIova(device, .fromInt(iova), 1);
     try std.testing.expectEqual(@as(usize, 1), vtd.TestSupport.usedPages(device));
-    try std.testing.expectError(types.KernelError.InvalidState, free_list.appendPage(0, page));
+    try std.testing.expectError(types.KernelError.PageQuarantined, free_list.appendPage(page));
 }

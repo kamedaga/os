@@ -470,10 +470,10 @@ int ph_gpu_queue_init_profile(struct ph_gpu_queue *queue,
         PACHA_FD_RIGHT_WAIT | PACHA_FD_RIGHT_POLL | PACHA_FD_RIGHT_CLOSE;
     long event_fd = pacha_syscall3(
         PACHA_FD_SYSCALL_EVENTFD_CREATE, 0, event_rights, 0);
-    if (event_fd < 16 || event_fd >= PACHA_FD_TABLE_LIMIT)
+    if (event_fd < 16 || event_fd >= PACHA_THREAD_SELF_FD)
         return -ENOMEM;
     queue->channel_id = channel_id;
-    queue->event_fd = (int)event_fd;
+    queue->event_fd = (pacha_fd_t)event_fd;
     queue->next_lane = GPUD_GPU_QUEUE_CONTROL;
     queue->atomics = *atomics;
     atomic_init(&queue->event_admitted, 1);

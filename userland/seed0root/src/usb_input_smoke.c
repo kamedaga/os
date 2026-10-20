@@ -9,13 +9,13 @@
 #include <string.h>
 
 struct probe {
-    int endpoint, page_fd, timer_fd;
+    pacha_fd_t endpoint, page_fd, timer_fd;
     void *page;
     uint64_t request_id;
 };
 
 static int invoke(struct probe *probe, uint32_t op, uint32_t size,
-    int notify_fd, uint64_t *out) {
+    pacha_fd_t notify_fd, uint64_t *out) {
     pacha_service_envelope_t *header = probe->page;
     const uint64_t id = ++probe->request_id;
     *header = (pacha_service_envelope_t){.magic = PACHA_SERVICE_REQUEST_MAGIC,
@@ -34,11 +34,8 @@ static int invoke(struct probe *probe, uint32_t op, uint32_t size,
     }
     const struct pacha_ipc_msg request = {.word0 = PACHA_SERVICE_REQUEST_MAGIC,
         .word3 = id, .fds = fds, .fd_count = count};
-    int reply_fd = pacha_ipc_call(probe->endpoint, &request);
-    if (reply_fd < 16) return reply_fd < 0 ? reply_fd : -5;
     struct pacha_ipc_msg reply = {0};
-    int result = pacha_ipc_recv_wait(reply_fd, &reply, PACHA_FD_WAIT_FOREVER);
-    (void)pacha_fd_close(reply_fd);
+    int result = pacha_ipc_call(probe->endpoint, &request, &reply, PACHA_FD_WAIT_FOREVER, NULL);
     if (result) return result;
     if (reply.word0 != PACHA_SERVICE_REPLY_MAGIC || reply.word3 != id ||
         header->magic != PACHA_SERVICE_REPLY_MAGIC ||
@@ -97,17 +94,17 @@ static int read_event(struct probe *probe, uint64_t handle,
     return 0;
 }
 
-int seed0root_usb_input_smoke(int endpoint) {
+int seed0root_usb_input_smoke(pacha_fd_t endpoint) {
     const uint64_t page_rights = PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_TRANSFER |
         PACHA_FD_RIGHT_MAP_READ | PACHA_FD_RIGHT_MAP_WRITE;
-    int page_fd = pacha_vmo_create(PACHA_SERVICE_PAGE_BYTES, page_rights, 0);
+    pacha_fd_t page_fd = pacha_vmo_create(PACHA_SERVICE_PAGE_BYTES, page_rights, 0);
     if (page_fd < 16) return -5;
     void *page = pacha_mmap(page_fd, PACHA_SERVICE_PAGE_BYTES,
         PACHA_PROT_READ | PACHA_PROT_WRITE, PACHA_MMAP_SHARED, 0);
     if (!page) { (void)pacha_fd_close(page_fd); return -5; }
     const uint64_t timer_rights = PACHA_FD_RIGHT_READ | PACHA_FD_RIGHT_WAIT |
         PACHA_FD_RIGHT_POLL | PACHA_FD_RIGHT_CLOSE;
-    int timer_fd = pacha_timerfd_create(UINT64_C(20000000),
+    pacha_fd_t timer_fd = pacha_timerfd_create(UINT64_C(20000000),
         UINT64_C(20000000), timer_rights, 0);
     if (timer_fd < 16) {
         (void)pacha_munmap(page, PACHA_SERVICE_PAGE_BYTES);

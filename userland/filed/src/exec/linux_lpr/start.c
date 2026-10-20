@@ -62,7 +62,7 @@ static const char *request_arg(const filed_exec_path_t *request, uint64_t index)
     return request->path;
 }
 
-static int lpr_exec_start_plan_impl(lpr_exec_plan_t *plan, const filed_exec_path_t *request, int bootstrap_fd, int start_thread, uint64_t *argv_va, uint64_t *envp_va)
+static int lpr_exec_start_plan_impl(lpr_exec_plan_t *plan, const filed_exec_path_t *request, pacha_fd_t bootstrap_fd, int start_thread, uint64_t *argv_va, uint64_t *envp_va)
 {
     if (plan == NULL || request == NULL || plan->process_fd < 16) {
         return -22;
@@ -92,7 +92,7 @@ static int lpr_exec_start_plan_impl(lpr_exec_plan_t *plan, const filed_exec_path
         PACHA_FD_RIGHT_MAP_WRITE;
     uint64_t stage_start = lpr_exec_now_ns();
     uint64_t stage_start_cycles = lpr_exec_now_cycles();
-    const int stack_fd = pacha_vmo_create(initial_bytes, stack_rights, 0);
+    const pacha_fd_t stack_fd = pacha_vmo_create(initial_bytes, stack_rights, 0);
     lpr_exec_metric("start_stack_vmo", stage_start, lpr_exec_now_ns());
     lpr_exec_metric_cycles("start_stack_vmo", stage_start_cycles, lpr_exec_now_cycles());
     if (stack_fd < 16) {
@@ -317,7 +317,7 @@ static int lpr_exec_start_plan_impl(lpr_exec_plan_t *plan, const filed_exec_path
         PACHA_FD_RIGHT_SET_CONTEXT;
     stage_start = lpr_exec_now_ns();
     stage_start_cycles = lpr_exec_now_cycles();
-    const int thread_fd = pacha_thread_create(
+    const pacha_fd_t thread_fd = pacha_thread_create(
         plan->process_fd,
         plan->runtime_entry,
         stack_base + sp,
@@ -344,7 +344,7 @@ static int lpr_exec_start_plan_impl(lpr_exec_plan_t *plan, const filed_exec_path
     return 0;
 }
 
-void lpr_exec_discard_process_fd(int process_fd)
+void lpr_exec_discard_process_fd(pacha_fd_t process_fd)
 {
     if (process_fd >= 16) {
         (void)pacha_syscall2(
@@ -356,7 +356,7 @@ void lpr_exec_discard_process_fd(int process_fd)
 }
 
 int lpr_exec_start_plan(lpr_exec_plan_t *plan,
-    const filed_exec_path_t *request, int bootstrap_fd, int start_thread)
+    const filed_exec_path_t *request, pacha_fd_t bootstrap_fd, int start_thread)
 {
     if (!request || request->argc > SIZE_MAX / sizeof(uint64_t) - 1 ||
         request->envc > SIZE_MAX / sizeof(uint64_t)) return -7;

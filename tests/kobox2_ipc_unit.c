@@ -8,26 +8,37 @@
 static struct pacha_fd_info info;
 static struct ph_ipc_packet incoming;
 static long info_status, send_status, recv_status;
-static unsigned int inspections, sends, receives, closes[PACHA_FD_TABLE_LIMIT];
+enum { former_fd_table_limit = 4096 };
+static unsigned int inspections, sends, receives, closes[former_fd_table_limit];
 static unsigned int close_fail_fd;
 static int copyout_failure;
 static uint64_t waited_ticks;
-static int notice_mode;
+static long notify_status, consume_status;
+static unsigned int notifies, consumes;
 
-long pacha_syscall4(uint64_t nr, uint64_t fd, uint64_t address,
+static long protocol_oracle2(uint64_t, uint64_t, uint64_t);
+static long protocol_oracle4(uint64_t nr, uint64_t fd, uint64_t address,
     uint64_t timeout, uint64_t flags) {
     assert(nr == PACHA_IPC_SYSCALL_RECV_WAIT && timeout && !flags);
     waited_ticks = timeout;
-    return pacha_syscall2(PACHA_IPC_SYSCALL_RECV, fd, address);
+    return protocol_oracle2(PACHA_IPC_SYSCALL_RECV, fd, address);
 }
 
 long pacha_syscall1(uint64_t nr, uint64_t fd) {
+    if (nr == PACHA_IPC_SYSCALL_NOTIFY) { assert(fd == 16); ++notifies; return notify_status; }
     assert(nr == PACHA_FD_SYSCALL_CLOSE && valid_fd(fd));
     ++closes[fd];
     return fd == close_fail_fd ? PACHA_SYSCALL_ERR_MAP : 0;
 }
 
-long pacha_syscall2(uint64_t nr, uint64_t fd, uint64_t address) {
+long pacha_syscall3(uint64_t nr, uint64_t fd, uint64_t timeout, uint64_t flags) {
+    /* A consume never blocks and never latches the peer. */
+    assert(nr == PACHA_IPC_SYSCALL_NOTIFY_WAIT && fd == 16 && !timeout && !flags);
+    ++consumes;
+    return consume_status;
+}
+
+static long protocol_oracle2(uint64_t nr, uint64_t fd, uint64_t address) {
     assert(valid_fd(fd));
     if (nr == PACHA_FD_SYSCALL_GET_INFO) {
         ++inspections;
@@ -39,9 +50,8 @@ long pacha_syscall2(uint64_t nr, uint64_t fd, uint64_t address) {
     if (nr == PACHA_IPC_SYSCALL_SEND) {
         ++sends;
         assert(message->word0 == 1 && message->word1 == 7 && message->word2 == 19);
-        assert(message->word3 == 123 && message->fd_count == (notice_mode ? 0 : 2));
-        if (notice_mode) assert(!message->fds);
-        else assert(message->fds[0].fd == 100 && message->fds[1].fd == 101);
+        assert(message->word3 == 123 && message->fd_count == 2);
+        assert(message->fds[0].fd == 100 && message->fds[1].fd == 101);
         return send_status;
     }
     assert(nr == PACHA_IPC_SYSCALL_RECV);
@@ -81,7 +91,7 @@ static void initialization(void) {
     assert(ph_ipc_init(NULL, 16, 7) == -EINVAL);
     assert(ph_ipc_init(&ipc, -1, 7) == -EINVAL);
     assert(ph_ipc_init(&ipc, 15, 7) == -EINVAL);
-    assert(ph_ipc_init(&ipc, PACHA_FD_TABLE_LIMIT, 7) == -EINVAL);
+    assert(ph_ipc_init(&ipc, PACHA_THREAD_SELF_FD, 7) == -EINVAL);
     assert(ph_ipc_init(&ipc, 16, 0) == -EINVAL && !inspections);
     info_status = PACHA_SYSCALL_ERR_INVALID;
     assert(ph_ipc_init(&ipc, 16, 7) == -EINVAL && !ipc.fd);
@@ -190,20 +200,21 @@ static void receiving(void) {
 }
 
 static void notices(void) {
-    reset(); notice_mode = 1;
-    const struct ph_ipc_notice notice = {.fd = 16, .operation = 1,
-        .generation = 7, .correlation = 19, .value = 123};
-    struct ph_ipc_notice before = notice;
+    reset(); notifies = consumes = 0; notify_status = consume_status = 0;
+    const struct ph_ipc_notice notice = {.fd = 16};
     assert(ph_ipc_notify(NULL) == -EINVAL);
     struct ph_ipc_notice invalid = notice; invalid.fd = -1;
-    assert(ph_ipc_notify(&invalid) == -EINVAL && !sends);
-    assert(!ph_ipc_notify(&notice) && sends == 1 && !inspections);
-    send_status = PACHA_SYSCALL_ERR_NOT_READY;
-    assert(ph_ipc_notify(&notice) == -EAGAIN);
-    send_status = PACHA_SYSCALL_ERR_CLOSED;
+    assert(ph_ipc_notify(&invalid) == -EINVAL && !notifies);
+    /* A latch is not a packet: no message buffer, send or inspection. */
+    assert(!ph_ipc_notify(&notice) && notifies == 1 && !sends && !inspections);
+    notify_status = PACHA_SYSCALL_ERR_CLOSED;
     assert(ph_ipc_notify(&notice) == -EPIPE);
-    assert(!memcmp(&notice, &before, sizeof(notice)) && !closes[16]);
-    notice_mode = 0;
+    assert(ph_ipc_notify_consume(-1) == -EINVAL && !consumes);
+    assert(!ph_ipc_notify_consume(16) && consumes == 1);
+    consume_status = PACHA_SYSCALL_ERR_EMPTY;
+    assert(ph_ipc_notify_consume(16) == -EAGAIN);
+    consume_status = PACHA_SYSCALL_ERR_CLOSED;
+    assert(ph_ipc_notify_consume(16) == -EPIPE && !receives && !closes[16]);
 }
 
 static void rejected_cleanup(void) {
@@ -249,4 +260,34 @@ int main(void) {
     rejected_cleanup();
     puts("kobox2 native IPC ownership/generation unit: PASS");
     return 0;
+}
+
+long pacha_syscall2(uint64_t nr, uint64_t a, uint64_t b) {
+    assert(nr != PACHA_IPC_SYSCALL_SEND && nr != PACHA_IPC_SYSCALL_RECV);
+    return protocol_oracle2(nr, a, b);
+}
+long pacha_syscall4(uint64_t nr, uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    assert(nr != PACHA_IPC_SYSCALL_RECV_WAIT);
+    return protocol_oracle4(nr, a, b, c, d);
+}
+long pacha_ipc_registers(uint64_t nr, uint64_t fd, uint64_t flags, uint64_t timeout,
+    uint64_t words[4], struct pacha_ipc_extension *extension, int *committed) {
+    const int sending = nr == PACHA_IPC_SYSCALL_SEND;
+    struct pacha_ipc_msg message = {
+        .word0=words[0], .word1=words[1], .word2=words[2], .word3=words[3],
+        .fds=extension ? (void *)(uintptr_t)(sending ? extension->send_array : extension->receive_array) : 0,
+        .fd_count=extension && sending ? extension->send_count : 0,
+        .fd_capacity=extension ? extension->receive_capacity : 0,
+    };
+    long status = nr == PACHA_IPC_SYSCALL_RECV_WAIT ?
+        protocol_oracle4(nr, fd, (uintptr_t)&message, timeout, flags) :
+        protocol_oracle2(nr, fd, (uintptr_t)&message);
+    words[0]=words[1]=words[2]=words[3]=0;
+    if (!sending && !status) {
+        words[0]=message.word0; words[1]=message.word1;
+        words[2]=message.word2; words[3]=message.word3;
+    }
+    if (extension) extension->received_count = message.fd_count;
+    if (committed) *committed=0;
+    return status;
 }

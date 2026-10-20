@@ -20,7 +20,7 @@
 struct service_session {
     struct service_session *next;
     struct unix_session *session;
-    int control_fd;
+    pacha_fd_t control_fd;
 #if defined(UNIXD_PROFILE) && UNIXD_PROFILE
     unsigned profile_pid;
     struct { uint64_t count, ticks; } profile[UNIX_OP_DIAG + 1][6];
@@ -64,7 +64,7 @@ struct service_thread {
     struct service_thread *next;
     struct service_session *session;
     uint64_t owner;
-    int thread_fd;
+    pacha_fd_t thread_fd;
 };
 
 struct service_watch {
@@ -78,14 +78,14 @@ struct service_waiter {
     struct service_watch *watches;
     uint64_t owner;
     uint32_t id;
-    int notify_fd;
+    pacha_fd_t notify_fd;
 };
 
 struct service_path { struct service_path *next; uint64_t socket, hold; };
 struct service_handoff {
     struct service_handoff *next;
     uint64_t id, socket, target;
-    int fd, imported;
+    pacha_fd_t fd, imported;
 };
 
 struct unix_service {
@@ -160,7 +160,7 @@ static int filed_path_call(struct unix_service *service, struct filed_unix_path 
 {
     const uint64_t rights = PACHA_FD_RIGHT_INSPECT | PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_TRANSFER |
         PACHA_FD_RIGHT_MAP_READ | PACHA_FD_RIGHT_MAP_WRITE;
-    int page_fd = pacha_vmo_create(4096, rights, 0);
+    pacha_fd_t page_fd = pacha_vmo_create(4096, rights, 0);
     if (page_fd < 16) return -ENOMEM;
     struct filed_unix_path *page = pacha_mmap(page_fd, 4096,
         PACHA_PROT_READ | PACHA_PROT_WRITE, PACHA_MMAP_SHARED, 0);
@@ -169,18 +169,13 @@ static int filed_path_call(struct unix_service *service, struct filed_unix_path 
     *page = *request;
     struct pacha_ipc_fd cap = { .fd = (uint64_t)page_fd, .rights = rights & ~PACHA_FD_RIGHT_TRANSFER };
     struct pacha_ipc_msg message = { .word0 = FILED_UNIX_PATH_MAGIC, .fds = &cap, .fd_count = 1 };
-    int reply = pacha_ipc_call(service->filed_path, &message);
-    int status = -EIO;
-    if (reply >= 16) {
-        struct pacha_ipc_msg response = {0};
-        status = (int)pacha_kernel_status_to_errno(pacha_ipc_recv_wait(reply, &response, PACHA_FD_WAIT_FOREVER));
-        if (status == 0) {
-            *request = *page;
-            const int64_t replied = (int64_t)response.word1;
-            status = response.word0 != FILED_UNIX_PATH_MAGIC || replied > 0 || replied < -4095 ? -EPROTO :
-                replied != 0 ? (int)replied : request->status == 0 ? 0 : -EPROTO;
-        }
-        (void)pacha_fd_close(reply);
+    struct pacha_ipc_msg response = {0};
+    int status = (int)pacha_kernel_status_to_errno(pacha_ipc_call(service->filed_path, &message, &response, PACHA_FD_WAIT_FOREVER, NULL));
+    if (!status) {
+        *request = *page;
+        const int64_t replied = (int64_t)response.word1;
+        status = response.word0 != FILED_UNIX_PATH_MAGIC || replied > 0 || replied < -4095 ? -EPROTO :
+            replied != 0 ? (int)replied : request->status == 0 ? 0 : -EPROTO;
     }
     (void)pacha_munmap(page, 4096);
     (void)pacha_fd_close(page_fd);
@@ -253,7 +248,7 @@ static void release_external(void *context, uint64_t reference)
     unix_escrow_release(&((struct unix_service *)context)->escrow, reference);
 }
 
-/* Reserve an entire incoming native message, including its reply capability.
+/* Reserve all explicit capabilities in an incoming native message.
  * Test before persistent allocations; CLOSE/recovery can always be received. */
 static int admit(unsigned retained)
 {
@@ -349,7 +344,7 @@ fail:
     return status;
 }
 
-static void append_cap(struct response *response, int fd, uint64_t rights, int move)
+static void append_cap(struct response *response, pacha_fd_t fd, uint64_t rights, int move)
 {
     response->capabilities[response->count++] = (struct pacha_ipc_fd){
         .fd = (uint64_t)(uint32_t)fd, .rights = rights,
@@ -641,7 +636,7 @@ static int sync_waiter(struct unix_service *service, struct service_session *ses
                 if (errors++ < 32) {
                     struct pacha_fd_info info = {0};
                     const int inspected = pacha_fd_get_info(waiter->notify_fd, &info);
-                    fprintf(stderr, "[unixd] notify failure id=%u fd=%d status=%d inspect=%d kind=%llu rights=%llx\n",
+                    fprintf(stderr, "[unixd] notify failure id=%u fd=%ld status=%d inspect=%d kind=%llu rights=%llx\n",
                         waiter->id, waiter->notify_fd, status, inspected,
                         (unsigned long long)info.kind, (unsigned long long)info.rights);
                 }
@@ -819,7 +814,7 @@ static int dispatch(struct unix_service *service, struct service_session *sessio
     if (op == UNIX_OP_THREAD_REGISTER) {
         if (count != 1) return -EINVAL;
         struct pacha_fd_info info;
-        if (pacha_fd_get_info((int)fds[0].fd, &info) != 0 ||
+        if (pacha_fd_get_info((pacha_fd_t)fds[0].fd, &info) != 0 ||
             info.kind != PACHA_FD_KIND_THREAD ||
             (info.rights & (PACHA_FD_RIGHT_WAIT | PACHA_FD_RIGHT_POLL)) !=
                 (PACHA_FD_RIGHT_WAIT | PACHA_FD_RIGHT_POLL)) return -EBADF;
@@ -828,7 +823,7 @@ static int dispatch(struct unix_service *service, struct service_session *sessio
         if (service->next_owner == UINT64_MAX) return -EOVERFLOW;
         struct service_thread *thread = calloc(1, sizeof(*thread));
         if (thread == NULL) return -ENOMEM;
-        thread->thread_fd = (int)fds[0].fd;
+        thread->thread_fd = (pacha_fd_t)fds[0].fd;
         fds[0].fd = 0;
         thread->session = session;
         thread->owner = service->next_owner++;
@@ -1010,25 +1005,19 @@ static int receive_one(struct unix_service *service, struct service_session *ses
     struct unix_control *page = NULL;
     int status = -EPROTO;
     uint64_t result = 0;
-    int reply_fd = -1;
+    pacha_fd_t reply_fd = PACHA_IPC_REPLY_IMPLICIT;
     uint64_t buffer_token = 0;
     int buffer_miss = 0;
-    if (message.fd_count >= 1 && message.fd_count <= PACHA_IPC_MAX_TRANSFER_FDS) {
-        const unsigned index = (unsigned)message.fd_count - 1u;
-        struct pacha_fd_info info;
-        if (pacha_fd_get_info((int)fds[index].fd, &info) == 0 && info.kind == PACHA_FD_KIND_REPLY)
-            reply_fd = (int)fds[index].fd;
-    }
     const unsigned page_caps = message.word2 < 2;
-    if (reply_fd >= 16 && message.word0 == UNIX_SERVICE_MAGIC && message.fd_count >= page_caps + 1u) {
+    if (message.word0 == UNIX_SERVICE_MAGIC && message.fd_count >= page_caps) {
         struct pacha_fd_info info;
         if (!page_caps) {
             page = find_buffer(service, session, message.word2);
             buffer_miss = page == NULL;
             if (page) buffer_token = message.word2;
-        } else if (pacha_fd_get_info((int)fds[0].fd, &info) == 0 &&
+        } else if (pacha_fd_get_info((pacha_fd_t)fds[0].fd, &info) == 0 &&
             info.kind == PACHA_FD_KIND_VMO && info.size >= UNIX_CONTROL_BYTES)
-            page = pacha_mmap((int)fds[0].fd, UNIX_CONTROL_BYTES,
+            page = pacha_mmap((pacha_fd_t)fds[0].fd, UNIX_CONTROL_BYTES,
                 PACHA_PROT_READ | PACHA_PROT_WRITE, PACHA_MMAP_SHARED, 0);
         if (page) {
             /* Never dispatch from a page the caller can change under us. */
@@ -1039,8 +1028,8 @@ static int receive_one(struct unix_service *service, struct service_session *ses
                 if (message.word2 == 1) buffer_token = retain_buffer(service, session, page);
                 request.result = 0;
                 status = handoff ? authorize_handoff(service, handoff, &request,
-                    (unsigned)message.fd_count - page_caps - 1u) : dispatch(service, session, &request, fds + page_caps,
-                    (unsigned)message.fd_count - page_caps - 1u, &response);
+                    (unsigned)message.fd_count - page_caps) : dispatch(service, session, &request, fds + page_caps,
+                    (unsigned)message.fd_count - page_caps, &response);
                 request.status = status;
                 request.magic = UNIX_REPLY_MAGIC;
                 request.buffer_token = buffer_token;
@@ -1052,21 +1041,24 @@ static int receive_one(struct unix_service *service, struct service_session *ses
     }
     if (page && !buffer_token) (void)pacha_munmap(page, UNIX_CONTROL_BYTES);
     SERVER_RECORD(3);
-    if (reply_fd >= 16) {
+    {
         const struct pacha_ipc_msg reply = {
             .word0 = buffer_miss ? UNIX_BUFFER_MISS_MAGIC : UNIX_REPLY_MAGIC,
             .word1 = buffer_miss ? 0 : (uint64_t)(int64_t)status,
             .word2 = buffer_miss ? message.word2 : result, .word3 = message.word3,
             .fds = response.capabilities, .fd_count = response.count,
         };
-        (void)pacha_ipc_reply(reply_fd, &reply);
+        if (pacha_ipc_reply(reply_fd, &reply)) {
+            const struct pacha_ipc_msg failed = {0};
+            (void)pacha_ipc_reply(reply_fd, &failed);
+        }
     }
     SERVER_RECORD(4);
     for (unsigned i = 0; i < response.count; i++)
         if (response.capabilities[i].transfer_flags & PACHA_IPC_TRANSFER_MOVE)
-            (void)pacha_fd_close((int)response.capabilities[i].fd);
+            (void)pacha_fd_close((pacha_fd_t)response.capabilities[i].fd);
     for (uint64_t i = 0; i < message.fd_count && i < PACHA_IPC_MAX_TRANSFER_FDS; i++)
-        if (fds[i].fd >= 16) (void)pacha_fd_close((int)fds[i].fd);
+        if (fds[i].fd >= 16) (void)pacha_fd_close((pacha_fd_t)fds[i].fd);
     SERVER_RECORD(5);
     return 0;
 }

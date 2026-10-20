@@ -1,0 +1,60 @@
+{
+  "state/ipc.zig": {
+    "clearIpcQueue": 1,
+    "clearIpcQueueWithFreeList": 1,
+    "ensureIpcBlock": 1,
+    "registerIpcDirectReceive": 3,
+    "cancelIpcDirectReceivers": 1,
+    "registerIpcPollWaiterInList": 1,
+    "registerIpcRecvCompletionWaiterForFd": 1,
+    "wakeIpcWaitersForSendFd": 1,
+    "noteIpcReceiverForFd": 3,
+    "takeIpcWritableWaitersForRecvFd": 1,
+    "takeIpcChannelPeerCloseWaiters": 2,
+    "ipcNotifyPeerForFd": 2,
+    "settleIpcPeerNotifyForFd": 1,
+    "consumeIpcNotifyForFd": 1,
+    "registerIpcNotifyWaiterForFd": 1,
+    "wakeIpcPollWaitersForSendFd": 1,
+    "enqueueIpcMessage": 1,
+    "ipcClaimCallReply": 1,
+    "releaseIpcCallAuthority": 1,
+    "ipcCreateCall": 2,
+    "ipcCall": 2,
+    "cancelCall": 4,
+    "takeIpcCancellationWritableWaiters": 2,
+    "drainIpcCancellations": 2,
+    "ipcRecv": 2
+  },
+  "state/fd.zig": {
+    "detachFdWaitGroup": 1
+  },
+  "state/types.zig": {
+    "appendReceive": 6,
+    "unlinkReceive": 6,
+    "takeDirectReceive": 1,
+    "register": 2,
+    "removeWaiter": 2,
+    "unregister": 1,
+    "takeReadable": 1,
+    "retain": 1,
+    "release": 1
+  },
+  "scheduler_connection.zig": {
+    "ipcBlockReusable": 1,
+    "tryIpcFastCall": 5,
+    "tryIpcFastEnqueue": 4,
+    "prepareDirectHandoff": 6,
+    "commitDirectHandoff": 6,
+    "prepareDirectNotify": 1,
+    "commitDirectNotify": 8,
+    "tryIpcFastReplyRecv": 5
+  },
+  "syscall/native_ipc.zig": {
+    "fastDispatchAfterRegisterAdmission": 2
+  },
+  "sync/ipc_endpoint.zig": {},
+  "state/reference_check.zig": {},
+  "state/fd_capability.zig": {},
+  "syscalls.zig": {}
+}

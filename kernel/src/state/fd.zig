@@ -1,3 +1,7 @@
+const b3 = @import("../ipc_path_trace.zig");
+const references = types.references;
+const dma_retention = @import("../memory/dma_retention.zig");
+const lock_diagnostics = @import("../sync/lock_diagnostics.zig");
 const std = @import("std");
 const builtin = @import("builtin");
 const kernel_log = @import("../kernel_log.zig");
@@ -8,12 +12,10 @@ const capsule = types.capsule;
 const initial_process_count = types.initial_process_count;
 const initial_process_capacity = types.initial_process_capacity;
 const process_count = types.process_count;
-const max_process_slots = types.max_process_slots;
+const process_principal_value_count = types.process_principal_value_count;
 const initial_thread_capacity = types.initial_thread_capacity;
-const max_thread_slots = types.max_thread_slots;
-const device_count = types.device_count;
+const thread_id_value_count = types.thread_id_value_count;
 const device_principal_raw = types.device_principal_raw;
-const principal_count = types.principal_count;
 const PrincipalRaw = types.PrincipalRaw;
 const PrincipalId = types.PrincipalId;
 const CapsuleKind = types.CapsuleKind;
@@ -23,8 +25,6 @@ const CapsuleSnapshot = types.CapsuleSnapshot;
 const CapsuleDmaDirection = types.CapsuleDmaDirection;
 const CapsuleIrqKind = types.CapsuleIrqKind;
 const MapProt = types.MapProt;
-const EndpointRoute = types.EndpointRoute;
-const Region = types.Region;
 const ProcessDescriptor = types.ProcessDescriptor;
 const ProcessStatus = types.ProcessStatus;
 const DebugProcessLifecycleReason = types.DebugProcessLifecycleReason;
@@ -33,8 +33,6 @@ const DmaDeviceId = types.DmaDeviceId;
 const invalid_dma_device_id = types.invalid_dma_device_id;
 const Fd = types.Fd;
 const fd_table_entries = types.fd_table_entries;
-const max_fd_objects = types.max_fd_objects;
-const max_pipes = types.max_pipes;
 const pipe_buffer_bytes = types.pipe_buffer_bytes;
 const fd_known_flags_mask = types.fd_known_flags_mask;
 const fd_known_rights_mask = types.fd_known_rights_mask;
@@ -64,12 +62,8 @@ const FdEntry = types.FdEntry;
 const FdInfo = types.FdInfo;
 const FdTable = types.FdTable;
 const FdTransferMode = types.FdTransferMode;
-const max_ipc_endpoints = types.max_ipc_endpoints;
-const max_ipc_channels = types.max_ipc_channels;
-const max_ipc_replies = types.max_ipc_replies;
 const max_ipc_queue_messages = types.max_ipc_queue_messages;
 const max_ipc_message_fds = types.max_ipc_message_fds;
-const max_ipc_waiters = types.max_ipc_waiters;
 const IpcEndpointRef = types.IpcEndpointRef;
 const IpcChannelRef = types.IpcChannelRef;
 const IpcChannelHandle = types.IpcChannelHandle;
@@ -80,8 +74,6 @@ const ThreadWakeTarget = types.ThreadWakeTarget;
 const FdWaitRegistrationRef = types.FdWaitRegistrationRef;
 const FdWaitGroupRef = types.FdWaitGroupRef;
 const TaskFdWaiter = types.TaskFdWaiter;
-const max_task_fd_waiters = types.max_task_fd_waiters;
-const max_ipc_object_waiters = types.max_ipc_object_waiters;
 const PipeSlot = types.PipeSlot;
 const IpcWaitList = types.IpcWaitList;
 const IpcTransferredFd = types.IpcTransferredFd;
@@ -95,8 +87,6 @@ const IpcSendMessage = types.IpcSendMessage;
 const IpcRecvFd = types.IpcRecvFd;
 const IpcRecvResult = types.IpcRecvResult;
 const native_page_size = types.native_page_size;
-const max_native_vmos = types.max_native_vmos;
-const max_vmas_per_process = types.max_vmas_per_process;
 const NativeVmoKind = types.NativeVmoKind;
 const NativeVmoRef = types.NativeVmoRef;
 const NativeCowTableRef = types.NativeCowTableRef;
@@ -107,18 +97,10 @@ const MmapFlags = types.MmapFlags;
 const VmaEntry = types.VmaEntry;
 const VmaTable = types.VmaTable;
 const NativeVmaFaultMapping = types.NativeVmaFaultMapping;
-const EndpointTable = types.EndpointTable;
-const PublishedEndpointTable = types.PublishedEndpointTable;
-const max_vmo_backing_pages = types.max_vmo_backing_pages;
-const max_vmo_backing_store_pages = types.max_vmo_backing_store_pages;
 const RegionFreeRange = types.RegionFreeRange;
 const FreePageList = types.FreePageList;
 const PageCapability = types.PageCapability;
-const empty_vmo_backing_page_store = types.empty_vmo_backing_page_store;
-const vmo_backing_page_store = types.vmo_backing_page_store;
 const empty_process_descriptors_extra = types.empty_process_descriptors_extra;
-const empty_endpoint_tables_extra = types.empty_endpoint_tables_extra;
-const empty_fd_tables_extra = types.empty_fd_tables_extra;
 const empty_vma_tables_extra = types.empty_vma_tables_extra;
 const processPrincipalFromIndex = types.processPrincipalFromIndex;
 const processIndexFromPrincipal = types.processIndexFromPrincipal;
@@ -140,16 +122,14 @@ const runtimeStorageBytes = types.runtimeStorageBytes;
 const initRuntimeStorage = types.initRuntimeStorage;
 
 pub fn fdIndex(fd: Fd) ?usize {
-    if (fd >= types.fd_table_limit) return null;
+    if (fd >= types.fd_number_capacity) return null;
     return @intCast(fd);
 }
 
 pub fn findFreeFd(table: *const FdTable, min_fd: Fd) ?usize {
-    var index = fdIndex(min_fd) orelse return null;
-    while (index < table.slots().len) : (index += 1) {
-        if (table.slots()[index].isEmpty()) return index;
-    }
-    return null;
+    const minimum = fdIndex(min_fd) orelse return null;
+    const index = table.entries.firstMarkedAtOrAfter(@intCast(minimum)) orelse return null;
+    return if (index < table.capacity) index else null;
 }
 
 pub fn nextObjectGeneration(generation: u32) u32 {
@@ -166,19 +146,19 @@ pub fn objectOwner(raw: PrincipalRaw) ?PrincipalId {
 
 pub fn irqPublishSlotForRef(self: anytype, object_ref: KernelObjectRef) ?*IrqPublishSlot {
     if (object_ref.kind != .irq) return null;
-    const index: usize = @intCast(object_ref.index);
-    if (index >= self.irq_publish_slots.len) return null;
-    return &self.irq_publish_slots[index];
+    const object = self.kernelObjectSlotConst(object_ref) orelse return null;
+    return self.irq_publish_slots.resolve(object.irq_publication orelse return null);
 }
 
 pub fn irqPublishSlotForRefConst(self: anytype, object_ref: KernelObjectRef) ?*const IrqPublishSlot {
     if (object_ref.kind != .irq) return null;
-    const index: usize = @intCast(object_ref.index);
-    if (index >= self.irq_publish_slots.len) return null;
-    return &self.irq_publish_slots[index];
+    const object = self.kernelObjectSlotConst(object_ref) orelse return null;
+    return self.irq_publish_slots.resolve(object.irq_publication orelse return null);
 }
 
 pub fn publishIrqObject(self: anytype, object_ref: KernelObjectRef, irq: IrqObject) void {
+    const flags = self.object_directory_leaf.lock();
+    defer self.object_directory_leaf.unlock(flags);
     const slot = self.irqPublishSlotForRef(object_ref) orelse return;
     @atomicStore(u8, &slot.active, 0, .release);
     @atomicStore(u64, &slot.event_count, 0, .release);
@@ -188,27 +168,19 @@ pub fn publishIrqObject(self: anytype, object_ref: KernelObjectRef, irq: IrqObje
     @atomicStore(DmaDeviceId, &slot.device, irq.device, .release);
     @atomicStore(u8, &slot.kind, @intFromEnum(irq.kind), .release);
     @atomicStore(u32, &slot.vector, irq.vector, .release);
-    // Publish the conservative candidate before making the slot active. IRQ
-    // registration keeps the hardware route masked/drained until this returns.
-    // Never clear individual bits: retirement/reuse still uses the active
-    // handshake below, without adding a bitmap-clear/republication race.
-    const index: usize = @intCast(object_ref.index);
-    _ = @atomicRmw(u64, &self.irq_publish_candidates[index / 64], .Or, @as(u64, 1) << @as(u6, @intCast(index % 64)), .release);
+    // Route admission still keeps hardware masked/drained until publication.
     @atomicStore(u8, &slot.active, 1, .release);
 }
 
 pub fn unpublishIrqObject(self: anytype, object_ref: KernelObjectRef) void {
+    const flags = self.object_directory_leaf.lock();
+    defer self.object_directory_leaf.unlock(flags);
     const slot = self.irqPublishSlotForRef(object_ref) orelse return;
-    const generation = @atomicLoad(u32, &slot.generation, .acquire);
-    if (generation != object_ref.generation) return;
-    // 1 is published; 2 is a publisher holding this slot. Merely storing
-    // inactive races an already validated handler incrementing a reused slot.
-    while (true) {
-        const active = @atomicLoad(u8, &slot.active, .acquire);
-        if (active == 0) return;
-        if (active == 1 and @cmpxchgWeak(u8, &slot.active, 1, 0, .acq_rel, .acquire) == null) return;
-        std.atomic.spinLoopHint();
-    }
+    if (slot.generation != object_ref.generation) return;
+    // The leaf excludes even readers that have not yet examined active.
+    // The old 1->2 handshake protected reuse, but not the gap from directory
+    // lookup to handshake acquisition when the body's grant can be returned.
+    @atomicStore(u8, &slot.active, 0, .release);
 }
 
 pub fn irqPublishedEventCount(self: anytype, object_ref: KernelObjectRef) ?u64 {
@@ -274,31 +246,22 @@ pub fn releaseMmioRegionObject(self: anytype, mmio: MmioRegionObject) void {
     }
     if (mmio.wc_window_lease_token != 0) {
         const x86 = @import("../arch/x86_64/platform.zig");
-        const limit = @import("../arch/x86_64/physical_layout.zig").identity_limit;
-        const low_size = if (mmio.paddr < limit) @min(mmio.size, limit - mmio.paddr) else 0;
-        if (low_size != 0) x86.wcIdentityRelease(mmio.paddr, low_size);
         @import("../user_copy.zig").retirePhysCopyWindowsForRange(x86.kernel_cr3_value, mmio.paddr, @intCast(mmio.size));
-        if (low_size != 0)
-            user_vm.flushAllUserIdentityContexts(mmio.paddr, @intCast(low_size));
         @import("../user_copy.zig").flushTlbAndCachesForCr3Range(x86.kernel_cr3_value, mmio.paddr, @intCast(mmio.size));
-        if (low_size != 0) {
-            x86.wcIdentityRestore(mmio.paddr, low_size);
-            user_vm.restorePrivateIdentityMarkers(mmio.paddr, low_size);
-            @import("../user_copy.zig").flushTlbForCr3Range(x86.kernel_cr3_value, mmio.paddr, @intCast(low_size));
-            user_vm.flushAllUserIdentityContexts(mmio.paddr, @intCast(low_size));
-        }
         @import("../user_copy.zig").releaseWcPhysicalWindowLease(mmio.wc_window_lease_token);
     }
 }
 
 pub fn releaseDmaBufferObject(self: anytype, dma: DmaBufferObject) void {
     _ = self;
+    if (dma.retention) |record| dma_retention.close(record);
     if (dma.size == 0) return;
     _ = releaseDmaIova(dma.device, dma.iova, dma.size);
 }
 
 pub fn releaseDmaMappingObject(self: anytype, mapping: DmaMappingObject) void {
     _ = self;
+    if (mapping.retention) |record| dma_retention.close(record);
     if (mapping.size == 0) return;
     _ = releaseDmaIova(mapping.device, mapping.iova, mapping.size);
 }
@@ -312,8 +275,8 @@ fn releaseDmaIova(device: DmaDeviceId, iova: u64, size: u64) bool {
     const aligned, const align_overflow = @addWithOverflow(span, page_size - 1);
     if (align_overflow != 0) return false;
     const page_count: usize = @intCast((aligned & ~(page_size - 1)) / page_size);
-    if (!iommu.unmapRangeForDevice(device, iova, size)) return false;
-    iommu.freeIova(device, iova_base, page_count);
+    if (!iommu.unmapRangeForDevice(device, .fromInt(iova), size)) return false;
+    iommu.freeIova(device, .fromInt(iova_base), page_count);
     return true;
 }
 
@@ -327,10 +290,12 @@ fn prepareLastDmaClose(self: anytype, object_ref: KernelObjectRef) KernelError!v
         .dma_buffer => |*dma| {
             if (!releaseDmaIova(dma.device, dma.iova, dma.size)) return KernelError.InvalidState;
             dma.size = 0;
+            if (slot.reference_state.?.payload_edge.target != null) references.Root.update(&slot.reference_state.?.payload_edge, slot.reference_state.?.payload_edge.identity, .{ .start = dma.user_va, .size = 0 });
         },
         .dma_mapping => |*dma| {
             if (!releaseDmaIova(dma.device, dma.iova, dma.size)) return KernelError.InvalidState;
             dma.size = 0;
+            if (slot.reference_state.?.payload_edge.target != null) references.Root.update(&slot.reference_state.?.payload_edge, slot.reference_state.?.payload_edge.identity, .{ .start = dma.user_va, .size = 0 });
         },
         else => {},
     }
@@ -350,11 +315,12 @@ pub fn objectPayloadMatches(kind: KernelObjectKind, payload: KernelObjectPayload
 }
 
 pub fn releaseKernelObjectPayload(self: anytype, slot: *const KernelObjectSlot) void {
+    if (slot.kind == .vmo) references.Root.disconnect(&slot.reference_state.?.payload_edge, true);
     switch (slot.payload) {
         .vmo => |vmo_ref| self.releaseNativeVmo(vmo_ref),
         .endpoint => |endpoint_ref| self.clearIpcEndpointSlot(endpoint_ref),
         .channel => |channel_handle| self.releaseIpcChannelHandle(channel_handle),
-        .reply => |reply_ref| self.clearIpcReplySlot(reply_ref),
+        .reply => |reply_ref| self.releaseIpcCallAuthority(reply_ref),
         .mmio_region => |mmio| self.releaseMmioRegionObject(mmio),
         .dma_buffer => |dma| self.releaseDmaBufferObject(dma),
         .dma_mapping => |mapping| self.releaseDmaMappingObject(mapping),
@@ -369,11 +335,12 @@ pub fn releaseKernelObjectPayloadWithFreeList(
     slot: *const KernelObjectSlot,
     free_list: *FreePageList,
 ) void {
+    if (slot.kind == .vmo) references.Root.disconnect(&slot.reference_state.?.payload_edge, true);
     switch (slot.payload) {
         .vmo => |vmo_ref| self.releaseNativeVmoWithFreeList(vmo_ref, free_list),
         .endpoint => |endpoint_ref| self.clearIpcEndpointSlotWithFreeList(endpoint_ref, free_list),
         .channel => |channel_handle| self.releaseIpcChannelHandleWithFreeList(channel_handle, free_list),
-        .reply => |reply_ref| self.clearIpcReplySlotWithFreeList(reply_ref, free_list),
+        .reply => |reply_ref| self.releaseIpcCallAuthority(reply_ref),
         .mmio_region => |mmio| self.releaseMmioRegionObject(mmio),
         .dma_buffer => |dma| self.releaseDmaBufferObject(dma),
         .dma_mapping => |mapping| self.releaseDmaMappingObject(mapping),
@@ -386,15 +353,31 @@ pub fn releaseKernelObjectPayloadWithFreeList(
 // Invalidate identity without destroying the payload. DMA publication failure
 // leaves IOVA cleanup to its caller; normal destruction calls this afterwards.
 fn resetKernelObjectSlot(self: anytype, slot: *KernelObjectSlot) void {
-    const index = (@intFromPtr(slot) - @intFromPtr(&self.fd_objects[0])) / @sizeOf(KernelObjectSlot);
-    self.pinned_object_slots.unset(index);
-    slot.kind = .none;
-    slot.ref_count = 0;
-    slot.payload = .{ .none = {} };
-    slot.generation = @TypeOf(self.*).nextObjectGeneration(slot.generation);
+    const index = @TypeOf(self.fd_objects).indexOf(slot);
+    // A waiter on a destroyed timer no longer resolves and leaves the scan.
+    if (slot.kind == .timer) self.markTimerDeadlineDirty();
+    _ = index;
+    if (slot.irq_publication) |ref| {
+        const publication = self.irq_publish_slots.resolve(ref).?;
+        std.debug.assert(publication.active == 0);
+        self.irq_publish_slots.remove(publication, &self.object_directory_leaf);
+    }
+    if (slot.reference_state) |record| {
+        references.Root.disconnect(&record.payload_edge, false);
+        self.object_reference_slots.remove(record, null);
+        slot.reference_state = null;
+    }
+    // K and endpoint exclusion have ended resource borrows. Withdraw lookup
+    // visibility before recycling the slot and advancing its generation.
+    slot.live.close();
+    self.fd_objects.withdraw(slot, &self.object_directory_leaf);
+    slot.retired_next = self.retired_fd_objects;
+    self.retired_fd_objects = slot;
+    self.reclaimFdCapabilities();
 }
 
 pub fn clearKernelObjectSlot(self: anytype, slot: *KernelObjectSlot) void {
+    slot.live.close();
     self.releaseKernelObjectPayload(slot);
     resetKernelObjectSlot(self, slot);
 }
@@ -404,31 +387,37 @@ pub fn clearKernelObjectSlotWithFreeList(
     slot: *KernelObjectSlot,
     free_list: *FreePageList,
 ) void {
+    slot.live.close();
     self.releaseKernelObjectPayloadWithFreeList(slot, free_list);
     resetKernelObjectSlot(self, slot);
 }
 
 pub fn resetKernelObjectTable(self: anytype) void {
-    for (self.irq_publish_slots[0..]) |*slot| {
-        @atomicStore(u8, &slot.active, 0, .release);
-        slot.* = .{};
+    @import("fd_capability.zig").deinit(self);
+    self.markTimerDeadlineDirty();
+    // Construction/teardown only: all producers and body borrowers are gone.
+    var objects = self.fd_objects.iterator();
+    while (objects.next()) |item| {
+        // Payload storage is about to disappear; weak process pin links must
+        // be detached first even when teardown bypasses ordinary last-close.
+        if (item.value.kind != .vmo) if (item.value.reference_state) |record|
+            references.Root.disconnect(&record.payload_edge, false);
+        if (item.value.kind != .none) self.releaseKernelObjectPayload(item.value);
     }
-    // Like the existing slot reset, this requires all IRQ producers quiescent.
-    @memset(&self.irq_publish_candidates, 0);
-    for (self.fd_objects[0..]) |*slot| {
-        if (slot.kind != .none) self.releaseKernelObjectPayload(slot);
-        slot.* = .{};
+    self.irq_publish_slots.deinit();
+    self.object_reference_slots.deinit();
+    self.fd_objects.deinit();
+    var pipes = self.pipes.iterator();
+    while (pipes.next()) |item| {
+        for (&item.value.waiters) |*list| list.waiters.deinitInto(&self.pipes.body_owner);
     }
-    self.pinned_object_slots = .initEmpty();
-    for (self.pipes[0..]) |*slot| {
-        slot.* = .{ .generation = @TypeOf(self.*).nextObjectGeneration(slot.generation) };
-    }
+    self.pipes.deinit();
     self.next_fd_object_scan = 0;
     self.next_pipe_scan = 0;
 }
 
 pub fn resetNativeVmoTable(self: anytype) void {
-    @memset(self.native_vmos[0..], .{});
+    self.native_vmos.deinit();
     self.next_native_vmo_scan = 0;
 }
 
@@ -441,8 +430,14 @@ fn reportObjectTableFull(self: anytype, requested: KernelObjectKind) void {
     if (builtin.is_test or object_full_reports >= 4) return;
     object_full_reports += 1;
     var counts = [_]usize{0} ** @typeInfo(KernelObjectKind).@"enum".fields.len;
-    for (self.fd_objects[0..]) |*slot| counts[@intFromEnum(slot.kind)] += 1;
-    kernel_log.writeFmt("fd: object-table-full requested={s} capacity={}\n", .{ @tagName(requested), max_fd_objects });
+    {
+        var pool_iter_26 = self.fd_objects.iterator();
+        while (pool_iter_26.next()) |pool_entry_26| {
+            const slot = pool_entry_26.value;
+            counts[@intFromEnum(slot.kind)] += 1;
+        }
+    }
+    kernel_log.writeFmt("fd: object-table-full requested={s} capacity={}\n", .{ @tagName(requested), self.fd_objects.capacity });
     for (counts, 0..) |count, kind| {
         if (count == 0) continue;
         kernel_log.writeFmt("fd: occupied kind={s} count={}\n", .{ @tagName(@as(KernelObjectKind, @enumFromInt(kind))), count });
@@ -455,58 +450,60 @@ pub fn createKernelObject(
     payload: KernelObjectPayload,
 ) KernelError!KernelObjectRef {
     if (kind == .none or !@TypeOf(self.*).objectPayloadMatches(kind, payload)) return KernelError.InvalidState;
-    var offset: usize = 0;
-    while (offset < max_fd_objects) : (offset += 1) {
-        const index = (self.next_fd_object_scan + offset) % max_fd_objects;
-        const slot = &self.fd_objects[index];
-        if (slot.kind != .none or slot.ref_count != 0) continue;
-        if (slot.generation == 0) slot.generation = 1;
-        slot.kind = kind;
-        slot.payload = payload;
-        slot.ref_count = 0;
-        self.pinned_object_slots.setValue(index, switch (kind) {
-            .mmio_region, .dma_buffer, .dma_mapping => true,
-            else => false,
-        });
-        self.next_fd_object_scan = (index + 1) % max_fd_objects;
-        return .{
-            .kind = kind,
-            .index = @intCast(index),
-            .generation = slot.generation,
-        };
+    const allocation = try self.allocatePool(&self.fd_objects, &self.object_directory_leaf, std.math.maxInt(u32));
+    const slot = allocation.value;
+    errdefer self.fd_objects.remove(slot, &self.object_directory_leaf);
+    // Reserve target metadata before publishing kind/payload. K already
+    // serializes object creation; connection uses only this record's leaf.
+    if (trackedReferenceKind(kind)) {
+        const record = try self.allocatePool(&self.object_reference_slots, null, std.math.maxInt(u32));
+        slot.reference_state = record.value;
     }
-    reportObjectTableFull(self, kind);
-    return KernelError.TableFull;
+    errdefer if (slot.reference_state) |record| self.object_reference_slots.remove(record, null);
+    if (kind == .irq) {
+        const publication = try self.allocatePool(&self.irq_publish_slots, &self.object_directory_leaf, std.math.maxInt(u32));
+        slot.irq_publication = publication.ref;
+    }
+    slot.live = @import("../sync/ipc_lifetime.zig").Admission.init();
+    slot.kind = kind;
+    slot.payload = payload;
+    self.fd_objects.mark(allocation.ref.index, 1, kind == .mmio_region or kind == .dma_buffer or kind == .dma_mapping);
+    slot.ref_count = 0;
+    if (payload == .vmo) {
+        const vmo = self.nativeVmoSlot(payload.vmo) orelse return KernelError.InvalidState;
+        vmo.references.connect(&slot.reference_state.?.payload_edge, .{ .kind = .fd_object, .index = allocation.ref.index, .generation = allocation.ref.generation }, .{}, true);
+    }
+    return .{ .kind = kind, .index = allocation.ref.index, .generation = allocation.ref.generation };
 }
 
 pub fn kernelObjectSlot(self: anytype, object_ref: KernelObjectRef) ?*KernelObjectSlot {
     if (object_ref.kind == .none) return null;
-    const index: usize = @intCast(object_ref.index);
-    if (index >= max_fd_objects) return null;
-    const slot = &self.fd_objects[index];
-    if (slot.kind != object_ref.kind or slot.generation != object_ref.generation) return null;
+    const slot = self.fd_objects.resolve(.{ .index = object_ref.index, .generation = object_ref.generation }) orelse return null;
+    if (slot.kind != object_ref.kind) return null;
     return slot;
 }
 
 pub fn kernelObjectSlotConst(self: anytype, object_ref: KernelObjectRef) ?*const KernelObjectSlot {
     if (object_ref.kind == .none) return null;
-    const index: usize = @intCast(object_ref.index);
-    if (index >= max_fd_objects) return null;
-    const slot = &self.fd_objects[index];
-    if (slot.kind != object_ref.kind or slot.generation != object_ref.generation) return null;
+    const slot = self.fd_objects.resolve(.{ .index = object_ref.index, .generation = object_ref.generation }) orelse return null;
+    if (slot.kind != object_ref.kind) return null;
     return slot;
 }
 
 pub fn retainKernelObject(self: anytype, object_ref: KernelObjectRef) KernelError!void {
     const slot = self.kernelObjectSlot(object_ref) orelse return KernelError.InvalidState;
     if (slot.ref_count == std.math.maxInt(u32)) return KernelError.TableFull;
+    if (trackedReferenceKind(slot.kind)) slot.reference_state.?.holders.retainTemporary();
+    if (slot.ref_count == 0 and trackedReferenceKind(slot.kind)) publishPinnedReference(self, slot, object_ref);
     slot.ref_count += 1;
 }
 
 pub fn releaseKernelObject(self: anytype, object_ref: KernelObjectRef) void {
     const slot = self.kernelObjectSlot(object_ref) orelse return;
     if (slot.ref_count == 0) return;
+    if (trackedReferenceKind(slot.kind)) slot.reference_state.?.holders.releaseTemporary();
     slot.ref_count -= 1;
+    if (slot.ref_count == 0 and slot.kind != .vmo) if (slot.reference_state) |record| references.Root.disconnect(&record.payload_edge, false);
     if (slot.ref_count == 0) {
         self.unpublishIrqObject(object_ref);
         self.clearKernelObjectSlot(slot);
@@ -520,7 +517,9 @@ pub fn releaseKernelObjectWithFreeList(
 ) void {
     const slot = self.kernelObjectSlot(object_ref) orelse return;
     if (slot.ref_count == 0) return;
+    if (trackedReferenceKind(slot.kind)) slot.reference_state.?.holders.releaseTemporary();
     slot.ref_count -= 1;
+    if (slot.ref_count == 0 and slot.kind != .vmo) if (slot.reference_state) |record| references.Root.disconnect(&record.payload_edge, false);
     if (slot.ref_count == 0) {
         self.unpublishIrqObject(object_ref);
         self.clearKernelObjectSlotWithFreeList(slot, free_list);
@@ -554,57 +553,71 @@ pub fn kernelObjectIsPinnedUserObject(self: anytype, object_ref: KernelObjectRef
     };
 }
 
-fn revokeKernelObjectFromIpcQueueWithFreeList(
-    self: anytype,
-    queue: *IpcQueue,
-    object_ref: KernelObjectRef,
-    free_list: *FreePageList,
-) void {
-    var msg_offset: usize = 0;
-    while (msg_offset < queue.len) : (msg_offset += 1) {
-        const msg = &queue.messages[queue.slotIndex(msg_offset)];
-        var fd_index: usize = 0;
-        while (fd_index < msg.fd_count and fd_index < max_ipc_message_fds) {
-            if (!sameKernelObjectRef(msg.fds[fd_index].object, object_ref)) {
-                fd_index += 1;
-                continue;
+// K (and all-AS for address-bound objects) is already held by revoke/exit.
+// Copy identity under leaf, then resolve source generations under that outer
+// transaction. Unlink transfers the existing strong retain to a temporary
+// pin; release consumes it only after the source no longer publishes it.
+// This needs neither allocation nor an extra refcount increment at close.
+pub fn revokeObjectHolders(self: anytype, object_ref: KernelObjectRef, free_list: *FreePageList, kind: ?references.Kind) void {
+    while (true) {
+        const slot = self.kernelObjectSlot(object_ref) orelse return;
+        const record = slot.reference_state orelse unreachable;
+        var cursor = references.Cursor.init(&record.holders);
+        var selected: ?references.Edge = null;
+        while (cursor.next()) |edge| {
+            if (kind == null or edge.identity.kind == kind.?) {
+                selected = edge;
+                break;
             }
-            self.releaseKernelObjectWithFreeList(object_ref, free_list);
-            var shift_index = fd_index + 1;
-            while (shift_index < msg.fd_count and shift_index < max_ipc_message_fds) : (shift_index += 1) {
-                msg.fds[shift_index - 1] = msg.fds[shift_index];
-            }
-            if (msg.fd_count != 0) msg.fd_count -= 1;
-            msg.fds[msg.fd_count] = .{};
         }
+        const edge = selected orelse return;
+        const id = edge.identity;
+        switch (id.kind) {
+            .fd_entry => {
+                const process = self.processDescriptorSlotConst(id.owner) orelse unreachable;
+                std.debug.assert(process.generation == id.owner_generation);
+                const table = self.fdTableForProcessIndex(id.owner) orelse unreachable;
+                std.debug.assert(id.index < table.capacity);
+                const entry = table.at(id.index);
+                std.debug.assert(sameKernelObjectRef(entry.object, object_ref) and entry.authority.reference.?.identity.eql(id));
+                self.unpublishFdReference(entry);
+                entry.replace(.{});
+                table.entries.mark(id.index, 1, true);
+            },
+            .ipc => {
+                const queue = switch (id.container) {
+                    1 => &(self.ipcEndpointSlot(.{ .index = id.owner, .generation = id.owner_generation }) orelse unreachable).queue,
+                    2 => &(self.ipcChannelSlot(.{ .index = id.owner, .generation = id.owner_generation }) orelse unreachable).queues[id.direction],
+                    3 => unreachable,
+                    else => unreachable,
+                };
+                var endpoint_guard = queue.acquire();
+                defer endpoint_guard.end();
+                var matched = false;
+                for (0..queue.len) |offset| if (queue.slotIndex(offset) == id.index and queue.messageSequence(offset) == id.sequence) {
+                    matched = true;
+                    break;
+                };
+                std.debug.assert(matched);
+                const msg = queue.messageAt(id.index);
+                const position: usize = id.position;
+                std.debug.assert(position < msg.fd_count and sameKernelObjectRef(msg.fds[position].object(), object_ref) and msg.referenceAt(position).?.identity.eql(id));
+                msg.removeReference(position);
+                var i = position + 1;
+                while (i < msg.fd_count) : (i += 1) {
+                    msg.fds[i - 1] = msg.fds[i];
+                    msg.shiftReference(i, i - 1);
+                }
+                msg.fd_count -= 1;
+                msg.fds[msg.fd_count] = .{};
+            },
+            else => unreachable,
+        }
+        self.releaseKernelObjectWithFreeList(object_ref, free_list);
     }
 }
-
-fn revokeKernelObjectEverywhereWithFreeList(
-    self: anytype,
-    object_ref: KernelObjectRef,
-    free_list: *FreePageList,
-) void {
-    var process_index: usize = 0;
-    while (process_index < self.process_capacity) : (process_index += 1) {
-        const table = self.fdTableForProcessIndex(process_index) orelse continue;
-        for (table.slots()[0..]) |*entry| {
-            if (!sameKernelObjectRef(entry.object, object_ref)) continue;
-            entry.* = .{};
-            self.releaseKernelObjectWithFreeList(object_ref, free_list);
-        }
-    }
-    for (self.ipc_endpoints[0..]) |*slot| {
-        if (slot.active) revokeKernelObjectFromIpcQueueWithFreeList(self, &slot.queue, object_ref, free_list);
-    }
-    for (self.ipc_channels[0..]) |*slot| {
-        if (!slot.active) continue;
-        revokeKernelObjectFromIpcQueueWithFreeList(self, &slot.queues[0], object_ref, free_list);
-        revokeKernelObjectFromIpcQueueWithFreeList(self, &slot.queues[1], object_ref, free_list);
-    }
-    for (self.ipc_replies[0..]) |*slot| {
-        if (slot.active) revokeKernelObjectFromIpcQueueWithFreeList(self, &slot.queue, object_ref, free_list);
-    }
+fn revokeKernelObjectEverywhereWithFreeList(self: anytype, object_ref: KernelObjectRef, free_list: *FreePageList) void {
+    revokeObjectHolders(self, object_ref, free_list, null);
 }
 
 /// Address-bound objects cannot outlive the owner address space recorded in
@@ -616,22 +629,34 @@ pub fn revokeOwnedPinnedUserObjectsWithFreeList(
     free_list: *FreePageList,
 ) void {
     const owner_raw: PrincipalRaw = @intFromEnum(owner);
-    var object_index: usize = 0;
-    while (object_index < self.fd_objects.len) : (object_index += 1) {
-        const slot = &self.fd_objects[object_index];
-        if (!objectOwnedPinnedRange(slot, owner_raw)) continue;
-        const object_ref = KernelObjectRef{
-            .kind = slot.kind,
-            .index = @intCast(object_index),
-            .generation = slot.generation,
-        };
+    var candidates = @import("vma.zig").pinnedObjectCursor(self, owner);
+    while (candidates.next()) |edge| {
+        const object_ref: KernelObjectRef = .{ .kind = @enumFromInt(edge.identity.container), .index = edge.identity.index, .generation = edge.identity.generation };
+        const slot = self.kernelObjectSlot(object_ref) orelse unreachable;
+        std.debug.assert(objectOwnedPinnedRange(slot, owner_raw));
+        switch (slot.payload) {
+            .dma_buffer => |*dma| if (dma.retention) |record| {
+                dma_retention.force(record);
+                dma.retention = null;
+            },
+            .dma_mapping => |*dma| if (dma.retention) |record| {
+                dma_retention.force(record);
+                dma.retention = null;
+            },
+            else => {},
+        }
         revokeKernelObjectEverywhereWithFreeList(self, object_ref, free_list);
     }
 }
 
 pub fn fdTableForActiveProcess(self: anytype, principal: PrincipalId) KernelError!*FdTable {
     try self.requireActiveProcess(principal);
-    return self.getFdTable(principal) orelse KernelError.InvalidState;
+    const result = self.getFdTable(principal) orelse return KernelError.InvalidState;
+    if (result.capacity == 0) {
+        defer self.finishFdGrowth(result);
+        try result.ensureCapacity(types.fd_table_entries, try self.poolAllocator(), &self.object_directory_leaf, &self.fd_retired);
+    }
+    return result;
 }
 
 pub fn fdTableForActiveProcessConst(self: anytype, principal: PrincipalId) KernelError!*const FdTable {
@@ -642,8 +667,8 @@ pub fn fdTableForActiveProcessConst(self: anytype, principal: PrincipalId) Kerne
 pub fn fdEntryConst(self: anytype, owner: PrincipalId, fd: Fd) ?*const FdEntry {
     const table = self.getFdTableConst(owner) orelse return null;
     const index = table.index(fd) orelse return null;
-    if (table.slots()[index].isEmpty()) return null;
-    return &table.slots()[index];
+    if (table.at(index).*.isEmpty()) return null;
+    return table.at(index);
 }
 
 // Caller holds KernelState and shared-VM-object locks together. Keep this
@@ -745,8 +770,8 @@ pub fn eventWakeOwnersForFd(
         if (!desc.active) continue;
         const table = self.fdTableForProcessIndexConst(process_index) orelse continue;
         var fd_index: usize = 0;
-        while (fd_index < table.slots().len) : (fd_index += 1) {
-            const candidate = table.slots()[fd_index];
+        while (fd_index < table.capacity) : (fd_index += 1) {
+            const candidate = table.at(fd_index).*;
             if (candidate.object.isNull()) continue;
             if (!candidate.rights.read or (!candidate.rights.wait and !candidate.rights.poll)) continue;
             if (candidate.object.kind != source.object.kind or
@@ -779,6 +804,7 @@ pub fn timerReadExpirations(self: anytype, owner: PrincipalId, fd: Fd, now_ns: u
     };
     const count = @TypeOf(self.*).timerDueCount(timer, now_ns);
     if (count == 0) return 0;
+    self.markTimerDeadlineDirty();
     if (timer.interval_ns == 0) {
         timer.deadline_ns = 0;
     } else {
@@ -815,6 +841,7 @@ pub fn setTimerFd(
         .timer => |timer| timer,
         else => return KernelError.InvalidState,
     };
+    self.markTimerDeadlineDirty();
     timer.deadline_ns = deadline_ns;
     timer.interval_ns = interval_ns;
     timer.flags = flags;
@@ -822,6 +849,9 @@ pub fn setTimerFd(
 }
 
 pub fn fdIpcReadable(self: anytype, payload: *const KernelObjectPayload) bool {
+    const exclusion = @import("ipc.zig").exclusionForPayload(self, payload) orelse return false;
+    var endpoint_guard = exclusion.acquire();
+    defer endpoint_guard.end();
     return switch (payload.*) {
         .endpoint => |endpoint_ref| blk: {
             const endpoint = self.ipcEndpointSlotConst(endpoint_ref) orelse break :blk false;
@@ -830,17 +860,20 @@ pub fn fdIpcReadable(self: anytype, payload: *const KernelObjectPayload) bool {
         .channel => |handle| blk: {
             if (handle.side > 1) break :blk false;
             const channel = self.ipcChannelSlotConst(handle.channel) orelse break :blk false;
-            break :blk !channel.queues[@as(usize, handle.side)].isEmpty();
+            // A latched notification must end WAIT_MANY like a message does:
+            // multi-threaded clients and the owner wait on many doorbells there.
+            break :blk !channel.queues[@as(usize, handle.side)].isEmpty() or
+                channel.notify_pending[@as(usize, handle.side)];
         },
-        .reply => |reply_ref| blk: {
-            const reply = self.ipcReplySlotConst(reply_ref) orelse break :blk false;
-            break :blk !reply.queue.isEmpty();
-        },
+        .reply => false,
         else => false,
     };
 }
 
 pub fn fdIpcWritable(self: anytype, payload: *const KernelObjectPayload) bool {
+    const exclusion = @import("ipc.zig").exclusionForPayload(self, payload) orelse return false;
+    var endpoint_guard = exclusion.acquire();
+    defer endpoint_guard.end();
     return switch (payload.*) {
         .endpoint => |endpoint_ref| blk: {
             const endpoint = self.ipcEndpointSlotConst(endpoint_ref) orelse break :blk false;
@@ -906,6 +939,8 @@ pub fn fdPollEventsWithWriteMin(self: anytype, owner: PrincipalId, fd: Fd, reque
         .channel => |handle| {
             if (handle.side > 1) return null;
             const channel = self.ipcChannelSlotConst(handle.channel) orelse return null;
+            var peer_guard = @constCast(channel).exclusion.acquire();
+            defer peer_guard.end();
             if (channel.ref_count == 1) ready |= @import("kernel_abi_root").fd_abi.event_hangup;
         },
         .pipe => |endpoint| {
@@ -934,6 +969,8 @@ pub fn fdPayloadWithRightsConst(
     fd: Fd,
     required_rights: FdRights,
 ) ?struct { rights: FdRights, payload: *const KernelObjectPayload } {
+    const b3_start = b3.now();
+    defer b3.end(101, b3_start);
     const entry = self.fdEntryConst(owner, fd) orelse return null;
     if (!isFdRightsSubset(required_rights, entry.rights)) return null;
     const slot = self.kernelObjectSlotConst(entry.object) orelse return null;
@@ -946,9 +983,11 @@ pub fn fdPayloadWithRights(
     fd: Fd,
     required_rights: FdRights,
 ) ?struct { rights: FdRights, payload: *KernelObjectPayload } {
+    const b3_start = b3.now();
+    defer b3.end(101, b3_start);
     const table = self.getFdTable(owner) orelse return null;
     const index = table.index(fd) orelse return null;
-    const entry = &table.slots()[index];
+    const entry = table.at(index);
     if (entry.isEmpty()) return null;
     if (!isFdRightsSubset(required_rights, entry.rights)) return null;
     const slot = self.kernelObjectSlot(entry.object) orelse return null;
@@ -1008,34 +1047,33 @@ pub fn recordDeviceInterruptEvent(
     wake_owners: []PrincipalId,
 ) usize {
     var wake_count: usize = 0;
-    for (&self.irq_publish_candidates, 0..) |*word, word_index| {
-        var candidates = @atomicLoad(u64, word, .acquire);
-        slots: while (candidates != 0) : (candidates &= candidates - 1) {
-            const index = word_index * 64 + @ctz(candidates);
-            if (index >= self.irq_publish_slots.len) continue;
-            const slot = &self.irq_publish_slots[index];
-            while (true) {
-                const active = @atomicLoad(u8, &slot.active, .acquire);
-                if (active == 0) continue :slots;
-                if (active == 1 and @cmpxchgWeak(u8, &slot.active, 1, 2, .acquire, .monotonic) == null) break;
-                std.atomic.spinLoopHint();
-            }
-            defer @atomicStore(u8, &slot.active, 1, .release);
-            const generation = @atomicLoad(u32, &slot.generation, .acquire);
-            const irq_device = @atomicLoad(DmaDeviceId, &slot.device, .acquire);
-            const kind = @atomicLoad(u8, &slot.kind, .acquire);
-            const irq_entry = @atomicLoad(u32, &slot.vector, .acquire);
-            if (irq_device != device or
-                !@TypeOf(self.*).irqKindMatchesInterrupt(kind, irq_entry, entry))
-            {
-                continue;
-            }
-            if (@atomicLoad(u32, &slot.generation, .acquire) != generation) continue;
-            _ = @atomicRmw(u64, &slot.event_count, .Add, 1, .acq_rel);
-            const owner_raw = @atomicLoad(PrincipalRaw, &slot.owner_principal_raw, .acquire);
-            const owner = @TypeOf(self.*).objectOwner(owner_raw) orelse continue;
-            @TypeOf(self.*).appendUniquePrincipal(wake_owners, &wake_count, owner);
+    var index: u64 = 0;
+    while (true) : (index += 1) {
+        // One candidate per hold: no allocator, callback, user copy, external
+        // lock, or complete-table scan may run inside this IRQ-save leaf.
+        const flags = self.object_directory_leaf.lock();
+        if (index >= self.irq_publish_slots.capacity) {
+            self.object_directory_leaf.unlock(flags);
+            break;
         }
+        const slot = self.irq_publish_slots.get(@intCast(index)) orelse {
+            self.object_directory_leaf.unlock(flags);
+            continue;
+        };
+        if (slot.active == 0 or slot.device != device or
+            !@TypeOf(self.*).irqKindMatchesInterrupt(slot.kind, slot.vector, entry))
+        {
+            self.object_directory_leaf.unlock(flags);
+            continue;
+        }
+        // Unpublish and withdrawal share this leaf. No slot pointer escapes,
+        // so a returned body cannot be touched by a delayed IRQ reader. The
+        // prior per-slot 1->2 handshake cannot provide that lifetime guarantee.
+        _ = @atomicRmw(u64, &slot.event_count, .Add, 1, .acq_rel);
+        const owner_raw = slot.owner_principal_raw;
+        self.object_directory_leaf.unlock(flags);
+        const owner = @TypeOf(self.*).objectOwner(owner_raw) orelse continue;
+        @TypeOf(self.*).appendUniquePrincipal(wake_owners, &wake_count, owner);
     }
     return wake_count;
 }
@@ -1086,6 +1124,19 @@ pub fn createMmioRegionFd(
     };
 }
 
+/// Commit a staged overlay only after its PTE publication succeeds. K is
+/// held from staging through here, so the FD and its pinned edge become
+/// visible with the same address; failure cleanup still sees address zero.
+pub fn publishMmioOverlayAddress(self: anytype, owner: PrincipalId, fd: Fd, user_va: u64, lease: u64) void {
+    const entry = self.fdEntryConst(owner, fd) orelse unreachable;
+    const slot = self.kernelObjectSlot(entry.object) orelse unreachable;
+    std.debug.assert(slot.kind == .mmio_region and slot.payload.mmio_region.user_va == 0);
+    const node = &slot.reference_state.?.payload_edge;
+    slot.payload.mmio_region.user_va = user_va;
+    slot.payload.mmio_region.wc_window_lease_token = lease;
+    references.Root.update(node, node.identity, .{ .start = user_va, .size = slot.payload.mmio_region.size });
+}
+
 /// The global KernelState lock serializes this check with MMIO FD publication
 /// and final close. Compare actual physical pages, not BAR ownership: a UC
 /// register window and a disjoint WC VRAM window may coexist on one device.
@@ -1094,15 +1145,19 @@ pub fn mmioPhysicalCacheConflict(self: anytype, paddr: u64, size: u64, wc: bool)
     if (size == 0 or paddr > std.math.maxInt(u64) - size) return true;
     const end = paddr + size;
     const capsule_abi = @import("kernel_abi_root").capsule_abi;
-    for (&self.fd_objects) |*slot| {
-        if (slot.kind != .mmio_region or slot.ref_count == 0) continue;
-        const mmio = slot.payload.mmio_region;
-        if (mmio.user_va == 0 or mmio.size == 0 or
-            mmio.paddr > std.math.maxInt(u64) - mmio.size) continue;
-        if (paddr >= mmio.paddr + mmio.size or mmio.paddr >= end) continue;
-        const kind = (mmio.flags & capsule_abi.mmio_map_cache_mask) >>
-            capsule_abi.mmio_map_cache_shift;
-        if ((kind == @intFromEnum(capsule_abi.MmioCache.wc)) != wc) return true;
+    {
+        var pool_iter_27 = self.fd_objects.iterator();
+        while (pool_iter_27.next()) |pool_entry_27| {
+            const slot = pool_entry_27.value;
+            if (slot.kind != .mmio_region or slot.ref_count == 0) continue;
+            const mmio = slot.payload.mmio_region;
+            if (mmio.user_va == 0 or mmio.size == 0 or
+                mmio.paddr > std.math.maxInt(u64) - mmio.size) continue;
+            if (paddr >= mmio.paddr + mmio.size or mmio.paddr >= end) continue;
+            const kind = (mmio.flags & capsule_abi.mmio_map_cache_mask) >>
+                capsule_abi.mmio_map_cache_shift;
+            if ((kind == @intFromEnum(capsule_abi.MmioCache.wc)) != wc) return true;
+        }
     }
     return false;
 }
@@ -1118,6 +1173,8 @@ pub fn createDmaBufferFd(
     if (dma.device == 0 or dma.user_va == 0 or dma.size == 0) return KernelError.InvalidState;
     var payload = dma;
     payload.owner_principal_raw = @intFromEnum(owner);
+    payload.retention = try prepareDmaRetention(self, dma.device, dma.iova, dma.size, &.{});
+    errdefer if (payload.retention) |record| dma_retention.close(record);
     const object_ref = try self.createKernelObject(.dma_buffer, .{ .dma_buffer = payload });
     return self.installFd(owner, object_ref, rights, flags, min_fd) catch |err| {
         // The syscall that owns the not-yet-published IOVA performs failure
@@ -1139,9 +1196,24 @@ pub fn createDmaMappingFd(
     flags: FdFlags,
     min_fd: Fd,
 ) KernelError!Fd {
+    return createDmaMappingFdWithBacking(self, owner, mapping, rights, flags, min_fd, &.{});
+}
+
+pub fn createDmaMappingFdWithBacking(
+    self: anytype,
+    owner: PrincipalId,
+    mapping: DmaMappingObject,
+    rights: FdRights,
+    flags: FdFlags,
+    min_fd: Fd,
+    backing: []const u64,
+) KernelError!Fd {
     if (mapping.device == 0 or mapping.user_va == 0 or mapping.size == 0) return KernelError.InvalidState;
     var payload = mapping;
     payload.owner_principal_raw = @intFromEnum(owner);
+    if (!iommu.isActive() and mapping.page_count != 0 and backing.len != mapping.page_count) return KernelError.InvalidState;
+    payload.retention = try prepareDmaRetention(self, mapping.device, mapping.iova, mapping.size, backing);
+    errdefer if (payload.retention) |record| dma_retention.close(record);
     const object_ref = try self.createKernelObject(.dma_mapping, .{ .dma_mapping = payload });
     return self.installFd(owner, object_ref, rights, flags, min_fd) catch |err| {
         if (self.kernelObjectSlot(object_ref)) |slot| {
@@ -1186,6 +1258,7 @@ pub fn createTimerFd(
         .deadline_ns = deadline_ns,
         .interval_ns = interval_ns,
     } });
+    self.markTimerDeadlineDirty();
     return self.installFd(owner, object_ref, rights, flags, min_fd) catch |err| {
         if (self.kernelObjectSlot(object_ref)) |slot| self.clearKernelObjectSlot(slot);
         return err;
@@ -1218,11 +1291,11 @@ pub fn createSerialFdAt(
     try self.requireActiveProcess(owner);
     const table = try self.fdTableForActiveProcess(owner);
     const index = table.index(fd) orelse return KernelError.InvalidState;
-    if (!table.slots()[index].isEmpty()) return KernelError.InvalidState;
+    if (!table.at(index).*.isEmpty()) return KernelError.InvalidState;
     const object_ref = try self.createKernelObject(.serial, .{ .serial = .{ .stream = stream } });
     errdefer if (self.kernelObjectSlot(object_ref)) |slot| self.clearKernelObjectSlot(slot);
     try self.retainKernelObject(object_ref);
-    table.slots()[index] = .{
+    table.write(index, .{
         .object = object_ref,
         .rights = .{
             .inspect = true,
@@ -1235,45 +1308,53 @@ pub fn createSerialFdAt(
             .write = true,
         },
         .flags = .{ .inherit = true },
-    };
+    });
 }
 
-pub fn installFd(
+pub fn installFd(self: anytype, owner: PrincipalId, object_ref: KernelObjectRef, rights: FdRights, flags: FdFlags, min_fd: Fd) KernelError!Fd {
+    const node = try self.prepareFdReference(object_ref);
+    errdefer if (node) |reserved| references.Pool.cancel(reserved);
+    return self.installFdPrepared(owner, object_ref, rights, flags, min_fd, node);
+}
+
+pub fn installFdPrepared(
     self: anytype,
     owner: PrincipalId,
     object_ref: KernelObjectRef,
     rights: FdRights,
     flags: FdFlags,
     min_fd: Fd,
+    node: ?*references.Node,
 ) KernelError!Fd {
     const table = try self.fdTableForActiveProcess(owner);
     const index = @TypeOf(self.*).findFreeFd(table, min_fd) orelse {
         if (!builtin.is_test and fd_full_reports < 4) {
             fd_full_reports += 1;
-            var free_slots: usize = 0;
-            for (table.slots()) |entry| {
-                if (entry.object.isNull()) free_slots += 1;
-            }
-            kernel_log.writeFmt("fd: process-table-full owner={} kind={s} capacity={} free={} min={}\n", .{ @intFromEnum(owner), @tagName(object_ref.kind), table.slots().len, free_slots, min_fd });
+            // A failed bounded index lookup already proves no usable slot;
+            // diagnostics must not reintroduce a capacity-wide scan on OOM.
+            kernel_log.writeFmt("fd: process-table-full owner={} kind={s} capacity={} min={}\n", .{ @intFromEnum(owner), @tagName(object_ref.kind), table.capacity, min_fd });
         }
         return KernelError.TableFull;
     };
     try self.retainKernelObject(object_ref);
-    table.slots()[index] = .{
+    table.write(index, .{
         .object = object_ref,
         .rights = fdRightsFromBits(fdRightsToBits(rights)),
         .flags = fdFlagsFromBits(fdFlagsToBits(flags)),
-    };
+    });
+    self.publishFdReference(owner, index, table.at(index), node);
     return @intCast(index);
 }
 
 pub fn closeFd(self: anytype, owner: PrincipalId, fd: Fd) KernelError!void {
     const table = try self.fdTableForActiveProcess(owner);
     const index = table.index(fd) orelse return KernelError.InvalidState;
-    const object_ref = table.slots()[index].object;
+    const object_ref = table.at(index).*.object;
     if (object_ref.isNull()) return KernelError.InvalidState;
     try prepareLastDmaClose(self, object_ref);
-    table.slots()[index] = .{};
+    self.closeIpcReceiveFd(owner, fd, object_ref);
+    self.unpublishFdReference(table.at(index));
+    table.write(index, .{});
     self.releaseKernelObject(object_ref);
 }
 
@@ -1285,10 +1366,12 @@ pub fn closeFdWithFreeList(
 ) KernelError!void {
     const table = try self.fdTableForActiveProcess(owner);
     const index = table.index(fd) orelse return KernelError.InvalidState;
-    const object_ref = table.slots()[index].object;
+    const object_ref = table.at(index).*.object;
     if (object_ref.isNull()) return KernelError.InvalidState;
     try prepareLastDmaClose(self, object_ref);
-    table.slots()[index] = .{};
+    self.closeIpcReceiveFd(owner, fd, object_ref);
+    self.unpublishFdReference(table.at(index));
+    table.write(index, .{});
     self.releaseKernelObjectWithFreeList(object_ref, free_list);
 }
 
@@ -1299,10 +1382,12 @@ pub fn closeCloexecFdsWithFreeList(
 ) KernelError!void {
     const table = try self.fdTableForActiveProcess(owner);
     var fd_index: usize = 0;
-    while (fd_index < table.slots().len) : (fd_index += 1) {
-        const entry = table.slots()[fd_index];
+    while (fd_index < table.capacity) : (fd_index += 1) {
+        const entry = table.at(fd_index).*;
         if (entry.object.isNull() or !entry.flags.cloexec) continue;
-        table.slots()[fd_index] = .{};
+        self.closeIpcReceiveFd(owner, @intCast(fd_index), entry.object);
+        self.unpublishFdReference(table.at(fd_index));
+        table.write(fd_index, .{});
         self.releaseKernelObjectWithFreeList(entry.object, free_list);
     }
 }
@@ -1317,7 +1402,7 @@ pub fn dupFd(
 ) KernelError!Fd {
     const table = try self.fdTableForActiveProcessConst(owner);
     const index = table.index(fd) orelse return KernelError.InvalidState;
-    const source = table.slots()[index];
+    const source = table.at(index).*;
     if (source.object.isNull()) return KernelError.InvalidState;
     if (!source.rights.dup) return KernelError.InvalidState;
     if (!isFdRightsSubset(rights, source.rights)) return KernelError.InvalidState;
@@ -1336,19 +1421,25 @@ pub fn replaceFd(
     const src_table = try self.fdTableForActiveProcessConst(owner);
     const src_index = src_table.index(src_fd) orelse return KernelError.InvalidState;
     const dst_index = src_table.index(dst_fd) orelse return KernelError.InvalidState;
-    const source = src_table.slots()[src_index];
+    const source = src_table.at(src_index).*;
     if (source.object.isNull()) return KernelError.InvalidState;
     if (!source.rights.dup) return KernelError.InvalidState;
     if (!isFdRightsSubset(rights, source.rights)) return KernelError.InvalidState;
 
+    const node = try self.prepareFdReference(source.object);
+    errdefer if (node) |reserved| references.Pool.cancel(reserved);
     try self.retainKernelObject(source.object);
+    errdefer self.releaseKernelObject(source.object);
     const dst_table = try self.fdTableForActiveProcess(owner);
-    const old_object = dst_table.slots()[dst_index].object;
-    dst_table.slots()[dst_index] = .{
+    const old_object = dst_table.at(dst_index).*.object;
+    self.closeIpcReceiveFd(owner, dst_fd, old_object);
+    self.unpublishFdReference(dst_table.at(dst_index));
+    dst_table.write(dst_index, .{
         .object = source.object,
         .rights = fdRightsFromBits(fdRightsToBits(rights)),
         .flags = fdFlagsFromBits(fdFlagsToBits(flags)),
-    };
+    });
+    self.publishFdReference(owner, dst_index, dst_table.at(dst_index), node);
     if (!old_object.isNull()) self.releaseKernelObject(old_object);
 }
 
@@ -1361,13 +1452,15 @@ pub fn setFdFlags(
 ) KernelError!void {
     const table = try self.fdTableForActiveProcess(owner);
     const index = table.index(fd) orelse return KernelError.InvalidState;
-    const entry = &table.slots()[index];
+    const entry = table.at(index);
     if (entry.object.isNull()) return KernelError.InvalidState;
     if (!entry.rights.set_flags) return KernelError.InvalidState;
     const old_bits = fdFlagsToBits(entry.flags);
     const mask_bits = fdFlagsToBits(mask);
     const new_bits = (old_bits & ~mask_bits) | (fdFlagsToBits(flags) & mask_bits);
-    entry.flags = fdFlagsFromBits(new_bits);
+    var replacement = entry.*;
+    replacement.flags = fdFlagsFromBits(new_bits);
+    table.write(index, replacement);
 }
 
 pub fn transferFd(
@@ -1383,7 +1476,7 @@ pub fn transferFd(
     if (from == to) return KernelError.InvalidState;
     const source_table = try self.fdTableForActiveProcessConst(from);
     const source_index = source_table.index(fd) orelse return KernelError.InvalidState;
-    const source = source_table.slots()[source_index];
+    const source = source_table.at(source_index).*;
     if (source.object.isNull()) return KernelError.InvalidState;
     if (!source.rights.transfer) return KernelError.InvalidState;
     if (!isFdRightsSubset(rights, source.rights)) return KernelError.InvalidState;
@@ -1393,25 +1486,30 @@ pub fn transferFd(
     const dest_table = try self.fdTableForActiveProcess(to);
     const dest_index = @TypeOf(self.*).findFreeFd(dest_table, min_fd) orelse return KernelError.TableFull;
 
+    const node = try self.prepareFdReference(source.object);
+    errdefer if (node) |reserved| references.Pool.cancel(reserved);
+    const mutable_source_table = if (mode == .move) try self.fdTableForActiveProcess(from) else null;
     switch (mode) {
         .copy => {
             try self.retainKernelObject(source.object);
-            dest_table.slots()[dest_index] = .{
+            dest_table.write(dest_index, .{
                 .object = source.object,
                 .rights = fdRightsFromBits(fdRightsToBits(rights)),
                 .flags = fdFlagsFromBits(fdFlagsToBits(flags)),
-            };
+            });
         },
         .move => {
-            const mutable_source_table = try self.fdTableForActiveProcess(from);
-            dest_table.slots()[dest_index] = .{
+            dest_table.write(dest_index, .{
                 .object = source.object,
                 .rights = fdRightsFromBits(fdRightsToBits(rights)),
                 .flags = fdFlagsFromBits(fdFlagsToBits(flags)),
-            };
-            mutable_source_table.slots()[source_index] = .{};
+            });
+            self.closeIpcReceiveFd(from, @intCast(source_index), source.object);
+            self.unpublishFdReference(mutable_source_table.?.at(source_index));
+            mutable_source_table.?.write(source_index, .{});
         },
     }
+    self.publishFdReference(to, dest_index, dest_table.at(dest_index), node);
     return @intCast(dest_index);
 }
 
@@ -1441,32 +1539,34 @@ pub fn registerTaskReadableWaiterForFd(
         else => return false,
     };
     const thread_index_u32: u32 = @intCast(thread_index);
-    var free_index: ?usize = null;
-    for (&self.task_fd_waiters, 0..) |*waiter, i| {
-        if (!waiter.active) {
-            if (free_index == null) free_index = i;
-            continue;
-        }
-        if (waiter.thread_index == thread_index_u32 and
-            waiter.thread_generation == thread_generation and
-            waiter.binding.wait_token == wait_token and
-            waiter.binding.group.matches(group) and
-            waiter.object.kind == entry.object.kind and
-            waiter.object.index == entry.object.index and
-            waiter.object.generation == entry.object.generation and
-            waiter.owner == owner and
-            waiter.pollfd_va == pollfd_va)
-        {
-            waiter.events |= requested_events;
-            return true;
+    {
+        var pool_iter_32 = self.task_fd_waiters.iterator();
+        while (pool_iter_32.next()) |pool_entry_32| {
+            const waiter = pool_entry_32.value;
+
+            if (waiter.thread_index == thread_index_u32 and
+                waiter.thread_generation == thread_generation and
+                waiter.binding.wait_token == wait_token and
+                waiter.binding.group.matches(group) and
+                waiter.object.kind == entry.object.kind and
+                waiter.object.index == entry.object.index and
+                waiter.object.generation == entry.object.generation and
+                waiter.owner == owner and
+                waiter.pollfd_va == pollfd_va)
+            {
+                waiter.events |= requested_events;
+                return true;
+            }
         }
     }
-    const target = free_index orelse return KernelError.TableFull;
+    const allocation = try self.allocateWaitPool(&self.task_fd_waiters);
+    const target = allocation.ref.index;
     const registration = FdWaitRegistrationRef{
         .kind = .task,
         .slot = @intCast(target),
+        .slot_generation = allocation.ref.generation,
     };
-    self.task_fd_waiters[target] = .{
+    self.task_fd_waiters.get(@intCast(target)).?.* = .{
         .active = true,
         .principal_raw = principal_raw,
         .object = entry.object,
@@ -1482,22 +1582,26 @@ pub fn registerTaskReadableWaiterForFd(
         },
     };
     self.linkFdWaitRegistration(group, registration) catch |err| {
-        self.task_fd_waiters[target] = .{};
+        self.task_fd_waiters.remove(allocation.value, null);
         return err;
     };
-    if (entry.object.kind == .timer) self.task_timer_waiter_slots.set(target);
+    if (entry.object.kind == .timer) {
+        self.task_fd_waiters.mark(target, 1, true);
+        self.markTimerDeadlineDirty();
+    }
     return true;
 }
 
 fn retireTaskReadableWaiter(self: anytype, slot_index: usize) void {
-    const waiter = &self.task_fd_waiters[slot_index];
+    const waiter = (self.task_fd_waiters.get(@intCast(slot_index)).?);
     // The object may already be destroyed or reused; unindex using the
     // linked record's kind, not the current payload in the object table.
     if (waiter.active and waiter.object.kind == .timer) {
-        std.debug.assert(self.task_timer_waiter_slots.isSet(slot_index));
-        self.task_timer_waiter_slots.unset(slot_index);
+        std.debug.assert(self.task_fd_waiters.isMarked(@intCast(slot_index), 1));
+        self.task_fd_waiters.mark(@intCast(slot_index), 1, false);
+        self.markTimerDeadlineDirty();
     }
-    waiter.* = .{};
+    self.task_fd_waiters.remove(waiter, null);
 }
 
 pub fn unregisterTaskReadableWaiterForThread(
@@ -1507,10 +1611,15 @@ pub fn unregisterTaskReadableWaiterForThread(
 ) void {
     if (thread_index > std.math.maxInt(u32)) return;
     const thread_index_u32: u32 = @intCast(thread_index);
-    for (&self.task_fd_waiters, 0..) |*waiter, slot_index| {
-        if (!waiter.active or waiter.binding.completion_pending) continue;
-        if (waiter.thread_index == thread_index_u32 and waiter.thread_generation == thread_generation) {
-            retireTaskReadableWaiter(self, slot_index);
+    {
+        var pool_iter_33 = self.task_fd_waiters.iterator();
+        while (pool_iter_33.next()) |pool_entry_33| {
+            const waiter = pool_entry_33.value;
+            const slot_index: usize = pool_entry_33.ref.index;
+            if (!waiter.active or waiter.binding.completion_pending) continue;
+            if (waiter.thread_index == thread_index_u32 and waiter.thread_generation == thread_generation) {
+                retireTaskReadableWaiter(self, slot_index);
+            }
         }
     }
 }
@@ -1529,39 +1638,39 @@ pub fn takeTaskReadableWaitersForPrincipal(
     principal: PrincipalId,
     out: []ThreadWakeTarget,
 ) usize {
+    if (out.len == 0) return 0;
     const fd_abi = @import("kernel_abi_root").fd_abi;
     const principal_raw: PrincipalRaw = @intFromEnum(principal);
     var count: usize = 0;
-    for (&self.task_fd_waiters) |*waiter| {
-        if (!waiter.active or waiter.binding.completion_pending) continue;
-        if (waiter.object.kind != .process and waiter.object.kind != .thread) continue;
-        if (waiter.principal_raw != principal_raw) continue;
-        if ((waiter.events & fd_abi.event_readable) == 0) continue;
-        // A single thread may exit while its process and siblings remain
-        // alive. Only publish readiness for the actual terminal objects.
-        const slot = self.kernelObjectSlotConst(waiter.object) orelse continue;
-        const terminal = switch (slot.payload) {
-            .process => |process| process.state.isTerminal(),
-            .thread => |thread| thread.state.isTerminal(),
-            else => false,
-        };
-        if (!terminal) continue;
-        if (count == out.len) break;
-        const target = ThreadWakeTarget{
-            .owner = waiter.owner,
-            .thread_index = @intCast(waiter.thread_index),
-            .thread_generation = waiter.thread_generation,
-            .wait_token = waiter.binding.wait_token,
-            .pollfd_va = waiter.pollfd_va,
-            .revents = fd_abi.event_readable,
-            .registration = waiter.registration,
-            .group = waiter.binding.group,
-            .group_link_index = waiter.binding.link_index,
-        };
-        waiter.binding.completion_pending = true;
-        if (count < out.len) {
-            out[count] = target;
-            count += 1;
+    {
+        var pool_iter_34 = self.task_fd_waiters.iterator();
+        while (pool_iter_34.next()) |pool_entry_34| {
+            const waiter = pool_entry_34.value;
+            if (!waiter.active) continue;
+            if (waiter.object.kind != .process and waiter.object.kind != .thread) continue;
+            if (waiter.principal_raw != principal_raw) continue;
+            if ((waiter.events & fd_abi.event_readable) == 0) continue;
+            // A single thread may exit while its process and siblings remain
+            // alive. Only publish readiness for the actual terminal objects.
+            const slot = self.kernelObjectSlotConst(waiter.object) orelse continue;
+            const terminal = switch (slot.payload) {
+                .process => |process| process.state.isTerminal(),
+                .thread => |thread| thread.state.isTerminal(),
+                else => false,
+            };
+            if (!terminal) continue;
+            const target = ThreadWakeTarget{
+                .owner = waiter.owner,
+                .thread_index = @intCast(waiter.thread_index),
+                .thread_generation = waiter.thread_generation,
+                .wait_token = waiter.binding.wait_token,
+                .pollfd_va = waiter.pollfd_va,
+                .revents = fd_abi.event_readable,
+                .registration = waiter.registration,
+                .group = waiter.binding.group,
+                .group_link_index = waiter.binding.link_index,
+            };
+            waiter.binding.appendReady(target, out, &count);
         }
     }
     return count;
@@ -1572,30 +1681,34 @@ pub fn takeObjectReadableWaiters(
     object: KernelObjectRef,
     out: []ThreadWakeTarget,
 ) usize {
+    if (out.len == 0) return 0;
     const fd_abi = @import("kernel_abi_root").fd_abi;
     var count: usize = 0;
-    for (&self.task_fd_waiters) |*waiter| {
-        if (!waiter.active or waiter.binding.completion_pending) continue;
-        if (waiter.object.kind != object.kind or waiter.object.index != object.index or
-            waiter.object.generation != object.generation or
-            (waiter.events & fd_abi.event_readable) == 0)
-        {
-            continue;
+    {
+        var pool_iter_35 = self.task_fd_waiters.iterator();
+        while (pool_iter_35.next()) |pool_entry_35| {
+            const waiter = pool_entry_35.value;
+            if (!waiter.active) continue;
+            if (waiter.object.kind != object.kind or waiter.object.index != object.index or
+                waiter.object.generation != object.generation or
+                (waiter.events & fd_abi.event_readable) == 0)
+            {
+                continue;
+            }
+            const target = ThreadWakeTarget{
+                .owner = waiter.owner,
+                .thread_index = waiter.thread_index,
+                .thread_generation = waiter.thread_generation,
+                .wait_token = waiter.binding.wait_token,
+                .pollfd_va = waiter.pollfd_va,
+                .revents = fd_abi.event_readable,
+                .registration = waiter.registration,
+                .group = waiter.binding.group,
+                .group_link_index = waiter.binding.link_index,
+            };
+            waiter.binding.appendReady(target, out, &count);
+            if (waiter.object.kind == .timer) self.markTimerDeadlineDirty();
         }
-        if (count >= out.len) break;
-        out[count] = .{
-            .owner = waiter.owner,
-            .thread_index = waiter.thread_index,
-            .thread_generation = waiter.thread_generation,
-            .wait_token = waiter.binding.wait_token,
-            .pollfd_va = waiter.pollfd_va,
-            .revents = fd_abi.event_readable,
-            .registration = waiter.registration,
-            .group = waiter.binding.group,
-            .group_link_index = waiter.binding.link_index,
-        };
-        waiter.binding.completion_pending = true;
-        count += 1;
     }
     return count;
 }
@@ -1604,45 +1717,48 @@ pub fn takeReadyIrqWaiters(
     self: anytype,
     out: []ThreadWakeTarget,
 ) usize {
+    if (out.len == 0) return 0;
     const fd_abi = @import("kernel_abi_root").fd_abi;
     var count: usize = 0;
-    for (&self.task_fd_waiters) |*waiter| {
-        if (!waiter.active or waiter.binding.completion_pending) continue;
-        if (waiter.object.kind != .irq) continue;
-        const slot = self.kernelObjectSlotConst(waiter.object) orelse continue;
-        const retired = slot.payload.irq.retired;
-        if (!retired and ((waiter.events & fd_abi.event_readable) == 0 or
-            !(self.irqPublishedEventPending(waiter.object) orelse false))) continue;
-        if (count >= out.len) break;
-        out[count] = .{
-            .owner = waiter.owner,
-            .thread_index = waiter.thread_index,
-            .thread_generation = waiter.thread_generation,
-            .wait_token = waiter.binding.wait_token,
-            .pollfd_va = waiter.pollfd_va,
-            .revents = if (retired) fd_abi.event_hangup else fd_abi.event_readable,
-            .registration = waiter.registration,
-            .group = waiter.binding.group,
-            .group_link_index = waiter.binding.link_index,
-        };
-        waiter.binding.completion_pending = true;
-        count += 1;
+    {
+        var pool_iter_36 = self.task_fd_waiters.iterator();
+        while (pool_iter_36.next()) |pool_entry_36| {
+            const waiter = pool_entry_36.value;
+            if (!waiter.active) continue;
+            if (waiter.object.kind != .irq) continue;
+            const slot = self.kernelObjectSlotConst(waiter.object) orelse continue;
+            const retired = slot.payload.irq.retired;
+            if (!retired and ((waiter.events & fd_abi.event_readable) == 0 or
+                !(self.irqPublishedEventPending(waiter.object) orelse false))) continue;
+            const target = ThreadWakeTarget{
+                .owner = waiter.owner,
+                .thread_index = waiter.thread_index,
+                .thread_generation = waiter.thread_generation,
+                .wait_token = waiter.binding.wait_token,
+                .pollfd_va = waiter.pollfd_va,
+                .revents = if (retired) fd_abi.event_hangup else fd_abi.event_readable,
+                .registration = waiter.registration,
+                .group = waiter.binding.group,
+                .group_link_index = waiter.binding.link_index,
+            };
+            waiter.binding.appendReady(target, out, &count);
+        }
     }
     return count;
 }
 
 pub fn takeReadyTimerWaiters(self: anytype, now_ns: u64, out: []ThreadWakeTarget) usize {
+    if (out.len == 0) return 0;
     const fd_abi = @import("kernel_abi_root").fd_abi;
     var count: usize = 0;
-    var slots = self.task_timer_waiter_slots.iterator(.{ .direction = .forward });
+    var slots = self.task_fd_waiters.marked(1);
     while (slots.next()) |slot_index| {
-        const waiter = &self.task_fd_waiters[slot_index];
-        if (!waiter.active or waiter.binding.completion_pending or waiter.object.kind != .timer or
+        const waiter = (self.task_fd_waiters.get(@intCast(slot_index)).?);
+        if (!waiter.active or waiter.object.kind != .timer or
             (waiter.events & fd_abi.event_readable) == 0) continue;
         const slot = self.kernelObjectSlotConst(waiter.object) orelse continue;
         if (timerDueCount(slot.payload.timer, now_ns) == 0) continue;
-        if (count == out.len) break;
-        out[count] = .{
+        const target = ThreadWakeTarget{
             .owner = waiter.owner,
             .thread_index = waiter.thread_index,
             .thread_generation = waiter.thread_generation,
@@ -1653,17 +1769,29 @@ pub fn takeReadyTimerWaiters(self: anytype, now_ns: u64, out: []ThreadWakeTarget
             .group = waiter.binding.group,
             .group_link_index = waiter.binding.link_index,
         };
-        waiter.binding.completion_pending = true;
-        count += 1;
+        waiter.binding.appendReady(target, out, &count);
+        self.markTimerDeadlineDirty();
     }
     return count;
 }
 
+pub fn markTimerDeadlineDirty(self: anytype) void {
+    self.timer_deadline_dirty = true;
+}
+
+/// Consume the dirty mark under the kernel lock. A clear result means the
+/// published deadline already equals nextTimerWaiterDeadline().
+pub fn takeTimerDeadlineDirty(self: anytype) bool {
+    const dirty = self.timer_deadline_dirty;
+    self.timer_deadline_dirty = false;
+    return dirty;
+}
+
 pub fn nextTimerWaiterDeadline(self: anytype) ?u64 {
     var earliest: ?u64 = null;
-    var slots = self.task_timer_waiter_slots.iterator(.{ .direction = .forward });
+    var slots = self.task_fd_waiters.marked(1);
     while (slots.next()) |slot_index| {
-        const waiter = &self.task_fd_waiters[slot_index];
+        const waiter = (self.task_fd_waiters.get(@intCast(slot_index)).?);
         if (!waiter.active or waiter.binding.completion_pending or waiter.object.kind != .timer) continue;
         const slot = self.kernelObjectSlotConst(waiter.object) orelse continue;
         const deadline = slot.payload.timer.deadline_ns;
@@ -1710,8 +1838,8 @@ fn fdWaitIpcWaiterForRegistration(
     registration: FdWaitRegistrationRef,
 ) ?*IpcWaiter {
     const list = fdWaitListForRegistration(self, registration) orelse return null;
-    if (registration.slot >= list.waiters.len) return null;
-    const waiter = &list.waiters[registration.slot];
+    if (registration.slot >= list.waiters.capacity) return null;
+    const waiter = list.waiters.resolve(.{ .index = registration.slot, .generation = registration.slot_generation }) orelse return null;
     if (!waiter.active or !waiter.registration.matches(registration)) return null;
     return waiter;
 }
@@ -1721,9 +1849,9 @@ fn fdWaitTaskWaiterForRegistration(
     registration: FdWaitRegistrationRef,
 ) ?*TaskFdWaiter {
     if (registration.kind != .task or
-        registration.slot >= self.task_fd_waiters.len)
+        registration.slot >= self.task_fd_waiters.capacity)
         return null;
-    const waiter = &self.task_fd_waiters[registration.slot];
+    const waiter = self.task_fd_waiters.resolve(.{ .index = registration.slot, .generation = registration.slot_generation }) orelse return null;
     if (!waiter.active or !waiter.registration.matches(registration)) return null;
     return waiter;
 }
@@ -1734,8 +1862,8 @@ fn nextFdWaitGroupGeneration(current: u32) u32 {
 }
 
 fn fdWaitGroupSlot(self: anytype, group: FdWaitGroupRef) ?*types.FdWaitGroupSlot {
-    if (group.isNull() or group.index >= self.fd_wait_groups.len) return null;
-    const slot = &self.fd_wait_groups[group.index];
+    if (group.isNull() or group.index >= self.fd_wait_groups.capacity) return null;
+    const slot = self.fd_wait_groups.resolve(.{ .index = group.index, .generation = group.generation }) orelse return null;
     if (slot.state == .free or slot.generation != group.generation) return null;
     return slot;
 }
@@ -1749,25 +1877,22 @@ pub fn beginFdWaitGroup(
 ) KernelError!FdWaitGroupRef {
     if (thread_index > std.math.maxInt(u32) or wait_token == 0)
         return KernelError.InvalidState;
-    var offset: usize = 0;
-    while (offset < self.fd_wait_groups.len) : (offset += 1) {
-        const index = (self.next_fd_wait_group_scan + offset) % self.fd_wait_groups.len;
-        const slot = &self.fd_wait_groups[index];
-        if (slot.state != .free) continue;
-        const generation = if (slot.generation == 0) 1 else slot.generation;
-        slot.* = .{
-            .state = .building,
-            .generation = generation,
-            .owner = owner,
-            .thread_index = @intCast(thread_index),
-            .thread_generation = thread_generation,
-            .wait_token = wait_token,
-        };
-        self.fd_wait_group_thread_counts[thread_index % self.fd_wait_group_thread_counts.len] += 1;
-        self.next_fd_wait_group_scan = (index + 1) % self.fd_wait_groups.len;
-        return .{ .index = @intCast(index), .generation = generation };
-    }
-    return KernelError.TableFull;
+    self.fd_wait_group_thread_counts.prepareIndex(@intCast(thread_index), try self.waitPoolAllocator()) catch return KernelError.OutOfFreePages;
+    const count = self.fd_wait_group_thread_counts.claimIndex(@intCast(thread_index)) catch return KernelError.OutOfFreePages;
+    errdefer if (count.* == 0) self.fd_wait_group_thread_counts.remove(count, null);
+    const allocation = try self.allocateWaitPool(&self.fd_wait_groups);
+    errdefer self.fd_wait_groups.remove(allocation.value, null);
+    self.fd_wait_group_links.prepareIndex(allocation.ref.index, try self.waitPoolAllocator()) catch return KernelError.OutOfFreePages;
+    const links = self.fd_wait_group_links.claimIndex(allocation.ref.index) catch return KernelError.OutOfFreePages;
+    const slot = allocation.value;
+    slot.links = links;
+    slot.state = .building;
+    slot.owner = owner;
+    slot.thread_index = @intCast(thread_index);
+    slot.thread_generation = thread_generation;
+    slot.wait_token = wait_token;
+    count.* += 1;
+    return .{ .index = allocation.ref.index, .generation = allocation.ref.generation };
 }
 
 pub fn linkFdWaitRegistration(
@@ -1777,10 +1902,11 @@ pub fn linkFdWaitRegistration(
 ) KernelError!void {
     if (registration.isNull()) return KernelError.InvalidState;
     const slot = fdWaitGroupSlot(self, group) orelse return KernelError.InvalidState;
-    if (slot.state != .building or slot.link_count >= slot.links.len)
-        return KernelError.TableFull;
-    const link_index = slot.link_count;
-    slot.links[link_index] = registration;
+    if (slot.state != .building) return KernelError.InvalidState;
+    const link_index: u32 = std.math.cast(u32, slot.link_count) orelse return KernelError.OutOfFreePages;
+    slot.links.?.prepareIndex(link_index, try self.waitPoolAllocator()) catch return KernelError.OutOfFreePages;
+    const link = slot.links.?.claimIndex(link_index) catch return KernelError.OutOfFreePages;
+    link.* = .{ .registration = registration };
     slot.link_count += 1;
 
     if (registration.kind == .task) {
@@ -1788,12 +1914,14 @@ pub fn linkFdWaitRegistration(
             return KernelError.InvalidState;
         if (!waiter.binding.group.matches(group)) return KernelError.InvalidState;
         waiter.binding.link_index = link_index;
+        waiter.binding.link = link;
         return;
     }
     const waiter = fdWaitIpcWaiterForRegistration(self, registration) orelse
         return KernelError.InvalidState;
     if (!waiter.binding.group.matches(group)) return KernelError.InvalidState;
     waiter.binding.link_index = link_index;
+    waiter.binding.link = link;
 }
 
 pub fn armFdWaitGroup(self: anytype, group: FdWaitGroupRef) KernelError!void {
@@ -1802,13 +1930,15 @@ pub fn armFdWaitGroup(self: anytype, group: FdWaitGroupRef) KernelError!void {
     slot.state = .armed;
 }
 
-pub fn cancelFdWaitGroup(self: anytype, group: FdWaitGroupRef, wait_token: u64) void {
+pub fn detachFdWaitGroup(self: anytype, group: FdWaitGroupRef, wait_token: u64) void {
     const slot = fdWaitGroupSlot(self, group) orelse return;
     if (wait_token == 0 or slot.wait_token != wait_token) return;
+    if (slot.state == .completing) return;
+    slot.state = .completing;
     const link_count: usize = slot.link_count;
     var link_index: usize = 0;
     while (link_index < link_count) : (link_index += 1) {
-        const registration = slot.links[link_index];
+        const registration = slot.links.?.get(@intCast(link_index)).?.registration;
         if (registration.kind == .task) {
             if (fdWaitTaskWaiterForRegistration(self, registration)) |waiter| {
                 if (waiter.binding.wait_token == wait_token and
@@ -1821,19 +1951,62 @@ pub fn cancelFdWaitGroup(self: anytype, group: FdWaitGroupRef, wait_token: u64) 
             continue;
         }
         if (fdWaitIpcWaiterForRegistration(self, registration)) |waiter| {
+            var endpoint_guard = waiter.list.?.acquire();
+            defer endpoint_guard.end();
             if (waiter.binding.wait_token == wait_token and
                 waiter.binding.group.matches(group) and
                 waiter.binding.link_index == link_index)
             {
-                waiter.* = .{};
+                waiter.list.?.removeWaiter(waiter);
             }
         }
     }
-    const next_generation = nextFdWaitGroupGeneration(slot.generation);
-    const bucket = slot.thread_index % self.fd_wait_group_thread_counts.len;
-    std.debug.assert(self.fd_wait_group_thread_counts[bucket] != 0);
-    self.fd_wait_group_thread_counts[bucket] -= 1;
-    slot.* = .{ .generation = next_generation };
+}
+
+pub fn cancelFdWaitGroup(self: anytype, group: FdWaitGroupRef, wait_token: u64) void {
+    const slot = fdWaitGroupSlot(self, group) orelse return;
+    if (wait_token == 0 or slot.wait_token != wait_token) return;
+    detachFdWaitGroup(self, group, wait_token);
+    const count = self.fd_wait_group_thread_counts.get(slot.thread_index).?;
+    std.debug.assert(count.* != 0);
+    count.* -= 1;
+    if (count.* == 0) self.fd_wait_group_thread_counts.remove(count, null);
+    // Cancellation ended every registration/snapshot loan. Link identities
+    // are private to this group generation, so their directory can also move
+    // to the detached cache; keeping it published would hide it from OOM.
+    const links = slot.links.?;
+    links.deinitInto(&self.fd_wait_group_links.body_owner);
+    self.fd_wait_group_links.remove(links, null);
+    self.fd_wait_groups.remove(slot, null);
+}
+
+/// K and a scheduler completion claim protect the detached group's snapshots.
+/// Coalesce duplicate poll items across the entire group, not just this batch.
+pub fn takeFdWaitGroupReadyBatch(self: anytype, group: FdWaitGroupRef, wait_token: u64, cursor: *u64, out: []ThreadWakeTarget) usize {
+    const slot = fdWaitGroupSlot(self, group) orelse return 0;
+    if (slot.state != .completing or slot.wait_token != wait_token) return 0;
+    var count: usize = 0;
+    while (cursor.* < slot.link_count and count < out.len) {
+        const index = cursor.*;
+        cursor.* += 1;
+        var target = slot.links.?.get(@intCast(index)).?.ready orelse continue;
+        if (target.pollfd_va == 0) continue;
+        var duplicate = false;
+        var links = slot.links.?.iterator();
+        while (links.next()) |item| {
+            const other = item.value.ready orelse continue;
+            if (other.pollfd_va != target.pollfd_va) continue;
+            if (item.ref.index < index) {
+                duplicate = true;
+                break;
+            }
+            target.revents |= other.revents;
+        }
+        if (duplicate) continue;
+        out[count] = target;
+        count += 1;
+    }
+    return count;
 }
 
 pub fn cancelFdWaitGroupsForThread(
@@ -1843,12 +2016,11 @@ pub fn cancelFdWaitGroupsForThread(
     thread_generation: u32,
 ) void {
     if (thread_index > std.math.maxInt(u32)) return;
-    if (self.fd_wait_group_thread_counts[thread_index % self.fd_wait_group_thread_counts.len] == 0)
-        return;
+    if (self.fd_wait_group_thread_counts.get(@intCast(thread_index)) == null) return;
     const thread_index_u32: u32 = @intCast(thread_index);
     var index: usize = 0;
-    while (index < self.fd_wait_groups.len) : (index += 1) {
-        const slot = &self.fd_wait_groups[index];
+    while (index < self.fd_wait_groups.capacity) : (index += 1) {
+        const slot = self.fd_wait_groups.get(@intCast(index)) orelse continue;
         if (slot.state == .free or slot.owner != owner or
             slot.thread_index != thread_index_u32 or
             slot.thread_generation != thread_generation)
@@ -1866,8 +2038,8 @@ pub fn cancelFdWaitGroupsForThread(
 
 pub fn cancelFdWaitGroupsForOwner(self: anytype, owner: PrincipalId) void {
     var index: usize = 0;
-    while (index < self.fd_wait_groups.len) : (index += 1) {
-        const slot = &self.fd_wait_groups[index];
+    while (index < self.fd_wait_groups.capacity) : (index += 1) {
+        const slot = self.fd_wait_groups.get(@intCast(index)) orelse continue;
         if (slot.state == .free or slot.owner != owner) continue;
         const group = FdWaitGroupRef{
             .index = @intCast(index),
@@ -1878,22 +2050,204 @@ pub fn cancelFdWaitGroupsForOwner(self: anytype, owner: PrincipalId) void {
     }
 }
 
+/// K excludes registration and completion borrowers. Only inactive group
+/// caches can be destroyed; active links may still carry completion snapshots.
+/// Retain generation metadata in all externally referenced slot tables.
+pub fn reclaimFdWaitStorage(self: anytype) void {
+    var caches = self.fd_wait_group_links.iterator();
+    while (caches.next()) |item| {
+        if (self.fd_wait_groups.get(item.ref.index) != null) continue;
+        item.value.deinitInto(&self.fd_wait_group_links.body_owner);
+        self.fd_wait_group_links.remove(item.value, null);
+    }
+    self.fd_wait_groups.reclaimEmptyBodies();
+    self.fd_wait_group_thread_counts.reclaimEmptyBodies();
+    self.task_fd_waiters.reclaimEmptyBodies();
+    inline for (.{ "ipc_endpoints", "ipc_replies" }) |name| {
+        var objects = @field(self, name).iterator();
+        while (objects.next()) |item| item.value.waiters.waiters.reclaimEmptyBodies();
+    }
+    inline for (.{ "pipes", "ipc_channels" }) |name| {
+        var objects = @field(self, name).iterator();
+        while (objects.next()) |item| for (&item.value.waiters) |*list| list.waiters.reclaimEmptyBodies();
+    }
+    _ = self.wait_storage_cache.reclaim();
+}
+
 pub fn snapshotFdWaitGroups(
     self: anytype,
     out: []types.FdWaitGroupSnapshot,
 ) usize {
     var count: usize = 0;
-    for (&self.fd_wait_groups, 0..) |*slot, index| {
-        if (slot.state == .free) continue;
-        if (count >= out.len) break;
-        out[count] = .{
-            .group = .{ .index = @intCast(index), .generation = slot.generation },
-            .owner = slot.owner,
-            .thread_index = slot.thread_index,
-            .thread_generation = slot.thread_generation,
-            .wait_token = slot.wait_token,
-        };
-        count += 1;
+    {
+        var pool_iter_37 = self.fd_wait_groups.iterator();
+        while (pool_iter_37.next()) |pool_entry_37| {
+            const slot = pool_entry_37.value;
+            const index: usize = pool_entry_37.ref.index;
+            if (slot.state == .free) continue;
+            if (count >= out.len) break;
+            out[count] = .{
+                .group = .{ .index = @intCast(index), .generation = slot.generation },
+                .owner = slot.owner,
+                .thread_index = slot.thread_index,
+                .thread_generation = slot.thread_generation,
+                .wait_token = slot.wait_token,
+            };
+            count += 1;
+        }
     }
     return count;
+}
+
+fn prepareDmaRetention(self: anytype, device: u64, iova: u64, size: u64, backing: []const u64) KernelError!?*dma_retention.Record {
+    if (iommu.isActive()) return null;
+    const first = iova & ~@as(u64, 4095);
+    const span = std.math.add(u64, iova - first, size) catch return KernelError.InvalidState;
+    const rounded = std.math.add(u64, span, 4095) catch return KernelError.InvalidState;
+    return dma_retention.prepare(try self.poolAllocator(), device, first, @intCast(rounded / 4096), backing) catch return KernelError.OutOfFreePages;
+}
+
+fn dmaEnablingReference(self: anytype, device: u64, object: KernelObjectRef, rights: FdRights) bool {
+    // config_write can set command.BME through the existing ABI. Counting
+    // only bus_master would let a surviving holder restart a stopped function.
+    if (!rights.bus_master and !rights.config_write) return false;
+    const slot = self.kernelObjectSlotConst(object) orelse return false;
+    return slot.kind == .device and slot.payload.device.device == device;
+}
+fn dmaReference(self: anytype, device: u64, object: KernelObjectRef) bool {
+    const slot = self.kernelObjectSlotConst(object) orelse return false;
+    return slot.kind == .device and slot.payload.device.device == device;
+}
+fn dmaEnablingQueue(self: anytype, device: u64, queue: *const IpcQueue, accounted: *usize) bool {
+    var endpoint_guard = queue.acquire();
+    defer endpoint_guard.end();
+    for (0..queue.len) |offset| {
+        const message = queue.messageAt(queue.slotIndex(offset));
+        for (message.fds[0..message.fd_count]) |fd| {
+            if (dmaEnablingReference(self, device, fd.object(), fd.rights())) return true;
+            if (dmaReference(self, device, fd.object())) accounted.* += 1;
+        }
+    }
+    return false;
+}
+fn hasDmaEnablingReference(self: anytype, device: u64) bool {
+    var accounted: usize = 0;
+    for (0..self.process_capacity) |process| {
+        const table = self.fdTableForProcessIndex(process) orelse continue;
+        for (0..table.capacity) |index| {
+            const fd = table.at(index).*;
+            if (dmaEnablingReference(self, device, fd.object, fd.rights)) return true;
+            if (dmaReference(self, device, fd.object)) accounted += 1;
+        }
+    }
+    inline for (.{"ipc_endpoints"}) |name| {
+        var iterator = @field(self, name).iterator();
+        while (iterator.next()) |item| {
+            if (item.value.active and dmaEnablingQueue(self, device, &item.value.queue, &accounted)) return true;
+        }
+    }
+    var channels = self.ipc_channels.iterator();
+    while (channels.next()) |item| {
+        if (!item.value.active) continue;
+        for (&item.value.queues) |*queue| if (dmaEnablingQueue(self, device, queue, &accounted)) return true;
+    }
+    // A retained reference outside these carriers (for example a staged IPC
+    // message) has no visible rights proof. Keep DMA backing until that loan
+    // ends; counting only installed FDs could stop a still-authorized device.
+    var reference_count: usize = 0;
+    var objects = self.fd_objects.iterator();
+    while (objects.next()) |item| {
+        const slot = item.value;
+        if (slot.kind == .device and slot.payload.device.device == device)
+            reference_count += slot.ref_count;
+    }
+    return reference_count != accounted;
+}
+
+/// Runs in the existing deferred return pass with KernelState/all-VM held.
+/// Capability publication, IPC transfer and PCI config writes share KernelState,
+/// so no BME-enabling reference or write can race the proof and ledger removal.
+pub fn retryForcedDma(self: anytype) void {
+    var cursor = dma_retention.firstRetained();
+    while (cursor) |record| {
+        if (hasDmaEnablingReference(self, record.device)) {
+            record.attempted = false;
+        } else if (!record.attempted) {
+            const device = record.device;
+            dma_retention.attempted(device);
+            if (@import("../pci.zig").stopBypassDma(device)) {
+                dma_retention.complete(device);
+                // Completion may remove several consecutive nodes. Never use
+                // a saved successor from their now-reclaimable metadata pages.
+                cursor = dma_retention.firstRetained();
+                continue;
+            }
+            if (!@import("builtin").is_test)
+                @import("../kernel_log.zig").writeFmt("dma: bypass drain unproven device=0x{x} backing-retained=1\n", .{device});
+        }
+        cursor = dma_retention.nextRetained(record);
+    }
+}
+
+fn trackedReferenceKind(kind: KernelObjectKind) bool {
+    return switch (kind) {
+        .vmo, .mmio_region, .dma_buffer, .dma_mapping => true,
+        else => false,
+    };
+}
+
+pub fn prepareFdReference(self: anytype, object: KernelObjectRef) KernelError!?*references.Node {
+    if (!trackedReferenceKind(object.kind)) return null;
+    return self.reference_nodes.reserve(try self.poolAllocator()) catch return KernelError.OutOfFreePages;
+}
+
+pub fn publishFdReference(self: anytype, owner: PrincipalId, index: usize, entry: *FdEntry, node: ?*references.Node) void {
+    // Every install/dup/transfer/fork publishes here under K, after acquiring
+    // its object reference. That reference retains the body until withdrawal;
+    // the cache adds no ownership and must never be used outside K. Rebuild
+    // it even for copies: tracked reference nodes are not shared by entries.
+    switch (entry.object.kind) {
+        .endpoint => {
+            const object = self.kernelObjectSlot(entry.object) orelse unreachable;
+            const body = self.ipcEndpointSlot(object.payload.endpoint) orelse unreachable;
+            entry.cursor = .{ .ipc_queue = &body.queue };
+            entry.authority = .{ .ipc_generation = body.generation };
+        },
+        .channel => {
+            const object = self.kernelObjectSlot(entry.object) orelse unreachable;
+            const handle = object.payload.channel;
+            const body = self.ipcChannelSlot(handle.channel) orelse unreachable;
+            // Store the local receive side. Only CALL reverses direction.
+            entry.cursor = .{ .ipc_queue = &body.queues[handle.side] };
+            entry.authority = .{ .ipc_generation = body.generation };
+        },
+        else => {},
+    }
+    const reserved = node orelse return;
+    const owner_index = processIndexFromPrincipal(owner) orelse unreachable;
+    const generation = (self.processDescriptorSlotConst(owner_index) orelse unreachable).generation;
+    const object = self.kernelObjectSlot(entry.object) orelse unreachable;
+    entry.authority.reference = reserved;
+    object.reference_state.?.holders.connect(reserved, .{ .kind = .fd_entry, .owner = @intCast(owner_index), .owner_generation = generation, .index = @intCast(index), .generation = reserved.allocation.generation, .sequence = reserved.allocation.index }, .{}, true);
+}
+
+pub fn unpublishFdReference(self: anytype, entry: *FdEntry) void {
+    _ = self;
+    if (!trackedReferenceKind(entry.object.kind)) return;
+    const node = entry.authority.reference orelse return;
+    references.Root.disconnect(node, true);
+    references.Pool.cancel(node);
+    entry.authority.reference = null;
+}
+
+fn publishPinnedReference(self: anytype, slot: *KernelObjectSlot, object: KernelObjectRef) void {
+    const Pinned = struct { owner: PrincipalRaw, range: references.Range };
+    const pinned: Pinned = switch (slot.payload) {
+        inline .mmio_region, .dma_buffer, .dma_mapping => |payload| .{ .owner = payload.owner_principal_raw, .range = .{ .start = payload.user_va, .size = payload.size } },
+        else => return,
+    };
+    const index = processIndexFromPrincipal(@enumFromInt(pinned.owner)) orelse unreachable;
+    const table = self.vmaTableForProcessIndex(index) orelse unreachable;
+    const generation = (self.processDescriptorSlotConst(index) orelse unreachable).generation;
+    table.pinned_objects.connect(&slot.reference_state.?.payload_edge, .{ .kind = .pinned_object, .container = @intFromEnum(slot.kind), .owner = @intCast(index), .owner_generation = generation, .index = object.index, .generation = object.generation }, pinned.range, false);
 }

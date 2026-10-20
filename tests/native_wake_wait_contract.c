@@ -74,8 +74,8 @@ __attribute__((used, noreturn)) static void ww_worker(unsigned i) {
     int bad = 0;
     STORE(entered[i], 1);
     if (LOAD(single_wait)) {
-        long rc = pacha_syscall3(PACHA_RUNTIME_SYSCALL_FUTEX_WAIT,
-            (uintptr_t)&permits[i], 0, 2000);
+        long rc = pacha_syscall4(PACHA_RUNTIME_SYSCALL_FUTEX_WAIT,
+            (uintptr_t)&permits[i], 0, 2000, 0);
         STORE(done[i], rc ? 2 : 1);
         (void)pacha_syscall3(PACHA_THREAD_SYSCALL_EXIT, rc ? 1 : 0, 0, 0);
         __builtin_trap();
@@ -83,8 +83,8 @@ __attribute__((used, noreturn)) static void ww_worker(unsigned i) {
     for (unsigned round = 0; round < 256 && !bad; ++round) {
         unsigned attempts = 0;
         while (!LOAD(permits[i])) {
-            long rc = pacha_syscall3(PACHA_RUNTIME_SYSCALL_FUTEX_WAIT,
-                (uintptr_t)&permits[i], 0, 20);
+            long rc = pacha_syscall4(PACHA_RUNTIME_SYSCALL_FUTEX_WAIT,
+                (uintptr_t)&permits[i], 0, 20, 0);
             if ((rc && rc != PACHA_SYSCALL_ERR_NOT_READY &&
                  rc != PACHA_FUTEX_WAIT_TIMED_OUT_STATUS) || ++attempts > 1000) {
                 bad = 1; break;
@@ -98,7 +98,7 @@ __attribute__((used, noreturn)) static void ww_worker(unsigned i) {
         /* The last publication still wakes once but intentionally mismatches
          * its own wait, so neither worker needs a post-exit inbound permit. */
         long rc = pacha_futex_wake_wait((uintptr_t)&permits[1 - i],
-            (uintptr_t)&permits[i], round == 255 ? 1 : 0, 20, &count);
+            (uintptr_t)&permits[i], round == 255 ? 1 : 0, 20, 0, &count);
         __asm__ volatile("movdqa %%xmm15,%0" : "=m"(observed));
         if (count > 1 || (rc && rc != PACHA_SYSCALL_ERR_NOT_READY &&
             rc != PACHA_FUTEX_WAIT_TIMED_OUT_STATUS) || !bases_ok(i) ||
@@ -203,7 +203,7 @@ static int completed_wake_contract(void) {
         uint64_t wait_va = scenario == 0 ? (uintptr_t)&own_word :
             scenario == 1 ? 0 : (uintptr_t)&permits[0];
         long rc = pacha_futex_wake_wait((uintptr_t)&permits[0], wait_va,
-            0, scenario == 2 ? 2 : 0, &count);
+            0, scenario == 2 ? 2 : 0, 0, &count);
         CHECK(count == 1);
         CHECK(rc == (scenario == 0 ? PACHA_SYSCALL_ERR_NOT_READY :
             scenario == 1 ? PACHA_SYSCALL_ERR_INVALID : PACHA_FUTEX_WAIT_TIMED_OUT_STATUS));
@@ -230,6 +230,7 @@ __asm__(".pushsection ww_handlers,\"ax\",@progbits\n.global ww_signal_entry\n"
     "mov $12,%esi; mov $" STRING(PACHA_THREAD_SYSCALL_SIGNAL) ",%eax; syscall\n"
     "test %rax,%rax; jnz 1f\n"
     "lea ww_word(%rip),%rdi; mov %rdi,%rsi; xor %r10d,%r10d; xor %r8d,%r8d\n"
+    "xor %r9d,%r9d\n"
     "mov $" STRING(PACHA_RUNTIME_SYSCALL_FUTEX_WAKE_WAIT) ",%eax; syscall\n"
     ".global ww_pending_resume\nww_pending_resume: mov %rdx,(%rbx)\n"
     "1: pop %rbx; ret\n");
@@ -247,19 +248,19 @@ static int checked_word_contract(void) {
      * final aligned word, readonly input and failures after permission/lifetime
      * changes; a fast copy must not use an unchecked physical alias. */
     for (unsigned readonly = 0; readonly < 2; ++readonly) {
-        CHECK(pacha_futex_wake_wait(address, address, 0, 0, &count) ==
+        CHECK(pacha_futex_wake_wait(address, address, 0, 0, 0, &count) ==
             PACHA_SYSCALL_ERR_NOT_READY && count == 0);
-        CHECK(pacha_futex_wake_wait(address, address + page - 4, 0, 0, &count) ==
+        CHECK(pacha_futex_wake_wait(address, address + page - 4, 0, 0, 0, &count) ==
             PACHA_SYSCALL_ERR_NOT_READY && count == 0);
         CHECK(!pacha_syscall3(PACHA_VM_SYSCALL_MPROTECT, address, page, PACHA_PROT_READ));
     }
-    CHECK(pacha_futex_wake_wait(address, address + 1, 0, 0, &count) ==
+    CHECK(pacha_futex_wake_wait(address, address + 1, 0, 0, 0, &count) ==
         PACHA_SYSCALL_ERR_INVALID && count == 0);
     CHECK(!pacha_syscall3(PACHA_VM_SYSCALL_MPROTECT, address, page, 0));
-    CHECK(pacha_futex_wake_wait(address, address, 0, 0, &count) ==
+    CHECK(pacha_futex_wake_wait(address, address, 0, 0, 0, &count) ==
         PACHA_SYSCALL_ERR_INVALID && count == 0);
     CHECK(!pacha_syscall2(PACHA_VM_SYSCALL_MUNMAP, address, page));
-    CHECK(pacha_futex_wake_wait(address, address + page - 4, 0, 0, &count) ==
+    CHECK(pacha_futex_wake_wait(address, address + page - 4, 0, 0, 0, &count) ==
         PACHA_SYSCALL_ERR_INVALID && count == 0);
     return 0;
 }
@@ -268,18 +269,18 @@ int native_wake_wait_contract(void) {
     CHECK(!checked_word_contract());
     uint64_t count = 99;
     unsigned word = 1;
-    CHECK(pacha_futex_wake_wait(0, (uintptr_t)&word, 0, 0, &count) ==
+    CHECK(pacha_futex_wake_wait(0, (uintptr_t)&word, 0, 0, 0, &count) ==
         PACHA_SYSCALL_ERR_INVALID && count == UINT64_MAX);
-    CHECK(pacha_futex_wake_wait((uintptr_t)&word, (uintptr_t)&word, 0, 0, &count) ==
+    CHECK(pacha_futex_wake_wait((uintptr_t)&word, (uintptr_t)&word, 0, 0, 0, &count) ==
         PACHA_SYSCALL_ERR_NOT_READY && count == 0);
-    CHECK(pacha_futex_wake_wait((uintptr_t)&word, 0, 0, 0, &count) ==
+    CHECK(pacha_futex_wake_wait((uintptr_t)&word, 0, 0, 0, 0, &count) ==
         PACHA_SYSCALL_ERR_INVALID && count == 0);
     word = 0;
-    CHECK(pacha_futex_wake_wait((uintptr_t)&word, (uintptr_t)&word, 0, 2, &count) ==
+    CHECK(pacha_futex_wake_wait((uintptr_t)&word, (uintptr_t)&word, 0, 2, 0, &count) ==
         PACHA_FUTEX_WAIT_TIMED_OUT_STATUS && count == 0);
     /* A timeout retired the caller token; alias must not wake that old wait. */
     word = 1;
-    CHECK(pacha_futex_wake_wait((uintptr_t)&word, (uintptr_t)&word, 0, 0, &count) ==
+    CHECK(pacha_futex_wake_wait((uintptr_t)&word, (uintptr_t)&word, 0, 0, 0, &count) ==
         PACHA_SYSCALL_ERR_NOT_READY && count == 0);
     CHECK(!completed_wake_contract());
     CHECK(!worker_contract(0));

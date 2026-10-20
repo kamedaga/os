@@ -49,7 +49,7 @@ static int credentials_valid(const kb2_fs_request_t *r,const uint8_t *bytes,
     return 0;
 }
 int filed_client_create(filed_runtime_t *rt,const kb2_fs_request_t *input,
-    const uint8_t *bytes,size_t size,int *client_fd,uint64_t *id)
+    const uint8_t *bytes,size_t size,pacha_fd_t *client_fd,uint64_t *id)
 {
     if (!rt || rt->actor || !client_fd || !id) return -1;
     int status=credentials_valid(input,bytes,size);

@@ -11,7 +11,7 @@ static size_t lpr_strnlen(const char *s, size_t n)
 #define lpr_strrchr strrchr
 #define lpr_strcmp strcmp
 struct pachaos_timespec { uint64_t tv_sec, tv_nsec; };
-static int64_t lpr_linux_write(uint64_t fd, uint64_t a, uint64_t b)
+static int64_t lpr_linux_write(uint64_t fd, uint64_t a, uint64_t b, unsigned *wait_not_ready __attribute__((unused)))
 { assert(fd == 2 && b < 256); (void)a; return (int64_t)b; }
 static int lpr_pacha_clock_gettime(uint64_t c, struct pachaos_timespec *t)
 { (void)c; t->tv_sec = 1; t->tv_nsec = 0; return 0; }

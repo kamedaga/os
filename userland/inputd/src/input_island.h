@@ -1,3 +1,4 @@
+#include <pacha/abi.h>
 #pragma once
 
 #include <stddef.h>
@@ -43,7 +44,7 @@ enum inputd_wait_source_kind {
 };
 
 struct inputd_wait_source {
-    int fd;
+    pacha_fd_t fd;
     uint32_t kind;
     uint32_t slot;
     uint32_t generation;
@@ -76,10 +77,10 @@ int inputd_input_source_end(struct inputd_input_island *island,
 int inputd_input_source_events(struct inputd_input_island *island,
     uint64_t source_id, uint64_t generation,
     const struct kobox_linux_input_record *records, size_t count);
-int inputd_input_open(uint32_t event_index, uint32_t flags, int notify_fd, uint64_t *out_handle);
+int inputd_input_open(uint32_t event_index, uint32_t flags, pacha_fd_t notify_fd, uint64_t *out_handle);
 int inputd_input_close(uint64_t handle);
 int inputd_input_dup(uint64_t handle, uint64_t *out_handle);
-int inputd_input_transfer_dup(uint64_t handle, int notify_fd, uint64_t *out_handle);
+int inputd_input_transfer_dup(uint64_t handle, pacha_fd_t notify_fd, uint64_t *out_handle);
 int inputd_input_read(inputd_read_request_t *request);
 int inputd_input_ioctl(inputd_ioctl_request_t *request);
 int inputd_input_poll(inputd_poll_request_t *request);

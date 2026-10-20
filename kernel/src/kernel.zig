@@ -1,3 +1,7 @@
+pub const ReferenceIndex = @import("memory/reference_index.zig");
+pub const ReferenceCheck = @import("state/reference_check.zig");
+const slot_storage = @import("memory/slot_table.zig");
+const lock_diagnostics = @import("sync/lock_diagnostics.zig");
 const std = @import("std");
 
 pub const acpi_dmar = @import("acpi_dmar.zig");
@@ -18,12 +22,10 @@ pub const capsule = types.capsule;
 pub const initial_process_count = types.initial_process_count;
 pub const initial_process_capacity = types.initial_process_capacity;
 pub const process_count = types.process_count;
-pub const max_process_slots = types.max_process_slots;
+pub const process_principal_value_count = types.process_principal_value_count;
 pub const initial_thread_capacity = types.initial_thread_capacity;
-pub const max_thread_slots = types.max_thread_slots;
-pub const device_count = types.device_count;
+pub const thread_id_value_count = types.thread_id_value_count;
 pub const device_principal_raw = types.device_principal_raw;
-pub const principal_count = types.principal_count;
 pub const PrincipalRaw = types.PrincipalRaw;
 pub const PrincipalId = types.PrincipalId;
 pub const CapsuleKind = types.CapsuleKind;
@@ -33,8 +35,6 @@ pub const CapsuleSnapshot = types.CapsuleSnapshot;
 pub const CapsuleDmaDirection = types.CapsuleDmaDirection;
 pub const CapsuleIrqKind = types.CapsuleIrqKind;
 pub const MapProt = types.MapProt;
-pub const EndpointRoute = types.EndpointRoute;
-pub const Region = types.Region;
 pub const ProcessDescriptor = types.ProcessDescriptor;
 pub const ProcessStatus = types.ProcessStatus;
 pub const DebugProcessLifecycleReason = types.DebugProcessLifecycleReason;
@@ -43,9 +43,7 @@ pub const DmaDeviceId = types.DmaDeviceId;
 pub const invalid_dma_device_id = types.invalid_dma_device_id;
 pub const Fd = types.Fd;
 pub const fd_table_entries = types.fd_table_entries;
-pub const fd_table_limit = types.fd_table_limit;
-pub const max_fd_objects = types.max_fd_objects;
-pub const max_pipes = types.max_pipes;
+pub const fd_number_capacity = types.fd_number_capacity;
 pub const pipe_buffer_bytes = types.pipe_buffer_bytes;
 pub const fd_known_flags_mask = types.fd_known_flags_mask;
 pub const fd_known_rights_mask = types.fd_known_rights_mask;
@@ -75,12 +73,8 @@ pub const FdEntry = types.FdEntry;
 pub const FdInfo = types.FdInfo;
 pub const FdTable = types.FdTable;
 pub const FdTransferMode = types.FdTransferMode;
-pub const max_ipc_endpoints = types.max_ipc_endpoints;
-pub const max_ipc_channels = types.max_ipc_channels;
-pub const max_ipc_replies = types.max_ipc_replies;
 pub const max_ipc_queue_messages = types.max_ipc_queue_messages;
 pub const max_ipc_message_fds = types.max_ipc_message_fds;
-pub const max_ipc_waiters = types.max_ipc_waiters;
 pub const IpcEndpointRef = types.IpcEndpointRef;
 pub const IpcChannelRef = types.IpcChannelRef;
 pub const IpcChannelHandle = types.IpcChannelHandle;
@@ -89,6 +83,9 @@ pub const IpcWaitKey = types.IpcWaitKey;
 pub const IpcWaiter = types.IpcWaiter;
 pub const ThreadWakeTarget = types.ThreadWakeTarget;
 pub const IpcReceiverHint = types.IpcReceiverHint;
+pub const IpcNotifyWaiter = types.IpcNotifyWaiter;
+pub const IpcNotifyConsumeResult = ipc_state.IpcNotifyConsumeResult;
+pub const IpcNotifyCompletion = ipc_state.IpcNotifyCompletion;
 pub const FdWaitRegistrationKind = types.FdWaitRegistrationKind;
 pub const FdWaitRegistrationRef = types.FdWaitRegistrationRef;
 pub const FdWaitGroupRef = types.FdWaitGroupRef;
@@ -96,11 +93,7 @@ pub const FdWaitGroupState = types.FdWaitGroupState;
 pub const FdWaitGroupSlot = types.FdWaitGroupSlot;
 pub const FdWaitGroupSnapshot = types.FdWaitGroupSnapshot;
 pub const FdWaitBinding = types.FdWaitBinding;
-pub const max_fd_wait_groups = types.max_fd_wait_groups;
-pub const max_fd_wait_group_links = types.max_fd_wait_group_links;
 pub const TaskFdWaiter = types.TaskFdWaiter;
-pub const max_task_fd_waiters = types.max_task_fd_waiters;
-pub const max_ipc_object_waiters = types.max_ipc_object_waiters;
 pub const PipeSlot = types.PipeSlot;
 pub const IpcWaitList = types.IpcWaitList;
 pub const IpcTransferredFd = types.IpcTransferredFd;
@@ -116,16 +109,12 @@ pub const IpcRecvResult = types.IpcRecvResult;
 pub const IpcRecvOutcome = types.IpcRecvOutcome;
 pub const native_page_size = types.native_page_size;
 pub const dma_pool_max_pages = @import("kernel_abi_root").capsule_abi.dma_pool_max_pages;
-pub const max_native_vmos = types.max_native_vmos;
-pub const max_vmas_per_process = types.max_vmas_per_process;
-pub const native_cow_table_slots_per_chunk = types.native_cow_table_slots_per_chunk;
 pub const NativeVmoKind = types.NativeVmoKind;
 pub const NativeVmoRef = types.NativeVmoRef;
 pub const NativeCowTableRef = types.NativeCowTableRef;
 pub const NativeVmoSlot = types.NativeVmoSlot;
 pub const RamCacheSnapshot = @import("memory/ram_cache_policy.zig").Snapshot;
 pub const NativeCowTableSlot = types.NativeCowTableSlot;
-pub const NativeCowTableChunk = types.NativeCowTableChunk;
 pub const VmaProt = types.VmaProt;
 pub const MmapFlags = types.MmapFlags;
 pub const VmaEntry = types.VmaEntry;
@@ -134,19 +123,15 @@ pub const NativeVmaFaultMapping = types.NativeVmaFaultMapping;
 pub const NativeVmaDmaPinMode = types.NativeVmaDmaPinMode;
 pub const NativeVmaPrepareKind = types.NativeVmaPrepareKind;
 pub const NativeVmaFaultPlan = types.NativeVmaFaultPlan;
-pub const EndpointTable = types.EndpointTable;
-pub const PublishedEndpointTable = types.PublishedEndpointTable;
-pub const max_vmo_backing_pages = types.max_vmo_backing_pages;
 pub const max_vmo_logical_pages = types.max_vmo_logical_pages;
-pub const max_vmo_backing_store_pages = types.max_vmo_backing_store_pages;
+pub const checkedVmoPageCount = types.checkedVmoPageCount;
 pub const RegionFreeRange = types.RegionFreeRange;
 pub const FreePageList = types.FreePageList;
+pub const PhysicalAccessTest = if (@import("builtin").is_test) @import("memory/physical_access_test.zig") else struct {};
+pub const DmaRetentionTestHold = @import("memory/dma_retention.zig").TestHold;
+pub const resetDmaRetentionForTest = @import("memory/dma_retention.zig").resetForTest;
 pub const PageCapability = types.PageCapability;
-pub const empty_vmo_backing_page_store = types.empty_vmo_backing_page_store;
-pub const vmo_backing_page_store = types.vmo_backing_page_store;
 pub const empty_process_descriptors_extra = types.empty_process_descriptors_extra;
-pub const empty_endpoint_tables_extra = types.empty_endpoint_tables_extra;
-pub const empty_fd_tables_extra = types.empty_fd_tables_extra;
 pub const empty_vma_tables_extra = types.empty_vma_tables_extra;
 pub const processPrincipalFromIndex = types.processPrincipalFromIndex;
 pub const processIndexFromPrincipal = types.processIndexFromPrincipal;
@@ -172,81 +157,169 @@ pub const freeVmoBackingPageStore = types.freeVmoBackingPageStore;
 pub const BackedPage = types.BackedPage;
 pub const snapshotVmoBackingPages = types.snapshotVmoBackingPages;
 pub const resetVmoBackingPageStore = types.resetVmoBackingPageStore;
-pub const vmoBackingPageStoreBucketForTest = types.vmoBackingPageStoreBucketForTest;
-pub const initVmoBackingPageStoreForTest = types.initVmoBackingPageStoreForTest;
-pub const lockVmoBackingPageStoreForTest = types.lockVmoBackingPageStoreForTest;
-pub const unlockVmoBackingPageStoreForTest = types.unlockVmoBackingPageStoreForTest;
 pub const kernelStaticStorageEndAddr = fd_state.kernelStaticStorageEndAddr;
 pub const runtimeStorageBytes = types.runtimeStorageBytes;
 pub const initRuntimeStorage = types.initRuntimeStorage;
 pub const dmaAddressForResolvedPages = vma_state.dmaAddressForResolvedPages;
+pub const InvocationStorageTestAllocator = if (@import("builtin").is_test) @import("memory/owned_storage.zig").TestAllocator else void;
 pub const KernelState = struct {
-    pub const max_regions = 256;
-    pub const low_memory_limit: u64 = 4 * 1024 * 1024 * 1024;
+    pub const low_memory_limit: u64 = @import("arch/x86_64/physical_layout.zig").low_memory_limit;
 
-    regions: [max_regions]Region = undefined,
-    region_len: usize = 0,
     process_descriptors: [process_count]ProcessDescriptor = [_]ProcessDescriptor{.{}} ** process_count,
     process_descriptors_extra: []ProcessDescriptor = empty_process_descriptors_extra[0..],
     process_capacity: usize = process_count,
+    process_timers: @import("state/process_timer.zig").Store = .{},
+    // KernelState exclusion protects publication and deferred PMM returns.
+    // The state must not be copied/reset while this owner holds allocations.
+    // Also owns never-published invocation workspace returns. Both lifetimes
+    // are serialized by KernelState; rollback never touches published records.
+    descriptor_storage: @import("memory/owned_storage.zig").Owner = .{},
+    invocation_test_allocator: if (@import("builtin").is_test) ?@import("memory/owned_storage.zig").Allocator else void = if (@import("builtin").is_test) null else {},
+    descriptor_lock: lock_diagnostics.Byte = .{},
+    descriptor_test_probe: if (@import("builtin").is_test) ?*u8 else void = if (@import("builtin").is_test) null else {},
     active_process_count: usize = 0,
-    endpoint_tables: [principal_count]EndpointTable = [_]EndpointTable{.{}} ** principal_count,
-    endpoint_tables_extra: []EndpointTable = empty_endpoint_tables_extra[0..],
-    published_service_endpoints: PublishedEndpointTable = .{},
-    endpoint_generation: u64 = 0,
+    fd_retired: @import("memory/owned_storage.zig").RetiredQueue = .{},
+    fd_process_capacity: usize = types.process_count,
+    fd_process_retired: bool = false,
+    retired_fd_tables: ?*FdTable = null,
+    retired_fd_objects: ?*KernelObjectSlot = null,
+    retired_ipc_endpoints: ?*IpcEndpointSlot = null,
+    retired_ipc_channels: ?*IpcChannelSlot = null,
     fd_tables: [process_count]FdTable = [_]FdTable{.{}} ** process_count,
     vma_tables: [process_count]VmaTable = [_]VmaTable{.{}} ** process_count,
-    fd_tables_extra: []FdTable = empty_fd_tables_extra[0..],
-    vma_tables_extra: []VmaTable = empty_vma_tables_extra[0..],
-    fd_objects: [max_fd_objects]KernelObjectSlot = [_]KernelObjectSlot{.{}} ** max_fd_objects,
+    // KernelState excludes every FD directory reader. Bodies cannot move:
+    // their entry-storage owners bind to their address and survive slot reuse.
+    fd_tables_extra: slot_storage.SlotTable(FdTable) = .{},
+    // Directory borrows end inside the accessor; VMA bodies stay at stable
+    // addresses while fault handling uses them under AS/shared VM exclusion.
+    vma_tables_extra: []*VmaTable = &.{},
+    vma_directory_lock: lock_diagnostics.Byte = .{},
+    vma_directory_test_probe: if (@import("builtin").is_test) ?*u8 else void = if (@import("builtin").is_test) null else {},
+    vma_directory_storage: @import("memory/owned_storage.zig").Owner = .{},
+    vma_body_storage: @import("memory/owned_storage.zig").Owner = .{},
+    pool_allocator: ?@import("memory/owned_storage.zig").Allocator = null,
+    wait_storage_cache: @import("memory/reclaim_cache.zig").Cache = .{},
+    object_directory_leaf: slot_storage.Leaf = .{},
+    vmo_directory_leaf: slot_storage.Leaf = .{},
+    fd_objects: slot_storage.SlotTable(KernelObjectSlot) = .{},
     // Candidate slots only: overlap checks still validate live payload/owner.
-    pinned_object_slots: std.StaticBitSet(max_fd_objects) = .initEmpty(),
-    pipes: [max_pipes]PipeSlot = [_]PipeSlot{.{}} ** max_pipes,
-    task_fd_waiters: [max_task_fd_waiters]TaskFdWaiter = [_]TaskFdWaiter{.{}} ** max_task_fd_waiters,
+    pipes: slot_storage.SlotTable(PipeSlot) = .{},
+    task_fd_waiters: slot_storage.SlotTable(TaskFdWaiter) = .{},
     // Enumerate timer records without scanning unrelated task FD waiters.
     // Pending completions and stale/disarmed objects stay indexed until
     // record retirement, so the index cannot hide a live registration.
-    task_timer_waiter_slots: std.StaticBitSet(max_task_fd_waiters) = .initEmpty(),
-    fd_wait_groups: [max_fd_wait_groups]FdWaitGroupSlot =
-        [_]FdWaitGroupSlot{.{}} ** max_fd_wait_groups,
+    // Whether nextTimerWaiterDeadline may differ from the published clock
+    // deadline. Every lock release used to rescan the timer waiters, but most
+    // stateful syscalls (IPC doorbells, FS round trips) never touch them.
+    // Set by every mutation of the scan's inputs, consumed under the lock.
+    // Storage is zero-filled, so resets set it explicitly.
+    timer_deadline_dirty: bool = true,
+    fd_wait_groups: slot_storage.SlotTable(FdWaitGroupSlot) = .{},
+    // K owns the link table for each live group. After cancellation its
+    // grants belong to the detached cache and are independently reclaimable.
+    fd_wait_group_links: slot_storage.SlotTable(slot_storage.SlotTable(types.FdWaitLink)) = .{},
     // Conservative thread buckets: zero proves that cancellation has no
     // groups to scan. Collisions only retain the existing exact scan.
     // Includes both building and armed groups; protected with KernelState.
-    fd_wait_group_thread_counts: [max_fd_wait_groups]u16 = [_]u16{0} ** max_fd_wait_groups,
+    fd_wait_group_thread_counts: slot_storage.SlotTable(u64) = .{},
     next_fd_wait_group_scan: usize = 0,
-    irq_publish_slots: [max_fd_objects]IrqPublishSlot = [_]IrqPublishSlot{.{}} ** max_fd_objects,
+    irq_publish_slots: slot_storage.SlotTable(IrqPublishSlot) = .{},
     // Conservative IRQ candidates, not ownership/publication state. Once set,
     // a bit survives retirement/reuse until the non-concurrent table reset.
-    irq_publish_candidates: [(max_fd_objects + 63) / 64]u64 = [_]u64{0} ** ((max_fd_objects + 63) / 64),
     next_fd_object_scan: usize = 0,
     next_pipe_scan: usize = 0,
-    native_vmos: [max_native_vmos]NativeVmoSlot = [_]NativeVmoSlot{.{}} ** max_native_vmos,
+    native_vmos: slot_storage.SlotTable(NativeVmoSlot) = .{},
     next_native_vmo_scan: usize = 0,
     pending_device_retirements: usize = 0,
     // Permanent reference to the read-only kernel clock page, created on first open.
     kernel_clock_page_vmo: NativeVmoRef = .{},
     pending_ram_cache_retirements: usize = 0,
-    native_cow_table_initial: NativeCowTableChunk = .{},
-    native_cow_table_overflow_head: ?*NativeCowTableChunk = null,
-    native_cow_table_chunk_count: usize = 1,
-    next_native_cow_table_scan: usize = 0,
+    // VMO finalizers use KernelState; COW fault finalizers use shared-VM.
+    // Only this hint is atomic across those domains. Draining actual slots
+    // requires BOTH domains; an atomic hint never authorizes a slot access.
+    pending_data_returns: usize = 0,
+    native_cow_tables: slot_storage.SlotTable(NativeCowTableSlot) = .{},
+    pending_cow_storage_return: u8 = 0,
     aslr_secret: u64 = 0x6a09_e667_f3bc_c909,
     aslr_sequence: u64 = 1,
-    ipc_endpoints: [max_ipc_endpoints]IpcEndpointSlot = [_]IpcEndpointSlot{.{}} ** max_ipc_endpoints,
+    ipc_endpoints: slot_storage.SlotTable(IpcEndpointSlot) = .{},
     next_ipc_endpoint_scan: usize = 0,
-    ipc_channels: [max_ipc_channels]IpcChannelSlot = [_]IpcChannelSlot{.{}} ** max_ipc_channels,
+    ipc_channels: slot_storage.SlotTable(IpcChannelSlot) = .{},
     next_ipc_channel_scan: usize = 0,
-    ipc_replies: [max_ipc_replies]IpcReplySlot = [_]IpcReplySlot{.{}} ** max_ipc_replies,
+    ipc_replies: slot_storage.SlotTable(IpcReplySlot) = .{},
+    ipc_cancel_writable_pending: bool = false,
     next_ipc_reply_scan: usize = 0,
     zero_physical_page_hook: ?*const fn (paddr: u64) bool = null,
     debug_process_lifecycle_hook: ?*const fn (state: *const KernelState, principal: PrincipalId, reason: DebugProcessLifecycleReason) void = null,
 
+    object_reference_slots: slot_storage.SlotTable(types.ObjectReferences) = .{},
+    clock_reference: @import("memory/reference_index.zig").Node = .{},
+    reference_nodes: @import("memory/reference_index.zig").Pool = .{},
+
+    /// K excludes FD/IPC publishers and record borrowers. Retry through the
+    /// original issuer even when no later tracked object is created.
+    pub fn retryReferenceStorage(self: *KernelState) void {
+        if (self.reference_nodes.needs_reclaim) self.reference_nodes.reclaim();
+        if (ReferenceIndex.pendingStorage(&self.object_reference_slots)) self.object_reference_slots.reclaim();
+    }
+
+    pub fn poolAllocator(self: *KernelState) KernelError!@import("memory/owned_storage.zig").Allocator {
+        if (self.pool_allocator) |allocator| return allocator;
+        if (@import("builtin").is_test) return slot_storage.hostTestAllocator();
+        return KernelError.OutOfFreePages;
+    }
+    pub fn waitPoolAllocator(self: *KernelState) KernelError!@import("memory/owned_storage.zig").Allocator {
+        return self.wait_storage_cache.allocator(try self.poolAllocator());
+    }
+    pub fn allocateWaitPool(self: *KernelState, table: anytype) KernelError!@TypeOf(table.*).Allocation {
+        return table.allocate(try self.waitPoolAllocator(), null, std.math.maxInt(u32)) catch return KernelError.OutOfFreePages;
+    }
+    pub fn allocatePool(self: *KernelState, table: anytype, leaf: ?*slot_storage.Leaf, max_index: u32) KernelError!@TypeOf(table.*).Allocation {
+        if (comptime @TypeOf(table.*) == slot_storage.SlotTable(KernelObjectSlot) or
+            @TypeOf(table.*) == slot_storage.SlotTable(IpcEndpointSlot) or
+            @TypeOf(table.*) == slot_storage.SlotTable(IpcChannelSlot)) table.return_queue = &self.fd_retired;
+        // Allocation can roll back unused draft metadata even on success.
+        // Transfer rejected returns after draft.finish, while K still excludes
+        // borrowers; unrelated syscalls no longer scan these owners for us.
+        defer if (comptime @TypeOf(table.*) == slot_storage.SlotTable(KernelObjectSlot) or
+            @TypeOf(table.*) == slot_storage.SlotTable(IpcEndpointSlot) or
+            @TypeOf(table.*) == slot_storage.SlotTable(IpcChannelSlot)) table.reclaim();
+        return table.allocate(try self.poolAllocator(), leaf, max_index) catch return KernelError.OutOfFreePages;
+    }
+    /// Test/shutdown storage teardown; caller already excluded IRQ/AS readers
+    /// and finalized payload resources. FD K borrows must have ended; stable
+    /// FD table bodies and nested owners must outlive entry/pool teardown.
+    pub fn deinitPools(self: *KernelState) void {
+        @import("state/fd_capability.zig").deinit(self);
+        self.fd_tables_extra.deinit();
+        // Source borrowers ended with the existing pool-teardown contract.
+        // Retired node grants retain their issuer even after source teardown.
+        self.process_timers.records.deinit();
+        self.process_timers.index = .{};
+        self.reference_nodes.nodes.deinit();
+        self.object_reference_slots.deinit();
+        inline for (.{ "pipes", "ipc_channels" }) |name| {
+            var iterator = @field(self, name).iterator();
+            while (iterator.next()) |item| for (&item.value.waiters) |*list| list.waiters.deinitInto(&@field(self, name).body_owner);
+        }
+        inline for (.{ "ipc_endpoints", "ipc_replies" }) |name| {
+            var iterator = @field(self, name).iterator();
+            while (iterator.next()) |item| item.value.waiters.waiters.deinitInto(&@field(self, name).body_owner);
+        }
+        var groups = self.fd_wait_group_links.iterator();
+        while (groups.next()) |item| item.value.deinitInto(&self.fd_wait_group_links.body_owner);
+        inline for (.{ "fd_objects", "pipes", "native_vmos", "native_cow_tables", "ipc_endpoints", "ipc_channels", "ipc_replies", "task_fd_waiters", "fd_wait_groups", "fd_wait_group_links", "fd_wait_group_thread_counts", "irq_publish_slots" }) |name| @field(self, name).deinit();
+        _ = self.fd_retired.reclaim();
+        std.debug.assert(self.fd_retired.head == null);
+        _ = self.wait_storage_cache.reclaim();
+    }
     pub const IpcChannelPair = struct {
         a: Fd,
         b: Fd,
     };
 
-    pub const resetStorageInPlace = memory_state.resetStorageInPlace;
+    pub const beginInvocationStorage = memory_state.beginInvocationStorage;
+    pub const retryInvocationStorage = memory_state.retryInvocationStorage;
     pub const pageAlignUp = memory_state.pageAlignUp;
     pub const pageAlignDown = memory_state.pageAlignDown;
     pub const isPageAligned = memory_state.isPageAligned;
@@ -258,9 +331,12 @@ pub const KernelState = struct {
     pub const nativeVmoSlot = vmo_state.nativeVmoSlot;
     pub const nativeVmoSlotConst = vmo_state.nativeVmoSlotConst;
     pub const clearNativeVmoSlot = vmo_state.clearNativeVmoSlot;
+    pub const hasPendingDataReturns = vmo_state.hasPendingDataReturns;
+    pub const drainPendingDataReturns = vmo_state.drainPendingDataReturns;
     pub const releaseNativeVmoOwnedPages = vmo_state.releaseNativeVmoOwnedPages;
     pub const createNativeVmoWithPageStore = vmo_state.createNativeVmoWithPageStore;
     pub const createNativeVmo = vmo_state.createNativeVmo;
+    pub const publishNativeVmoParent = vmo_state.publishNativeVmoParent;
     pub const createNativePageView = vmo_state.createNativePageView;
     pub const createNativeDeviceMemoryBacking = vmo_state.createNativeDeviceMemoryBacking;
     pub const kernelClockPageVmo = vmo_state.kernelClockPageVmo;
@@ -323,6 +399,7 @@ pub const KernelState = struct {
     pub const nativeVmoOwnPagePaddr = vmo_state.nativeVmoOwnPagePaddr;
     pub const nativeVmoResolvedPagePaddr = vmo_state.nativeVmoResolvedPagePaddr;
     pub const nativeVmoResolvedPagePaddrOrZero = vmo_state.nativeVmoResolvedPagePaddrOrZero;
+    pub const resolveOrInstallNativeVmoPage = vmo_state.resolveOrInstallNativeVmoPage;
     pub const nativeVmoIsZeroOnDemand = vmo_state.nativeVmoIsZeroOnDemand;
     pub const nativeRamCachePages = vmo_state.nativeRamCachePages;
     pub const prepareNativeRamCacheLifetime = vmo_state.prepareNativeRamCacheLifetime;
@@ -350,8 +427,11 @@ pub const KernelState = struct {
     pub const readFdVmoBytes = vmo_state.readFdVmoBytes;
     pub const installNativeVmoPages = vmo_state.installNativeVmoPages;
     pub const fdIndex = fd_state.fdIndex;
+    pub const finishFdGrowth = @import("state/fd_capability.zig").finishGrowth;
+    pub const retireFdStorage = @import("state/fd_capability.zig").retireTable;
+    pub const reclaimFdCapabilities = @import("state/fd_capability.zig").reclaim;
     pub const ensureFdTableCapacity = process_state.ensureFdTableCapacity;
-    pub const retireFdStorage = process_state.retireFdStorage;
+    pub const releaseFdStorage = process_state.releaseFdStorage;
     pub const reclaimFdStorage = process_state.reclaimFdStorage;
     pub const findFreeFd = fd_state.findFreeFd;
     pub const nextObjectGeneration = fd_state.nextObjectGeneration;
@@ -393,12 +473,10 @@ pub const KernelState = struct {
     pub const hasActivePrincipal = process_state.hasActivePrincipal;
     pub const requireActiveProcess = process_state.requireActiveProcess;
     pub const requireActivePrincipal = process_state.requireActivePrincipal;
-    pub const principalStorageIndex = process_state.principalStorageIndex;
     pub const extraIndex = process_state.extraIndex;
-    pub const processDescriptorSlot = process_state.processDescriptorSlot;
     pub const processDescriptorSlotConst = process_state.processDescriptorSlotConst;
-    pub const endpointTableForProcessIndex = process_state.endpointTableForProcessIndex;
-    pub const endpointTableForProcessIndexConst = process_state.endpointTableForProcessIndexConst;
+    pub const tryProcessLabel = process_state.tryProcessLabel;
+    pub const processCapacitySnapshot = process_state.processCapacitySnapshot;
     pub const fdTableForProcessIndex = process_state.fdTableForProcessIndex;
     pub const fdTableForProcessIndexConst = process_state.fdTableForProcessIndexConst;
     pub const vmaTableForProcessIndex = process_state.vmaTableForProcessIndex;
@@ -423,6 +501,7 @@ pub const KernelState = struct {
     pub const userRangeIsUnbackedMmioReservation = vma_state.userRangeIsUnbackedMmioReservation;
     pub const vmaProtAllowsFault = vma_state.vmaProtAllowsFault;
     pub const nativeFaultMappingProt = vma_state.nativeFaultMappingProt;
+    pub const nativeVmaFaultMappingForEntry = vma_state.nativeVmaFaultMappingForEntry;
     pub const nativeVmaFaultMapping = vma_state.nativeVmaFaultMapping;
     pub const nativeVmaDmaPinMode = vma_state.nativeVmaDmaPinMode;
     pub const nativeVmaInitialMapping = vma_state.nativeVmaInitialMapping;
@@ -442,7 +521,6 @@ pub const KernelState = struct {
     pub const nativeVmoMappingsOverlapPinnedUserObjects = vmo_state.nativeVmoMappingsOverlapPinnedUserObjects;
     pub const nativeVmoTreeMappingsOverlapPinnedUserObjects = vmo_state.nativeVmoTreeMappingsOverlapPinnedUserObjects;
     pub const revokeNativeVmoFromFdTablesWithFreeList = vmo_state.revokeNativeVmoFromFdTablesWithFreeList;
-    pub const revokeNativeVmoFromIpcQueueWithFreeList = vmo_state.revokeNativeVmoFromIpcQueueWithFreeList;
     pub const revokeNativeVmoFromIpcMessagesWithFreeList = vmo_state.revokeNativeVmoFromIpcMessagesWithFreeList;
     pub const revokeNativeVmoFromVmaTablesWithFreeList = vmo_state.revokeNativeVmoFromVmaTablesWithFreeList;
     pub const revokeVmoFdWithFreeList = vmo_state.revokeVmoFdWithFreeList;
@@ -456,6 +534,7 @@ pub const KernelState = struct {
     pub const replaceVmaTableForExec = vma_state.replaceVmaTableForExec;
     pub const resetProcessRuntimeTables = vma_state.resetProcessRuntimeTables;
     pub const findFreeVma = vma_state.findFreeVma;
+    pub const refreshVmaReferences = vma_state.refreshVmaReferences;
     pub const installVmaEntry = vma_state.installVmaEntry;
     pub const clearVmaEntry = vma_state.clearVmaEntry;
     pub const removeActiveVmaIndex = vma_state.removeActiveVmaIndex;
@@ -514,9 +593,11 @@ pub const KernelState = struct {
     pub const recordDeviceInterruptEvent = fd_state.recordDeviceInterruptEvent;
     pub const irqEventCountForFd = fd_state.irqEventCountForFd;
     pub const createDeviceFd = fd_state.createDeviceFd;
+    pub const publishMmioOverlayAddress = fd_state.publishMmioOverlayAddress;
     pub const createMmioRegionFd = fd_state.createMmioRegionFd;
     pub const createDmaBufferFd = fd_state.createDmaBufferFd;
     pub const createDmaMappingFd = fd_state.createDmaMappingFd;
+    pub const createDmaMappingFdWithBacking = fd_state.createDmaMappingFdWithBacking;
     pub const createIrqFd = fd_state.createIrqFd;
     pub const createTimerFd = fd_state.createTimerFd;
     pub const createEventFd = fd_state.createEventFd;
@@ -538,6 +619,10 @@ pub const KernelState = struct {
     pub const prepareMremapWithFreeList = vma_state.prepareMremapWithFreeList;
     pub const discardMremapPrepared = vma_state.discardMremapPrepared;
     pub const commitMremapPrepared = vma_state.commitMremapPrepared;
+    pub const prepareFdReference = fd_state.prepareFdReference;
+    pub const publishFdReference = fd_state.publishFdReference;
+    pub const unpublishFdReference = fd_state.unpublishFdReference;
+    pub const installFdPrepared = fd_state.installFdPrepared;
     pub const installFd = fd_state.installFd;
     pub const closeFd = fd_state.closeFd;
     pub const closeFdWithFreeList = fd_state.closeFdWithFreeList;
@@ -547,12 +632,10 @@ pub const KernelState = struct {
     pub const setFdFlags = fd_state.setFdFlags;
     pub const transferFd = fd_state.transferFd;
     pub const endpointRights = ipc_state.endpointRights;
-    pub const replyReceiveRights = ipc_state.replyReceiveRights;
     pub const replySendRights = ipc_state.replySendRights;
     pub const createIpcEndpointFd = ipc_state.createIpcEndpointFd;
     pub const createIpcChannelPairFds = ipc_state.createIpcChannelPairFds;
     pub const ipcMessageQueueForSend = ipc_state.ipcMessageQueueForSend;
-    pub const markReplySentIfNeeded = ipc_state.markReplySentIfNeeded;
     pub const endpointRefEqual = ipc_state.endpointRefEqual;
     pub const channelRefEqual = ipc_state.channelRefEqual;
     pub const replyRefEqual = ipc_state.replyRefEqual;
@@ -575,8 +658,11 @@ pub const KernelState = struct {
     pub const beginFdWaitGroup = fd_state.beginFdWaitGroup;
     pub const armFdWaitGroup = fd_state.armFdWaitGroup;
     pub const linkFdWaitRegistration = fd_state.linkFdWaitRegistration;
+    pub const detachFdWaitGroup = fd_state.detachFdWaitGroup;
+    pub const takeFdWaitGroupReadyBatch = fd_state.takeFdWaitGroupReadyBatch;
     pub const cancelFdWaitGroup = fd_state.cancelFdWaitGroup;
     pub const cancelFdWaitGroupsForThread = fd_state.cancelFdWaitGroupsForThread;
+    pub const reclaimFdWaitStorage = fd_state.reclaimFdWaitStorage;
     pub const cancelFdWaitGroupsForOwner = fd_state.cancelFdWaitGroupsForOwner;
     pub const snapshotFdWaitGroups = fd_state.snapshotFdWaitGroups;
     pub const takeTaskReadableWaitersForPrincipal = fd_state.takeTaskReadableWaitersForPrincipal;
@@ -584,11 +670,22 @@ pub const KernelState = struct {
     pub const takeReadyIrqWaiters = fd_state.takeReadyIrqWaiters;
     pub const takeReadyTimerWaiters = fd_state.takeReadyTimerWaiters;
     pub const nextTimerWaiterDeadline = fd_state.nextTimerWaiterDeadline;
+    pub const markTimerDeadlineDirty = fd_state.markTimerDeadlineDirty;
+    pub const takeTimerDeadlineDirty = fd_state.takeTimerDeadlineDirty;
     pub const wakeIpcWaitersForSendFd = ipc_state.wakeIpcWaitersForSendFd;
     pub const noteIpcReceiverForFd = ipc_state.noteIpcReceiverForFd;
     pub const ipcReceiverHandoffHintForSendFd = ipc_state.ipcReceiverHandoffHintForSendFd;
     pub const takeIpcWritableWaitersForRecvFd = ipc_state.takeIpcWritableWaitersForRecvFd;
     pub const takeIpcChannelPeerCloseWaiters = ipc_state.takeIpcChannelPeerCloseWaiters;
+    pub const ipcNotifyPeerForFd = ipc_state.ipcNotifyPeerForFd;
+    pub const settleIpcPeerNotifyForFd = ipc_state.settleIpcPeerNotifyForFd;
+    pub const consumeIpcNotifyForFd = ipc_state.consumeIpcNotifyForFd;
+    pub const ipcNotifyWaiterForFd = ipc_state.ipcNotifyWaiterForFd;
+    pub const registerIpcNotifyWaiterForFd = ipc_state.registerIpcNotifyWaiterForFd;
+    pub const unregisterIpcNotifyWaiterForFd = ipc_state.unregisterIpcNotifyWaiterForFd;
+    pub const ipcChannelNotifyWaiterSnapshot = ipc_state.ipcChannelNotifyWaiterSnapshot;
+    pub const takeIpcChannelNotifyWaitersAfterClose = ipc_state.takeIpcChannelNotifyWaitersAfterClose;
+    pub const wakeIpcPollWaitersForSendFd = ipc_state.wakeIpcPollWaitersForSendFd;
     pub const ipcRecvWakeOwnersForSendFd = ipc_state.ipcRecvWakeOwnersForSendFd;
     pub const ipcMessageQueueForRecv = ipc_state.ipcMessageQueueForRecv;
     pub const fdFreeCountFrom = ipc_state.fdFreeCountFrom;
@@ -598,9 +695,24 @@ pub const KernelState = struct {
     pub const buildIpcMessage = ipc_state.buildIpcMessage;
     pub const enqueueIpcMessage = ipc_state.enqueueIpcMessage;
     pub const ipcSend = ipc_state.ipcSend;
-    pub const ipcReply = ipc_state.ipcReply;
+    pub const ipcClaimCallReply = ipc_state.ipcClaimCallReply;
+    pub const ipcFinishCallReply = ipc_state.ipcFinishCallReply;
+    pub const releaseIpcCallReference = ipc_state.releaseIpcCallReference;
+    pub const releaseIpcCallAuthority = ipc_state.releaseIpcCallAuthority;
+    pub const ipcExtractReply = ipc_state.ipcExtractReply;
+    pub const drainIpcCancellations = ipc_state.drainIpcCancellations;
+    pub const takeIpcCancellationWritableWaiters = ipc_state.takeIpcCancellationWritableWaiters;
     pub const ipcCall = ipc_state.ipcCall;
+    pub const ipcCreateCall = ipc_state.ipcCreateCall;
+    pub const ensureIpcBlock = ipc_state.ensureIpcBlock;
+    pub const registerIpcDirectReceive = ipc_state.registerIpcDirectReceive;
+    pub const cancelIpcDirectReceivers = ipc_state.cancelIpcDirectReceivers;
+    pub const closeIpcReceiveFd = ipc_state.closeIpcReceiveFd;
+    pub const ipcTakeDirectReceiver = ipc_state.ipcTakeDirectReceiver;
+    pub const ipcCancelCall = ipc_state.ipcCancelCall;
+    pub const ipcInstallMessage = ipc_state.ipcInstallMessage;
     pub const ipcRecv = ipc_state.ipcRecv;
+    pub const ipcRecvPendingCall = ipc_state.ipcRecvPendingCall;
     pub const ipcRecvWithWritableWake = ipc_state.ipcRecvWithWritableWake;
     pub const nextProcessCapacity = process_state.nextProcessCapacity;
     pub const ensureProcessCapacity = process_state.ensureProcessCapacity;
@@ -621,29 +733,10 @@ pub const KernelState = struct {
     pub const clearPrincipalState = process_state.clearPrincipalState;
     pub const initPrincipalState = process_state.initPrincipalState;
     pub const initDynamicPrincipalState = process_state.initDynamicPrincipalState;
+    // Constructors require fresh storage, not an initialized/live KernelState.
+    // No live reset API exists until all owned storage can be safely reclaimed.
     pub const initPhase1InPlace = memory_state.initPhase1InPlace;
-    pub fn initPhase1() KernelState {
-        var state: KernelState = undefined;
-        state.initPhase1InPlace();
-        return state;
-    }
     pub const initFromDetectedRegionsInPlace = memory_state.initFromDetectedRegionsInPlace;
-    pub fn initFromDetectedRegions(region_count: usize) KernelError!KernelState {
-        var state: KernelState = undefined;
-        try state.initFromDetectedRegionsInPlace(region_count);
-        return state;
-    }
-    pub const getRegion = memory_state.getRegion;
-    pub const getRegionConst = memory_state.getRegionConst;
-    pub const getEndpointTable = process_state.getEndpointTable;
-    pub const getEndpointTableConst = process_state.getEndpointTableConst;
-    pub const bumpEndpointGeneration = process_state.bumpEndpointGeneration;
-    pub const installEndpoint = process_state.installEndpoint;
-    pub const installServiceEndpointForActiveProcesses = process_state.installServiceEndpointForActiveProcesses;
-    pub const publishServiceEndpoint = process_state.publishServiceEndpoint;
-    pub const unpublishServiceEndpointsForTarget = process_state.unpublishServiceEndpointsForTarget;
-    pub const endpointTargetFor = process_state.endpointTargetFor;
-    pub const endpointTargetForKnownActiveOwner = process_state.endpointTargetForKnownActiveOwner;
     pub const debugWriteField = memory_state.debugWriteField;
     pub const debugLogMemoryOwnership = memory_state.debugLogMemoryOwnership;
     pub const allocPhysicalPage = memory_state.allocPhysicalPage;
@@ -659,7 +752,9 @@ fn containsCapId(ids: []const u64, target: u64) bool {
 }
 
 test "ipc send wake owner scan follows channel receive side" {
-    var state = KernelState.initPhase1();
+    var state: KernelState = undefined;
+    state.initPhase1InPlace();
+    defer state.deinitPools();
     const sender = processPrincipalFromIndex(0).?;
     const receiver = processPrincipalFromIndex(1).?;
     const rights = FdRights{
@@ -682,7 +777,9 @@ test "ipc send wake owner scan follows channel receive side" {
 }
 
 test "ipc send wake owner scan includes endpoint receiver" {
-    var state = KernelState.initPhase1();
+    var state: KernelState = undefined;
+    state.initPhase1InPlace();
+    defer state.deinitPools();
     const owner = processPrincipalFromIndex(0).?;
     const rights = FdRights{
         .inspect = true,
@@ -701,7 +798,9 @@ test "ipc send wake owner scan includes endpoint receiver" {
 }
 
 test "mmapFdIntoProcess installs vmo fd into target vma table" {
-    var state = KernelState.initPhase1();
+    var state: KernelState = undefined;
+    state.initPhase1InPlace();
+    defer state.deinitPools();
     const source = processPrincipalFromIndex(0).?;
     const target = processPrincipalFromIndex(1).?;
     const vmo_fd = try state.createAnonymousVmoFd(source, native_page_size, .{
@@ -730,4 +829,13 @@ test "mmapFdIntoProcess installs vmo fd into target vma table" {
     try std.testing.expect(!vma.prot.write);
     try std.testing.expect(vma.flags.fixed);
     try std.testing.expect(vma.flags.shared);
+}
+
+pub const BackingRef = types.BackingRef;
+pub const BackingStore = types.backing_index.Store;
+pub const backing_index = types.backing_index;
+
+pub fn useBackingPmmForTest(free_list: *types.FreePageList) void {
+    if (!@import("builtin").is_test) @compileError("test-only backing allocator");
+    types.backing_index.test_allocator = @import("memory/identity_allocator.zig").allocator(free_list);
 }

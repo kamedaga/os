@@ -14,7 +14,7 @@ static int64_t lpr_linux_file_vmo_call(uint32_t op, uint64_t flags,
     kb2_fs_request_t request = {.opcode = op, .handle = file->handle,
         .offset = (int64_t)file_offset, .length = length, .flags = flags};
     kb2_fs_response_t response;
-    int returned = -1;
+    pacha_fd_t returned = -1;
     const int64_t status = lpr_fs_call(&request, 0, 0, 0, 0, 0, 0,
         &response, -1, &returned);
     if (status < 0) return status;
@@ -52,7 +52,7 @@ int64_t lpr_linux_shared_file_vmo(
         out_file_size);
 }
 
-int64_t lpr_backend_write(uint64_t fd, uint64_t buf, uint64_t count)
+int64_t lpr_backend_write(uint64_t fd, uint64_t buf, uint64_t count, unsigned *wait_not_ready __attribute__((unused)))
 {
     if (lpr_block_backend(fd)) {
         const uint64_t offset = lpr_filed_control_offset(fd);
@@ -68,7 +68,7 @@ int64_t lpr_backend_write(uint64_t fd, uint64_t buf, uint64_t count)
         return count <= INT64_MAX ? (int64_t)count : -LPR_LINUX_EINVAL;
     }
     if (lpr_linux_tty_fd_active(fd)) {
-        return lpr_tty_io(TERMD_OP_HANDLE_WRITE, fd, buf, count);
+        return lpr_tty_io(TERMD_OP_HANDLE_WRITE, fd, buf, count, wait_not_ready);
     }
     if (lpr_linux_eventfd_active(fd)) {
         if (count < sizeof(uint64_t)) {
@@ -127,7 +127,7 @@ int64_t lpr_backend_write(uint64_t fd, uint64_t buf, uint64_t count)
             if (wait_status == 0)
                 wait_status = lpr_wait_deadline_init(&deadline, -1);
             if (wait_status == 0)
-                wait_status = lpr_wait_graph_block(&graph, &deadline);
+                wait_status = lpr_wait_graph_block(&graph, &deadline, wait_not_ready);
             if (wait_status != 0) return wait_status;
         }
     }
@@ -145,7 +145,7 @@ int64_t lpr_backend_write(uint64_t fd, uint64_t buf, uint64_t count)
         for (;;) {
             const int64_t n = lpr_pacha_syscall3(
                 PACHAOS_SYSCALL_FD_WRITE,
-                (uint64_t)(uint32_t)pipe->native.raw,
+                (uint64_t)pipe->native.raw,
                 buf,
                 count);
             if (n >= 0) return n;
@@ -160,7 +160,7 @@ int64_t lpr_backend_write(uint64_t fd, uint64_t buf, uint64_t count)
                 return err;
             }
             const uint64_t min_write = count <= LPR_LINUX_PIPE_BUF_BYTES ? count : 1;
-            const int64_t wait_status = lpr_pipe_wait(fd, 0x0004u, min_write);
+            const int64_t wait_status = lpr_pipe_wait(fd, 0x0004u, min_write, wait_not_ready);
             if (wait_status != 0) {
                 return wait_status;
             }
@@ -178,13 +178,13 @@ int64_t lpr_backend_write(uint64_t fd, uint64_t buf, uint64_t count)
     return -LPR_LINUX_EBADF;
 }
 
-int64_t lpr_backend_writev(uint64_t fd, uint64_t iov_raw, uint64_t iov_count)
+int64_t lpr_backend_writev(uint64_t fd, uint64_t iov_raw, uint64_t iov_count, unsigned *wait_not_ready __attribute__((unused)))
 {
     if (iov_raw == 0 && iov_count != 0) {
         return -LPR_LINUX_EFAULT;
     }
     if (lpr_block_backend(fd))
-        return lpr_iov_scalar_io(fd, iov_raw, iov_count, 1);
+        return lpr_iov_scalar_io(fd, iov_raw, iov_count, 1, wait_not_ready);
     if (lpr_linux_device_fd_active(fd)) {
         if ((lpr_device_backend(fd)->flags & LPR_LINUX_O_ACCMODE) == LPR_LINUX_O_RDONLY) {
             return -LPR_LINUX_EBADF;
@@ -198,7 +198,7 @@ int64_t lpr_backend_writev(uint64_t fd, uint64_t iov_raw, uint64_t iov_count)
         return (int64_t)total;
     }
     if (lpr_linux_tty_fd_active(fd)) {
-        return lpr_iov_scalar_io(fd, iov_raw, iov_count, 1);
+        return lpr_iov_scalar_io(fd, iov_raw, iov_count, 1, wait_not_ready);
     }
     if (!lpr_fd_is_filed(fd)) {
         if (lpr_pipe_fd_is_active(fd)) {
@@ -209,7 +209,7 @@ int64_t lpr_backend_writev(uint64_t fd, uint64_t iov_raw, uint64_t iov_count)
             for (;;) {
                 const int64_t n = lpr_pacha_syscall3(
                     PACHAOS_SYSCALL_FD_WRITEV,
-                    (uint64_t)(uint32_t)pipe->native.raw,
+                    (uint64_t)pipe->native.raw,
                     iov_raw,
                     iov_count);
                 if (n >= 0) {
@@ -226,7 +226,7 @@ int64_t lpr_backend_writev(uint64_t fd, uint64_t iov_raw, uint64_t iov_count)
                     return err;
                 }
                 const uint64_t min_write = lpr_pipe_writev_wait_min(iov_raw, iov_count);
-                const int64_t wait_status = lpr_pipe_wait(fd, 0x0004u, min_write);
+                const int64_t wait_status = lpr_pipe_wait(fd, 0x0004u, min_write, wait_not_ready);
                 if (wait_status != 0) {
                     return wait_status;
                 }
@@ -236,7 +236,7 @@ int64_t lpr_backend_writev(uint64_t fd, uint64_t iov_raw, uint64_t iov_count)
             int64_t total = 0;
             const lpr_linux_iovec_t *iov = (const lpr_linux_iovec_t *)(uintptr_t)iov_raw;
             for (uint64_t i = 0; i < iov_count; i += 1) {
-                const int64_t n = lpr_linux_write(fd, iov[i].base, iov[i].len);
+                const int64_t n = lpr_linux_write(fd, iov[i].base, iov[i].len, wait_not_ready);
                 if (n < 0) {
                     return total != 0 ? total : n;
                 }
@@ -592,7 +592,7 @@ int64_t lpr_linux_flock(uint64_t fd, uint64_t operation)
     }
 }
 
-int64_t lpr_backend_ioctl(uint64_t fd, uint64_t request, uint64_t arg)
+int64_t lpr_backend_ioctl(uint64_t fd, uint64_t request, uint64_t arg, unsigned *wait_not_ready __attribute__((unused)))
 {
     if (request == LPR_LINUX_FIONBIO) {
         if (arg == 0) {
@@ -618,7 +618,7 @@ int64_t lpr_backend_ioctl(uint64_t fd, uint64_t request, uint64_t arg)
         return lpr_input_ioctl(fd, request, arg);
     }
     if (lpr_linux_drm_fd_active(fd)) {
-        return lpr_drm_ioctl(fd, request, arg);
+        return lpr_drm_ioctl(fd, request, arg, wait_not_ready);
     }
     if (lpr_linux_tty_fd_active(fd)) {
         return lpr_tty_ioctl(fd, request, arg);
@@ -844,7 +844,7 @@ int64_t lpr_backend_fstat(uint64_t fd, uint64_t statbuf)
     return status;
 }
 
-static int64_t lpr_filed_fstat_close_metadata(uint64_t fd, uint64_t statbuf)
+static int64_t lpr_filed_fstat_close_metadata(uint64_t fd, uint64_t statbuf, unsigned *wait_not_ready __attribute__((unused)))
 {
     /* Keep metadata and close as individually acknowledged operations.  The
      * former two-entry fast-session batch had an unrecoverable ambiguity: if
@@ -854,12 +854,12 @@ static int64_t lpr_filed_fstat_close_metadata(uint64_t fd, uint64_t statbuf)
      * entries remained active, so a later fork observed a valid local FD with
      * a stale Filed handle.  A private newfstatat staging FD does not justify
      * weakening every other open file description in the process. */
-    const int64_t stat_status = lpr_linux_fstat(fd, statbuf);
+    const int64_t stat_status = lpr_linux_fstat(fd, statbuf, wait_not_ready);
     (void)lpr_linux_close(fd);
     return stat_status;
 }
 
-int64_t lpr_linux_newfstatat(uint64_t dirfd, uint64_t path_raw, uint64_t statbuf, uint64_t flags)
+int64_t lpr_linux_newfstatat(uint64_t dirfd, uint64_t path_raw, uint64_t statbuf, uint64_t flags, unsigned *wait_not_ready __attribute__((unused)))
 {
     if (statbuf == 0) {
         return -LPR_LINUX_EFAULT;
@@ -870,7 +870,7 @@ int64_t lpr_linux_newfstatat(uint64_t dirfd, uint64_t path_raw, uint64_t statbuf
     const uint64_t known_flags = LPR_LINUX_AT_EMPTY_PATH | LPR_LINUX_AT_SYMLINK_NOFOLLOW | 0x800u; /* AT_NO_AUTOMOUNT */
     if ((flags & ~known_flags) != 0) return -LPR_LINUX_EINVAL;
     if ((flags & LPR_LINUX_AT_EMPTY_PATH) != 0 && path[0] == 0) {
-        return lpr_linux_fstat(dirfd, statbuf);
+        return lpr_linux_fstat(dirfd, statbuf, wait_not_ready);
     }
     if (path[0] == '\0') return -LPR_LINUX_ENOENT;
     const int64_t drm_stat = lpr_drm_stat_path(path, statbuf);
@@ -903,22 +903,22 @@ int64_t lpr_linux_newfstatat(uint64_t dirfd, uint64_t path_raw, uint64_t statbuf
     if ((flags & LPR_LINUX_AT_SYMLINK_NOFOLLOW) != 0) {
         open_flags |= LPR_LINUX_O_NOFOLLOW;
     }
-    int64_t fd = lpr_linux_openat(dirfd, path_raw, open_flags, 0);
+    int64_t fd = lpr_linux_openat(dirfd, path_raw, open_flags, 0, wait_not_ready);
     /* ENOENT is definitive: adding O_DIRECTORY cannot make a missing path
      * appear, and toolkit startup probes many optional paths.  Only EISDIR
      * means the first open found an object that needs a directory handle. */
     if (fd == -LPR_LINUX_EISDIR) {
         fd = lpr_linux_openat(
-            dirfd, path_raw, open_flags | LPR_LINUX_O_DIRECTORY, 0);
+            dirfd, path_raw, open_flags | LPR_LINUX_O_DIRECTORY, 0, wait_not_ready);
     }
     lpr_trace_process_event("newfstatat_open", dirfd, flags, fd);
     if (fd < 0) {
         return fd;
     }
     if (lpr_fd_is_filed((uint64_t)fd)) {
-        return lpr_filed_fstat_close_metadata((uint64_t)fd, statbuf);
+        return lpr_filed_fstat_close_metadata((uint64_t)fd, statbuf, wait_not_ready);
     }
-    const int64_t status = lpr_linux_fstat((uint64_t)fd, statbuf);
+    const int64_t status = lpr_linux_fstat((uint64_t)fd, statbuf, wait_not_ready);
     lpr_trace_process_event("newfstatat_fstat", (uint64_t)fd, flags, status);
     (void)lpr_linux_close((uint64_t)fd);
     return status;
@@ -939,7 +939,7 @@ int64_t lpr_linux_statx(
     uint64_t path_raw,
     uint64_t flags,
     uint64_t mask,
-    uint64_t statxbuf)
+    uint64_t statxbuf, unsigned *wait_not_ready __attribute__((unused)))
 {
     enum {
         LPR_STATX_TYPE = 0x00000001u,
@@ -991,7 +991,7 @@ int64_t lpr_linux_statx(
         dirfd,
         path_raw,
         (uint64_t)(uintptr_t)&st,
-        flags & (LPR_LINUX_AT_SYMLINK_NOFOLLOW | LPR_LINUX_AT_EMPTY_PATH));
+        flags & (LPR_LINUX_AT_SYMLINK_NOFOLLOW | LPR_LINUX_AT_EMPTY_PATH), wait_not_ready);
     if (status != 0) {
         return status;
     }
@@ -1050,19 +1050,19 @@ int64_t lpr_linux_faccessat(uint64_t dirfd, uint64_t path_raw, uint64_t mode, ui
 }
 
 
-int64_t lpr_linux_open_metadata(uint64_t dirfd, uint64_t path_raw, uint64_t flags)
+int64_t lpr_linux_open_metadata(uint64_t dirfd, uint64_t path_raw, uint64_t flags, unsigned *wait_not_ready __attribute__((unused)))
 {
     uint64_t open_flags = LPR_LINUX_O_RDONLY;
     if ((flags & LPR_LINUX_AT_SYMLINK_NOFOLLOW) != 0) {
         open_flags |= LPR_LINUX_O_NOFOLLOW;
     }
-    int64_t fd = lpr_linux_openat(dirfd, path_raw, open_flags, 0);
+    int64_t fd = lpr_linux_openat(dirfd, path_raw, open_flags, 0, wait_not_ready);
     if (fd == -LPR_LINUX_EISDIR) {
         fd = lpr_linux_openat(
             dirfd,
             path_raw,
             open_flags | LPR_LINUX_O_DIRECTORY,
-            0);
+            0, wait_not_ready);
     }
     return fd;
 }

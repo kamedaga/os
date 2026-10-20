@@ -1,8 +1,10 @@
+const mmio = @import("memory/mmio.zig");
+const builtin = @import("builtin");
+const lock_diagnostics = @import("sync/lock_diagnostics.zig");
 const std = @import("std");
 const acpi_tables = @import("acpi_tables.zig");
 const user_copy = @import("user_copy.zig");
 const boot_scratch = @import("boot/boot_scratch.zig");
-const identity_limit = @import("arch/x86_64/physical_layout.zig").identity_limit;
 
 pub const Location = struct {
     bus: u8,
@@ -47,6 +49,7 @@ pub fn kernelStaticStorageEndAddr() usize {
     end = @max(end, @intFromPtr(&interrupt_route_no_pending_reuse) + @sizeOf(@TypeOf(interrupt_route_no_pending_reuse)));
     end = @max(end, @intFromPtr(&device_apertures) + @sizeOf(@TypeOf(device_apertures)));
     end = @max(end, @intFromPtr(&ecam_windows) + @sizeOf(@TypeOf(ecam_windows)));
+    if (comptime lock_diagnostics.enabled) end = @max(end, @intFromPtr(&config_record) + @sizeOf(@TypeOf(config_record)));
     return @max(end, @intFromPtr(&config_lock) + @sizeOf(@TypeOf(config_lock)));
 }
 
@@ -143,34 +146,179 @@ pub fn bootFunctionAt(index: usize) ?BootFunction {
 /// Capture firmware-assigned BARs before user drivers can enable bus mastering.
 /// The table is sized by discovery, rather than truncating at the IRQ budget.
 pub fn captureBootFunctions() bool {
+    return captureBootFunctionsWith(NativeBootCapture, boot_scratch);
+}
+
+const NativeBootCapture = struct {
+    const vendorId = readVendorId;
+    const headerType = readHeaderType;
+    const classCode = readClassCode;
+    const capture = captureBarAperturesInto;
+};
+
+// The same ownership transaction is exercised without PCI I/O in host tests.
+// Reader is compile-time selected: boot retains direct hardware calls, not a
+// runtime callback layer. Only the serial pre-AP boot wrapper may call this.
+fn captureBootFunctionsWith(comptime Reader: type, scratch: anytype) bool {
     var count: usize = 0;
     for (0..256) |bus| for (0..32) |device| {
         const first = Location{ .bus = @intCast(bus), .device = @intCast(device), .function = 0 };
-        if (readVendorId(first) == 0xffff) continue;
-        const functions: usize = if ((readHeaderType(first) & 0x80) != 0) 8 else 1;
+        if (Reader.vendorId(first) == 0xffff) continue;
+        const functions: usize = if ((Reader.headerType(first) & 0x80) != 0) 8 else 1;
         for (0..functions) |function| {
             const loc = Location{ .bus = @intCast(bus), .device = @intCast(device), .function = @intCast(function) };
-            if (readVendorId(loc) != 0xffff and readClassCode(loc) != 0x06) count += 1;
+            if (Reader.vendorId(loc) != 0xffff and Reader.classCode(loc) != 0x06) count += 1;
         }
     };
+    if (count == 0) {
+        device_apertures = &.{};
+        return true;
+    }
     const size = std.math.mul(usize, count, @sizeOf(DeviceApertures)) catch return false;
-    const storage = boot_scratch.allocate(size) orelse return false;
+    const allocation = scratch.reservePersistent(size) catch return false;
+    var loan: boot_scratch.Borrow = .{};
+    allocation.borrowInto(&loan) catch @panic("PCI catalog borrow rejected");
+    var published = false;
+    defer {
+        if (!loan.ended) loan.end() catch @panic("PCI catalog borrow end rejected");
+        if (!published) allocation.release() catch @panic("PCI catalog rollback rejected");
+    }
+    const storage = loan.bytes() catch @panic("PCI catalog view rejected");
     const entries: [*]DeviceApertures = @ptrCast(@alignCast(storage.ptr));
-    device_apertures = entries[0..count];
-    @memset(device_apertures, .{});
+    const draft = entries[0..count];
+    @memset(draft, .{});
     var index: usize = 0;
     for (0..256) |bus| for (0..32) |device| {
         const first = Location{ .bus = @intCast(bus), .device = @intCast(device), .function = 0 };
-        if (readVendorId(first) == 0xffff) continue;
-        const functions: usize = if ((readHeaderType(first) & 0x80) != 0) 8 else 1;
+        if (Reader.vendorId(first) == 0xffff) continue;
+        const functions: usize = if ((Reader.headerType(first) & 0x80) != 0) 8 else 1;
         for (0..functions) |function| {
             const loc = Location{ .bus = @intCast(bus), .device = @intCast(device), .function = @intCast(function) };
-            if (readVendorId(loc) == 0xffff or readClassCode(loc) == 0x06) continue;
-            if (index >= count or !captureBarApertures(resourceIdFromLocation(loc), index)) return false;
+            if (Reader.vendorId(loc) == 0xffff or Reader.classCode(loc) == 0x06) continue;
+            if (index >= count or !Reader.capture(draft, resourceIdFromLocation(loc), index)) return false;
             index += 1;
         }
     };
-    return index == count;
+    if (index != count) return false;
+    loan.end() catch @panic("PCI catalog borrow end rejected");
+    const catalog = allocation.publishPersistent() catch @panic("PCI catalog publication rejected");
+    // Firmware capture is complete before clients can observe any catalog.
+    device_apertures = @as([*]DeviceApertures, @ptrCast(@alignCast(catalog.ptr)))[0..count];
+    published = true;
+    return true;
+}
+
+fn TestBootCapture(comptime count: usize, comptime fail_index: ?usize) type {
+    return struct {
+        var expected: []DeviceApertures = &.{};
+        var captures: usize = 0;
+        var premature_publication: bool = false;
+
+        fn vendorId(loc: Location) u16 {
+            return if (loc.bus == 0 and loc.device < count and loc.function == 0) 0x1234 else 0xffff;
+        }
+        fn headerType(_: Location) u8 {
+            return 0;
+        }
+        fn classCode(_: Location) u8 {
+            return 0;
+        }
+        fn capture(draft: []DeviceApertures, resource_id: u64, index: usize) bool {
+            captures += 1;
+            if (device_apertures.ptr != expected.ptr or device_apertures.len != expected.len)
+                premature_publication = true;
+            if (fail_index == index) return false;
+            draft[index].resource_id = resource_id;
+            return true;
+        }
+    };
+}
+
+test "PCI empty boot capture leaves scratch untouched" {
+    var buffer: [4096]u8 align(4096) = undefined;
+    var owner: boot_scratch.Arena = .{};
+    try owner.install(&buffer);
+    const previous = device_apertures;
+    defer device_apertures = previous;
+    const Reader = TestBootCapture(0, null);
+    try std.testing.expect(captureBootFunctionsWith(Reader, &owner));
+    try std.testing.expectEqual(@as(usize, 0), device_apertures.len);
+    try std.testing.expectEqual(@as(usize, 0), owner.used);
+    try std.testing.expectEqual(@as(u64, 1), owner.next_id);
+    try owner.seal();
+}
+
+test "PCI partial boot capture cancels draft without publication" {
+    var buffer: [4096]u8 align(4096) = undefined;
+    var owner: boot_scratch.Arena = .{};
+    try owner.install(&buffer);
+    var old: [1]DeviceApertures = .{.{ .resource_id = 71 }};
+    const previous = device_apertures;
+    device_apertures = &old;
+    defer device_apertures = previous;
+    const Reader = TestBootCapture(3, 1);
+    Reader.expected = device_apertures;
+    Reader.captures = 0;
+    Reader.premature_publication = false;
+    try std.testing.expect(!captureBootFunctionsWith(Reader, &owner));
+    try std.testing.expectEqual(@as(usize, 2), Reader.captures);
+    try std.testing.expect(!Reader.premature_publication);
+    try std.testing.expect(device_apertures.ptr == old[0..].ptr);
+    try std.testing.expectEqual(@as(u64, 71), device_apertures[0].resource_id);
+    try std.testing.expectEqual(@as(usize, 0), owner.used);
+    // seal rejects a leaked private record/loan, not just a nonzero cursor.
+    try owner.seal();
+}
+
+test "PCI complete boot capture publishes only after all records" {
+    var buffer: [8192]u8 align(4096) = undefined;
+    var owner: boot_scratch.Arena = .{};
+    try owner.install(&buffer);
+    const previous = device_apertures;
+    defer device_apertures = previous;
+    const Reader = TestBootCapture(3, null);
+    Reader.expected = device_apertures;
+    Reader.captures = 0;
+    Reader.premature_publication = false;
+    try std.testing.expect(captureBootFunctionsWith(Reader, &owner));
+    try std.testing.expectEqual(@as(usize, 3), Reader.captures);
+    try std.testing.expect(!Reader.premature_publication);
+    try std.testing.expectEqual(@as(usize, 3), device_apertures.len);
+    for (device_apertures, 0..) |entry, index| {
+        try std.testing.expectEqual(resourceIdFromLocation(.{ .bus = 0, .device = @intCast(index), .function = 0 }), entry.resource_id);
+    }
+    try std.testing.expect(owner.used > 0);
+    const pointer = device_apertures.ptr;
+    try owner.seal();
+    // The real catalog lives in the prefix even when a future physical owner
+    // overwrites every reclaimable page. Claim and lookup still use that view.
+    try std.testing.expectEqual(@as(usize, 4096), owner.buffer.len);
+    @memset(buffer[4096..], 0xdd);
+    try std.testing.expect(device_apertures.ptr == pointer);
+    try std.testing.expectEqual(@as(usize, 3), bootFunctionCount());
+    try std.testing.expect(bootFunctionAt(2) != null);
+    markBootFunctionClaimed(2);
+    try std.testing.expect(bootFunctionClaimed(2));
+}
+
+test "PCI boot catalog reservation failure keeps existing publication" {
+    var buffer: [4096]u8 align(4096) = undefined;
+    var owner: boot_scratch.Arena = .{};
+    try owner.install(&buffer);
+    var old: [1]DeviceApertures = .{.{ .resource_id = 71 }};
+    const previous = device_apertures;
+    device_apertures = &old;
+    defer device_apertures = previous;
+    const Reader = TestBootCapture(32, null);
+    Reader.expected = device_apertures;
+    Reader.captures = 0;
+    Reader.premature_publication = false;
+    try std.testing.expect(!captureBootFunctionsWith(Reader, &owner));
+    try std.testing.expectEqual(@as(usize, 0), Reader.captures);
+    try std.testing.expect(device_apertures.ptr == old[0..].ptr);
+    try std.testing.expectEqual(@as(usize, 0), owner.used);
+    try std.testing.expectEqual(@as(u64, 1), owner.next_id);
+    try owner.seal();
 }
 
 test "PCI catalog is not bounded by interrupt-route slots" {
@@ -209,7 +357,15 @@ pub fn bootDmaWindowEnd(start: u64, ceiling: u64) u64 {
             return readConfigU32(loc, offset);
         }
     };
-    return bootDmaWindowEndWithReader(start, ceiling, ecam_windows.entries[0..ecam_windows.count], Reader{});
+    var end = ceiling;
+    var cursor = ecam_windows.head;
+    while (cursor) |node| : (cursor = node.next) {
+        const w = &node.window;
+        const base = w.base + (@as(u64, w.bus_start) << 20);
+        const last = w.base + ((@as(u64, w.bus_end) + 1) << 20) - 1;
+        end = @import("iova.zig").exclude(start, end, base, last);
+    }
+    return bootDmaWindowEndWithReader(start, end, &.{}, Reader{});
 }
 
 fn bootDmaWindowEndWithReader(start: u64, ceiling: u64, windows: []const EcamWindow, reader: anytype) u64 {
@@ -280,9 +436,9 @@ fn dmaBridgeWindowEnd(start: u64, end: u64, low: u32, base_high: u32, last_high:
 /// Called once while boot owns the device, before exposing any device FD.
 /// The capability grants these firmware-assigned apertures, not later BAR
 /// addresses a client writes. There is no allocator or resource policy here.
-pub fn captureBarApertures(resource_id: u64, device_index: usize) bool {
+fn captureBarAperturesInto(entries: []DeviceApertures, resource_id: u64, device_index: usize) bool {
     const loc = locationFromResourceId(resource_id) orelse return false;
-    if (device_index >= device_apertures.len or device_apertures[device_index].resource_id != 0) return false;
+    if (device_index >= entries.len or entries[device_index].resource_id != 0) return false;
     var captured = DeviceApertures{
         .resource_id = resource_id,
         .vendor_device = readConfigU32(loc, 0),
@@ -299,7 +455,7 @@ pub fn captureBarApertures(resource_id: u64, device_index: usize) bool {
             .high = if ((info.flags & bar_flag_64bit) != 0) readConfigU32(loc, 0x14 + bar_index * 4) else 0,
         };
     }
-    device_apertures[device_index] = captured;
+    entries[device_index] = captured;
     return true;
 }
 
@@ -327,7 +483,7 @@ pub fn authorizedBarInfo(resource_id: u64, bar_index: u8) ?BarInfo {
 const config_address_port: u16 = 0xCF8;
 const config_data_port: u16 = 0xCFC;
 
-const max_ecam_windows = 32;
+const owned_storage = @import("memory/owned_storage.zig");
 pub const EcamWindow = struct {
     base: u64,
     segment: u16,
@@ -342,12 +498,73 @@ pub const EcamWindow = struct {
             (@as(u64, loc.device) << 15) + (@as(u64, loc.function) << 12) + offset;
     }
 };
+/// A validated MCFG view, borrowed only until the PCI catalog is built.
 pub const EcamWindows = struct {
-    entries: [max_ecam_windows]EcamWindow = undefined,
-    count: usize = 0,
+    bytes: []const u8,
+    count: usize,
+    pub fn windowAt(self: EcamWindows, index: usize) EcamWindow {
+        const entry = self.bytes[index * 16 ..][0..16];
+        return .{ .base = std.mem.readInt(u64, entry[0..8], .little), .segment = std.mem.readInt(u16, entry[8..10], .little), .bus_start = entry[10], .bus_end = entry[11] };
+    }
 };
-var ecam_windows: EcamWindows = .{};
+const EcamNode = struct { next: ?*EcamNode = null, window: EcamWindow = undefined };
+// Allocation granularity, not a catalog limit: every grant occupies one page,
+// including owned_storage's header. Nodes stay stable; traversal allocates and
+// validates nothing and uses no indirect calls after boot publication.
+const ecam_nodes_per_page = blk: {
+    @setEvalBranchQuota(10000);
+    var n: usize = 1;
+    while ((owned_storage.requiredPages(EcamNode, n + 1) catch unreachable) == 1) : (n += 1) {}
+    break :blk n;
+};
+const EcamCatalog = struct {
+    owner: owned_storage.Owner = .{},
+    head: ?*EcamNode = null,
+    initialized: bool = false,
+    fn install(self: *EcamCatalog, parsed: EcamWindows, allocator: owned_storage.Allocator, mapper: anytype) !void {
+        if (self.initialized) return error.InvalidState;
+        var tx = owned_storage.Transaction.init(&self.owner, allocator);
+        var committed = false;
+        defer if (!committed) tx.rollback() catch @panic("ECAM draft rollback failed");
+        var draft: ?*EcamNode = null;
+        var link = &draft;
+        var index: usize = 0;
+        while (index < parsed.count) {
+            const count = @min(ecam_nodes_per_page, parsed.count - index);
+            const nodes = try tx.reserve(EcamNode, count, .replaceable);
+            for (nodes) |*node| {
+                node.* = .{ .window = parsed.windowAt(index) };
+                link.* = node;
+                link = &node.next;
+                index += 1;
+            }
+        }
+        // Reserve the entire catalog before changing mappings. No later OOM
+        // can expose a truncated prefix. Mapping failures retain legacy config.
+        var published: ?*EcamNode = null;
+        link = &published;
+        var cursor = draft;
+        while (cursor) |node| {
+            cursor = node.next;
+            const w = &node.window;
+            if (w.segment != 0 or !mapper.map(w.*)) continue;
+            link.* = node;
+            link = &node.next;
+        }
+        link.* = null;
+        if (published == null) {
+            self.initialized = true;
+            return;
+        }
+        try tx.commit();
+        committed = true;
+        self.head = published;
+        self.initialized = true;
+    }
+};
+var ecam_windows: EcamCatalog = .{};
 var config_lock: u8 = 0;
+var config_record: lock_diagnostics.Record = .{};
 
 pub fn parseMcfg(bytes: []const u8) ?EcamWindows {
     if (bytes.len < 44 or !std.mem.eql(u8, bytes[0..4], "MCFG")) return null;
@@ -356,10 +573,9 @@ pub fn parseMcfg(bytes: []const u8) ?EcamWindows {
     var sum: u8 = 0;
     for (bytes[0..length]) |byte| sum +%= byte;
     if (sum != 0 or !std.mem.allEqual(u8, bytes[36..44], 0)) return null;
-    var result = EcamWindows{};
+    const result = EcamWindows{ .bytes = bytes[44..length], .count = (length - 44) / 16 };
     var offset: usize = 44;
     while (offset < length) : (offset += 16) {
-        if (result.count == result.entries.len) return null;
         const entry = bytes[offset..][0..16];
         const window = EcamWindow{
             .base = std.mem.readInt(u64, entry[0..8], .little),
@@ -372,7 +588,8 @@ pub fn parseMcfg(bytes: []const u8) ?EcamWindows {
         const span = (@as(u64, window.bus_end) + 1) << 20;
         const end, const overflow = @addWithOverflow(window.base, span);
         if (overflow != 0 or end > 0x0010_0000_0000_0000) return null;
-        for (result.entries[0..result.count]) |prior| {
+        for (0..(offset - 44) / 16) |prior_index| {
+            const prior = result.windowAt(prior_index);
             if (prior.segment == window.segment and prior.bus_start <= window.bus_end and
                 window.bus_start <= prior.bus_end) return null;
             const start = window.base + (@as(u64, window.bus_start) << 20);
@@ -380,15 +597,13 @@ pub fn parseMcfg(bytes: []const u8) ?EcamWindows {
             const prior_end = prior.base + ((@as(u64, prior.bus_end) + 1) << 20);
             if (start < prior_end and prior_start < end) return null;
         }
-        result.entries[result.count] = window;
-        result.count += 1;
     }
     return result;
 }
 
 pub fn initEcam(rsdp_paddr: u64) void {
     const log = @import("kernel_log.zig");
-    ecam_windows.count = 0;
+    if (ecam_windows.initialized) return;
     const bytes = acpi_tables.find(rsdp_paddr, "MCFG", 44) orelse {
         log.write("pci: ECAM unavailable reason=no-valid-MCFG\n");
         return;
@@ -397,26 +612,26 @@ pub fn initEcam(rsdp_paddr: u64) void {
         log.write("pci: ECAM unavailable reason=invalid-MCFG-window\n");
         return;
     };
-    for (parsed.entries[0..parsed.count]) |window| {
-        if (window.segment != 0) continue;
-        const address = window.base + (@as(u64, window.bus_start) << 20);
-        const size = (@as(u64, window.bus_end) - window.bus_start + 1) << 20;
-        const mapped = @import("arch/x86_64/platform.zig").mapBootMmioIdentityRange(address, size);
-        log.writeFmt("pci: ECAM base=0x{x} segment={} buses={}-{} mapped_uc={}\n", .{
-            window.base, window.segment, window.bus_start, window.bus_end,
-            mapped,
-        });
-        if (!mapped) continue;
-        ecam_windows.entries[ecam_windows.count] = window;
-        ecam_windows.count += 1;
-    }
+    const Mapper = struct {
+        fn map(_: @This(), window: EcamWindow) bool {
+            const address = window.base + (@as(u64, window.bus_start) << 20);
+            const size = (@as(u64, window.bus_end) - window.bus_start + 1) << 20;
+            const mapped = @import("arch/x86_64/platform.zig").mapBootMmioRange(address, size);
+            log.writeFmt("pci: ECAM base=0x{x} segment={} buses={}-{} mapped_uc={}\n", .{ window.base, window.segment, window.bus_start, window.bus_end, mapped });
+            return mapped;
+        }
+    };
+    ecam_windows.install(parsed, @import("memory/identity_allocator.zig").allocator(@import("kernel_runtime.zig").global_free_list), Mapper{}) catch |err| {
+        log.writeFmt("pci: ECAM unavailable reason=storage error={s}\n", .{@errorName(err)});
+    };
 }
 
 fn ecamAddress(loc: Location, offset: u16) ?u64 {
-    for (ecam_windows.entries[0..ecam_windows.count]) |window| {
+    var cursor = ecam_windows.head;
+    while (cursor) |node| : (cursor = node.next) {
+        const window = &node.window;
         const address = window.address(loc, offset) orelse continue;
         // Only windows mapped UC before SMP startup are published here.
-        if (address >= identity_limit) return null;
         return address;
     }
     return null;
@@ -429,16 +644,19 @@ pub fn configAccessValid(loc: Location, offset: u32, width: u32) bool {
 }
 
 fn lockConfig() u64 {
-    const flags = asm volatile ("pushfq; popq %[flags]; cli"
+    const flags = if (builtin.is_test) @as(u64, 0) else asm volatile ("pushfq; popq %[flags]; cli"
         : [flags] "=r" (-> u64),
         :
         : .{ .memory = true });
+    lock_diagnostics.beforeAcquire(&config_record, .{ .class = .pci_config });
     while (@cmpxchgWeak(u8, &config_lock, 0, 1, .acquire, .monotonic) != null)
         std.atomic.spinLoopHint();
+    lock_diagnostics.acquired(&config_record, .{ .class = .pci_config });
     return flags;
 }
 
 fn unlockConfig(flags: u64) void {
+    lock_diagnostics.releasing(&config_record);
     @atomicStore(u8, &config_lock, 0, .release);
     if ((flags & (1 << 9)) != 0) asm volatile ("sti" ::: .{ .memory = true });
 }
@@ -535,14 +753,15 @@ pub fn readConfig(loc: Location, offset: u32, width: u32) ?u32 {
     defer unlockConfig(flags);
     if (offset < 256) return readLegacyConfig(NativeConfigIo{}, loc, @intCast(offset), width);
     const address = ecamAddress(loc, @intCast(offset)) orelse return null;
-    return readEcam(address, width);
+    const borrow = (@import("arch/x86_64/platform.zig").kernelMmioBorrow(address, width) orelse unreachable);
+    return readEcam(&borrow, width);
 }
 
-fn readEcam(address: u64, width: u32) u32 {
+fn readEcam(borrow: *const mmio.Borrow, width: u32) u32 {
     return switch (width) {
-        1 => @as(*volatile u8, @ptrFromInt(address)).*,
-        2 => @as(*volatile u16, @ptrFromInt(address)).*,
-        4 => @as(*volatile u32, @ptrFromInt(address)).*,
+        1 => borrow.read(u8, 0),
+        2 => borrow.read(u16, 0),
+        4 => borrow.read(u32, 0),
         else => unreachable,
     };
 }
@@ -555,16 +774,17 @@ pub fn writeConfig(loc: Location, offset: u32, width: u32, value: u32) bool {
         writeLegacyConfig(NativeConfigIo{}, loc, @intCast(offset), width, value);
     } else {
         const address = ecamAddress(loc, @intCast(offset)) orelse return false;
-        writeEcam(address, width, value);
+        const borrow = (@import("arch/x86_64/platform.zig").kernelMmioBorrow(address, width) orelse unreachable);
+        writeEcam(&borrow, width, value);
     }
     return true;
 }
 
-fn writeEcam(address: u64, width: u32, value: u32) void {
+fn writeEcam(borrow: *const mmio.Borrow, width: u32, value: u32) void {
     switch (width) {
-        1 => @as(*volatile u8, @ptrFromInt(address)).* = @truncate(value),
-        2 => @as(*volatile u16, @ptrFromInt(address)).* = @truncate(value),
-        4 => @as(*volatile u32, @ptrFromInt(address)).* = value,
+        1 => borrow.write(u8, 0, @truncate(value)),
+        2 => borrow.write(u16, 0, @truncate(value)),
+        4 => borrow.write(u32, 0, value),
         else => unreachable,
     }
 }
@@ -712,6 +932,20 @@ fn interruptEntryMask(kind: InterruptKind, entry: u32) ?u16 {
 }
 
 const NativeInterruptIo = struct {
+    fn waitMillis(_: @This(), ms: u32) bool {
+        const hpet = @import("hpet.zig");
+        const start = hpet.monotonicNs() orelse return false;
+        const duration = @as(u64, ms) * 1_000_000;
+        // A stopped clock must not hang owner teardown under KernelState.
+        var polls: usize = 0;
+        while (polls < 100_000_000) : (polls += 1) {
+            const now = hpet.monotonicNs() orelse return false;
+            if (now < start) return false;
+            if (now - start >= duration) return true;
+            std.atomic.spinLoopHint();
+        }
+        return false;
+    }
     fn config(_: @This(), loc: Location, offset: u8, width: u32) ?u32 {
         return readConfig(loc, offset, width);
     }
@@ -1480,7 +1714,7 @@ test "MCFG validates checksum ranges overlap and bus-zero-relative 4KiB ECAM add
     bytes[54] = 32;
     bytes[55] = 63;
     mcfgChecksum(bytes[0..60]);
-    const window = parseMcfg(bytes[0..60]).?.entries[0];
+    const window = parseMcfg(bytes[0..60]).?.windowAt(0);
     try std.testing.expectEqual(@as(?u64, 0xe20f_fffc), window.address(.{ .bus = 32, .device = 31, .function = 7 }, 4092));
     try std.testing.expect(window.address(.{ .bus = 31, .device = 0, .function = 0 }, 0) == null);
     try std.testing.expect(window.address(.{ .bus = 32, .device = 0, .function = 0 }, 4096) == null);
@@ -1505,14 +1739,13 @@ test "MCFG validates checksum ranges overlap and bus-zero-relative 4KiB ECAM add
 
 test "ECAM accesses preserve byte word and DWORD widths at the extended boundary" {
     var bytes: [4096]u8 align(4096) = [_]u8{0xa5} ** 4096;
-    const base: u64 = @intFromPtr(&bytes);
-    writeEcam(base + 4092, 4, 0x1122_3344);
-    try std.testing.expectEqual(@as(u32, 0x1122_3344), readEcam(base + 4092, 4));
-    writeEcam(base + 4092, 2, 0x5566);
-    try std.testing.expectEqual(@as(u32, 0x1122_5566), readEcam(base + 4092, 4));
-    writeEcam(base + 4095, 1, 0x77);
-    try std.testing.expectEqual(@as(u32, 0x77), readEcam(base + 4095, 1));
-    try std.testing.expectEqual(@as(u32, 0x7722), readEcam(base + 4094, 2));
+    writeEcam(&mmio.mappedAfterValidation(bytes[4092..].ptr, 4, .uc), 4, 0x1122_3344);
+    try std.testing.expectEqual(@as(u32, 0x1122_3344), readEcam(&mmio.mappedAfterValidation(bytes[4092..].ptr, 4, .uc), 4));
+    writeEcam(&mmio.mappedAfterValidation(bytes[4092..].ptr, 2, .uc), 2, 0x5566);
+    try std.testing.expectEqual(@as(u32, 0x1122_5566), readEcam(&mmio.mappedAfterValidation(bytes[4092..].ptr, 4, .uc), 4));
+    writeEcam(&mmio.mappedAfterValidation(bytes[4095..].ptr, 1, .uc), 1, 0x77);
+    try std.testing.expectEqual(@as(u32, 0x77), readEcam(&mmio.mappedAfterValidation(bytes[4095..].ptr, 1, .uc), 1));
+    try std.testing.expectEqual(@as(u32, 0x7722), readEcam(&mmio.mappedAfterValidation(bytes[4094..].ptr, 2, .uc), 2));
     try std.testing.expectEqual(@as(u8, 0xa5), bytes[4091]);
 }
 
@@ -1565,4 +1798,233 @@ test "routed interrupt vectors preserve device and MSI-X entry" {
     );
     try std.testing.expectEqual(@as(?InterruptRoute, null), interruptRouteForVector(0x41));
     try std.testing.expectEqual(@as(?InterruptRoute, null), interruptRouteForVector(0xD0));
+}
+
+test "lock ordering PCI config actual leaf holds forbid IPI waiting" {
+    if (!lock_diagnostics.enabled) return;
+    const flags = lockConfig();
+    try std.testing.expectEqual(lock_diagnostics.order.Class.pci_config, lock_diagnostics.testCpu().head.?.key.class);
+    try std.testing.expectError(error.IpiWaitWithBlockingLock, lock_diagnostics.testCpu().assertCanWaitForIpi());
+    unlockConfig(flags);
+    lock_diagnostics.assertRootEmpty();
+}
+
+fn testMcfg(allocator: std.mem.Allocator, count: usize) ![]u8 {
+    const bytes = try allocator.alloc(u8, 44 + count * 16);
+    @memset(bytes, 0);
+    @memcpy(bytes[0..4], "MCFG");
+    std.mem.writeInt(u32, bytes[4..8], @intCast(bytes.len), .little);
+    for (0..count) |index| {
+        const entry = bytes[44 + index * 16 ..][0..16];
+        std.mem.writeInt(u64, entry[0..8], 0x2000_0000 + (index / 256) * 0x1000_0000, .little);
+        std.mem.writeInt(u16, entry[8..10], @intCast(index / 256), .little);
+        entry[10] = @intCast(index % 256);
+        entry[11] = entry[10];
+    }
+    var sum: u8 = 0;
+    for (bytes) |b| sum +%= b;
+    bytes[9] = 0 -% sum;
+    return bytes;
+}
+
+test "MCFG former bounds and page grants publish only mapped windows" {
+    const Mapper = struct {
+        calls: *usize,
+        fn map(self: @This(), window: EcamWindow) bool {
+            self.calls.* += 1;
+            return window.bus_start % 2 == 0;
+        }
+    };
+    for ([_]usize{ 31, 32, 33, 256 }) |count| {
+        const bytes = try testMcfg(std.testing.allocator, count);
+        defer std.testing.allocator.free(bytes);
+        const parsed = parseMcfg(bytes).?;
+        try std.testing.expectEqual(count, parsed.count);
+        try std.testing.expectEqual(@as(u8, @intCast(count - 1)), parsed.windowAt(count - 1).bus_start);
+        var backend: owned_storage.TestAllocator = .{};
+        defer backend.deinit();
+        var catalog: EcamCatalog = .{};
+        var calls: usize = 0;
+        try catalog.install(parsed, backend.interface(), Mapper{ .calls = &calls });
+        try std.testing.expectEqual(count, calls);
+        try std.testing.expectEqual((count + ecam_nodes_per_page - 1) / ecam_nodes_per_page, backend.calls);
+        try std.testing.expectEqual(@as(usize, 1), backend.last_pages);
+        var node = catalog.head;
+        var index: usize = 0;
+        while (node) |entry| : (node = entry.next) {
+            try std.testing.expectEqual(index, entry.window.bus_start);
+            try std.testing.expectEqual(@as(?u64, 0x2000_0000 + index * 0x100000), entry.window.address(.{ .bus = @intCast(index), .device = 0, .function = 0 }, 0));
+            index += 2;
+        }
+        try std.testing.expectEqual((count + 1) / 2 * 2, index);
+        {
+            // Exercise the actual config lookup across page-grant boundaries.
+            const saved_head = ecam_windows.head;
+            ecam_windows.head = catalog.head;
+            defer ecam_windows.head = saved_head;
+            const last: u8 = @intCast((count - 1) & ~@as(usize, 1));
+            const loc = Location{ .bus = last, .device = 0, .function = 0 };
+            try std.testing.expectEqual(@as(?u64, 0x2000_0000 + @as(u64, last) * 0x100000 + 256), ecamAddress(loc, 256));
+            try std.testing.expect(configAccessValid(loc, 256, 4));
+            if (count > 1) try std.testing.expect(ecamAddress(.{ .bus = 1, .device = 0, .function = 0 }, 256) == null);
+        }
+        // Test owner teardown excludes every reader before retiring its pages.
+        catalog.head = null;
+        var retire = owned_storage.Transaction.init(&catalog.owner, backend.interface());
+        try retire.commit();
+        try catalog.owner.reclaimRetiredAfterBorrowExclusion();
+        try std.testing.expectEqual(@as(usize, 0), backend.active());
+    }
+}
+
+test "ECAM reservation failure never maps or publishes a prefix and retains refused returns" {
+    const bytes = try testMcfg(std.testing.allocator, 256);
+    defer std.testing.allocator.free(bytes);
+    const parsed = parseMcfg(bytes).?;
+    const Mapper = struct {
+        calls: *usize,
+        fn map(self: @This(), _: EcamWindow) bool {
+            self.calls.* += 1;
+            return true;
+        }
+    };
+    const pages = (parsed.count + ecam_nodes_per_page - 1) / ecam_nodes_per_page;
+    for (1..pages + 1) |fail_at| {
+        var backend = owned_storage.TestAllocator{ .fail_at = fail_at, .fail_return = true };
+        defer backend.deinit();
+        var catalog: EcamCatalog = .{};
+        var calls: usize = 0;
+        try std.testing.expectError(error.OutOfMemory, catalog.install(parsed, backend.interface(), Mapper{ .calls = &calls }));
+        try std.testing.expectEqual(@as(usize, 0), calls);
+        try std.testing.expect(catalog.head == null and !catalog.initialized);
+        try std.testing.expectEqual(fail_at - 1, backend.active());
+        try catalog.owner.retryUnpublished();
+        try std.testing.expectEqual(fail_at - 1, backend.active());
+        backend.fail_return = false;
+        try catalog.owner.retryUnpublished();
+        try std.testing.expect(catalog.owner.pending == null);
+        try std.testing.expectEqual(@as(usize, 0), backend.active());
+    }
+}
+
+test "ECAM all mapping failures publish no windows and retain refused draft returns" {
+    const bytes = try testMcfg(std.testing.allocator, 256);
+    defer std.testing.allocator.free(bytes);
+    const Mapper = struct {
+        fn map(_: @This(), _: EcamWindow) bool {
+            return false;
+        }
+    };
+    var backend = owned_storage.TestAllocator{ .fail_return = true };
+    defer backend.deinit();
+    var catalog: EcamCatalog = .{};
+    try catalog.install(parseMcfg(bytes).?, backend.interface(), Mapper{});
+    try std.testing.expect(catalog.initialized and catalog.head == null);
+    try std.testing.expect(catalog.owner.pending != null);
+    try std.testing.expectEqual(backend.calls, backend.active());
+    try catalog.owner.retryUnpublished();
+    try std.testing.expectEqual(backend.calls, backend.active());
+    backend.fail_return = false;
+    try catalog.owner.retryUnpublished();
+    try std.testing.expect(catalog.owner.pending == null);
+    try std.testing.expectEqual(@as(usize, 0), backend.active());
+}
+
+/// Caller excludes every surviving authority that can enable BME, including
+/// config_write, and holds that exclusion through ledger withdrawal. A clear
+/// BME bit alone is not a drain proof for conventional PCI or failed config IO.
+pub const BypassDmaTest = if (@import("builtin").is_test) struct {
+    pub var stop: ?*const fn (u64) bool = null;
+} else struct {};
+pub fn stopBypassDma(resource_id: u64) bool {
+    const loc = locationFromResourceId(resource_id) orelse return false;
+    if (@import("builtin").is_test) return if (BypassDmaTest.stop) |stop| stop(resource_id) else false;
+    return stopBypassDmaWith(NativeInterruptIo{}, loc);
+}
+
+fn stopBypassDmaWith(io: anytype, loc: Location) bool {
+    const command = io.config(loc, 4, 2) orelse return false;
+    if (command == 0xffff or !io.setConfig(loc, 4, 2, command & ~@as(u32, 4))) return false;
+    const readback = io.config(loc, 4, 2) orelse return false;
+    if (readback == 0xffff or readback & 4 != 0) return false;
+    const status = io.config(loc, 6, 2) orelse return false;
+    if (status == 0xffff or status & 0x10 == 0) return false;
+    const header = io.config(loc, 0x0e, 1) orelse return false;
+    if (header & 0x7f > 1) return false;
+    var cap = io.config(loc, 0x34, 1) orelse return false;
+    var seen: u64 = 0;
+    while (cap != 0) {
+        if (cap < 0x40 or cap > 0xfc or cap & 3 != 0) return false;
+        const bit = @as(u64, 1) << @as(u6, @intCast(cap / 4));
+        if (seen & bit != 0) return false;
+        seen |= bit;
+        const entry = io.config(loc, @intCast(cap), 2) orelse return false;
+        if (entry & 0xff == 0x10) {
+            if (cap > 0xf4) return false;
+            // Same bounded retry schedule as Linux pci_wait_for_pending:
+            // immediate, 100ms, 200ms, 400ms. Never clear the device-owned TP.
+            for ([_]u32{ 0, 100, 200, 400 }) |ms| {
+                if (ms != 0 and !io.waitMillis(ms)) return false;
+                const state = io.config(loc, @intCast(cap + 0x0a), 2) orelse return false;
+                if (state == 0xffff) return false;
+                if (state & 0x20 == 0) return true;
+            }
+            return false;
+        }
+        cap = (entry >> 8) & 0xff;
+    }
+    // No portable bound proves that conventional PCI bridges have drained
+    // posted DMA merely because a software delay elapsed. Retain the PFNs.
+    return false;
+}
+
+test "MMIO overlay PCI bypass DMA stop requires BME readback and bounded TP completion" {
+    const Io = struct {
+        command: u32 = 7,
+        status: u32 = 0x10,
+        capability: u32 = 0x10,
+        pending: bool = true,
+        clear_after: usize = 0,
+        waits: usize = 0,
+        milliseconds: u32 = 0,
+        ignore_write: bool = false,
+        fn config(self: *@This(), _: Location, offset: u8, _: u32) ?u32 {
+            return switch (offset) {
+                4 => self.command,
+                6 => self.status,
+                0x0e => 0,
+                0x34 => 0x40,
+                0x40 => self.capability,
+                0x4a => if (self.pending) 0x20 else 0,
+                else => null,
+            };
+        }
+        fn setConfig(self: *@This(), _: Location, offset: u8, width: u32, value: u32) bool {
+            std.debug.assert(offset == 4 and width == 2);
+            if (!self.ignore_write) self.command = value;
+            return true;
+        }
+        fn waitMillis(self: *@This(), ms: u32) bool {
+            std.debug.assert(self.command & 4 == 0);
+            self.waits += 1;
+            self.milliseconds += ms;
+            if (self.clear_after != 0 and self.waits == self.clear_after) self.pending = false;
+            return true;
+        }
+    };
+    const loc = Location{ .bus = 0, .device = 2, .function = 0 };
+    var ready = Io{ .clear_after = 2 };
+    try std.testing.expect(stopBypassDmaWith(&ready, loc));
+    try std.testing.expectEqual(@as(u32, 3), ready.command);
+    try std.testing.expectEqual(@as(u32, 300), ready.milliseconds);
+    var timeout = Io{};
+    try std.testing.expect(!stopBypassDmaWith(&timeout, loc));
+    try std.testing.expectEqual(@as(u32, 700), timeout.milliseconds);
+    var ignored = Io{ .ignore_write = true, .pending = false };
+    try std.testing.expect(!stopBypassDmaWith(&ignored, loc));
+    var conventional = Io{ .status = 0, .pending = false };
+    try std.testing.expect(!stopBypassDmaWith(&conventional, loc));
+    try std.testing.expectEqual(@as(u32, 3), conventional.command);
+    var cycle = Io{ .capability = 0x4001 };
+    try std.testing.expect(!stopBypassDmaWith(&cycle, loc));
 }

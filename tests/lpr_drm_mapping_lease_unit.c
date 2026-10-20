@@ -1,3 +1,4 @@
+#include "lpr_ipc_mock.h"
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
@@ -8,6 +9,8 @@
 
 static unsigned closes;
 static uint64_t pair_flags;
+static uint64_t pair_base = 80;
+static uint64_t high_closed;
 lpr_state_t lpr_state;
 static unsigned char wire_page[4096];
 static uint64_t request_id;
@@ -17,11 +20,11 @@ static int64_t map_failure, remap_failure;
 #if defined(LPR_UNMAP_PROFILE) && LPR_UNMAP_PROFILE
 static unsigned profile_logs;
 #endif
-int lpr_create_tty_wire_page(void **out) { *out = wire_page; return 91; }
-void lpr_destroy_tty_wire_page(int fd, void *page)
+pacha_fd_t lpr_create_tty_wire_page(void **out) { *out = wire_page; return 91; }
+void lpr_destroy_tty_wire_page(pacha_fd_t fd, void *page)
 { assert(fd == 91 && page == wire_page); }
 uint64_t lpr_next_request_id(volatile uint64_t *counter) { return ++*counter; }
-int64_t lpr_pacha_syscall2(uint64_t nr, uint64_t fd, uint64_t message)
+static int64_t fixture_prepare_request(uint64_t nr, uint64_t fd, uint64_t message)
 {
 #if defined(LPR_UNMAP_PROFILE) && LPR_UNMAP_PROFILE
     if (nr == PACHAOS_SYSCALL_LOG) {
@@ -60,7 +63,7 @@ int lpr_native_fd_info(uint64_t fd, struct pacha_fd_info *info)
             PACHA_FD_RIGHT_TRANSFER | PACHA_FD_RIGHT_SET_FLAGS };
     return 1;
 }
-int64_t lpr_pacha_syscall4(uint64_t nr, uint64_t fd, uint64_t min,
+static int64_t fixture_finish_request(uint64_t nr, uint64_t fd, uint64_t min,
     uint64_t rights, uint64_t flags)
 {
     if (nr == PACHAOS_SYSCALL_IPC_RECV_WAIT) {
@@ -86,6 +89,7 @@ void lpr_state_unlock(volatile uint32_t *lock)
 { assert(*lock == 1); __atomic_store_n(lock, 0, __ATOMIC_RELEASE); }
 int64_t lpr_pacha_syscall1(uint64_t nr, uint64_t fd)
 {
+    if (nr == PACHAOS_SYSCALL_FD_CLOSE && fd >= 0x80000000ull) { high_closed = fd; return 0; }
     assert(nr == PACHAOS_SYSCALL_FD_CLOSE && (fd == 80 || fd == 81 || fd == 92));
     if (fd != 92) ++closes;
     return 0;
@@ -96,7 +100,7 @@ int64_t lpr_pacha_syscall3(uint64_t nr, uint64_t address, uint64_t rights, uint6
     assert(rights & PACHA_FD_RIGHT_CLOSE);
     pair_flags = flags;
     uint64_t *pair = (void *)(uintptr_t)address;
-    pair[0] = 80; pair[1] = 81;
+    pair[0] = pair_base; pair[1] = pair_base + 1;
     return 0;
 }
 int64_t lpr_pacha_syscall6(uint64_t nr, uint64_t fd, uint64_t address,
@@ -173,6 +177,16 @@ static void check_native_replacements(void)
 
 int main(void)
 {
+    pacha_fd_t high_local, high_remote;
+    pair_base = 0x80000000ull;
+    assert(!lpr_native_wait_pair(&high_local, &high_remote));
+    assert(high_local == 0x80000000ll && high_remote == 0x80000001ll);
+    lpr_event_backend_t event = { .wait_fd.raw = high_local, .notify_fd.raw = high_remote };
+    assert(event.wait_fd.raw == high_local && event.notify_fd.raw == high_remote);
+    assert(lpr_drm_map_received(90, 0xfffffffdll, 0x50000, 4096, 3, 1, 0) == 0x50000);
+    assert(!lpr_drm_native_munmap(0x50000, 4096));
+    assert(high_closed == 0xfffffffdull);
+    pair_base = 80;
     check_unmap_reuse();
     check_native_replacements();
 #if defined(LPR_UNMAP_PROFILE) && LPR_UNMAP_PROFILE
@@ -184,7 +198,7 @@ int main(void)
     assert(lpr_unmap_profile_totals.value[0] == 0);
 #endif
     closes = 0;
-    int local, remote;
+    pacha_fd_t local, remote;
     assert(!lpr_native_wait_pair(&local, &remote));
     assert(pair_flags == PACHA_FD_FLAG_INHERIT);
     assert(!lpr_native_wait_pair_flags(&local, &remote,
@@ -227,4 +241,32 @@ int main(void)
     lpr_drm_mapping_unmapped(0x900000, 4096);
     assert(closes == 6 + LPR_DRM_MAPPING_LEASE_CAPACITY + 1);
     puts("DRM mapping lease flags, split-unmap and fixed-replacement PASS");
+}
+
+/* Request preparation and reply rendering are fixture phases within one
+ * synchronous syscall. Their transaction tags never become caller FDs. */
+int64_t lpr_pacha_syscall2(uint64_t nr, uint64_t a, uint64_t b)
+{
+    assert(nr != PACHAOS_SYSCALL_IPC_CALL);
+    return fixture_prepare_request(nr, a, b);
+}
+int64_t lpr_pacha_syscall4(uint64_t nr, uint64_t a, uint64_t b, uint64_t c, uint64_t d)
+{
+    return fixture_finish_request(nr, a, b, c, d);
+}
+int64_t lpr_ipc_message(uint64_t nr, uint64_t endpoint,
+    uint64_t request, uint64_t reply, uint64_t timeout, uint64_t flags, int *sent)
+{
+    if (nr != PACHA_IPC_SYSCALL_CALL) return test_lpr_ipc_noncall(nr, endpoint, request, reply, timeout, flags, sent);
+
+    assert(nr == PACHAOS_SYSCALL_IPC_CALL && request && reply);
+    assert(timeout == UINT64_MAX && flags == PACHA_WAIT_UNINTERRUPTIBLE);
+    *sent = 0;
+    int64_t transaction = fixture_prepare_request(nr, endpoint, request);
+    if (transaction < 16) return transaction;
+    *sent = 1;
+    int64_t status = fixture_finish_request(PACHAOS_SYSCALL_IPC_RECV_WAIT,
+        (uint64_t)transaction, reply, timeout, flags);
+
+    return status;
 }

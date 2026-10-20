@@ -1,3 +1,4 @@
+#include <pacha/abi.h>
 /* SPDX-License-Identifier: MIT */
 #pragma once
 
@@ -9,7 +10,7 @@
 struct filed_storage_owner;
 struct ph_fs_channel_config;
 
-int filed_storage_owner_create(int bootfs_fd, uint64_t bootfs_size,
+int filed_storage_owner_create(pacha_fd_t bootfs_fd, uint64_t bootfs_size,
     const storage_filed_bootstrap_t *bootstrap, struct filed_storage_owner **out);
 int filed_storage_owner_start(struct filed_storage_owner *owner);
 /* Serialized control-plane calls. IDs are fresh even after detach; caller
@@ -22,7 +23,7 @@ int filed_storage_owner_start(struct filed_storage_owner *owner);
 int filed_storage_owner_client_config(struct filed_storage_owner *, uint64_t client, uint64_t minimum_arena,
     struct ph_fs_channel_config *);
 int filed_storage_owner_client_bind(struct filed_storage_owner *,
-    const struct ph_fs_channel_config *, int vmo_fd, int doorbell_fd);
+    const struct ph_fs_channel_config *, pacha_fd_t vmo_fd, pacha_fd_t doorbell_fd);
 int filed_storage_owner_client_release(struct filed_storage_owner *, uint64_t channel_id);
 int filed_storage_owner_call(struct filed_storage_owner *owner,
     const uint8_t *request, size_t request_size, uint8_t *response,

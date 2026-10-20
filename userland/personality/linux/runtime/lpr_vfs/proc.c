@@ -35,7 +35,7 @@ static lpr_cpuid_result_t lpr_cpuid(uint32_t leaf, uint32_t subleaf)
     return result;
 }
 
-static int64_t lpr_proc_write_all(uint64_t fd, const void *buffer, uint64_t length)
+static int64_t lpr_proc_write_all(uint64_t fd, const void *buffer, uint64_t length, unsigned *wait_not_ready __attribute__((unused)))
 {
     const uint8_t *bytes = (const uint8_t *)buffer;
     uint64_t written = 0;
@@ -43,7 +43,7 @@ static int64_t lpr_proc_write_all(uint64_t fd, const void *buffer, uint64_t leng
         const int64_t status = lpr_linux_write(
             fd,
             (uint64_t)(uintptr_t)(bytes + written),
-            length - written);
+            length - written, wait_not_ready);
         if (status < 0) return status;
         if (status == 0) return -LPR_LINUX_EIO;
         written += (uint64_t)status;
@@ -51,9 +51,9 @@ static int64_t lpr_proc_write_all(uint64_t fd, const void *buffer, uint64_t leng
     return 0;
 }
 
-static int64_t lpr_proc_write_string(uint64_t fd, const char *string)
+static int64_t lpr_proc_write_string(uint64_t fd, const char *string, unsigned *wait_not_ready __attribute__((unused)))
 {
-    return lpr_proc_write_all(fd, string, (uint64_t)lpr_strlen(string));
+    return lpr_proc_write_all(fd, string, (uint64_t)lpr_strlen(string), wait_not_ready);
 }
 
 static uint64_t lpr_proc_format_u64(char *buffer, uint64_t value)
@@ -117,22 +117,22 @@ static int64_t lpr_proc_buffer_append_field_u64(
     return status;
 }
 
-static int64_t lpr_proc_write_u64(uint64_t fd, uint64_t value)
+static int64_t lpr_proc_write_u64(uint64_t fd, uint64_t value, unsigned *wait_not_ready __attribute__((unused)))
 {
     char buffer[24];
     const uint64_t length = lpr_proc_format_u64(buffer, value);
-    return lpr_proc_write_all(fd, buffer, length);
+    return lpr_proc_write_all(fd, buffer, length, wait_not_ready);
 }
 
 static int64_t lpr_proc_write_field_u64(
     uint64_t fd,
     const char *name,
     uint64_t value,
-    const char *suffix)
+    const char *suffix, unsigned *wait_not_ready __attribute__((unused)))
 {
-    int64_t status = lpr_proc_write_string(fd, name);
-    if (status == 0) status = lpr_proc_write_u64(fd, value);
-    if (status == 0) status = lpr_proc_write_string(fd, suffix);
+    int64_t status = lpr_proc_write_string(fd, name, wait_not_ready);
+    if (status == 0) status = lpr_proc_write_u64(fd, value, wait_not_ready);
+    if (status == 0) status = lpr_proc_write_string(fd, suffix, wait_not_ready);
     return status;
 }
 
@@ -327,7 +327,7 @@ static int64_t lpr_proc_buffer_append_cpu_flags(
     return status;
 }
 
-static int64_t lpr_proc_write_cpuinfo(uint64_t fd)
+static int64_t lpr_proc_write_cpuinfo(uint64_t fd, unsigned *wait_not_ready __attribute__((unused)))
 {
     pachaos_system_info_t system_info;
     lpr_memset(&system_info, 0, sizeof(system_info));
@@ -388,13 +388,13 @@ static int64_t lpr_proc_write_cpuinfo(uint64_t fd)
         if (status == 0) status = lpr_proc_buffer_append_cpu_flags(
             &record, &leaf1, &leaf7, &extended1);
         if (status != 0) return status;
-        status = lpr_proc_write_all(fd, record.bytes, record.length);
+        status = lpr_proc_write_all(fd, record.bytes, record.length, wait_not_ready);
         if (status != 0) return status;
     }
     return 0;
 }
 
-static int64_t lpr_proc_write_meminfo(uint64_t fd)
+static int64_t lpr_proc_write_meminfo(uint64_t fd, unsigned *wait_not_ready __attribute__((unused)))
 {
     pachaos_system_info_t system_info;
     lpr_memset(&system_info, 0, sizeof(system_info));
@@ -405,9 +405,9 @@ static int64_t lpr_proc_write_meminfo(uint64_t fd)
     uint64_t total_kb = system_info.total_usable_memory_bytes / 1024u;
     uint64_t free_kb = system_info.free_memory_bytes / 1024u;
     if (free_kb > total_kb) free_kb = total_kb;
-    int64_t status = lpr_proc_write_field_u64(fd, "MemTotal:       ", total_kb, " kB\n");
-    if (status == 0) status = lpr_proc_write_field_u64(fd, "MemFree:        ", free_kb, " kB\n");
-    if (status == 0) status = lpr_proc_write_field_u64(fd, "MemAvailable:   ", free_kb, " kB\n");
+    int64_t status = lpr_proc_write_field_u64(fd, "MemTotal:       ", total_kb, " kB\n", wait_not_ready);
+    if (status == 0) status = lpr_proc_write_field_u64(fd, "MemFree:        ", free_kb, " kB\n", wait_not_ready);
+    if (status == 0) status = lpr_proc_write_field_u64(fd, "MemAvailable:   ", free_kb, " kB\n", wait_not_ready);
     if (status == 0) status = lpr_proc_write_string(
         fd,
         "Buffers:               0 kB\n"
@@ -417,25 +417,25 @@ static int64_t lpr_proc_write_meminfo(uint64_t fd)
         "Inactive:              0 kB\n"
         "Shmem:                 0 kB\n"
         "SwapTotal:             0 kB\n"
-        "SwapFree:              0 kB\n");
+        "SwapFree:              0 kB\n", wait_not_ready);
     return status;
 }
 
 static int64_t lpr_proc_write_stat_cpu(
     uint64_t fd,
     const char *name,
-    uint64_t idle_ticks)
+    uint64_t idle_ticks, unsigned *wait_not_ready __attribute__((unused)))
 {
-    int64_t status = lpr_proc_write_string(fd, name);
-    if (status == 0) status = lpr_proc_write_string(fd, " 0 0 0 ");
-    if (status == 0) status = lpr_proc_write_u64(fd, idle_ticks);
+    int64_t status = lpr_proc_write_string(fd, name, wait_not_ready);
+    if (status == 0) status = lpr_proc_write_string(fd, " 0 0 0 ", wait_not_ready);
+    if (status == 0) status = lpr_proc_write_u64(fd, idle_ticks, wait_not_ready);
     if (status == 0) {
-        status = lpr_proc_write_string(fd, " 0 0 0 0 0 0\n");
+        status = lpr_proc_write_string(fd, " 0 0 0 0 0 0\n", wait_not_ready);
     }
     return status;
 }
 
-static int64_t lpr_proc_write_stat(uint64_t fd)
+static int64_t lpr_proc_write_stat(uint64_t fd, unsigned *wait_not_ready __attribute__((unused)))
 {
     pachaos_system_info_t system_info;
     lpr_memset(&system_info, 0, sizeof(system_info));
@@ -458,7 +458,7 @@ static int64_t lpr_proc_write_stat(uint64_t fd)
      * to enumerate CPUs during glibtop_init(), before callers request any CPU
      * accounting.  PachaOS does not expose per-CPU accounting to userland, so
      * report elapsed boot time as idle time instead of inventing busy time. */
-    status = lpr_proc_write_stat_cpu(fd, "cpu", idle_ticks * cpu_count);
+    status = lpr_proc_write_stat_cpu(fd, "cpu", idle_ticks * cpu_count, wait_not_ready);
     for (uint64_t cpu = 0; status == 0 && cpu < cpu_count; ++cpu) {
         lpr_proc_buffer_t name;
         lpr_memset(&name, 0, sizeof(name));
@@ -466,7 +466,7 @@ static int64_t lpr_proc_write_stat(uint64_t fd)
         if (status == 0) status = lpr_proc_buffer_append_u64(&name, cpu);
         if (status != 0) break;
         name.bytes[name.length] = '\0';
-        status = lpr_proc_write_stat_cpu(fd, name.bytes, idle_ticks);
+        status = lpr_proc_write_stat_cpu(fd, name.bytes, idle_ticks, wait_not_ready);
     }
     if (status == 0) {
         status = lpr_proc_write_string(
@@ -475,19 +475,19 @@ static int64_t lpr_proc_write_stat(uint64_t fd)
             "ctxt 0\n"
             "processes 0\n"
             "procs_running 1\n"
-            "procs_blocked 0\n");
+            "procs_blocked 0\n", wait_not_ready);
     }
     return status;
 }
 
-static int64_t lpr_proc_write_mounts(uint64_t fd)
+static int64_t lpr_proc_write_mounts(uint64_t fd, unsigned *wait_not_ready __attribute__((unused)))
 {
     return lpr_proc_write_string(
         fd,
         "rootfs / ext4 rw,relatime 0 0\n"
         "tmpfs /run tmpfs rw,nosuid,nodev 0 0\n"
         "tmpfs /dev/shm tmpfs rw,nosuid,nodev 0 0\n"
-        "proc /proc proc ro,nosuid,nodev,noexec,relatime 0 0\n");
+        "proc /proc proc ro,nosuid,nodev,noexec,relatime 0 0\n", wait_not_ready);
 }
 
 typedef struct lpr_proc_root_entry {
@@ -621,103 +621,103 @@ static const char *lpr_proc_pid_state_text(char state)
  * report the call the process is inside, which is what the field is read for. */
 static int64_t lpr_proc_write_pid_wchan(
     uint64_t fd,
-    const lprs_process_query_t *info)
+    const lprs_process_query_t *info, unsigned *wait_not_ready __attribute__((unused)))
 {
-    if (info->diag_valid == 0) return lpr_proc_write_string(fd, "0");
+    if (info->diag_valid == 0) return lpr_proc_write_string(fd, "0", wait_not_ready);
     if (info->syscall_nr == LPRS_DIAG_SYSCALL_NONE)
-        return lpr_proc_write_string(fd, "0");
-    int64_t status = lpr_proc_write_string(fd, "syscall_");
-    if (status == 0) status = lpr_proc_write_u64(fd, info->syscall_nr);
+        return lpr_proc_write_string(fd, "0", wait_not_ready);
+    int64_t status = lpr_proc_write_string(fd, "syscall_", wait_not_ready);
+    if (status == 0) status = lpr_proc_write_u64(fd, info->syscall_nr, wait_not_ready);
     return status;
 }
 
 /* Linux prints "nr arg0 ... arg5 sp pc", or "running" outside a call. */
 static int64_t lpr_proc_write_pid_syscall(
     uint64_t fd,
-    const lprs_process_query_t *info)
+    const lprs_process_query_t *info, unsigned *wait_not_ready __attribute__((unused)))
 {
     if (info->diag_valid == 0 || info->syscall_nr == LPRS_DIAG_SYSCALL_NONE) {
-        return lpr_proc_write_string(fd, "running\n");
+        return lpr_proc_write_string(fd, "running\n", wait_not_ready);
     }
-    int64_t status = lpr_proc_write_u64(fd, info->syscall_nr);
+    int64_t status = lpr_proc_write_u64(fd, info->syscall_nr, wait_not_ready);
     if (status == 0)
-        status = lpr_proc_write_field_u64(fd, " 0x", info->syscall_arg0, "");
+        status = lpr_proc_write_field_u64(fd, " 0x", info->syscall_arg0, "", wait_not_ready);
     if (status == 0)
-        status = lpr_proc_write_field_u64(fd, " 0x", info->syscall_arg1, "");
+        status = lpr_proc_write_field_u64(fd, " 0x", info->syscall_arg1, "", wait_not_ready);
     if (status == 0)
         status = lpr_proc_write_field_u64(
-            fd, " enter_tsc=", info->syscall_enter_tick, "");
-    if (status == 0) status = lpr_proc_write_string(fd, "\n");
+            fd, " enter_tsc=", info->syscall_enter_tick, "", wait_not_ready);
+    if (status == 0) status = lpr_proc_write_string(fd, "\n", wait_not_ready);
     return status;
 }
 
 static int64_t lpr_proc_write_pid_comm(
     uint64_t fd,
-    const lprs_process_query_t *info)
+    const lprs_process_query_t *info, unsigned *wait_not_ready __attribute__((unused)))
 {
     int64_t status = lpr_proc_write_string(
-        fd, info->comm[0] != '\0' ? info->comm : "unknown");
-    if (status == 0) status = lpr_proc_write_string(fd, "\n");
+        fd, info->comm[0] != '\0' ? info->comm : "unknown", wait_not_ready);
+    if (status == 0) status = lpr_proc_write_string(fd, "\n", wait_not_ready);
     return status;
 }
 
 static int64_t lpr_proc_write_pid_cmdline(
     uint64_t fd,
-    const lprs_process_query_t *info)
+    const lprs_process_query_t *info, unsigned *wait_not_ready __attribute__((unused)))
 {
     /* Linux separates arguments with NUL bytes.  Only the executed path is
      * recorded, so emit that single entry in the same shape. */
     if (info->cmdline[0] == '\0') return 0;
     const uint64_t length = (uint64_t)lpr_strnlen(
         info->cmdline, sizeof(info->cmdline));
-    const int64_t status = lpr_proc_write_all(fd, info->cmdline, length);
+    const int64_t status = lpr_proc_write_all(fd, info->cmdline, length, wait_not_ready);
     if (status != 0) return status;
-    return lpr_proc_write_all(fd, "", 1u);
+    return lpr_proc_write_all(fd, "", 1u, wait_not_ready);
 }
 
 static int64_t lpr_proc_write_pid_status(
     uint64_t fd,
     uint64_t pid,
-    const lprs_process_query_t *info)
+    const lprs_process_query_t *info, unsigned *wait_not_ready __attribute__((unused)))
 {
     const char state = lpr_proc_pid_state_char(info);
-    int64_t status = lpr_proc_write_string(fd, "Name:\t");
+    int64_t status = lpr_proc_write_string(fd, "Name:\t", wait_not_ready);
     if (status == 0)
         status = lpr_proc_write_string(
-            fd, info->comm[0] != '\0' ? info->comm : "unknown");
-    if (status == 0) status = lpr_proc_write_string(fd, "\nState:\t");
+            fd, info->comm[0] != '\0' ? info->comm : "unknown", wait_not_ready);
+    if (status == 0) status = lpr_proc_write_string(fd, "\nState:\t", wait_not_ready);
     if (status == 0)
-        status = lpr_proc_write_string(fd, lpr_proc_pid_state_text(state));
-    if (status == 0) status = lpr_proc_write_string(fd, "\n");
-    if (status == 0) status = lpr_proc_write_field_u64(fd, "Tgid:\t", pid, "\n");
-    if (status == 0) status = lpr_proc_write_field_u64(fd, "Pid:\t", pid, "\n");
+        status = lpr_proc_write_string(fd, lpr_proc_pid_state_text(state), wait_not_ready);
+    if (status == 0) status = lpr_proc_write_string(fd, "\n", wait_not_ready);
+    if (status == 0) status = lpr_proc_write_field_u64(fd, "Tgid:\t", pid, "\n", wait_not_ready);
+    if (status == 0) status = lpr_proc_write_field_u64(fd, "Pid:\t", pid, "\n", wait_not_ready);
     if (status == 0)
-        status = lpr_proc_write_field_u64(fd, "PPid:\t", info->ppid, "\n");
+        status = lpr_proc_write_field_u64(fd, "PPid:\t", info->ppid, "\n", wait_not_ready);
     if (status == 0)
-        status = lpr_proc_write_field_u64(fd, "NSpid:\t", pid, "\n");
-    if (status == 0) status = lpr_proc_write_string(fd, "Threads:\t1\n");
+        status = lpr_proc_write_field_u64(fd, "NSpid:\t", pid, "\n", wait_not_ready);
+    if (status == 0) status = lpr_proc_write_string(fd, "Threads:\t1\n", wait_not_ready);
     return status;
 }
 
 static int64_t lpr_proc_write_pid_stat(
     uint64_t fd,
     uint64_t pid,
-    const lprs_process_query_t *info)
+    const lprs_process_query_t *info, unsigned *wait_not_ready __attribute__((unused)))
 {
     /* Fields 1..24 of the Linux layout.  Everything the supervisor cannot
      * observe is reported as zero rather than invented, with the scheduling
      * constants at their defaults so parsers keep working. */
-    int64_t status = lpr_proc_write_u64(fd, pid);
-    if (status == 0) status = lpr_proc_write_string(fd, " (");
+    int64_t status = lpr_proc_write_u64(fd, pid, wait_not_ready);
+    if (status == 0) status = lpr_proc_write_string(fd, " (", wait_not_ready);
     if (status == 0)
         status = lpr_proc_write_string(
-            fd, info->comm[0] != '\0' ? info->comm : "unknown");
-    if (status == 0) status = lpr_proc_write_string(fd, ") ");
+            fd, info->comm[0] != '\0' ? info->comm : "unknown", wait_not_ready);
+    if (status == 0) status = lpr_proc_write_string(fd, ") ", wait_not_ready);
     char state[2] = { lpr_proc_pid_state_char(info), '\0' };
-    if (status == 0) status = lpr_proc_write_string(fd, state);
-    if (status == 0) status = lpr_proc_write_field_u64(fd, " ", info->ppid, "");
-    if (status == 0) status = lpr_proc_write_field_u64(fd, " ", info->pgrp, "");
-    if (status == 0) status = lpr_proc_write_field_u64(fd, " ", info->sid, "");
+    if (status == 0) status = lpr_proc_write_string(fd, state, wait_not_ready);
+    if (status == 0) status = lpr_proc_write_field_u64(fd, " ", info->ppid, "", wait_not_ready);
+    if (status == 0) status = lpr_proc_write_field_u64(fd, " ", info->pgrp, "", wait_not_ready);
+    if (status == 0) status = lpr_proc_write_field_u64(fd, " ", info->sid, "", wait_not_ready);
     /* Fields 7..52.  procps parses a fixed count and fails outright on a short
      * line, so the row is emitted at full width: tty_nr, tpgid, then zeros for
      * everything the supervisor cannot observe, with priority 20, nice 0 and a
@@ -734,8 +734,8 @@ static int64_t lpr_proc_write_pid_stat(
             " 0 0 0 0 0"          /* 38-42 exit_signal processor rt_priority policy blkio */
             " 0 0 0"              /* 43-45 guest_time cguest_time start_data */
             " 0 0 0 0 0 0"        /* 46-51 end_data..env_end */
-            " 0");                /* 52    exit_code */
-    if (status == 0) status = lpr_proc_write_string(fd, "\n");
+            " 0", wait_not_ready);                /* 52    exit_code */
+    if (status == 0) status = lpr_proc_write_string(fd, "\n", wait_not_ready);
     return status;
 }
 
@@ -743,7 +743,7 @@ static int64_t lpr_proc_pid_snapshot_open(
     const char *path,
     uint64_t pid,
     lpr_proc_pid_kind_t kind,
-    uint64_t flags)
+    uint64_t flags, unsigned *wait_not_ready __attribute__((unused)))
 {
     lprs_process_query_t info;
     lpr_memset(&info, 0, sizeof(info));
@@ -755,22 +755,22 @@ static int64_t lpr_proc_pid_snapshot_open(
     int64_t status = 0;
     switch (kind) {
     case LPR_PROC_PID_COMM:
-        status = lpr_proc_write_pid_comm((uint64_t)staging_fd, &info);
+        status = lpr_proc_write_pid_comm((uint64_t)staging_fd, &info, wait_not_ready);
         break;
     case LPR_PROC_PID_CMDLINE:
-        status = lpr_proc_write_pid_cmdline((uint64_t)staging_fd, &info);
+        status = lpr_proc_write_pid_cmdline((uint64_t)staging_fd, &info, wait_not_ready);
         break;
     case LPR_PROC_PID_STAT:
-        status = lpr_proc_write_pid_stat((uint64_t)staging_fd, pid, &info);
+        status = lpr_proc_write_pid_stat((uint64_t)staging_fd, pid, &info, wait_not_ready);
         break;
     case LPR_PROC_PID_STATUS:
-        status = lpr_proc_write_pid_status((uint64_t)staging_fd, pid, &info);
+        status = lpr_proc_write_pid_status((uint64_t)staging_fd, pid, &info, wait_not_ready);
         break;
     case LPR_PROC_PID_WCHAN:
-        status = lpr_proc_write_pid_wchan((uint64_t)staging_fd, &info);
+        status = lpr_proc_write_pid_wchan((uint64_t)staging_fd, &info, wait_not_ready);
         break;
     case LPR_PROC_PID_SYSCALL:
-        status = lpr_proc_write_pid_syscall((uint64_t)staging_fd, &info);
+        status = lpr_proc_write_pid_syscall((uint64_t)staging_fd, &info, wait_not_ready);
         break;
     default:
         status = -LPR_LINUX_ENOENT;
@@ -896,7 +896,7 @@ int64_t lpr_linux_proc_getdents64(uint64_t fd, uint64_t buf, uint64_t count)
     return (int64_t)written;
 }
 
-int64_t lpr_linux_proc_snapshot_open(const char *path, uint64_t flags)
+int64_t lpr_linux_proc_snapshot_open(const char *path, uint64_t flags, unsigned *wait_not_ready __attribute__((unused)))
 {
     enum {
         LPR_PROC_NONE = 0,
@@ -935,7 +935,7 @@ int64_t lpr_linux_proc_snapshot_open(const char *path, uint64_t flags)
         if (pid_kind == LPR_PROC_PID_NONE || pid_kind == LPR_PROC_PID_DIR) {
             return -LPR_LINUX_ENOENT;
         }
-        return lpr_proc_pid_snapshot_open(path, pid, pid_kind, flags);
+        return lpr_proc_pid_snapshot_open(path, pid, pid_kind, flags, wait_not_ready);
     }
 
     const int64_t staging_fd = lpr_proc_snapshot_create(name, flags);
@@ -943,21 +943,21 @@ int64_t lpr_linux_proc_snapshot_open(const char *path, uint64_t flags)
     int64_t status = 0;
     switch (kind) {
     case LPR_PROC_CPUINFO:
-        status = lpr_proc_write_cpuinfo((uint64_t)staging_fd);
+        status = lpr_proc_write_cpuinfo((uint64_t)staging_fd, wait_not_ready);
         break;
     case LPR_PROC_MEMINFO:
-        status = lpr_proc_write_meminfo((uint64_t)staging_fd);
+        status = lpr_proc_write_meminfo((uint64_t)staging_fd, wait_not_ready);
         break;
     case LPR_PROC_STAT:
-        status = lpr_proc_write_stat((uint64_t)staging_fd);
+        status = lpr_proc_write_stat((uint64_t)staging_fd, wait_not_ready);
         break;
     case LPR_PROC_MOUNTS:
-        status = lpr_proc_write_mounts((uint64_t)staging_fd);
+        status = lpr_proc_write_mounts((uint64_t)staging_fd, wait_not_ready);
         break;
     case LPR_PROC_VERSION:
         /* Match the Linux personality's uname identity, not the host kernel. */
         status = lpr_proc_write_string((uint64_t)staging_fd,
-            "Linux version 6.12.0 (PachaOS Linux shim)\n");
+            "Linux version 6.12.0 (PachaOS Linux shim)\n", wait_not_ready);
         break;
     default:
         status = -LPR_LINUX_ENOENT;

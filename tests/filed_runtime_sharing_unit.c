@@ -6,22 +6,22 @@ static unsigned allocations, maps, closes;
 static uint64_t buffer_size;
 static void *buffer;
 static uint64_t expected_pointer;
-int pacha_vmo_create(uint64_t size, uint64_t rights, uint32_t flags)
+pacha_fd_t pacha_vmo_create(uint64_t size, uint64_t rights, uint32_t flags)
 {
     (void)rights; (void)flags;
     assert(!buffer); buffer = calloc(1, size); assert(buffer);
     buffer_size = size; ++allocations; return 20;
 }
-void *pacha_mmap(int fd, uint64_t size, uint64_t prot, uint64_t flags, uint64_t offset)
+void *pacha_mmap(pacha_fd_t fd, uint64_t size, uint64_t prot, uint64_t flags, uint64_t offset)
 {
     (void)prot; (void)flags;
     assert(fd == 20 && size == buffer_size && !offset); return buffer;
 }
 int pacha_munmap(void *addr, uint64_t size)
 { assert(addr == buffer && size == buffer_size); return 0; }
-int pacha_fd_close(int fd)
+int pacha_fd_close(pacha_fd_t fd)
 { assert(fd == 20); ++closes; free(buffer); buffer = NULL; return 0; }
-int pacha_process_map_batch(int fd, const struct pacha_process_map_batch_entry *entries, uint64_t count)
+int pacha_process_map_batch(pacha_fd_t fd, const struct pacha_process_map_batch_entry *entries, uint64_t count)
 {
     assert(fd >= 30 && count == 1);
     assert(entries[0].vmo_fd == 20 && entries[0].flags == PACHA_PROCESS_MAP_PRIVATE);

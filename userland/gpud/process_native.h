@@ -3,6 +3,7 @@
 #define PACHA_GPUD_PROCESS_NATIVE_H
 
 #include <stdint.h>
+#include <pacha/abi.h>
 
 /* Native PROCESS_WAIT layout, not Linux wait status or a shared wire type. */
 struct gpud_process_exit {
@@ -13,7 +14,7 @@ enum { GPUD_PROCESS_EXITED = 2, GPUD_PROCESS_KILLED = 3 };
 
 struct gpud_native_process {
     uint64_t generation;
-    int fd;
+    pacha_fd_t fd;
     unsigned int kill_accepted, terminal;
     struct gpud_process_exit exit;
 };
@@ -23,7 +24,7 @@ struct gpud_native_process {
  * Thread handles and launch mappings remain the launch owner's responsibility.
  * Release retains a generation watermark even if the FD number is reused.
  * This component contains no controller or GPL dependencies. */
-int gpud_native_process_adopt(struct gpud_native_process *process, int fd,
+int gpud_native_process_adopt(struct gpud_native_process *process, pacha_fd_t fd,
     uint64_t generation);
 /* EAGAIN means no terminal observation. Every other error also retains the FD
  * and must NOT be interpreted as death. Only successful PROCESS_WAIT with a

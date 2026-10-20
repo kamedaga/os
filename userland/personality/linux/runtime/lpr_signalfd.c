@@ -154,8 +154,8 @@ int64_t lpr_linux_signalfd4(
         return requested_fd;
     }
 
-    int wait_fd = -1;
-    int notify_fd = -1;
+    pacha_fd_t wait_fd = -1;
+    pacha_fd_t notify_fd = -1;
     const int pair_status = lpr_native_wait_pair(&wait_fd, &notify_fd);
     if (pair_status != 0) {
         return pair_status;
@@ -168,16 +168,16 @@ int64_t lpr_linux_signalfd4(
     const int fd = lpr_fd_alloc_state(LPR_FD_OPS_EVENT, flags, mask,
         &record, sizeof(record));
     if (fd < 0) {
-        (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)wait_fd);
-        (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)notify_fd);
+        (void)lpr_close_native_fd_if_open((uint64_t)wait_fd);
+        (void)lpr_close_native_fd_if_open((uint64_t)notify_fd);
         return fd;
     }
     lpr_event_backend_t *event =
         lpr_event_backend((uint64_t)(uint32_t)fd);
     if (event == 0) {
         lpr_control_close_fd((uint64_t)(uint32_t)fd);
-        (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)wait_fd);
-        (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)notify_fd);
+        (void)lpr_close_native_fd_if_open((uint64_t)wait_fd);
+        (void)lpr_close_native_fd_if_open((uint64_t)notify_fd);
         return -LPR_LINUX_EIO;
     }
     lpr_signalfd_refresh_mask();
@@ -218,7 +218,7 @@ static uint32_t lpr_signalfd_take_signal(lpr_event_backend_t *event)
     }
 }
 
-int64_t lpr_linux_signalfd_read(uint64_t fd, uint64_t buf, uint64_t count)
+int64_t lpr_linux_signalfd_read(uint64_t fd, uint64_t buf, uint64_t count, unsigned *wait_not_ready __attribute__((unused)))
 {
     lpr_event_backend_t *event = lpr_event_backend(fd);
     if (!lpr_linux_signalfd_active(fd)) {
@@ -259,7 +259,7 @@ int64_t lpr_linux_signalfd_read(uint64_t fd, uint64_t buf, uint64_t count)
             status = lpr_wait_deadline_init(&deadline, -1);
         }
         if (status == 0) {
-            status = lpr_wait_graph_block(&graph, &deadline);
+            status = lpr_wait_graph_block(&graph, &deadline, wait_not_ready);
         }
         if (status != 0 && lpr_signalfd_ready_mask(event) == 0) {
             return status;

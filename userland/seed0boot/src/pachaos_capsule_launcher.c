@@ -30,7 +30,7 @@ static long find_nvme_index(void)
     return -19;
 }
 
-static int create_inherited_vmo(const void *data, uint64_t size, const char *label)
+static pacha_fd_t create_inherited_vmo(const void *data, uint64_t size, const char *label)
 {
     if (data == NULL || size == 0 || size > UINT64_MAX - 4095u) return -22;
     const uint64_t map_size = (size + 4095u) & ~4095ull;
@@ -39,7 +39,7 @@ static int create_inherited_vmo(const void *data, uint64_t size, const char *lab
         PACHA_FD_RIGHT_SET_FLAGS | PACHA_FD_RIGHT_CLOSE |
         PACHA_FD_RIGHT_READ | PACHA_FD_RIGHT_MAP_READ |
         PACHA_FD_RIGHT_MAP_WRITE;
-    const int fd = pacha_vmo_create(map_size, rights, 0);
+    const pacha_fd_t fd = pacha_vmo_create(map_size, rights, 0);
     if (fd < 16) return fd;
     void *mapped = pacha_mmap(fd, map_size,
         PACHA_PROT_READ | PACHA_PROT_WRITE, PACHA_MMAP_SHARED, 0);
@@ -50,15 +50,15 @@ static int create_inherited_vmo(const void *data, uint64_t size, const char *lab
     memset(mapped, 0, (size_t)map_size);
     memcpy(mapped, data, (size_t)size);
     (void)pacha_munmap(mapped, map_size);
-    printf("[seed0boot] inherited VMO ready label=%s fd=%d size=%llu\n",
+    printf("[seed0boot] inherited VMO ready label=%s fd=%ld size=%llu\n",
         label, fd, (unsigned long long)size);
     return fd;
 }
 
-static int create_inherited_readonly_vmo(
+static pacha_fd_t create_inherited_readonly_vmo(
     const void *data, uint64_t size, const char *label)
 {
-    const int writable_fd = create_inherited_vmo(data, size, label);
+    const pacha_fd_t writable_fd = create_inherited_vmo(data, size, label);
     if (writable_fd < 16) return writable_fd;
     const uint64_t rights = PACHA_FD_RIGHT_INSPECT | PACHA_FD_RIGHT_TRANSFER |
         PACHA_FD_RIGHT_SET_FLAGS | PACHA_FD_RIGHT_CLOSE |
@@ -66,12 +66,12 @@ static int create_inherited_readonly_vmo(
     const long readonly_fd = pacha_fd_fcntl(
         writable_fd, PACHA_FD_FCNTL_DUP, 16, rights);
     (void)pacha_fd_close(writable_fd);
-    if (readonly_fd < 16) return (int)readonly_fd;
-    return (int)readonly_fd;
+    if (readonly_fd < 16) return (pacha_fd_t)readonly_fd;
+    return (pacha_fd_t)readonly_fd;
 }
 
-int seed0_launch_storage_boot_nvme(int ready_channel_fd,
-    int root_handoff_channel_fd, int power_channel_fd)
+int seed0_launch_storage_boot_nvme(pacha_fd_t ready_channel_fd,
+    pacha_fd_t root_handoff_channel_fd, pacha_fd_t power_channel_fd)
 {
     const struct seed0_init_descriptor_page *desc = seed0_bootstrap_descriptor();
     if (desc == NULL || ready_channel_fd < 16 || root_handoff_channel_fd < 16 ||
@@ -88,13 +88,13 @@ int seed0_launch_storage_boot_nvme(int ready_channel_fd,
 
     if (desc->bootfs_archive.image_va == 0 || desc->bootfs_archive.size_bytes == 0)
         return -5;
-    const int bootfs_fd = create_inherited_readonly_vmo(
+    const pacha_fd_t bootfs_fd = create_inherited_readonly_vmo(
         (const void *)(uintptr_t)desc->bootfs_archive.image_va,
         desc->bootfs_archive.size_bytes,
         "bootfs archive");
     if (bootfs_fd < 16) return bootfs_fd;
 
-    const int device_fd = pacha_capsule_pci_claim((uint64_t)nvme_index);
+    const pacha_fd_t device_fd = pacha_capsule_pci_claim((uint64_t)nvme_index);
     if (device_fd < 16) {
         (void)pacha_fd_close(bootfs_fd);
         return device_fd;
@@ -115,7 +115,7 @@ int seed0_launch_storage_boot_nvme(int ready_channel_fd,
     config.framebuffer_width = desc->primary_display.width;
     config.framebuffer_height = desc->primary_display.height;
     config.framebuffer_pitch = desc->primary_display.pitch;
-    const int config_fd = create_inherited_vmo(&config, sizeof(config),
+    const pacha_fd_t config_fd = create_inherited_vmo(&config, sizeof(config),
         "storage_boot config");
     if (config_fd < 16) {
         (void)pacha_fd_close(device_fd);
@@ -151,8 +151,8 @@ int seed0_launch_storage_boot_nvme(int ready_channel_fd,
     return status;
 }
 
-int seed0_launch_live_filed(int ready_channel_fd, int unix_path_fd,
-    int *out_endpoint_fd)
+int seed0_launch_live_filed(pacha_fd_t ready_channel_fd, pacha_fd_t unix_path_fd,
+    pacha_fd_t *out_endpoint_fd)
 {
     if (ready_channel_fd < 16 || unix_path_fd < 16 ||
         out_endpoint_fd == NULL) return -22;
@@ -165,7 +165,7 @@ int seed0_launch_live_filed(int ready_channel_fd, int unix_path_fd,
     int status = seed0_bootfs_open_file("/sbin/filed.elf", &image, &image_size);
     if (status != 0) return status;
 
-    const int bootfs_fd = create_inherited_readonly_vmo(
+    const pacha_fd_t bootfs_fd = create_inherited_readonly_vmo(
         (const void *)(uintptr_t)desc->bootfs_archive.image_va,
         desc->bootfs_archive.size_bytes, "live bootfs archive");
     if (bootfs_fd < 16) return bootfs_fd;
@@ -174,7 +174,7 @@ int seed0_launch_live_filed(int ready_channel_fd, int unix_path_fd,
         PACHA_FD_RIGHT_WAIT | PACHA_FD_RIGHT_POLL |
         PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_RECV |
         PACHA_FD_RIGHT_CALL | PACHA_FD_RIGHT_TRANSFER;
-    const int endpoint_fd = pacha_ipc_endpoint_create(endpoint_rights, 0);
+    const pacha_fd_t endpoint_fd = pacha_ipc_endpoint_create(endpoint_rights, 0);
     if (endpoint_fd < 16) {
         (void)pacha_fd_close(bootfs_fd);
         return endpoint_fd;
@@ -187,7 +187,7 @@ int seed0_launch_live_filed(int ready_channel_fd, int unix_path_fd,
         .ready_channel_fd = (uint64_t)(uint32_t)ready_channel_fd,
         .unix_path_fd = (uint64_t)(uint32_t)unix_path_fd,
     };
-    const int config_fd = create_inherited_vmo(&config, sizeof(config),
+    const pacha_fd_t config_fd = create_inherited_vmo(&config, sizeof(config),
         "live filed config");
     if (config_fd < 16) {
         (void)pacha_fd_close(endpoint_fd);
@@ -220,8 +220,8 @@ int seed0_launch_live_filed(int ready_channel_fd, int unix_path_fd,
     return 0;
 }
 
-int seed0_launch_live_seed0root(int filed_endpoint_fd, int unix_path_fd,
-    int root_handoff_fd, int power_channel_fd)
+int seed0_launch_live_seed0root(pacha_fd_t filed_endpoint_fd, pacha_fd_t unix_path_fd,
+    pacha_fd_t root_handoff_fd, pacha_fd_t power_channel_fd)
 {
     const struct seed0_init_descriptor_page *desc = seed0_bootstrap_descriptor();
     if (desc == NULL || filed_endpoint_fd < 16 || unix_path_fd < 16 ||
@@ -244,7 +244,7 @@ int seed0_launch_live_seed0root(int filed_endpoint_fd, int unix_path_fd,
         .height = desc->primary_display.height,
         .pitch = desc->primary_display.pitch,
     };
-    const int config_fd = create_inherited_vmo(&config, sizeof(config),
+    const pacha_fd_t config_fd = create_inherited_vmo(&config, sizeof(config),
         "live root config");
     if (config_fd < 16) return config_fd;
     const struct pacha_process_fd_grant grants[] = {

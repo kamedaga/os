@@ -34,6 +34,11 @@ lpr_filed_backend_t *lpr_filed_backend(uint64_t fd)
     return fd == 3 ? &file : NULL;
 }
 
+int64_t lpr_filed_fd_binding(uint64_t fd)
+{
+    return lpr_filed_backend(fd) ? 0 : -LPR_LINUX_EBADF;
+}
+
 int64_t lpr_dir_handle_for(uint64_t fd, const char *path, uint64_t *handle)
 {
     if (fd != 3 && (int64_t)fd != LPR_LINUX_AT_FDCWD && path[0] != '/')
@@ -45,7 +50,7 @@ int64_t lpr_dir_handle_for(uint64_t fd, const char *path, uint64_t *handle)
 int64_t lpr_fs_call(kb2_fs_request_t *request, const char *path,
     const char *second, const void *data, uint64_t bytes,
     void *output, uint64_t output_bytes, kb2_fs_response_t *response,
-    int transfer, int *cap)
+    pacha_fd_t transfer, pacha_fd_t *cap)
 {
     assert(request->opcode == KB2_FILESYSTEM_OP_UTIMENSAT && request->handle == 42);
     assert(path && !second && !output && !output_bytes && transfer == -1 && !cap);

@@ -1,3 +1,4 @@
+#error "Archived syscall ABI is unsupported; migrate to current shared ABI before enabling this target"
 typedef unsigned char u8;
 typedef unsigned short u16;
 typedef unsigned int u32;

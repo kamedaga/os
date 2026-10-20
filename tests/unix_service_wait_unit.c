@@ -20,10 +20,10 @@ int pacha_munmap(void *page, uint64_t bytes)
     return 0;
 }
 
-uint64_t pacha_service_wait_revents(const struct pacha_service_wait_set *set, int fd)
+uint64_t pacha_service_wait_revents(const struct pacha_service_wait_set *set, pacha_fd_t fd)
 {
     for (uint64_t i = 0; i < set->count; i++)
-        if (set->fds[i].fd == fd) return set->fds[i].revents;
+        if (set->fds[i].fd == (uint64_t)fd) return set->fds[i].revents;
     return 0;
 }
 
@@ -35,14 +35,14 @@ int pacha_fd_table(uint64_t minimum, struct pacha_fd_table_info *out)
     return 0;
 }
 
-int pacha_fd_get_info(int fd, struct pacha_fd_info *out)
+int pacha_fd_get_info(pacha_fd_t fd, struct pacha_fd_info *out)
 {
     if (fd < 16 || fd >= 256 || !native_fds[fd].kind) return -1;
     *out = (struct pacha_fd_info){ .kind = native_fds[fd].kind };
     return 0;
 }
 
-int pacha_fd_close(int fd)
+int pacha_fd_close(pacha_fd_t fd)
 {
     assert(fd >= 16 && fd < 256 && native_fds[fd].kind);
     native_fds[fd].kind = 0;
@@ -66,7 +66,7 @@ int pacha_ipc_channel_create(struct pacha_ipc_channel_pair *out, uint64_t rights
     return 0;
 }
 
-int pacha_ipc_send(int fd, const struct pacha_ipc_msg *message)
+int pacha_ipc_send(pacha_fd_t fd, const struct pacha_ipc_msg *message)
 {
     assert(fd >= 16 && fd < 256 && native_fds[fd].kind);
     assert(message->word0 == UNIX_NOTIFY_MAGIC && !message->fd_count);

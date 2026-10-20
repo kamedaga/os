@@ -58,14 +58,14 @@ int filed_storage_pread(filed_runtime_t *rt,uint64_t handle,uint64_t offset,
     for(size_t i=0;i<length;++i) ((uint8_t *)data)[i]=(uint8_t)(offset+i);
     *got=length;return 0;
 }
-int pacha_vmo_create(uint64_t size,uint64_t rights,uint32_t flags)
+pacha_fd_t pacha_vmo_create(uint64_t size,uint64_t rights,uint32_t flags)
 {
     assert((rights&PACHA_FD_RIGHT_MAP_READ) && !flags);
     assert(!vmo_memory);vmo_size=(size_t)size;vmo_memory=malloc(vmo_size);assert(vmo_memory);
     /* Match the native eager VMO_CREATE zero-fill contract, including EOF. */
     memset(vmo_memory,0,vmo_size);return 80;
 }
-void *pacha_mmap(int fd,uint64_t size,uint64_t protection,uint64_t flags,uint64_t offset)
+void *pacha_mmap(pacha_fd_t fd,uint64_t size,uint64_t protection,uint64_t flags,uint64_t offset)
 {
     assert(fd==80 && size==vmo_size && !offset);
     assert(protection==(PACHA_PROT_READ|PACHA_PROT_WRITE) && flags==PACHA_MMAP_SHARED);
@@ -75,21 +75,21 @@ int pacha_munmap(void *memory,uint64_t size)
 {
     assert(memory==vmo_memory && size==vmo_size);return 0;
 }
-int pacha_ipc_recv(int fd,struct pacha_ipc_msg *message)
+int pacha_ipc_recv(pacha_fd_t fd,struct pacha_ipc_msg *message)
 {
     assert(fd==60);message->word0=FILED_LEASE_MAGIC;message->word1=44;
-    message->word2=lease_target;message->word3=99;message->fd_count=1;
-    message->fds[0].fd=70;return 0;
+    message->word2=lease_target;message->word3=99;message->fd_count=0;
+    return 0;
 }
-int pacha_fd_get_info(int fd,struct pacha_fd_info *info)
+int pacha_fd_get_info(pacha_fd_t fd,struct pacha_fd_info *info)
 {
     assert(fd==70);*info=(struct pacha_fd_info){.kind=PACHA_FD_KIND_REPLY};return 0;
 }
-int pacha_ipc_reply(int fd,const struct pacha_ipc_msg *message)
+int pacha_ipc_reply(pacha_fd_t fd,const struct pacha_ipc_msg *message)
 {
-    assert(fd==70);lease_reply=*message;return 0;
+    assert(fd==PACHA_IPC_REPLY_IMPLICIT);lease_reply=*message;return 0;
 }
-int pacha_fd_close(int fd)
+int pacha_fd_close(pacha_fd_t fd)
 {
     assert(fd==70);++closed_count;return 0;
 }
@@ -144,20 +144,20 @@ int main(void)
     runtime.actor=&client;
     struct filed_lease lease={.id=44,.handle=44,.client=1,.fd=60};
     lease_target=9;assert(!lease_receive(&runtime,&lease));
-    assert(transfers==1 && closed_handle==44 && closed_count==1);
+    assert(transfers==1 && closed_handle==44 && closed_count==0);
     assert(lease.client==9 && lease.handle==88 && !lease_reply.word1 && lease_reply.word2==88);
     assert(!lease_receive(&runtime,&lease));
-    assert(transfers==1 && closed_count==2 && lease_reply.word2==88);
+    assert(transfers==1 && closed_count==0 && lease_reply.word2==88);
     struct filed_client other={.id=10};client.next=&other;lease_target=10;
     assert(!lease_receive(&runtime,&lease));
-    assert((int64_t)lease_reply.word1==-EPERM && transfers==1 && closed_count==3);
+    assert((int64_t)lease_reply.word1==-EPERM && transfers==1 && closed_count==0);
     lease_target=9;lease=(struct filed_lease){.id=44,.handle=44,.client=1,.fd=60};
     close_status=-EIO;runtime.storage_generation=31;
     assert(!lease_receive(&runtime,&lease));
-    assert(!runtime.storage_generation && transfers==2 && closed_count==4);
+    assert(!runtime.storage_generation && transfers==2 && closed_count==0);
     assert((int64_t)lease_reply.word1==-EIO && !lease_reply.word2);
     request=(kb2_fs_request_t){.handle=90,.offset=9000,.length=5000};
-    response=(kb2_fs_response_t){0};int vmo=-1;
+    response=(kb2_fs_response_t){0};pacha_fd_t vmo=-1;
     assert(!make_file_vmo(&runtime,&request,&response,&vmo));
     assert(vmo==80 && vmo_size==8192 && response.result==1000 && !response.handle);
     for(size_t i=0;i<1000;++i) assert(vmo_memory[i]==(uint8_t)(9000+i));

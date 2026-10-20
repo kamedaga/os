@@ -75,6 +75,9 @@ typedef struct lpr_manifest {
     uint64_t linux_sid;
     uint64_t linux_pgrp;
     uint64_t linux_next_pid;
+    /* Admission state survives exec; inherited entries may exceed soft. */
+    uint64_t nofile_soft;
+    uint64_t nofile_hard;
     uint64_t signal_mask;
     uint64_t signal_ignored_mask;
     uint64_t cwd_handle;
@@ -131,4 +134,4 @@ static inline lpr_manifest_capability_t *lpr_manifest_capabilities(lpr_manifest_
 _Static_assert(sizeof(lpr_manifest_entry_t) == 32, "lpr manifest entry size");
 _Static_assert(sizeof(lpr_manifest_ofd_t) == 64, "lpr manifest ofd size");
 _Static_assert(sizeof(lpr_manifest_capability_t) == 24, "lpr manifest capability size");
-_Static_assert(sizeof(lpr_manifest_t) == 272, "lpr manifest header size");
+_Static_assert(sizeof(lpr_manifest_t) == 288, "lpr manifest header size");

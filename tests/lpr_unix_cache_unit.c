@@ -22,11 +22,11 @@ int64_t lpr_pacha_syscall2(uint64_t nr, uint64_t p, uint64_t bytes)
     assert(munmap((void *)(uintptr_t)p, bytes) == 0 && maps);
     maps--; unmaps++; return 0;
 }
-static int page_create(struct unix_control **page)
+static pacha_fd_t page_create(struct unix_control **page)
 {
     *page = map_page(UNIX_CONTROL_BYTES); return next_fd++;
 }
-static void page_destroy(int fd, struct unix_control *page)
+static void page_destroy(pacha_fd_t fd, struct unix_control *page)
 {
     assert(fd >= 16); closes++;
     assert(!lpr_pacha_syscall2(PACHAOS_SYSCALL_MUNMAP, (uintptr_t)page, UNIX_CONTROL_BYTES));
@@ -107,4 +107,14 @@ int main(void)
     lpr_unix_cache_end(&lease, 0);
     assert(!maps);
     puts("unix cache: warm page/route reuse, bounded eviction, generation mismatch, active+idle fork cleanup, no private-FD close, parent intact, failed-RPC discard passed");
+}
+
+#include "lpr_ipc_mock.h"
+int64_t lpr_ipc_message(uint64_t nr, uint64_t fd, uint64_t send, uint64_t receive,
+    uint64_t timeout, uint64_t flags, int *committed) {
+    return test_lpr_ipc_noncall(nr, fd, send, receive, timeout, flags, committed);
+}
+
+int64_t lpr_pacha_syscall4(uint64_t nr,uint64_t a,uint64_t b,uint64_t c,uint64_t d) {
+    (void)nr;(void)a;(void)b;(void)c;(void)d;abort();
 }

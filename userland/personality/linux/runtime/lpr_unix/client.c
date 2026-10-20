@@ -4,7 +4,7 @@
 #include <unixd/profile.h>
 #include "../lpr_filed_internal.h"
 
-static int native_page_create(struct unix_control **out)
+static pacha_fd_t native_page_create(struct unix_control **out)
 {
     const uint64_t rights = PACHA_FD_RIGHT_INSPECT | PACHA_FD_RIGHT_CLOSE |
         PACHA_FD_RIGHT_TRANSFER | PACHA_FD_RIGHT_MAP_READ | PACHA_FD_RIGHT_MAP_WRITE;
@@ -18,36 +18,26 @@ static int native_page_create(struct unix_control **out)
         return -LPR_LINUX_ENOMEM;
     }
     *out = (struct unix_control *)(uintptr_t)mapped;
-    return (int)fd;
+    return (pacha_fd_t)fd;
 }
 
-static void native_page_destroy(int fd, struct unix_control *page)
+static void native_page_destroy(pacha_fd_t fd, struct unix_control *page)
 {
     (void)lpr_pacha_syscall2(PACHAOS_SYSCALL_MUNMAP, (uint64_t)(uintptr_t)page, UNIX_CONTROL_BYTES);
-    (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, (uint64_t)(uint32_t)fd);
+    (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, (uint64_t)fd);
 }
 
-static int native_call(int endpoint, const struct pacha_ipc_msg *request)
+static int native_call(pacha_fd_t endpoint, const struct pacha_ipc_msg *request,
+    struct pacha_ipc_msg *reply)
 {
-    /* Threads share the process session's bounded request queue. A full
-     * queue has not accepted the request (or MOVE capabilities); wait for
-     * writable and retry only that explicit backpressure result. */
-    const int64_t fd = lpr_native_ipc_call_wait((uint64_t)(uint32_t)endpoint, request);
-    if (fd < 16) lpr_unix_diag('E', (uint64_t)(uint32_t)endpoint, fd, 106, request->word1);
-    return fd >= 16 ? (int)fd : fd ? (int)pacha_kernel_status_to_errno(fd) : -LPR_LINUX_EIO;
-}
-
-static int native_receive(int fd, struct pacha_ipc_msg *reply)
-{
-    /* Finish the same reply after a native signal cancels its waiter. */
-    const int64_t status = lpr_native_ipc_recv_wait((uint64_t)(uint32_t)fd, reply);
-    if (status) lpr_unix_diag('E', (uint64_t)(uint32_t)fd, status, 107, 0);
+    const int64_t status = lpr_native_ipc_call_wait((uint64_t)endpoint, request, reply, NULL);
+    if (status) lpr_unix_diag('E', (uint64_t)endpoint, status, 106, request->word1);
     return (int)pacha_kernel_status_to_errno(status);
 }
 
-static void native_close(int fd)
+static void native_close(pacha_fd_t fd)
 {
-    (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, (uint64_t)(uint32_t)fd);
+    (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, (uint64_t)fd);
 }
 
 int lpr_unix_client_open(struct lpr_unix_client *out)
@@ -57,7 +47,7 @@ int lpr_unix_client_open(struct lpr_unix_client *out)
     lpr_linux_process_state_init();
     if (!lpr_supervisor_enabled || !lpr_supervisor_token) return -LPR_LINUX_ENOTCONN;
     void *page = NULL;
-    const int page_fd = lpr_create_standalone_wire_page(&page);
+    const pacha_fd_t page_fd = lpr_create_standalone_wire_page(&page);
     if (page_fd < 16) return page_fd;
     const uint64_t token = lpr_supervisor_token;
     const int64_t status = lpr_process_client_unix_session(&lpr_request_id, lpr_pacha_status_to_errno,
@@ -87,7 +77,7 @@ int lpr_unix_client_call(const struct lpr_unix_client *client, struct unix_contr
     if (!client || !client->session || !client->process_token ||
         client->process_token != lpr_supervisor_token) return -LPR_LINUX_ENOTCONN;
     static const struct unix_client_io io = {
-        native_page_create, native_page_destroy, native_call, native_receive, native_close,
+        native_page_create, native_page_destroy, native_call, native_close,
     };
     struct lpr_unix_cache_lease lease;
     UP_BEGIN(total, UP_RPC, request->operation, UP_TOTAL);
@@ -124,7 +114,7 @@ int lpr_unix_client_register_thread(const struct lpr_unix_client *client,
     struct unix_control request = { .operation = UNIX_OP_THREAD_REGISTER, .request = request_id };
     unsigned count = 0;
     const int status = lpr_unix_client_call(client, &request, &observed, 1, NULL, 0, &count);
-    native_close((int)thread_fd);
+    native_close((pacha_fd_t)thread_fd);
     if (status != 0) return status;
     if (!request.result || request.result == UNIX_TRANSPORT_RECOVERING) return -LPR_LINUX_EIO;
     *out_owner = request.result;

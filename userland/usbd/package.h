@@ -1,3 +1,4 @@
+#include <pacha/abi.h>
 /* SPDX-License-Identifier: MIT */
 #ifndef PACHA_USBD_PACKAGE_H
 #define PACHA_USBD_PACKAGE_H
@@ -22,12 +23,12 @@ struct usbd_package {
     struct ph_bootstrap_item items[USBD_PACKAGE_ITEMS];
     struct ph_package_identity identity;
     struct ph_device_authority device;
-    int device_fd;
+    pacha_fd_t device_fd;
 };
 
 /* The fixed closure is checked against its immutable manifest before any
  * upstream module is initialized. The capsule remains owned by usbd. */
-int usbd_package_open(struct usbd_package *package, int filed_fd, int device_fd,
+int usbd_package_open(struct usbd_package *package, pacha_fd_t filed_fd, pacha_fd_t device_fd,
     uint32_t kind);
 int usbd_package_bind(struct usbd_package *package, uint64_t generation);
 int usbd_package_unbind(struct usbd_package *package, uint64_t generation);

@@ -7,5 +7,5 @@ mkdir -p "$out"
   -fuse-ld=lld -nostdlib -static -ffreestanding -fno-builtin \
   -fno-stack-protector -mno-red-zone -O2 -Wall -Wextra -Werror \
   -I "$repo_root/userland/libpacha/include" -I "$repo_root/userland/libipc/include" \
-  "$repo_root/tests/native_vmo_lifetime.c" \
+  "$repo_root/tests/native_vmo_lifetime.c" "$repo_root/userland/libpacha/src/syscall.c" \
   -Wl,-e,_start,--image-base=0x400000 -o "$out/native_vmo_lifetime.elf"

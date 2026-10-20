@@ -10,6 +10,6 @@ done
 "${CC:-clang}" -std=c11 -O2 -g -Wall -Wextra -Werror \
   -ffunction-sections -fdata-sections -Wl,--gc-sections \
   -fsanitize=address,undefined -fno-omit-frame-pointer \
-  "${includes[@]}" -Imusl/pachaos/include \
+  "${includes[@]}" -Iuserland -Ikobox2/protocol/include -Ikobox2/protocol/generated/include -Imusl/pachaos/include \
   tests/lpr_sched_yield_unit.c userland/libipc/src/status.c -o "$out/unit"
 "$out/unit"

@@ -1,4 +1,7 @@
+const b3 = @import("ipc_path_trace.zig");
+const cpu_runtime = @import("arch/x86_64/cpu_runtime.zig");
 const std = @import("std");
+const lock_diagnostics = @import("sync/lock_diagnostics.zig");
 const kernel = @import("kernel.zig");
 const boot_static = @import("boot/main_static.zig");
 const halt = @import("halt.zig");
@@ -13,6 +16,7 @@ const lapic = @import("lapic.zig");
 const process_abi = @import("kernel_abi_root").process_abi;
 const user_copy = @import("user_copy.zig");
 const user_vm = @import("memory/user_vm.zig");
+const UserVirtualAddress = @import("memory/addresses.zig").UserVirtualAddress;
 const scheduler = @import("scheduler.zig").connection;
 const smp = @import("smp.zig");
 const syscall_numbers = @import("syscall/numbers.zig");
@@ -31,15 +35,20 @@ const user_return_iret_qword_count = 5;
 const trap_frame_iret_offset = @offsetOf(TrapFrame, "rip");
 const exception_trap_frame_iret_offset = @offsetOf(ExceptionTrapFrame, "rip");
 
-pub export var page_fault_work_frames: [smp.max_cpus]ExceptionTrapFrame = [_]ExceptionTrapFrame{std.mem.zeroes(ExceptionTrapFrame)} ** smp.max_cpus;
-pub export var trap_fault_work_frames: [smp.max_cpus]TrapFrame = [_]TrapFrame{std.mem.zeroes(TrapFrame)} ** smp.max_cpus;
-pub export var fatal_exception_resume_work_frames: [smp.max_cpus]TrapFrame = [_]TrapFrame{std.mem.zeroes(TrapFrame)} ** smp.max_cpus;
-pub export var timer_interrupt_work_frames: [smp.max_cpus]TrapFrame = [_]TrapFrame{std.mem.zeroes(TrapFrame)} ** smp.max_cpus;
-pub export var syscall_work_frame: TrapFrame = std.mem.zeroes(TrapFrame);
-pub export var syscall_work_frames: [smp.max_cpus]TrapFrame = [_]TrapFrame{std.mem.zeroes(TrapFrame)} ** smp.max_cpus;
-pub export var syscall_entry_lock: u64 = 0;
-pub export var user_return_saved_gprs_by_cpu: [smp.max_cpus][16]u64 align(16) = [_][16]u64{[_]u64{0} ** 16} ** smp.max_cpus;
-pub export var user_return_iret_frames_by_cpu: [smp.max_cpus][8]u64 align(16) = [_][8]u64{[_]u64{0} ** 8} ** smp.max_cpus;
+var bootstrap_page_fault_work_frames: [1]ExceptionTrapFrame align(16) = .{std.mem.zeroes(ExceptionTrapFrame)};
+pub export var page_fault_work_frames: [*]ExceptionTrapFrame = &bootstrap_page_fault_work_frames;
+var bootstrap_trap_fault_work_frames: [1]TrapFrame align(16) = .{std.mem.zeroes(TrapFrame)};
+pub export var trap_fault_work_frames: [*]TrapFrame = &bootstrap_trap_fault_work_frames;
+var bootstrap_fatal_exception_resume_work_frames: [1]TrapFrame align(16) = .{std.mem.zeroes(TrapFrame)};
+pub export var fatal_exception_resume_work_frames: [*]TrapFrame = &bootstrap_fatal_exception_resume_work_frames;
+var bootstrap_timer_interrupt_work_frames: [1]TrapFrame align(16) = .{std.mem.zeroes(TrapFrame)};
+pub export var timer_interrupt_work_frames: [*]TrapFrame = &bootstrap_timer_interrupt_work_frames;
+var bootstrap_syscall_work_frames: [1]TrapFrame align(16) = .{std.mem.zeroes(TrapFrame)};
+pub export var syscall_work_frames: [*]TrapFrame = &bootstrap_syscall_work_frames;
+var bootstrap_user_return_saved_gprs_by_cpu: [1][16]u64 align(16) = .{std.mem.zeroes([16]u64)};
+pub export var user_return_saved_gprs_by_cpu: [*][16]u64 = &bootstrap_user_return_saved_gprs_by_cpu;
+var bootstrap_user_return_iret_frames_by_cpu: [1][8]u64 align(16) = .{std.mem.zeroes([8]u64)};
+pub export var user_return_iret_frames_by_cpu: [*][8]u64 = &bootstrap_user_return_iret_frames_by_cpu;
 
 fn staticStorageEnd(comptime T: type, ptr: *T) usize {
     return @intFromPtr(ptr) + @sizeOf(T);
@@ -62,9 +71,7 @@ const runtime_storage_ptrs = .{
     &trap_fault_work_frames,
     &fatal_exception_resume_work_frames,
     &timer_interrupt_work_frames,
-    &syscall_work_frame,
     &syscall_work_frames,
-    &syscall_entry_lock,
     &user_return_saved_gprs_by_cpu,
     &user_return_iret_frames_by_cpu,
     &user_return_saved_r10,
@@ -85,11 +92,10 @@ pub fn mapKernelRuntimeStorage(map_identity_range: *const fn (u64, usize) bool) 
     return true;
 }
 
-extern var kernel_cr3_value: u64;
+extern var kernel_cr3_entry_value: u64;
 extern var kernel_syscall_stack_top: u64;
-extern var kernel_syscall_stack_tops: [smp.max_cpus]u64;
+extern var kernel_syscall_stack_tops: [*]u64;
 extern var x86_rdtscp_supported: u64;
-extern var thread_contexts_ptr: *anyopaque;
 extern var lapic_tick_count: u64;
 extern var user_return_saved_r10: u64;
 extern var user_return_saved_gprs: [15]u64 align(16);
@@ -102,17 +108,13 @@ extern fn resumeAfterFatalUserException(principal: kernel.PrincipalId, fault_vec
 
 pub export fn timerInterruptWorkFrameForCurrentCpuFromAsm() callconv(.winapi) *TrapFrame {
     const cpu_slot = scheduler.currentCpu();
-    const bounded_slot = if (cpu_slot < timer_interrupt_work_frames.len) cpu_slot else 0;
+    const bounded_slot = if (cpu_slot < cpu_runtime.capacity()) cpu_slot else 0;
     return &timer_interrupt_work_frames[bounded_slot];
-}
-
-pub export fn syscallWorkFrameFromAsm() callconv(.winapi) *TrapFrame {
-    return &syscall_work_frame;
 }
 
 fn boundedCurrentCpuSlot() usize {
     const cpu_slot = scheduler.currentCpu();
-    return if (cpu_slot < smp.max_cpus) cpu_slot else 0;
+    return if (cpu_slot < cpu_runtime.capacity()) cpu_slot else 0;
 }
 
 pub export fn pageFaultWorkFrameForCurrentCpuFromAsm() callconv(.winapi) *ExceptionTrapFrame {
@@ -151,8 +153,33 @@ pub export fn userReturnIretFrameForCurrentCpuFromAsm() callconv(.winapi) *u64 {
     return &user_return_iret_frames_by_cpu[cpu_slot][0];
 }
 
-pub export fn userReturnCr3ForCurrentCpuFromAsm() callconv(.winapi) u64 {
-    return scheduler.currentCr3();
+/// Set by a fault retry that needs this CPU's next user CR3 load to flush;
+/// consumed with interrupts off on the user return path.
+var bootstrap_user_return_flush: [1]u8 = .{0};
+var user_return_flush: []u8 = &bootstrap_user_return_flush;
+
+pub export fn userReturnCr3ForCurrentCpuFromAsm() callconv(.c) u64 {
+    scheduler.notifyDiagnosticUserReturn();
+    const cr3 = scheduler.currentCr3();
+    const cpu = boundedCurrentCpuSlot();
+    if (user_return_flush[cpu] != 0) {
+        user_return_flush[cpu] = 0;
+        _ = @import("tlb_residency.zig").enter(cpu, cr3);
+        return cr3;
+    }
+    return x86_platform.userCr3NoFlush(cr3);
+}
+
+/// The syscall return's single call: install the current thread's bases and
+/// produce the user CR3 operand (userReturnToSavedFrame makes these two calls
+/// plus two more for staged copies).
+// This no-argument helper uses the scalar C ABI so calling the scalar CR3
+// helper cannot introduce a Win64 XMM-preservation bridge after XRSTOR.
+// applyThreadBases deliberately installs the thread's PKRU as before; it is
+// not part of the pure CPU-identity gate, which includes the CR3 helper itself.
+pub export fn syscallUserReturnCr3FromAsm() callconv(.c) u64 {
+    _ = scheduler.applyThreadBases(scheduler.currentThread());
+    return userReturnCr3ForCurrentCpuFromAsm();
 }
 
 pub export fn applyCurrentThreadFsBaseForUserReturnFromAsm() callconv(.winapi) void {
@@ -162,7 +189,7 @@ pub export fn applyCurrentThreadFsBaseForUserReturnFromAsm() callconv(.winapi) v
 fn asmCopyStackFrameToWorkFrame(comptime work_frame_symbol: []const u8, comptime qword_count: usize) []const u8 {
     return std.fmt.comptimePrint(
         \\
-        \\lea {s}(%rip), %rdi
+        \\mov {s}(%rip), %rdi
         \\mov %rsp, %rsi
         \\mov ${d}, %ecx
         \\cld
@@ -183,30 +210,43 @@ fn asmCopyStackFrameToWorkFramePointer(comptime qword_count: usize) []const u8 {
     , .{qword_count});
 }
 
+// GPRs are already saved. APIC mode selects the architectural ID source;
+// CPUID topology-leaf availability must not truncate a valid x2APIC ID.
 fn asmCpuSlotIntoEcx() []const u8 {
-    return std.fmt.comptimePrint(
-        \\
-        \\cmpq $0, x86_rdtscp_supported(%rip)
-        \\je 3f
-        \\rdtscp
-        \\cmp ${d}, %ecx
-        \\jb 4f
-        \\3:
-        \\mov $1, %eax
-        \\cpuid
-        \\shr $24, %ebx
-        \\xor %ecx, %ecx
-        \\lea runtime_lapic_ids(%rip), %rax
-        \\5:
-        \\cmpb %bl, (%rax,%rcx,1)
-        \\je 4f
-        \\inc %ecx
-        \\cmp ${d}, %ecx
-        \\jb 5b
-        \\xor %ecx, %ecx
-        \\4:
-        \\
-    , .{ smp.max_cpus, smp.max_cpus });
+    return
+    \\
+    \\cmpq $0, x86_rdtscp_supported(%rip)
+    \\je 3f
+    \\rdtscp
+    \\cmp runtime_cpu_capacity(%rip), %rcx
+    \\jb 4f
+    \\3:
+    \\mov $0x1b, %ecx
+    \\rdmsr
+    \\test $0x400, %eax
+    \\jz 7f
+    \\mov $0x802, %ecx
+    \\rdmsr
+    \\mov %eax, %edx
+    \\jmp 6f
+    \\7:
+    \\mov $1, %eax
+    \\cpuid
+    \\shr $24, %ebx
+    \\mov %ebx, %edx
+    \\6:
+    \\xor %ecx, %ecx
+    \\mov runtime_lapic_ids(%rip), %rax
+    \\5:
+    \\cmp %edx, (%rax,%rcx,4)
+    \\je 4f
+    \\inc %ecx
+    \\cmp runtime_cpu_capacity(%rip), %rcx
+    \\jb 5b
+    \\xor %ecx, %ecx
+    \\4:
+    \\
+    ;
 }
 
 fn asmCopyUserInterruptFrameToCpuWorkFrame(comptime work_frame_symbol: []const u8) []const u8 {
@@ -216,37 +256,18 @@ fn asmCopyUserInterruptFrameToCpuWorkFrame(comptime work_frame_symbol: []const u
         \\mov %r14, %r13
         \\shl $3, %r13
         \\imul ${d}, %r14, %r14
-        \\lea {s}(%rip), %r12
+        \\mov {s}(%rip), %r12
         \\add %r14, %r12
         \\mov %r12, %rdi
         \\mov %rsp, %rsi
         \\mov ${d}, %ecx
         \\cld
         \\rep movsq
-        \\lea kernel_syscall_stack_tops(%rip), %r14
+        \\mov kernel_syscall_stack_tops(%rip), %r14
         \\mov (%r14,%r13,1), %rsp
         \\push %r12
         \\
     , .{ @sizeOf(TrapFrame), work_frame_symbol, trap_frame_qword_count });
-}
-
-fn asmCopyFramePointerToWorkFrameOnKernelStack(
-    comptime frame_reg: []const u8,
-    comptime work_frame_symbol: []const u8,
-    comptime cpu_slot: usize,
-    comptime qword_count: usize,
-) []const u8 {
-    return std.fmt.comptimePrint(
-        \\
-        \\mov {s}, %r12
-        \\mov kernel_syscall_stack_tops+{d}(%rip), %rsp
-        \\lea {s}(%rip), %rdi
-        \\mov %r12, %rsi
-        \\mov ${d}, %ecx
-        \\cld
-        \\rep movsq
-        \\
-    , .{ frame_reg, cpu_slot * @sizeOf(u64), work_frame_symbol, qword_count });
 }
 
 fn asmCallAligned(comptime target: []const u8) []const u8 {
@@ -279,7 +300,7 @@ fn asmDispatchKernelInterruptPreservingFx(comptime target: []const u8) []const u
 fn asmStageUserReturnFromWorkFrame(comptime work_frame_symbol: []const u8, comptime iret_offset: usize) []const u8 {
     return std.fmt.comptimePrint(
         \\
-        \\lea {s}(%rip), %rcx
+        \\mov {s}(%rip), %rcx
         \\mov ${d}, %rdx
     , .{ work_frame_symbol, iret_offset }) ++ asmCallAligned("stageUserReturnFromFramePointerForCurrentCpu");
 }
@@ -342,9 +363,8 @@ fn writeReg(label: []const u8, value: u64) void {
 fn writeCommonTrapRegs(frame: anytype) void {
     const cpu_slot = scheduler.currentCpu();
     writeReg("CPU", @intCast(cpu_slot));
-    if (scheduler.threadContext(scheduler.currentThread())) |ctx| {
-        writeReg("FS_BASE", ctx.fs_base);
-    }
+    var fs_base: UserVirtualAddress = undefined;
+    if (scheduler.currentFsBaseSnapshot(&fs_base)) writeReg("FS_BASE", fs_base.toInt());
     writeReg("RAX", frame.rax);
     writeReg("RBX", frame.rbx);
     writeReg("RCX", frame.rcx);
@@ -460,65 +480,185 @@ pub export fn userReturnToSavedFrame() callconv(.naked) noreturn {
     );
 }
 
-pub export fn syscallEntryStub() callconv(.naked) noreturn {
-    asm volatile (
-        \\1:
-        \\lock btsq $0, syscall_entry_lock(%rip)
-        \\jc 1b
-        \\mov %r15, syscall_work_frame+0(%rip)
-        \\mov %r14, syscall_work_frame+8(%rip)
-        \\mov %r13, syscall_work_frame+16(%rip)
-        \\mov %r12, syscall_work_frame+24(%rip)
-        \\movq $0, syscall_work_frame+32(%rip)
-        \\mov %r10, syscall_work_frame+40(%rip)
-        \\mov %r9, syscall_work_frame+48(%rip)
-        \\mov %r8, syscall_work_frame+56(%rip)
-        \\mov %rbp, syscall_work_frame+64(%rip)
-        \\mov %rdi, syscall_work_frame+72(%rip)
-        \\mov %rsi, syscall_work_frame+80(%rip)
-        \\mov %rdx, syscall_work_frame+88(%rip)
-        \\movq $0, syscall_work_frame+96(%rip)
-        \\mov %rcx, syscall_work_frame+120(%rip)
-        \\mov %rbx, syscall_work_frame+104(%rip)
-        \\mov %rax, syscall_work_frame+112(%rip)
-        \\movq $0x1b, syscall_work_frame+128(%rip)
-        \\mov %r11, syscall_work_frame+136(%rip)
-        \\mov %rsp, syscall_work_frame+144(%rip)
-        \\movq $0x23, syscall_work_frame+152(%rip)
-    ++ asmCpuSlotIntoEcx() ++
-        \\
-        \\mov %ecx, %r12d
+/// Register save for CPU `slot`, straight into its own work frame. Each CPU's
+/// LSTAR names its own copy, so the entry knows its frame before it has any
+/// scratch register. A single shared frame needed a global spin lock (a
+/// cache line every CPU's syscall contended on), RDTSCP to learn the CPU,
+/// then a REP MOVSQ copy into the per-CPU frame.
+var syscall_entries: []u8 = &.{};
+const syscall_code = @import("arch/x86_64/syscall_entry_code.zig");
+const syscall_entry_stride = syscall_code.stride;
+
+/// LSTAR is published only after its boot-generated page loses every RW alias.
+pub fn syscallEntryForCpu(slot: usize) usize {
+    if (slot >= cpu_runtime.capacity() or syscall_entries.len == 0) return 0;
+    return @intFromPtr(syscall_entries.ptr) + slot * syscall_entry_stride;
+}
+pub fn initCpuStorage(count: usize) !void {
+    try b3.init(count);
+    try @import("syscalls.zig").initDirectIpcStorage(count);
+    try @import("xstate_runtime.zig").initCpuStorage(count);
+    page_fault_work_frames = (try cpu_runtime.alloc(ExceptionTrapFrame, count)).ptr;
+    trap_fault_work_frames = (try cpu_runtime.alloc(TrapFrame, count)).ptr;
+    fatal_exception_resume_work_frames = (try cpu_runtime.alloc(TrapFrame, count)).ptr;
+    timer_interrupt_work_frames = (try cpu_runtime.alloc(TrapFrame, count)).ptr;
+    syscall_work_frames = (try cpu_runtime.alloc(TrapFrame, count)).ptr;
+    user_return_saved_gprs_by_cpu = (try cpu_runtime.alloc([16]u64, count)).ptr;
+    user_return_iret_frames_by_cpu = (try cpu_runtime.alloc([8]u64, count)).ptr;
+    user_return_flush = try cpu_runtime.alloc(u8, count);
+    const bytes = std.mem.alignForward(usize, try std.math.mul(usize, count, syscall_entry_stride), 4096);
+    syscall_entries = try cpu_runtime.alloc(u8, bytes);
+    for (0..count) |slot| syscall_code.generateDirect(syscall_entries[slot * syscall_entry_stride ..][0..syscall_entry_stride], @intFromPtr(&syscall_work_frames[slot]), slot, @intFromPtr(&syscallEntryCommon), @intFromPtr(&syscallDirectIpcEntry));
+    try cpu_runtime.makeExecutable(syscall_entries);
+    x86_platform.enableSyscallEntry(syscallEntryForCpu(0));
+}
+
+comptime {
+    // The offsets above spell out this layout.
+    if (@offsetOf(TrapFrame, "rcx") != 96 or @offsetOf(TrapFrame, "rip") != 120 or
+        @offsetOf(TrapFrame, "rbx") != 104 or @offsetOf(TrapFrame, "rax") != 112 or
+        @offsetOf(TrapFrame, "cs") != 128 or @offsetOf(TrapFrame, "rflags") != 136 or
+        @offsetOf(TrapFrame, "rsp") != 144 or @offsetOf(TrapFrame, "ss") != 152 or
+        @offsetOf(TrapFrame, "r10") != 40 or @offsetOf(TrapFrame, "rdx") != 88)
+        @compileError("syscall entry frame offsets out of date");
+}
+
+pub export fn finishIpcLive() callconv(.c) void {
+    if (@import("builtin").is_test) return;
+    @import("xstate_runtime.zig").finishIpcLive();
+}
+
+// A read-only dedicated miss has completed every user GPR store and still
+// owns the kernel root with IF clear. Reuse the ordinary frame/stack setup,
+// but do not reload that same CR3 before entering the generic handler.
+fn syscallCommonPreamble(comptime load_cr3: bool) []const u8 {
+    return b3.stamp(0) ++
+        \\cld
         \\mov %r12, %r14
         \\shl $3, %r14
-        \\imul %[trap_frame_size], %r12, %r13
-        \\lea syscall_work_frames(%rip), %rdi
-        \\add %r13, %rdi
-        \\lea syscall_work_frame(%rip), %rsi
-        \\mov %[trap_frame_qwords], %ecx
-        \\cld
-        \\rep movsq
-        \\lea syscall_work_frames(%rip), %r12
+    ++ std.fmt.comptimePrint("\nimul ${d}, %r12, %r13\n", .{@sizeOf(TrapFrame)}) ++
+        \\mov syscall_work_frames(%rip), %r12
         \\add %r13, %r12
-        \\mov kernel_cr3_value(%rip), %r10
+        \\mov kernel_cr3_entry_value(%rip), %r10
+    ++ b3.stamp(9) ++ (if (b3.enabled) "\nmov %r10, 80(%r11)\n" else "") ++ (if (load_cr3) "\nmov %r10, %cr3\n" else "");
+}
+
+pub export fn syscallEntryCommonFromKernel() callconv(.naked) noreturn {
+    asm volatile (syscallCommonPreamble(false) ++
+            \\jmp syscallEntryCommonKernelReady
+    );
+}
+
+// RAX names the partial frame, R11 the CPU slot. RBX/RBP/R13/R14 still hold
+// user values across the Win64 read-only preflight. No IRQ window is opened.
+pub export fn syscallDirectIpcEntry() callconv(.naked) noreturn {
+    asm volatile (
+        \\cld
+        \\mov kernel_cr3_entry_value(%rip), %r10
         \\mov %r10, %cr3
-        \\lea kernel_syscall_stack_tops(%rip), %r13
-        \\mov (%r13,%r14,1), %rsp
-        \\push %r12
-        \\movq $0, syscall_entry_lock(%rip)
-    ++ asmCallAligned("saveCurrentThreadXState") ++
+        \\mov kernel_syscall_stack_tops(%rip), %r10
+        \\mov (%r10,%r11,8), %rsp
+        \\push %r11
+        \\push %rax
+        \\mov %rax, %rcx
+    ++ asmCallAligned("syscallDirectIpcPrepare") ++
+        \\mov (%rsp), %r10
+        \\mov %rbx, 104(%r10)
+        \\mov %rbp, 64(%r10)
+        \\mov %r13, 16(%r10)
+        \\mov %r14, 8(%r10)
+        \\test %rax, %rax
+        \\jnz 1f
+        \\mov 8(%rsp), %r12
+        \\jmp syscallEntryCommonFromKernel
+        \\1:
+        \\mov %r10, %rcx
+    ++ asmCallAligned("syscallDirectIpcCommit") ++
+        \\mov %rax, %r14
+    ++ asmCallAligned("finishIpcLive") ++
+        \\cmp $2, %r14
+        \\je syscallIpcCommittedReturn
         \\mov (%rsp), %r12
-        \\mov %r12, %rcx
-    ++ asmCallAligned("syscallDispatch") ++
-        \\mov (%rsp), %r12
-    ++ asmCallAligned("restoreCurrentThreadXState") ++
-        \\mov (%rsp), %r12
-        \\add $8, %rsp
-        \\mov %r12, %rax
-    ++ asmStageUserReturnFromWorkFramePointer(trap_frame_iret_offset) ++
-        \\jmp userReturnToSavedFrame
-        :
-        : [trap_frame_size] "i" (@sizeOf(TrapFrame)),
-          [trap_frame_qwords] "i" (trap_frame_qword_count),
+    ++ asmCallAligned("syscallUserReturnCr3FromAsm") ++
+        \\mov %r12, %rsi
+        \\mov %rax, %cr3
+        \\mov 0(%rsi), %r15
+        \\mov 8(%rsi), %r14
+        \\mov 16(%rsi), %r13
+        \\mov 24(%rsi), %r12
+        \\mov 48(%rsi), %r9
+        \\mov 56(%rsi), %r8
+        \\mov 64(%rsi), %rbp
+        \\mov 88(%rsi), %rdx
+        \\mov 104(%rsi), %rbx
+        \\mov 112(%rsi), %rax
+        \\mov 120(%rsi), %rcx
+        \\mov 136(%rsi), %r11
+        \\mov 144(%rsi), %rsp
+        \\mov 40(%rsi), %r10
+        \\mov 72(%rsi), %rdi
+        \\mov 80(%rsi), %rsi
+        \\sysretq
+    );
+}
+
+/// Shared tail of every per-CPU entry: r12d holds the CPU slot and its work
+/// frame already holds the user registers.
+pub export fn syscallEntryCommon() callconv(.naked) noreturn {
+    asm volatile (syscallCommonPreamble(true) ++
+            \\.global syscallEntryCommonKernelReady
+            \\syscallEntryCommonKernelReady:
+        ++ b3.stamp(1) ++
+            \\mov kernel_syscall_stack_tops(%rip), %r13
+            \\mov (%r13,%r14,1), %rsp
+            \\push %r12
+        ++ b3.stamp(2) ++
+            \\mov %r12, %rcx
+        ++ b3.stamp(3) ++ asmCallAligned("syscallIpcScalarDispatch") ++
+            \\test %rax, %rax
+            \\jnz 1f
+        ++ asmCallAligned("saveCurrentThreadXState") ++ b3.stamp(3) ++
+            \\mov (%rsp), %r12
+            \\mov %r12, %rcx
+        ++ asmCallAligned("syscallDispatch") ++ b3.stamp(4) ++
+            \\mov (%rsp), %r12
+        ++ asmCallAligned("restoreCurrentThreadXState") ++
+            \\jmp 2f
+            \\1:
+        ++ b3.stamp(4) ++ asmCallAligned("finishIpcLive") ++
+            \\2:
+            \\.global syscallIpcCommittedReturn
+            \\syscallIpcCommittedReturn:
+        ++ b3.stamp(5) ++
+            \\mov (%rsp), %r12
+            \\add $8, %rsp
+        ++ asmCallAligned("syscallUserReturnCr3FromAsm") ++
+            \\# r12 is this CPU's work frame, mapped under the user CR3 as the
+            \\# entry stub wrote it before switching. Its rip..ss slots are the
+            \\# iret frame, so return straight from it: no staging copies and no
+            \\# per-field lookups (userReturnToSavedFrame serves other frames).
+            \\mov %rax, %r10
+            \\mov %r12, %rsi
+            \\lea 120(%r12), %rdi
+        ++ (if (b3.enabled) "" else "\nmov 112(%rsi), %rax\n") ++ b3.stamp(6) ++ (if (b3.enabled) "\nmov %r10, 88(%r11)\n" else "") ++
+            \\mov %r10, %cr3
+        ++ b3.stamp(7) ++ b3.stamp(8) ++ (if (b3.enabled) "\nmov 112(%rsi), %rax\n" else "") ++
+            \\mov 0(%rsi), %r15
+            \\mov 8(%rsi), %r14
+            \\mov 16(%rsi), %r13
+            \\mov 24(%rsi), %r12
+            \\mov 32(%rsi), %r11
+            \\mov 48(%rsi), %r9
+            \\mov 56(%rsi), %r8
+            \\mov 64(%rsi), %rbp
+            \\mov 88(%rsi), %rdx
+            \\mov 96(%rsi), %rcx
+            \\mov 104(%rsi), %rbx
+            \\mov %rdi, %rsp
+            \\mov 40(%rsi), %r10
+            \\mov 72(%rsi), %rdi
+            \\mov 80(%rsi), %rsi
+            \\iretq
     );
 }
 
@@ -579,12 +719,16 @@ pub export fn pageFaultDispatch(frame: *ExceptionTrapFrame) callconv(.winapi) u6
         // through the normal user CR3 reload and retry instead of treating
         // that resolved race as a fatal user fault.
         const not_present_fault = (ec & 1) == 0;
-        // A recycled principal uses the same PCID and page-table storage.  A
-        // CPU can therefore report a protection fault from an older cached
-        // translation even though the locked current PTE permits the access.
-        // The normal return path reloads CR3 (without no-flush), so retry only
-        // when the present PTE proves that this exact access is legal.  Never
-        // retry reserved-bit, protection-key, or shadow-stack violations.
+        // A CPU can report a protection fault from an older cached
+        // translation even though the locked current PTE permits the access:
+        // a recycled principal reuses its PCID and page-table storage, and a
+        // paging-structure cache can still hold a replaced shared table (for
+        // example after seedPdSlotFromExistingPdp). User returns normally keep
+        // the PCID's TLB entries (userCr3NoFlush), so mark this CPU's next
+        // return to flush explicitly; correctness must not depend on the #PF
+        // invalidating only the faulting address. Retry only when the present
+        // PTE proves that this exact access is legal. Never retry
+        // reserved-bit, protection-key, or shadow-stack violations.
         const exceptional_protection = (ec & ((1 << 3) | (1 << 5) | (1 << 6))) != 0;
         const stale_permitted_translation = !not_present_fault and
             !exceptional_protection and
@@ -594,6 +738,7 @@ pub export fn pageFaultDispatch(frame: *ExceptionTrapFrame) callconv(.winapi) u6
                 write_access,
                 instruction_fetch,
             );
+        if (stale_permitted_translation) user_return_flush[boundedCurrentCpuSlot()] = 1;
         return if (not_present_fault or stale_permitted_translation) 1 else 0;
     }
     const fault_mapping = user_copy.resolveNativeVmaFaultMappingWithAddressSpaceLocked(
@@ -741,6 +886,10 @@ comptime {
 pub fn stagePendingSignalForUserReturn(frame: *TrapFrame) void {
     if ((frame.cs & 3) != 3 or (frame.ss & 3) != 3) return;
     const claimed = scheduler.claimCurrentSignalForUserReturn(frame.rip) orelse return;
+    // A scalar IPC may return without ever saving. Materialize the source
+    // image before signal copy; after a switch this helper is deliberately a
+    // no-op, because hardware still holds the outgoing thread's registers.
+    if (!@import("builtin").is_test) @import("xstate_runtime.zig").saveIpcLiveIfNeeded();
     const stack_cost = process_abi.signal_red_zone_size +
         process_abi.signal_frame_size + process_abi.signal_runtime_stack_size;
     if (frame.rsp <= stack_cost) {
@@ -810,27 +959,23 @@ fn stageFaultForUserReturn(vector: u64, error_code: u64, address: u64, frame: *T
     return true;
 }
 
-fn deliverExpiredProcessSignalTimers(now_tick: u64) void {
-    while (scheduler.takeExpiredProcessSignalTimer(now_tick)) |expired| {
-        const delivery = scheduler.deliverSignal(
-            expired.principal,
-            expired.signo,
-            syscall_numbers.syscall_err_not_ready,
-        ) orelse {
-            scheduler.clearProcessSignalTimer(expired.principal);
-            continue;
-        };
-        _ = delivery;
-    }
-}
-
 pub export fn timerInterruptDispatch(frame: *TrapFrame) callconv(.winapi) void {
+    const diagnostic_scope = lock_diagnostics.enterInterrupt((frame.cs & 3) == 3);
+    const profile_from_user = if (@import("lock_profile.zig").enabled) (frame.cs & 3) == 3 else false;
+    if (comptime @import("lock_profile.zig").enabled) @import("lock_profile.zig").irqEnter(profile_from_user);
+    defer if (comptime @import("lock_profile.zig").enabled) @import("lock_profile.zig").irqLeave(profile_from_user);
+    defer diagnostic_scope.end();
     lapic.eoiLegacyPicMaster();
     lapic.eoi();
     const user_mode = ((frame.cs & 0x3) == 0x3) and ((frame.ss & 0x3) == 0x3);
     if (!scheduler.isBootstrapSchedulerCpu()) {
         if (user_mode) {
             if (!scheduler.apUserThreadCanContinue()) {
+                // STOP can beat its lifecycle IPI to this timer boundary.
+                // Capture the live user frame before redispatch publishes idle;
+                // CONT must not resume the previous syscall's saved stack.
+                _ = scheduler.quiesceStoppedCurrentUserThread(frame);
+                lock_diagnostics.assertRootEmpty();
                 smp.returnCurrentApAfterTimerInterrupt();
             }
             // Stage pending state in the outgoing frame before preemption
@@ -839,7 +984,17 @@ pub export fn timerInterruptDispatch(frame: *TrapFrame) callconv(.winapi) void {
             stagePendingSignalForUserReturn(frame);
             switch (scheduler.preemptApUserThread(boot_static.scheduler_slice_ticks, frame)) {
                 .continue_running => {},
-                .preempt, .invalid => smp.returnCurrentApAfterTimerInterrupt(),
+                .preempt => {
+                    lock_diagnostics.assertRootEmpty();
+                    smp.returnCurrentApAfterTimerInterrupt();
+                },
+                .invalid => {
+                    // STOP can also win after the readiness probe but before
+                    // the slice transition acquires the thread table.
+                    _ = scheduler.quiesceStoppedCurrentUserThread(frame);
+                    lock_diagnostics.assertRootEmpty();
+                    smp.returnCurrentApAfterTimerInterrupt();
+                },
             }
             _ = lapic.armTimer(lapic.timerInitialCount(boot_static.lapic_timer_initial_count) * @as(u32, @intCast(boot_static.scheduler_slice_ticks)));
             return;
@@ -860,11 +1015,12 @@ pub export fn timerInterruptDispatch(frame: *TrapFrame) callconv(.winapi) void {
     defer clockevent.rearmAfterTimerInterrupt();
     @import("realtime_clock.zig").updateFromBootstrapTimer();
     if (!kernel_runtime.kernel_state_ready) return;
-    syscalls.completePendingTimerFdWaitersFromInterrupt(now_ns orelse next_tick *| 1_000_000);
+    syscalls.completePendingTimerFdWaitersFromInterrupt(now_ns orelse next_tick *| 1_000_000, user_mode);
     // A sub-ms deadline IRQ is not a scheduler tick.
     if (!tick_elapsed) return;
-    deliverExpiredProcessSignalTimers(scheduler.lapic_tick_count);
-    syscalls.completePendingIrqFdWaitersFromInterrupt();
+    syscalls.completeProcessSignalTimersFromInterrupt(scheduler.lapic_tick_count, user_mode);
+    syscalls.completePendingIrqFdWaitersFromInterrupt(user_mode);
+    scheduler.retryPendingThreadMaintenance();
     scheduler.wakeExpiredTimers(scheduler.lapic_tick_count);
     if (!user_mode) return;
     if (boot_static.scheduler_slice_ticks != 0) {
@@ -874,6 +1030,11 @@ pub export fn timerInterruptDispatch(frame: *TrapFrame) callconv(.winapi) void {
 }
 
 pub export fn deviceInterruptDispatch(frame: *TrapFrame) callconv(.winapi) void {
+    const diagnostic_scope = lock_diagnostics.enterInterrupt((frame.cs & 3) == 3);
+    const profile_from_user = if (@import("lock_profile.zig").enabled) (frame.cs & 3) == 3 else false;
+    if (comptime @import("lock_profile.zig").enabled) @import("lock_profile.zig").irqEnter(profile_from_user);
+    defer if (comptime @import("lock_profile.zig").enabled) @import("lock_profile.zig").irqLeave(profile_from_user);
+    defer diagnostic_scope.end();
     defer smp.acknowledgeInterruptDrain();
     const active_vector = lapic.activeInterruptVectorInRange(
         device_interrupt_vector,
@@ -883,7 +1044,6 @@ pub export fn deviceInterruptDispatch(frame: *TrapFrame) callconv(.winapi) void 
         return;
     };
     lapic.eoi();
-    _ = frame;
     if (!kernel_runtime.kernel_state_ready) return;
     const route = pci.interruptRouteForVector(active_vector) orelse return;
     var ignored_wake_owners: [16]kernel.PrincipalId = undefined;
@@ -892,11 +1052,19 @@ pub export fn deviceInterruptDispatch(frame: *TrapFrame) callconv(.winapi) void 
         route.entry,
         ignored_wake_owners[0..],
     );
-    syscalls.completePendingIrqFdWaitersFromInterrupt();
+    syscalls.completePendingIrqFdWaitersFromInterrupt((frame.cs & 3) == 3 and (frame.ss & 3) == 3);
 }
 
 pub export fn schedulerMaintenanceIpiDispatch(frame: *TrapFrame) callconv(.winapi) void {
-    _ = frame;
+    const diagnostic_scope = lock_diagnostics.enterInterrupt((frame.cs & 3) == 3);
+    const profile_from_user = if (@import("lock_profile.zig").enabled) (frame.cs & 3) == 3 else false;
+    if (comptime @import("lock_profile.zig").enabled) @import("lock_profile.zig").irqEnter(profile_from_user);
+    defer if (comptime @import("lock_profile.zig").enabled) @import("lock_profile.zig").irqLeave(profile_from_user);
+    defer diagnostic_scope.end();
+    schedulerMaintenanceIpiBody();
+}
+
+inline fn schedulerMaintenanceIpiBody() void {
     user_copy.acknowledgePendingTlbShootdown();
     @import("clockevent.zig").rearm();
     lapic.eoi();
@@ -904,7 +1072,19 @@ pub export fn schedulerMaintenanceIpiDispatch(frame: *TrapFrame) callconv(.winap
 }
 
 pub export fn schedulerWakeIpiDispatch(frame: *TrapFrame) callconv(.winapi) void {
-    schedulerMaintenanceIpiDispatch(frame);
+    smp.receiveNotifyWake();
+    const diagnostic_scope = lock_diagnostics.enterInterrupt((frame.cs & 3) == 3);
+    const profile_from_user = if (@import("lock_profile.zig").enabled) (frame.cs & 3) == 3 else false;
+    if (comptime @import("lock_profile.zig").enabled) @import("lock_profile.zig").irqEnter(profile_from_user);
+    defer if (comptime @import("lock_profile.zig").enabled) @import("lock_profile.zig").irqLeave(profile_from_user);
+    defer diagnostic_scope.end();
+    // This is a direct helper call, not another hardware IRQ entry. Enter the
+    // diagnostic context only once for the wake vector's maintenance work.
+    if (comptime lock_diagnostics.enabled) {
+        schedulerMaintenanceIpiBody();
+    } else {
+        schedulerMaintenanceIpiDispatch(frame);
+    }
     // A lifecycle IPI can interrupt a target while it is executing a syscall
     // and holding kernel locks.  Saving that ring-0 trap frame as a stopped
     // user context would abandon the syscall before its deferred unlocks run.
@@ -913,6 +1093,7 @@ pub export fn schedulerWakeIpiDispatch(frame: *TrapFrame) callconv(.winapi) void
     if ((frame.cs & 3) != 3) return;
     if (scheduler.quiesceStoppedCurrentUserThread(frame)) {
         if (!scheduler.isBootstrapSchedulerCpu()) {
+            lock_diagnostics.assertRootEmpty();
             smp.returnCurrentApToIdleFromInterrupt();
         }
         while (!scheduler.loadNextReadyThread(frame)) {
@@ -930,7 +1111,7 @@ pub export fn schedulerWakeIpiDispatch(frame: *TrapFrame) callconv(.winapi) void
 pub export fn pageFaultHandlerStub() callconv(.naked) noreturn {
     asm volatile (
         \\push %r10
-        \\mov kernel_cr3_value(%rip), %r10
+        \\mov kernel_cr3_entry_value(%rip), %r10
         \\mov %r10, %cr3
         \\pop %r10
         \\push %rax
@@ -1017,7 +1198,7 @@ pub export fn pageFaultHandlerStub() callconv(.naked) noreturn {
 pub export fn doubleFaultHandlerStub() callconv(.naked) noreturn {
     asm volatile (
         \\push %r10
-        \\mov kernel_cr3_value(%rip), %r10
+        \\mov kernel_cr3_entry_value(%rip), %r10
         \\mov %r10, %cr3
         \\pop %r10
         \\mov (%rsp), %rdi
@@ -1032,7 +1213,7 @@ pub export fn timerInterruptHandlerStub() callconv(.naked) noreturn {
     if (debug_skip_kernel_fx_state) {
         asm volatile (
             \\push %r10
-            \\mov kernel_cr3_value(%rip), %r10
+            \\mov kernel_cr3_entry_value(%rip), %r10
             \\mov %r10, %cr3
             \\pop %r10
             \\push %rax
@@ -1085,7 +1266,7 @@ pub export fn timerInterruptHandlerStub() callconv(.naked) noreturn {
     } else {
         asm volatile (
             \\push %r10
-            \\mov kernel_cr3_value(%rip), %r10
+            \\mov kernel_cr3_entry_value(%rip), %r10
             \\mov %r10, %cr3
             \\pop %r10
             \\push %rax
@@ -1143,7 +1324,7 @@ pub export fn deviceInterruptHandlerStub() callconv(.naked) noreturn {
     if (debug_skip_kernel_fx_state) {
         asm volatile (
             \\push %r10
-            \\mov kernel_cr3_value(%rip), %r10
+            \\mov kernel_cr3_entry_value(%rip), %r10
             \\mov %r10, %cr3
             \\pop %r10
             \\push %rax
@@ -1196,7 +1377,7 @@ pub export fn deviceInterruptHandlerStub() callconv(.naked) noreturn {
     } else {
         asm volatile (
             \\push %r10
-            \\mov kernel_cr3_value(%rip), %r10
+            \\mov kernel_cr3_entry_value(%rip), %r10
             \\mov %r10, %cr3
             \\pop %r10
             \\push %rax
@@ -1253,7 +1434,7 @@ pub export fn deviceInterruptHandlerStub() callconv(.naked) noreturn {
 pub export fn schedulerWakeIpiHandlerStub() callconv(.naked) noreturn {
     asm volatile (
         \\push %r10
-        \\mov kernel_cr3_value(%rip), %r10
+        \\mov kernel_cr3_entry_value(%rip), %r10
         \\mov %r10, %cr3
         \\pop %r10
         \\push %rax
@@ -1309,7 +1490,7 @@ pub export fn schedulerWakeIpiHandlerStub() callconv(.naked) noreturn {
 pub export fn generalProtectionHandlerStub() callconv(.naked) noreturn {
     asm volatile (
         \\push %r10
-        \\mov kernel_cr3_value(%rip), %r10
+        \\mov kernel_cr3_entry_value(%rip), %r10
         \\mov %r10, %cr3
         \\pop %r10
         \\push %rax
@@ -1333,7 +1514,7 @@ pub export fn generalProtectionHandlerStub() callconv(.naked) noreturn {
 pub export fn invalidTssHandlerStub() callconv(.naked) noreturn {
     asm volatile (
         \\push %r10
-        \\mov kernel_cr3_value(%rip), %r10
+        \\mov kernel_cr3_entry_value(%rip), %r10
         \\mov %r10, %cr3
         \\pop %r10
         \\push %rax
@@ -1357,7 +1538,7 @@ pub export fn invalidTssHandlerStub() callconv(.naked) noreturn {
 pub export fn segmentNotPresentHandlerStub() callconv(.naked) noreturn {
     asm volatile (
         \\push %r10
-        \\mov kernel_cr3_value(%rip), %r10
+        \\mov kernel_cr3_entry_value(%rip), %r10
         \\mov %r10, %cr3
         \\pop %r10
         \\push %rax
@@ -1381,7 +1562,7 @@ pub export fn segmentNotPresentHandlerStub() callconv(.naked) noreturn {
 pub export fn stackSegmentFaultHandlerStub() callconv(.naked) noreturn {
     asm volatile (
         \\push %r10
-        \\mov kernel_cr3_value(%rip), %r10
+        \\mov kernel_cr3_entry_value(%rip), %r10
         \\mov %r10, %cr3
         \\pop %r10
         \\push %rax
@@ -1405,7 +1586,7 @@ pub export fn stackSegmentFaultHandlerStub() callconv(.naked) noreturn {
 pub export fn divideErrorHandlerStub() callconv(.naked) noreturn {
     asm volatile (
         \\push %r10
-        \\mov kernel_cr3_value(%rip), %r10
+        \\mov kernel_cr3_entry_value(%rip), %r10
         \\mov %r10, %cr3
         \\pop %r10
         \\push %rax
@@ -1445,7 +1626,7 @@ pub export fn divideErrorHandlerStub() callconv(.naked) noreturn {
 pub export fn breakpointHandlerStub() callconv(.naked) noreturn {
     asm volatile (
         \\push %r10
-        \\mov kernel_cr3_value(%rip), %r10
+        \\mov kernel_cr3_entry_value(%rip), %r10
         \\mov %r10, %cr3
         \\pop %r10
         \\push %rax
@@ -1485,7 +1666,7 @@ pub export fn breakpointHandlerStub() callconv(.naked) noreturn {
 pub export fn invalidOpcodeHandlerStub() callconv(.naked) noreturn {
     asm volatile (
         \\push %r10
-        \\mov kernel_cr3_value(%rip), %r10
+        \\mov kernel_cr3_entry_value(%rip), %r10
         \\mov %r10, %cr3
         \\pop %r10
         \\push %rax

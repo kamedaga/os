@@ -100,7 +100,7 @@ int64_t lpr_linux_pipe2(uint64_t fds_raw, uint64_t flags)
         const uint32_t linux_flags = lpr_pipe_flags_from_info(infos[i]);
         *backends[i] = (lpr_pipe_backend_t){
             .active = 1, .readable = i == 0, .writable = i == 1,
-            .flags = linux_flags, .native.raw = (int32_t)pair[i],
+            .flags = linux_flags, .native.raw = (pacha_fd_t)pair[i],
         };
         installs[i] = (lpr_fd_install_t){
             .ops_id = LPR_FD_OPS_PIPE,
@@ -135,14 +135,14 @@ int64_t lpr_linux_eventfd2(uint64_t initval, uint64_t flags)
     if ((flags & ~known_flags) != 0) {
         return -LPR_LINUX_EINVAL;
     }
-    int wait_fd = -1;
-    int notify_fd = -1;
+    pacha_fd_t wait_fd = -1;
+    pacha_fd_t notify_fd = -1;
     const int pair_status = lpr_native_wait_pair(&wait_fd, &notify_fd);
     if (pair_status != 0) return pair_status;
     lpr_event_backend_t *event = lpr_backend_state_alloc(sizeof(*event));
     if (event == 0) {
-        (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)wait_fd);
-        (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)notify_fd);
+        (void)lpr_close_native_fd_if_open((uint64_t)wait_fd);
+        (void)lpr_close_native_fd_if_open((uint64_t)notify_fd);
         return -LPR_LINUX_ENOMEM;
     }
     *event = (lpr_event_backend_t){
@@ -162,8 +162,8 @@ int64_t lpr_linux_eventfd2(uint64_t initval, uint64_t flags)
     const int fd = lpr_fd_alloc_initialized(&install);
     if (fd < 0) {
         (void)lpr_backend_state_free(event, sizeof(*event));
-        (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)wait_fd);
-        (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)notify_fd);
+        (void)lpr_close_native_fd_if_open((uint64_t)wait_fd);
+        (void)lpr_close_native_fd_if_open((uint64_t)notify_fd);
     }
     return fd;
 }
@@ -182,10 +182,7 @@ void lpr_event_backend_notify(lpr_event_backend_t *event)
     }
 #endif
     const struct pacha_ipc_msg message = {0};
-    const int64_t status = lpr_pacha_syscall2(
-        PACHAOS_SYSCALL_IPC_SEND,
-        (uint64_t)(uint32_t)event->notify_fd.raw,
-        (uint64_t)(uintptr_t)&message);
+    const int64_t status = lpr_ipc_message(PACHAOS_SYSCALL_IPC_SEND, (uint64_t)event->notify_fd.raw, (uint64_t)(uintptr_t)((uint64_t)(uintptr_t)&message), 0, 0, 0, 0);
     (void)status;
 #if defined(LPR_GLYCIN_DIAG) && LPR_GLYCIN_DIAG
     if (__atomic_load_n(&lpr_glycin_diag_armed, __ATOMIC_ACQUIRE) != 0u) {
@@ -199,7 +196,7 @@ void lpr_event_backend_notify(lpr_event_backend_t *event)
 #endif
 }
 
-int lpr_eventfd_native_wait_fd(uint64_t fd)
+pacha_fd_t lpr_eventfd_native_wait_fd(uint64_t fd)
 {
     lpr_event_backend_t *event = lpr_event_backend(fd);
     return event != 0 ? event->wait_fd.raw : -1;
@@ -227,10 +224,7 @@ void lpr_eventfd_drain_wait(uint64_t fd)
      * Consume at most one token so a continuously active producer cannot keep
      * this thread here instead of returning it to the logical-state scan. */
     struct pacha_ipc_msg message = {0};
-    (void)lpr_pacha_syscall2(
-        PACHAOS_SYSCALL_IPC_RECV,
-        (uint64_t)(uint32_t)event->wait_fd.raw,
-        (uint64_t)(uintptr_t)&message);
+    (void)lpr_ipc_message(PACHAOS_SYSCALL_IPC_RECV, (uint64_t)event->wait_fd.raw, 0, (uint64_t)(uintptr_t)((uint64_t)(uintptr_t)&message), 0, 0, 0);
 #if defined(LPR_GLYCIN_DIAG) && LPR_GLYCIN_DIAG
     if (__atomic_load_n(&lpr_glycin_diag_armed, __ATOMIC_ACQUIRE) != 0u) {
         lpr_glycin_diag_event(
@@ -249,27 +243,28 @@ int64_t lpr_linux_dup_into(uint64_t fd, int target_fd, uint64_t min_fd, uint64_t
         return -LPR_LINUX_EBADF;
     }
     if (target_fd < 0) {
-        if (min_fd > LPR_LINUX_FD_MAX) {
+        if (min_fd >= lpr_fd_table_soft_limit(&lpr_control_fd_table)) {
             return -LPR_LINUX_EINVAL;
         }
         for (;;) {
             const int64_t prepared = lpr_fd_prepare_dup(fd);
             if (prepared) return prepared;
             lpr_linux_fd_t new_fd;
-            if (!lpr_fd_table_dup_excluding(&lpr_control_fd_table,
+            const int duplicated = lpr_fd_table_dup_excluding(&lpr_control_fd_table,
                     (uint32_t)fd, (uint32_t)min_fd, cloexec ? LPR_FD_ENTRY_CLOEXEC : 0,
                     lpr_fd_allocation_excluded, sizeof(lpr_fd_allocation_excluded) /
-                        sizeof(lpr_fd_allocation_excluded[0]), &new_fd))
-                return new_fd;
+                        sizeof(lpr_fd_allocation_excluded[0]), &new_fd);
+            if (!duplicated) return new_fd;
+            if (duplicated == -LPR_LINUX_EINVAL) return duplicated;
             const uint64_t capacity = lpr_fd_table_capacity;
-            if (capacity >= LPR_FD_TABLE_MAX_SIZE ||
+            if (capacity >= lpr_fd_table_soft_limit(&lpr_control_fd_table) ||
                 lpr_fd_table_ensure_capacity(min_fd >= capacity ? min_fd + 1 : capacity + 1))
                 return -LPR_LINUX_EMFILE;
         }
     }
     const uint64_t new_fd = (uint64_t)(uint32_t)target_fd;
-    if (target_fd < 0 || new_fd > LPR_LINUX_FD_MAX) {
-        return -LPR_LINUX_EINVAL;
+    if (new_fd >= lpr_fd_table_soft_limit(&lpr_control_fd_table)) {
+        return -LPR_LINUX_EBADF;
     }
     if (fd == new_fd) {
         return (int64_t)new_fd;
@@ -298,12 +293,15 @@ int64_t lpr_linux_dup(uint64_t fd, uint64_t min_fd, uint64_t cloexec)
 int64_t lpr_linux_dup2(uint64_t old_fd, uint64_t new_fd, uint64_t flags)
 {
     const uint64_t known_flags = LPR_LINUX_O_CLOEXEC;
-    if ((flags & ~known_flags) != 0 || new_fd > LPR_LINUX_FD_MAX) {
+    if ((flags & ~known_flags) != 0) {
         return -LPR_LINUX_EINVAL;
     }
+    lpr_fd_arrays_init();
+    if (new_fd >= lpr_fd_table_soft_limit(&lpr_control_fd_table))
+        return -LPR_LINUX_EBADF;
     if (old_fd == new_fd) {
         return flags == 0 && lpr_control_require_fd(old_fd) == 0 ?
-            (int64_t)new_fd : -LPR_LINUX_EINVAL;
+            (int64_t)new_fd : -LPR_LINUX_EBADF;
     }
     return lpr_linux_dup_into(
         old_fd,

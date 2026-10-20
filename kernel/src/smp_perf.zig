@@ -1,4 +1,4 @@
-const std = @import("std");
+const storage = @import("diagnostic_cpu_storage.zig");
 const root = @import("root");
 const smp = @import("smp.zig");
 const platform = @import("arch/x86_64/platform.zig");
@@ -24,7 +24,17 @@ pub const Counter = enum(usize) {
 };
 // One cacheline-separated row per CPU. No hot-path logging or shared lock.
 // Diagnostic host tooling reads these through QMP physical-memory snapshots.
-pub export var smp_perf_counters: [smp.max_cpus][16]u64 align(128) = std.mem.zeroes([smp.max_cpus][16]u64);
+const boot_rows = if (enabled) 1 else 0;
+var smp_boot: [boot_rows][16]u64 align(128) = @splat(@splat(0));
+var smp_perf_counters: [][16]u64 = &smp_boot;
+var smp_perf_counters_view = @import("diagnostic_cpu_storage.zig").Descriptor([16]u64).init(&smp_boot);
+var smp_perf_layout = [_]u64{ boot_rows, 16 };
+comptime {
+    if (enabled) {
+        @export(&smp_perf_counters_view, .{ .name = "smp_perf_counters" });
+        @export(&smp_perf_layout, .{ .name = "smp_perf_layout" });
+    }
+}
 
 // Separate diagnostic array: preserve the existing SMP counter layout and
 // allocate no additional storage in release builds. Counters aggregate all
@@ -47,17 +57,18 @@ pub const MunmapCounter = enum(usize) {
     size_5_to_64_pages,
     size_over_64_pages,
 };
-const munmap_cpu_rows = if (enabled) smp.max_cpus else 0;
-var munmap_perf_counters: [munmap_cpu_rows][16]u64 align(128) =
-    std.mem.zeroes([munmap_cpu_rows][16]u64);
+const munmap_cpu_rows = boot_rows;
+var munmap_perf_counters_boot: [munmap_cpu_rows][16]u64 align(128) = @splat(@splat(0));
+var munmap_perf_counters: [][16]u64 = &munmap_perf_counters_boot;
+var munmap_perf_counters_view = @import("diagnostic_cpu_storage.zig").Descriptor([16]u64).init(&munmap_perf_counters_boot);
 comptime {
-    if (enabled) @export(&munmap_perf_counters, .{ .name = "munmap_perf_counters" });
+    if (enabled) @export(&munmap_perf_counters_view, .{ .name = "munmap_perf_counters" });
 }
 
 pub fn munmapAdd(counter: MunmapCounter, value: u64) void {
     if (!enabled) return;
     const cpu = smp.currentCpuSlot();
-    if (cpu >= smp.max_cpus) return;
+    if (cpu >= smp_perf_counters.len) return;
     _ = @atomicRmw(u64, &munmap_perf_counters[cpu][@intFromEnum(counter)], .Add, value, .monotonic);
 }
 pub fn munmapElapsed(counter: MunmapCounter, start: u64) void {
@@ -82,15 +93,16 @@ pub const VmoCounter = enum(usize) {
     partial_total_cycles,
     final_drop_with_store,
 };
-var vmo_perf_counters: [munmap_cpu_rows][16]u64 align(128) =
-    std.mem.zeroes([munmap_cpu_rows][16]u64);
+var vmo_perf_counters_boot: [munmap_cpu_rows][16]u64 align(128) = @splat(@splat(0));
+var vmo_perf_counters: [][16]u64 = &vmo_perf_counters_boot;
+var vmo_perf_counters_view = @import("diagnostic_cpu_storage.zig").Descriptor([16]u64).init(&vmo_perf_counters_boot);
 comptime {
-    if (enabled) @export(&vmo_perf_counters, .{ .name = "vmo_perf_counters" });
+    if (enabled) @export(&vmo_perf_counters_view, .{ .name = "vmo_perf_counters" });
 }
 pub fn vmoAdd(counter: VmoCounter, value: u64) void {
     if (!enabled) return;
     const cpu = smp.currentCpuSlot();
-    if (cpu >= smp.max_cpus) return;
+    if (cpu >= smp_perf_counters.len) return;
     _ = @atomicRmw(u64, &vmo_perf_counters[cpu][@intFromEnum(counter)], .Add, value, .monotonic);
 }
 pub fn vmoElapsed(counter: VmoCounter, start: u64) void {
@@ -114,15 +126,16 @@ pub const PtRetireCounter = enum(usize) {
     release_cycles,
     range_total_cycles,
 };
-var pt_retire_perf_counters: [munmap_cpu_rows][16]u64 align(128) =
-    std.mem.zeroes([munmap_cpu_rows][16]u64);
+var pt_retire_perf_counters_boot: [munmap_cpu_rows][16]u64 align(128) = @splat(@splat(0));
+var pt_retire_perf_counters: [][16]u64 = &pt_retire_perf_counters_boot;
+var pt_retire_perf_counters_view = @import("diagnostic_cpu_storage.zig").Descriptor([16]u64).init(&pt_retire_perf_counters_boot);
 comptime {
-    if (enabled) @export(&pt_retire_perf_counters, .{ .name = "pt_retire_perf_counters" });
+    if (enabled) @export(&pt_retire_perf_counters_view, .{ .name = "pt_retire_perf_counters" });
 }
 pub fn ptRetireAdd(counter: PtRetireCounter, value: u64) void {
     if (!enabled) return;
     const cpu = smp.currentCpuSlot();
-    if (cpu >= smp.max_cpus) return;
+    if (cpu >= smp_perf_counters.len) return;
     _ = @atomicRmw(u64, &pt_retire_perf_counters[cpu][@intFromEnum(counter)], .Add, value, .monotonic);
 }
 pub fn ptRetireElapsed(counter: PtRetireCounter, start: u64) void {
@@ -131,16 +144,17 @@ pub fn ptRetireElapsed(counter: PtRetireCounter, start: u64) void {
 
 // Unlock-time timer scan + deadline publish, not notifyChanged(). Column 3 is
 // reserved. Separate from existing layouts; absent from normal releases.
-var timer_scan_perf_counters: [munmap_cpu_rows][4]u64 align(128) =
-    std.mem.zeroes([munmap_cpu_rows][4]u64);
+var timer_scan_perf_counters_boot: [munmap_cpu_rows][4]u64 align(128) = @splat(@splat(0));
+var timer_scan_perf_counters: [][4]u64 = &timer_scan_perf_counters_boot;
+var timer_scan_perf_counters_view = @import("diagnostic_cpu_storage.zig").Descriptor([4]u64).init(&timer_scan_perf_counters_boot);
 comptime {
-    if (enabled) @export(&timer_scan_perf_counters, .{ .name = "timer_scan_perf_counters" });
+    if (enabled) @export(&timer_scan_perf_counters_view, .{ .name = "timer_scan_perf_counters" });
 }
 pub fn timerScanRecord(start: u64, changed: bool) void {
     if (!enabled) return;
     const cycles = timestamp() -% start;
     const cpu = smp.currentCpuSlot();
-    if (cpu >= smp.max_cpus) return;
+    if (cpu >= smp_perf_counters.len) return;
     _ = @atomicRmw(u64, &timer_scan_perf_counters[cpu][0], .Add, 1, .monotonic);
     _ = @atomicRmw(u64, &timer_scan_perf_counters[cpu][1], .Add, cycles, .monotonic);
     if (changed) _ = @atomicRmw(u64, &timer_scan_perf_counters[cpu][2], .Add, 1, .monotonic);
@@ -171,10 +185,11 @@ pub const RuntimeCounter = enum(usize) {
 };
 pub const runtime_counter_count = @typeInfo(RuntimeCounter).@"enum".fields.len;
 pub const runtime_path_stride = @typeInfo(RuntimePath).@"enum".fields.len * runtime_counter_count;
-var runtime_path_perf_counters: [munmap_cpu_rows][runtime_path_stride]u64 align(128) =
-    std.mem.zeroes([munmap_cpu_rows][runtime_path_stride]u64);
+var runtime_path_perf_counters_boot: [munmap_cpu_rows][runtime_path_stride]u64 align(128) = @splat(@splat(0));
+var runtime_path_perf_counters: [][runtime_path_stride]u64 = &runtime_path_perf_counters_boot;
+var runtime_path_perf_counters_view = @import("diagnostic_cpu_storage.zig").Descriptor([runtime_path_stride]u64).init(&runtime_path_perf_counters_boot);
 comptime {
-    if (enabled) @export(&runtime_path_perf_counters, .{ .name = "runtime_path_perf_counters" });
+    if (enabled) @export(&runtime_path_perf_counters_view, .{ .name = "runtime_path_perf_counters" });
 }
 pub fn runtimePath(nr: u64, op: u64) ?RuntimePath {
     if (!enabled) return null;
@@ -194,7 +209,7 @@ pub fn runtimeAdd(path: ?RuntimePath, counter: RuntimeCounter, value: u64) void 
     if (!enabled) return;
     const selected = path orelse return;
     const cpu = smp.currentCpuSlot();
-    if (cpu >= smp.max_cpus) return;
+    if (cpu >= smp_perf_counters.len) return;
     const index = @intFromEnum(selected) * runtime_counter_count + @intFromEnum(counter);
     _ = @atomicRmw(u64, &runtime_path_perf_counters[cpu][index], .Add, value, .monotonic);
 }
@@ -224,15 +239,16 @@ pub const HandoffCounter = enum(usize) {
     install_failed,
 };
 pub const handoff_counter_count = @typeInfo(HandoffCounter).@"enum".fields.len;
-var wake_wait_handoff_perf_counters: [munmap_cpu_rows][handoff_counter_count]u64 align(128) =
-    std.mem.zeroes([munmap_cpu_rows][handoff_counter_count]u64);
+var wake_wait_handoff_perf_counters_boot: [munmap_cpu_rows][handoff_counter_count]u64 align(128) = @splat(@splat(0));
+var wake_wait_handoff_perf_counters: [][handoff_counter_count]u64 = &wake_wait_handoff_perf_counters_boot;
+var wake_wait_handoff_perf_counters_view = @import("diagnostic_cpu_storage.zig").Descriptor([handoff_counter_count]u64).init(&wake_wait_handoff_perf_counters_boot);
 comptime {
-    if (enabled) @export(&wake_wait_handoff_perf_counters, .{ .name = "wake_wait_handoff_perf_counters" });
+    if (enabled) @export(&wake_wait_handoff_perf_counters_view, .{ .name = "wake_wait_handoff_perf_counters" });
 }
 pub fn handoffAdd(counter: HandoffCounter, value: u64) void {
     if (!enabled) return;
     const cpu = smp.currentCpuSlot();
-    if (cpu >= smp.max_cpus) return;
+    if (cpu >= smp_perf_counters.len) return;
     _ = @atomicRmw(u64, &wake_wait_handoff_perf_counters[cpu][@intFromEnum(counter)], .Add, value, .monotonic);
 }
 pub fn handoffElapsed(counter: HandoffCounter, start: u64) void {
@@ -245,17 +261,36 @@ pub fn timestamp() u64 {
 pub fn add(counter: Counter, value: u64) void {
     if (!enabled) return;
     const cpu = smp.currentCpuSlot();
-    if (cpu >= smp.max_cpus) return;
+    if (cpu >= smp_perf_counters.len) return;
     _ = @atomicRmw(u64, &smp_perf_counters[cpu][@intFromEnum(counter)], .Add, value, .monotonic);
 }
 pub fn elapsed(counter: Counter, start: u64) void {
     if (enabled) add(counter, timestamp() -% start);
 }
+// BSP migration runs with interrupts disabled before any AP is published.
+pub fn initCpuStorage(count: usize) !void {
+    if (comptime !enabled) return;
+    smp_perf_counters = try storage.grow([16]u64, smp_perf_counters, count, @splat(0));
+    munmap_perf_counters = try storage.grow([16]u64, munmap_perf_counters, count, @splat(0));
+    vmo_perf_counters = try storage.grow([16]u64, vmo_perf_counters, count, @splat(0));
+    pt_retire_perf_counters = try storage.grow([16]u64, pt_retire_perf_counters, count, @splat(0));
+    timer_scan_perf_counters = try storage.grow([4]u64, timer_scan_perf_counters, count, @splat(0));
+    runtime_path_perf_counters = try storage.grow([runtime_path_stride]u64, runtime_path_perf_counters, count, @splat(0));
+    wake_wait_handoff_perf_counters = try storage.grow([handoff_counter_count]u64, wake_wait_handoff_perf_counters, count, @splat(0));
+    smp_perf_layout[0] = count;
+    smp_perf_counters_view = @TypeOf(smp_perf_counters_view).init(smp_perf_counters);
+    munmap_perf_counters_view = @TypeOf(munmap_perf_counters_view).init(munmap_perf_counters);
+    vmo_perf_counters_view = @TypeOf(vmo_perf_counters_view).init(vmo_perf_counters);
+    pt_retire_perf_counters_view = @TypeOf(pt_retire_perf_counters_view).init(pt_retire_perf_counters);
+    timer_scan_perf_counters_view = @TypeOf(timer_scan_perf_counters_view).init(timer_scan_perf_counters);
+    runtime_path_perf_counters_view = @TypeOf(runtime_path_perf_counters_view).init(runtime_path_perf_counters);
+    wake_wait_handoff_perf_counters_view = @TypeOf(wake_wait_handoff_perf_counters_view).init(wake_wait_handoff_perf_counters);
+}
 pub fn staticEnd() usize {
-    const smp_end = @intFromPtr(&smp_perf_counters) + @sizeOf(@TypeOf(smp_perf_counters));
-    if (!enabled) return smp_end;
-    const existing_end = @max(@max(@max(smp_end, @intFromPtr(&munmap_perf_counters) + @sizeOf(@TypeOf(munmap_perf_counters))), @intFromPtr(&vmo_perf_counters) + @sizeOf(@TypeOf(vmo_perf_counters))), @intFromPtr(&timer_scan_perf_counters) + @sizeOf(@TypeOf(timer_scan_perf_counters)));
-    const runtime_end = @max(existing_end, @intFromPtr(&runtime_path_perf_counters) + @sizeOf(@TypeOf(runtime_path_perf_counters)));
-    const retire_end = @max(runtime_end, @intFromPtr(&pt_retire_perf_counters) + @sizeOf(@TypeOf(pt_retire_perf_counters)));
-    return @max(retire_end, @intFromPtr(&wake_wait_handoff_perf_counters) + @sizeOf(@TypeOf(wake_wait_handoff_perf_counters)));
+    if (comptime !enabled) return 0;
+    var end: usize = @import("lock_profile.zig").staticEnd();
+    inline for (.{ &smp_perf_counters, &smp_perf_layout, &smp_boot, &smp_perf_counters_view, &munmap_perf_counters_view, &vmo_perf_counters_view, &pt_retire_perf_counters_view, &timer_scan_perf_counters_view, &runtime_path_perf_counters_view, &wake_wait_handoff_perf_counters_view, &munmap_perf_counters, &munmap_perf_counters_boot, &vmo_perf_counters, &vmo_perf_counters_boot, &pt_retire_perf_counters, &pt_retire_perf_counters_boot, &timer_scan_perf_counters, &timer_scan_perf_counters_boot, &runtime_path_perf_counters, &runtime_path_perf_counters_boot, &wake_wait_handoff_perf_counters, &wake_wait_handoff_perf_counters_boot }) |ptr| {
+        end = @max(end, @intFromPtr(ptr) + @sizeOf(@TypeOf(ptr.*)));
+    }
+    return end;
 }

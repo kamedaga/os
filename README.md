@@ -15,6 +15,10 @@
 詳しくは [設計思想](pacha_docs/architecture.md)
 を参照してください。
 
+## Contributing
+
+カーネルの変更前とレビュー時には、[カーネル開発規約](kernel/CONTRIBUTING.md) を確認してください。
+
 ---
 ![xfce4 fastfetch](/assets/xfce-screenshot.png)
 

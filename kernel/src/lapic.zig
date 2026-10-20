@@ -1,3 +1,4 @@
+const mmio = @import("memory/mmio.zig");
 const std = @import("std");
 const realtime_clock = @import("realtime_clock.zig");
 
@@ -21,7 +22,58 @@ const lapic_reg_divide_config: u32 = 0x3E0;
 pub const pit_frequency_hz: u64 = 1_193_182;
 pub const calibration_pit_ticks: u16 = 59_659;
 pub const timer_target_period_ns: u64 = 1_000_000;
-const pit_poll_limit: u64 = 50_000_000;
+// PIT mode 0 nominally completes in 50 ms. HPET is independent of both
+// clocks being calibrated. A second work bound handles a stopped HPET; it
+// is not a claim about wall time of a trapped port I/O instruction.
+const pit_timeout_ns: u64 = 100_000_000;
+const pit_clock_stall_limit: usize = 100_000;
+pub const CalibrationReason = enum { ready, unavailable, no_deadline_clock, pit_not_low, timeout, clock_stalled, invalid_measurement };
+
+const PitWait = struct {
+    start: u64,
+    previous: u64,
+    stagnant: usize = 0,
+    fn check(self: *PitWait, now: u64, done: bool) ?CalibrationReason {
+        if (now < self.previous or now - self.start >= pit_timeout_ns) return .timeout;
+        if (now == self.previous) self.stagnant += 1 else self.stagnant = 0;
+        self.previous = now;
+        if (self.stagnant >= pit_clock_stall_limit) return .clock_stalled;
+        return if (done) .ready else null;
+    }
+};
+
+// With no HPET, mode 0's decreasing count is the deadline clock itself.
+// The PIT's known frequency bounds the progressing window to ~50 ms; stalled
+// reads have a separate work bound, not a wall-time claim about port I/O.
+const PitCounterWait = struct {
+    previous: u16 = calibration_pit_ticks,
+    observed_count: bool = false,
+    stagnant: usize = 0,
+
+    fn check(self: *PitCounterWait, count: u16, done: bool) ?CalibrationReason {
+        // Read OUT after the latch: reaching zero between those reads is a
+        // successful terminal count, not a timeout. OUT stays high in mode 0.
+        if (done) return .ready;
+        // Before the first PIT clock loads the programmed value, a latch can
+        // still return zero. Bound that initialization wait like a stall.
+        if (count == 0 and !self.observed_count) {
+            self.stagnant += 1;
+        } else {
+            if (count == 0 or count > self.previous) return .timeout;
+            self.observed_count = true;
+            if (count == self.previous) self.stagnant += 1 else self.stagnant = 0;
+            self.previous = count;
+        }
+        return if (self.stagnant >= pit_clock_stall_limit) .clock_stalled else null;
+    }
+};
+
+fn latchPitCounter2() u16 {
+    outb(0x43, 0x80); // channel 2 counter latch; preserve mode and gate
+    const low = inb(0x42);
+    const high = inb(0x42);
+    return @as(u16, low) | (@as(u16, high) << 8);
+}
 
 const icr_delivery_status: u32 = 1 << 12;
 const icr_level_assert: u32 = 1 << 14;
@@ -30,6 +82,7 @@ const icr_delivery_init: u32 = 0x5 << 8;
 const icr_delivery_startup: u32 = 0x6 << 8;
 
 var lapic_base_pa: u64 = 0;
+var registers: mmio.Borrow = undefined;
 // Chosen by the BSP before AP startup, then read-only. Each AP must enable
 // and verify this mode before it is made online; a mismatch fails closed.
 var x2apic_mode: bool = false;
@@ -37,7 +90,7 @@ var bsp_timer_initial_count: u32 = 0;
 var timer_frequency_hz: u64 = 0;
 
 pub fn kernelStaticStorageEndAddr() usize {
-    return @max(@max(@intFromPtr(&timer_frequency_hz) + @sizeOf(u64), @intFromPtr(&bsp_timer_initial_count) + @sizeOf(u32)), @max(@intFromPtr(&lapic_base_pa) + @sizeOf(u64), @intFromPtr(&x2apic_mode) + @sizeOf(bool)));
+    return @max(@max(@intFromPtr(&timer_frequency_hz) + @sizeOf(u64), @intFromPtr(&bsp_timer_initial_count) + @sizeOf(u32)), @max(@max(@intFromPtr(&lapic_base_pa) + @sizeOf(u64), @intFromPtr(&registers) + @sizeOf(mmio.Borrow)), @intFromPtr(&x2apic_mode) + @sizeOf(bool)));
 }
 
 pub fn usesX2Apic() bool {
@@ -73,12 +126,13 @@ fn registerMsr(offset: u32) u32 {
     return 0x800 + (offset >> 4);
 }
 
-fn x2Icr(destination: u8, command: u32) u64 {
+fn x2Icr(destination: u32, command: u32) u64 {
     return (@as(u64, destination) << 32) | command;
 }
 
 pub const TimerCalibration = struct {
     calibrated: bool,
+    reason: CalibrationReason = .ready,
     frequency_hz: u64,
     initial_count: u32,
     rearm_overhead_ns: u64,
@@ -124,8 +178,7 @@ fn inb(port: u16) u8 {
 
 fn readRegister(offset: u32) u32 {
     if (x2apic_mode) return @truncate(rdmsr(registerMsr(offset)));
-    const reg: *volatile u32 = @ptrFromInt(lapic_base_pa + offset);
-    return reg.*;
+    return registers.read(u32, offset);
 }
 
 fn writeRegister(offset: u32, value: u32) void {
@@ -133,8 +186,7 @@ fn writeRegister(offset: u32, value: u32) void {
         wrmsr(registerMsr(offset), value);
         return;
     }
-    const reg: *volatile u32 = @ptrFromInt(lapic_base_pa + offset);
-    reg.* = value;
+    registers.write(u32, offset, value);
 }
 
 fn waitIcrIdle() bool {
@@ -146,7 +198,10 @@ fn waitIcrIdle() bool {
     return (readRegister(lapic_reg_icr_low) & icr_delivery_status) == 0;
 }
 
-fn sendIcr(destination: u8, command: u32) bool {
+fn sendIcr(destination: u32, command: u32) bool {
+    // The all-ones destination is architecturally reserved for broadcast,
+    // never a physical per-CPU destination in either APIC mode.
+    if (command & (@as(u32, 3) << 18) == 0 and destination == 0xffffffff) return false;
     if (x2apic_mode) {
         // x2APIC WRMSR is not serializing. Publish prior memory updates
         // before notifying the target CPU (Intel SDM, x2APIC ordering).
@@ -154,6 +209,8 @@ fn sendIcr(destination: u8, command: u32) bool {
         wrmsr(registerMsr(lapic_reg_icr_low), x2Icr(destination, command));
         return true;
     }
+    // xAPIC 255 is broadcast, never a directed CPU destination.
+    if (command & (@as(u32, 3) << 18) == 0 and destination > 254) return false;
     if (!waitIcrIdle()) return false;
     // Shorthand delivery ignores the high destination register.
     if (command & (@as(u32, 3) << 18) == 0)
@@ -205,12 +262,13 @@ pub fn initialCountForPeriod(frequency_hz: u64, period_ns: u64, rearm_overhead_n
     return @intCast(initial_count);
 }
 
-fn fallbackCalibration(fallback_initial_count: u32, rearm_overhead_ns: u64) TimerCalibration {
+fn fallbackCalibration(fallback_initial_count: u32, rearm_overhead_ns: u64, reason: CalibrationReason) TimerCalibration {
     timer_frequency_hz = 0;
     bsp_timer_initial_count = fallback_initial_count;
     _ = armTimer(fallback_initial_count);
     return .{
         .calibrated = false,
+        .reason = reason,
         .frequency_hz = 0,
         .initial_count = fallback_initial_count,
         .rearm_overhead_ns = rearm_overhead_ns,
@@ -220,9 +278,15 @@ fn fallbackCalibration(fallback_initial_count: u32, rearm_overhead_ns: u64) Time
 
 pub fn calibrateTimer(fallback_initial_count: u32, rearm_overhead_ns: u64) TimerCalibration {
     if (lapic_base_pa == 0 or fallback_initial_count == 0) {
-        return fallbackCalibration(fallback_initial_count, rearm_overhead_ns);
+        return fallbackCalibration(fallback_initial_count, rearm_overhead_ns, .invalid_measurement);
     }
 
+    // Prefer the post-SMP UC-verified HPET. When absent, use the PIT's own
+    // known-frequency counter; TSC remains only a measurement target.
+    const hpet = @import("hpet.zig");
+    const start = hpet.monotonicNs();
+    var wait = PitWait{ .start = start orelse 0, .previous = start orelse 0 };
+    var pit_wait: PitCounterWait = .{};
     const original_port_b = inb(0x61);
     defer outb(0x61, original_port_b);
 
@@ -233,33 +297,42 @@ pub fn calibrateTimer(fallback_initial_count: u32, rearm_overhead_ns: u64) Timer
     outb(0x42, @truncate(calibration_pit_ticks));
     outb(0x42, @truncate(calibration_pit_ticks >> 8));
     if ((inb(0x61) & 0x20) != 0) {
-        return fallbackCalibration(fallback_initial_count, rearm_overhead_ns);
+        return fallbackCalibration(fallback_initial_count, rearm_overhead_ns, .invalid_measurement);
     }
 
     writeRegister(lapic_reg_initial_count, std.math.maxInt(u32));
     const counter_start = realtime_clock.readCounter();
     outb(0x61, (original_port_b & ~@as(u8, 0x02)) | 0x01);
 
-    var polls: u64 = 0;
-    while ((inb(0x61) & 0x20) == 0 and polls < pit_poll_limit) : (polls += 1) {
+    while (true) {
+        const outcome = if (start != null) hpet_wait: {
+            const done = (inb(0x61) & 0x20) != 0;
+            const now = hpet.monotonicNs() orelse
+                return fallbackCalibration(fallback_initial_count, rearm_overhead_ns, .no_deadline_clock);
+            break :hpet_wait wait.check(now, done);
+        } else pit_counter_wait: {
+            const count = latchPitCounter2();
+            const done = (inb(0x61) & 0x20) != 0;
+            break :pit_counter_wait pit_wait.check(count, done);
+        };
+        if (outcome) |reason| {
+            if (reason != .ready) return fallbackCalibration(fallback_initial_count, rearm_overhead_ns, reason);
+            break;
+        }
         asm volatile ("pause");
     }
-    if ((inb(0x61) & 0x20) == 0) {
-        return fallbackCalibration(fallback_initial_count, rearm_overhead_ns);
-    }
-
     const counter_end = realtime_clock.readCounter();
     const current_count = readRegister(lapic_reg_current_count);
     const elapsed_counts = std.math.maxInt(u32) - current_count;
     const frequency_hz = frequencyFromPitMeasurement(elapsed_counts, calibration_pit_ticks) orelse {
-        return fallbackCalibration(fallback_initial_count, rearm_overhead_ns);
+        return fallbackCalibration(fallback_initial_count, rearm_overhead_ns, .invalid_measurement);
     };
     const initial_count = initialCountForPeriod(
         frequency_hz,
         timer_target_period_ns,
         rearm_overhead_ns,
     ) orelse {
-        return fallbackCalibration(fallback_initial_count, rearm_overhead_ns);
+        return fallbackCalibration(fallback_initial_count, rearm_overhead_ns, .invalid_measurement);
     };
 
     bsp_timer_initial_count = initial_count;
@@ -341,19 +414,25 @@ pub fn enableLocalApic() bool {
     if (lapic_base_pa == 0) {
         x2apic_mode = selected;
         lapic_base_pa = base;
+        // The architectural APIC aperture is one aligned page selected by
+        // IA32_APIC_BASE; x2APIC never dereferences this mapping.
+        if (!selected) {
+            if (!@import("arch/x86_64/platform.zig").mapBootMmioRange(base, 4096)) return false;
+            registers = (@import("arch/x86_64/platform.zig").kernelMmioBorrow(base, 4096) orelse unreachable);
+        }
     }
     writeRegister(lapic_reg_svr, 0x100 | 0xFF);
     return true;
 }
 
-pub fn localApicId() u8 {
+pub fn localApicId() u32 {
     if (lapic_base_pa == 0 and !enableLocalApic()) return 0;
     const raw = readRegister(lapic_reg_id);
     const id = if (x2apic_mode) raw else raw >> 24;
-    return if (id < 0xff) @intCast(id) else 0xff;
+    return id;
 }
 
-pub fn sendInitSipi(apic_id: u8, startup_vector: u8) bool {
+pub fn sendInitSipi(apic_id: u32, startup_vector: u8) bool {
     if (lapic_base_pa == 0 and !enableLocalApic()) return false;
     if (!sendIcr(apic_id, icr_delivery_init | icr_level_assert | icr_trigger_level)) return false;
     delayIpi();
@@ -362,7 +441,7 @@ pub fn sendInitSipi(apic_id: u8, startup_vector: u8) bool {
     return sendIcr(apic_id, icr_delivery_startup | @as(u32, startup_vector));
 }
 
-pub fn sendFixedIpi(apic_id: u8, vector: u8) bool {
+pub fn sendFixedIpi(apic_id: u32, vector: u8) bool {
     if (lapic_base_pa == 0 and !enableLocalApic()) return false;
     return sendIcr(apic_id, vector);
 }
@@ -494,4 +573,49 @@ test "x2APIC register mapping and physical ICR encoding" {
     try std.testing.expectEqual(@as(u32, 0x830), registerMsr(lapic_reg_icr_low));
     try std.testing.expectEqual(@as(u64, 0x7e00000040), x2Icr(0x7e, 0x40));
     try std.testing.expectEqual(@as(u64, 0xc0040), x2Icr(0, (3 << 18) | 0x40));
+}
+
+test "PIT deadline bounds missing slow and stopped responses" {
+    var wait = PitWait{ .start = 0, .previous = 0 };
+    var now: u64 = 0;
+    while (wait.check(now, false) == null) now += 1_000_000;
+    try std.testing.expectEqual(pit_timeout_ns, now);
+    try std.testing.expectEqual(CalibrationReason.timeout, wait.check(now, true).?);
+    wait = .{ .start = 0, .previous = 0 };
+    try std.testing.expect(wait.check(49_000_000, false) == null);
+    try std.testing.expectEqual(CalibrationReason.ready, wait.check(50_000_000, true).?);
+    wait = .{ .start = 0, .previous = 0 };
+    for (1..pit_clock_stall_limit) |_| try std.testing.expect(wait.check(0, false) == null);
+    try std.testing.expectEqual(CalibrationReason.clock_stalled, wait.check(0, false).?);
+}
+
+test "PIT deadline without HPET bounds missing output stopped counter and slow response" {
+    var wait: PitCounterWait = .{};
+    // A not-yet-loaded counter must not reject an otherwise normal device.
+    try std.testing.expect(wait.check(0, false) == null);
+    try std.testing.expect(wait.check(calibration_pit_ticks, false) == null);
+    var count: u16 = calibration_pit_ticks - 1;
+    while (count != 0) : (count -= 1) {
+        // Slow polling/progress is valid, and each decrement resets stalls.
+        try std.testing.expect(wait.check(count, false) == null);
+        try std.testing.expect(wait.check(count, false) == null);
+    }
+    try std.testing.expectEqual(CalibrationReason.ready, wait.check(0, true).?);
+    wait = .{};
+    try std.testing.expect(wait.check(100, false) == null);
+    try std.testing.expectEqual(CalibrationReason.timeout, wait.check(0, false).?);
+    wait = .{};
+    try std.testing.expect(wait.check(1, false) == null);
+    try std.testing.expectEqual(CalibrationReason.timeout, wait.check(65535, false).?);
+    for ([_]u16{ 0, calibration_pit_ticks, 12345 }) |stopped| {
+        wait = .{};
+        if (stopped == 12345) try std.testing.expect(wait.check(stopped, false) == null);
+        for (1..pit_clock_stall_limit) |_| try std.testing.expect(wait.check(stopped, false) == null);
+        try std.testing.expectEqual(CalibrationReason.clock_stalled, wait.check(stopped, false).?);
+    }
+    // Terminal count can wrap before a slow reader gets scheduled again;
+    // OUT is sticky high and still proves completion of the programmed count.
+    wait = .{};
+    try std.testing.expect(wait.check(1, false) == null);
+    try std.testing.expectEqual(CalibrationReason.ready, wait.check(65535, true).?);
 }

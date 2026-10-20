@@ -26,23 +26,23 @@ static int native_grant(uint64_t source,uint64_t requested)
 {
     return !(source&PACHA_FD_RIGHT_TRANSFER) || (requested&~source) ? -1 : 0;
 }
-int pacha_ipc_recv(int fd,struct pacha_ipc_msg *message)
+int pacha_ipc_recv(pacha_fd_t fd,struct pacha_ipc_msg *message)
 {
     assert(fd==60 && message->fd_capacity>=3);
     message->word0=KB2_FILESYSTEM_OP_EXEC_SELF;
     message->word1=request_size;message->word2=KB2_FILESYSTEM_RESPONSE_SIZE;
-    message->word3=7;message->fd_count=3;
+    message->word3=7;message->fd_count=2;
     message->fds[0]=(struct pacha_ipc_fd){.fd=80};
     message->fds[1]=(struct pacha_ipc_fd){.fd=81};
-    message->fds[2]=(struct pacha_ipc_fd){.fd=70};return 0;
+    return 0;
 }
-int pacha_fd_get_info(int fd,struct pacha_fd_info *info)
+int pacha_fd_get_info(pacha_fd_t fd,struct pacha_fd_info *info)
 {
     assert(fd==70 || fd==80);
     *info=(struct pacha_fd_info){.kind=fd==70 ? PACHA_FD_KIND_REPLY : PACHA_FD_KIND_VMO,
         .size=sizeof(memory)};return 0;
 }
-void *pacha_mmap(int fd,uint64_t size,uint64_t protection,uint64_t flags,uint64_t offset)
+void *pacha_mmap(pacha_fd_t fd,uint64_t size,uint64_t protection,uint64_t flags,uint64_t offset)
 {
     assert(fd==80 && size==sizeof(memory) && !offset);
     assert(protection==(PACHA_PROT_READ|PACHA_PROT_WRITE) && flags==PACHA_MMAP_SHARED);
@@ -62,7 +62,7 @@ int filed_storage_exec_close(filed_runtime_t *rt,uint64_t handle)
     assert(!rt->actor && handle==42);++guards_closed;return 0;
 }
 int filed_exec_linux_lpr_prepare_self(filed_runtime_t *rt,filed_handle_id_t handle,
-    const filed_exec_path_t *request,int *process,int *thread)
+    const filed_exec_path_t *request,pacha_fd_t *process,pacha_fd_t *thread)
 {
     assert(!rt->actor && handle==42 && !strcmp(request->path,"/bin/true"));
     assert(request->flags==(FILED_EXEC_LINUX_LPR|FILED_EXEC_BOOTSTRAP_FD|FILED_EXEC_SELF));
@@ -78,7 +78,7 @@ int filed_exec_linux_lpr_prepare_self(filed_runtime_t *rt,filed_handle_id_t hand
         PACHA_FD_RIGHT_START|PACHA_FD_RIGHT_SET_CONTEXT;
     ++prepared;*process=94;*thread=95;return 0;
 }
-long pacha_fd_fcntl(int fd,uint64_t command,uint64_t minimum,uint64_t rights)
+long pacha_fd_fcntl(pacha_fd_t fd,uint64_t command,uint64_t minimum,uint64_t rights)
 {
     assert(fd==81 && command==PACHA_FD_FCNTL_DUP && minimum==16);
     assert(rights==(manifest_recipient|PACHA_FD_RIGHT_TRANSFER));
@@ -87,9 +87,10 @@ long pacha_fd_fcntl(int fd,uint64_t command,uint64_t minimum,uint64_t rights)
     if(duplicate_error) return duplicate_error;
     return native_duplicate(source_rights[81],rights,&source_rights[96]);
 }
-int pacha_ipc_reply(int fd,const struct pacha_ipc_msg *message)
+int pacha_ipc_reply(pacha_fd_t fd,const struct pacha_ipc_msg *message)
 {
-    assert(fd==70);++replied;
+    if (reply_error && !message->word0) return reply_error;
+    assert(fd==PACHA_IPC_REPLY_IMPLICIT);++replied;
     assert(message->word0==KB2_FILESYSTEM_OP_EXEC_SELF && message->word3==7);
     assert(message->word2==KB2_FILESYSTEM_RESPONSE_SIZE);
     assert((int64_t)message->word1==expect_result);
@@ -117,7 +118,7 @@ int pacha_ipc_reply(int fd,const struct pacha_ipc_msg *message)
     for(unsigned i=0;i<3;++i) source_rights[94+i]=0;
     return 0;
 }
-int pacha_fd_close(int fd)
+int pacha_fd_close(pacha_fd_t fd)
 {
     assert(fd==70 || fd==80 || fd==81 || fd==94 || fd==95 || fd==96);
     ++closed[fd];
@@ -139,15 +140,15 @@ int filed_storage_stat(filed_runtime_t *a,uint64_t b,filed_storage_stat_t *c) { 
 int filed_storage_pread(filed_runtime_t *a,uint64_t b,uint64_t c,void *d,size_t e,size_t *f) { abort(); }
 int filed_storage_close(filed_runtime_t *a,uint64_t b) { abort(); }
 int filed_storage_executable_mapping(filed_runtime_t *a,uint64_t b) { abort(); }
-int filed_client_create(filed_runtime_t *a,const kb2_fs_request_t *b,const uint8_t *c,size_t d,int *e,uint64_t *f) { abort(); }
+int filed_client_create(filed_runtime_t *a,const kb2_fs_request_t *b,const uint8_t *c,size_t d,pacha_fd_t *e,uint64_t *f) { abort(); }
 int filed_client_credentials(filed_runtime_t *a,const kb2_fs_request_t *b,const uint8_t *c,size_t d) { abort(); }
 int filed_client_release(filed_runtime_t *a,struct filed_client *b) { abort(); }
 int filed_owner_control(filed_runtime_t *a,kb2_fs_request_t *b,const uint8_t *c,size_t d,kb2_fs_response_t *e) { abort(); }
-int pacha_vmo_create(uint64_t a,uint64_t b,uint32_t c) { abort(); }
+pacha_fd_t pacha_vmo_create(uint64_t a,uint64_t b,uint32_t c) { abort(); }
 int ph_fs_channel_layout(const struct ph_fs_channel_config *a,size_t *b,size_t *c) { abort(); }
 int ph_fs_channel_bind(struct ph_fs_channel *a,void *b,size_t c,const struct ph_fs_channel_config *d,kb2_vq_side_t e,const kb2_vq_atomic_ops_t *f,kb2_vq_chain_t **g,uint16_t *h) { abort(); }
 const kb2_vq_atomic_ops_t kb2_vq_x86_64_atomics={0};
-int filed_exec_handle(filed_runtime_t *a,filed_handle_id_t b,const filed_exec_path_t *c,const int *d,uint64_t e,int f,int *g,int *h) { abort(); }
+int filed_exec_handle(filed_runtime_t *a,filed_handle_id_t b,const filed_exec_path_t *c,const pacha_fd_t *d,uint64_t e,pacha_fd_t f,pacha_fd_t *g,pacha_fd_t *h) { abort(); }
 #pragma GCC diagnostic pop
 
 static void setup(void)
@@ -174,7 +175,7 @@ static void setup(void)
 static void check_consumed(void)
 {
     assert(prepared==1 && guards_opened==1 && guards_closed==1 && duplicated==1 && replied==1);
-    assert(closed[70]==1 && closed[80]==1 && closed[81]==1);
+    assert(closed[70]==0 && closed[80]==1 && closed[81]==1);
 }
 static void check_unwound(void)
 {

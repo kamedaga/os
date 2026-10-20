@@ -35,34 +35,18 @@ static int send_page(struct usbd_source_client *source, uint32_t kind,
     const struct pacha_ipc_msg request = {.word0 = INPUTD_SOURCE_MAGIC,
         .word1 = source->source_id, .word2 = source->generation,
         .word3 = correlation, .fds = &fd, .fd_count = 1};
-    int reply_fd = pacha_ipc_call(source->endpoint_fd, &request);
-    if (reply_fd < 16) return reply_fd < 0 ? reply_fd : -EIO;
-    int result = pacha_timerfd_settime(source->timeout_fd,
-        UINT64_C(2000000000), 0, 0);
-    if (!result) {
-        struct pacha_pollfd events[2] = {
-            {.fd = reply_fd, .events = PACHA_FD_EVENT_READABLE | PACHA_FD_EVENT_HANGUP},
-            {.fd = source->timeout_fd, .events = PACHA_FD_EVENT_READABLE},
-        };
-        long waited = pacha_fd_wait_many(events, 2, PACHA_FD_WAIT_FOREVER);
-        if (waited <= 0 || events[1].revents ||
-            events[0].revents != PACHA_FD_EVENT_READABLE)
-            result = -ETIMEDOUT;
-        else {
-            struct pacha_ipc_msg reply = {0};
-            result = pacha_ipc_recv(reply_fd, &reply);
-            if (!result)
-                result = reply.word0 == INPUTD_SOURCE_MAGIC &&
-                    reply.word3 == correlation && !reply.fd_count ?
-                    (int)(int64_t)reply.word1 : -EPROTO;
-        }
-    }
-    (void)pacha_timerfd_settime(source->timeout_fd, 0, 0, 0);
-    (void)pacha_fd_close(reply_fd);
+    struct pacha_ipc_msg reply = {0};
+    /* Native wait deadlines use millisecond scheduler ticks. */
+    int result = pacha_ipc_call(source->endpoint_fd, &request, &reply, 2000, NULL);
+    if (result == PACHA_ERR_NOT_READY || result == PACHA_ERR_EMPTY) result = -ETIMEDOUT;
+    if (!result)
+        result = reply.word0 == INPUTD_SOURCE_MAGIC &&
+            reply.word3 == correlation && !reply.fd_count ?
+            (int)(int64_t)reply.word1 : -EPROTO;
     return result;
 }
 
-int usbd_source_open(struct usbd_source_client *source, int endpoint_fd,
+int usbd_source_open(struct usbd_source_client *source, pacha_fd_t endpoint_fd,
     uint64_t source_id, uint64_t generation,
     uint16_t pci_segment, uint8_t pci_bus, uint8_t pci_device,
     uint8_t pci_function) {
@@ -71,22 +55,13 @@ int usbd_source_open(struct usbd_source_client *source, int endpoint_fd,
         return -EINVAL;
     const uint64_t rights = PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_TRANSFER |
         PACHA_FD_RIGHT_MAP_READ | PACHA_FD_RIGHT_MAP_WRITE;
-    int fd = pacha_vmo_create(INPUTD_SOURCE_PAGE_BYTES, rights, 0);
+    pacha_fd_t fd = pacha_vmo_create(INPUTD_SOURCE_PAGE_BYTES, rights, 0);
     if (fd < 16) return fd < 0 ? fd : -ENOMEM;
     void *mapped = pacha_mmap(fd, INPUTD_SOURCE_PAGE_BYTES,
         PACHA_PROT_READ | PACHA_PROT_WRITE, PACHA_MMAP_SHARED, 0);
     if (!mapped) { (void)pacha_fd_close(fd); return -ENOMEM; }
-    const uint64_t timer_rights = PACHA_FD_RIGHT_INSPECT | PACHA_FD_RIGHT_READ |
-        PACHA_FD_RIGHT_WRITE | PACHA_FD_RIGHT_WAIT |
-        PACHA_FD_RIGHT_POLL | PACHA_FD_RIGHT_CLOSE;
-    int timeout_fd = pacha_timerfd_create(0, 0, timer_rights, 0);
-    if (timeout_fd < 16) {
-        (void)pacha_munmap(mapped, INPUTD_SOURCE_PAGE_BYTES);
-        (void)pacha_fd_close(fd);
-        return timeout_fd < 0 ? timeout_fd : -ENOMEM;
-    }
     *source = (struct usbd_source_client){.endpoint_fd = endpoint_fd,
-        .page_fd = fd, .timeout_fd = timeout_fd, .page = mapped,
+        .page_fd = fd, .page = mapped,
         .source_id = source_id, .generation = generation,
         .pci_segment = pci_segment, .pci_bus = pci_bus,
         .pci_device = pci_device, .pci_function = pci_function};
@@ -94,7 +69,7 @@ int usbd_source_open(struct usbd_source_client *source, int endpoint_fd,
 }
 
 int usbd_source_sync(struct usbd_source_client *source,
-    struct usbd_input_bridge *bridge, struct ph_ipc *ipc, int process_fd,
+    struct usbd_input_bridge *bridge, struct ph_ipc *ipc, pacha_fd_t process_fd,
     int lost_events) {
     const struct kobox_linux_input_device_info *devices;
     size_t count = 0;
@@ -115,7 +90,7 @@ int usbd_source_sync(struct usbd_source_client *source,
 }
 
 int usbd_source_pump(struct usbd_source_client *source,
-    struct usbd_input_bridge *bridge, struct ph_ipc *ipc, int process_fd) {
+    struct usbd_input_bridge *bridge, struct ph_ipc *ipc, pacha_fd_t process_fd) {
     for (unsigned pass = 0; pass < 8; pass++) {
         const struct kobox_linux_input_record *records;
         size_t count = 0;
@@ -160,10 +135,6 @@ int usbd_source_close(struct usbd_source_client *source) {
         result = pacha_munmap(source->page, INPUTD_SOURCE_PAGE_BYTES);
     if (source->page_fd >= 16) {
         int closed = pacha_fd_close(source->page_fd);
-        if (!result) result = closed;
-    }
-    if (source->timeout_fd >= 16) {
-        int closed = pacha_fd_close(source->timeout_fd);
         if (!result) result = closed;
     }
     *source = (struct usbd_source_client){0};

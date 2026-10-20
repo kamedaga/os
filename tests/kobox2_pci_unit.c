@@ -218,7 +218,7 @@ int main(void) {
         {PACHA_SYSCALL_ERR_ALLOC, -ENOMEM},
         {PACHA_SYSCALL_ERR_MAP, -EIO},
         {5, -EPROTO}, {PACHA_SYSCALL_ERR_CLOSED, -ENODEV},
-        {PACHA_FD_TABLE_LIMIT, -EPROTO},
+        {PACHA_THREAD_SELF_FD, -EPROTO},
     };
     for (size_t i = 0; i < sizeof(failures) / sizeof(failures[0]); ++i) {
         derive_result = failures[i].raw;

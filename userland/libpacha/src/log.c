@@ -5,7 +5,7 @@
 
 static uint32_t next_record;
 
-int pacha_log_emit(int endpoint_fd, unsigned source, const char *text, size_t length)
+int pacha_log_emit(pacha_fd_t endpoint_fd, unsigned source, const char *text, size_t length)
 {
     if (endpoint_fd < 16 || source == 0 || source > UINT8_MAX ||
         (length != 0 && text == NULL)) return -1;
@@ -27,8 +27,7 @@ int pacha_log_emit(int endpoint_fd, unsigned source, const char *text, size_t le
                 ((uint64_t)index << 8) | bytes;
             unsigned char *payload = (unsigned char *)&message.word2;
             for (unsigned i = 0; i < bytes; ++i) payload[i] = (unsigned char)text[offset + i];
-            if (pacha_syscall2(PACHA_IPC_SYSCALL_SEND,
-                    (uint64_t)(uint32_t)endpoint_fd, (uint64_t)(uintptr_t)&message) != 0)
+            if (pacha_ipc_message_syscall(PACHA_IPC_SYSCALL_SEND, (uint64_t)endpoint_fd, (struct pacha_ipc_msg *)(uintptr_t)((uint64_t)(uintptr_t)&message), 0, 0, 0, 0) != 0)
                 return -1;
         }
         text += record_bytes;

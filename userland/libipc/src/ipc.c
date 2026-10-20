@@ -9,8 +9,8 @@ int pacha_fd_table(uint64_t minimum_capacity, struct pacha_fd_table_info *out) {
         minimum_capacity, (uint64_t)(uintptr_t)out));
 }
 
-int pacha_ipc_endpoint_create(uint64_t rights, uint32_t flags) {
-    return pacha_fd_result_to_int(pacha_syscall2(PACHA_IPC_SYSCALL_ENDPOINT_CREATE, rights, flags));
+pacha_fd_t pacha_ipc_endpoint_create(uint64_t rights, uint32_t flags) {
+    return pacha_fd_result(pacha_syscall2(PACHA_IPC_SYSCALL_ENDPOINT_CREATE, rights, flags));
 }
 
 int pacha_ipc_channel_create(struct pacha_ipc_channel_pair *out, uint64_t rights, uint32_t flags) {
@@ -18,30 +18,28 @@ int pacha_ipc_channel_create(struct pacha_ipc_channel_pair *out, uint64_t rights
     uint64_t pair[2] = {0, 0};
     const long status = pacha_syscall3(PACHA_IPC_SYSCALL_CHANNEL_CREATE, (uint64_t)(uintptr_t)pair, rights, flags);
     if (status != 0) return -(int)status;
-    out->a = (int)pair[0];
-    out->b = (int)pair[1];
+    if (pair[0] < 16 || pair[0] >= PACHA_THREAD_SELF_FD ||
+        pair[1] < 16 || pair[1] >= PACHA_THREAD_SELF_FD) return PACHA_ERR_INVALID;
+    out->a = (pacha_fd_t)pair[0];
+    out->b = (pacha_fd_t)pair[1];
     return 0;
 }
 
-int pacha_ipc_send(int fd, const struct pacha_ipc_msg *msg) {
+int pacha_ipc_send(pacha_fd_t fd, const struct pacha_ipc_msg *msg) {
     if (!msg) return -1;
-    return pacha_status_to_int(pacha_syscall2(PACHA_IPC_SYSCALL_SEND, (uint64_t)(uint32_t)fd, (uint64_t)(uintptr_t)msg));
+    return pacha_status_to_int(pacha_ipc_message_syscall(PACHA_IPC_SYSCALL_SEND, (uint64_t)fd, msg, 0, 0, 0, 0));
 }
 
-int pacha_ipc_recv(int fd, struct pacha_ipc_msg *msg) {
+int pacha_ipc_recv(pacha_fd_t fd, struct pacha_ipc_msg *msg) {
     if (!msg) return -1;
-    return pacha_status_to_int(pacha_syscall2(PACHA_IPC_SYSCALL_RECV, (uint64_t)(uint32_t)fd, (uint64_t)(uintptr_t)msg));
+    return pacha_status_to_int(pacha_ipc_message_syscall(PACHA_IPC_SYSCALL_RECV, (uint64_t)fd, 0, msg, 0, 0, 0));
 }
 
-int pacha_ipc_recv_wait(int fd, struct pacha_ipc_msg *msg, uint64_t timeout_ticks) {
+int pacha_ipc_recv_wait(pacha_fd_t fd, struct pacha_ipc_msg *msg, uint64_t timeout_ticks) {
     if (!msg) return -1;
     for (;;) {
-        const int status = pacha_status_to_int(pacha_syscall4(
-            PACHA_IPC_SYSCALL_RECV_WAIT,
-            (uint64_t)(uint32_t)fd,
-            (uint64_t)(uintptr_t)msg,
-            timeout_ticks,
-            0));
+        const int status = pacha_status_to_int(pacha_ipc_message_syscall(PACHA_IPC_SYSCALL_RECV_WAIT, (uint64_t)fd,
+            0, msg, timeout_ticks, PACHA_WAIT_UNINTERRUPTIBLE, 0));
         if (status == PACHA_ERR_NOT_READY && timeout_ticks == PACHA_FD_WAIT_FOREVER) {
             continue;
         }
@@ -49,31 +47,46 @@ int pacha_ipc_recv_wait(int fd, struct pacha_ipc_msg *msg, uint64_t timeout_tick
     }
 }
 
-int pacha_ipc_call(int fd, const struct pacha_ipc_msg *msg) {
-    if (!msg) return -1;
-    return pacha_fd_result_to_int(pacha_syscall2(PACHA_IPC_SYSCALL_CALL, (uint64_t)(uint32_t)fd, (uint64_t)(uintptr_t)msg));
+int pacha_ipc_call(pacha_fd_t fd, const struct pacha_ipc_msg *msg,
+    struct pacha_ipc_msg *reply, uint64_t timeout_ticks, int *sent) {
+    if (sent) *sent = 0;
+    if (!msg || !reply) return PACHA_ERR_INVALID;
+    return pacha_status_to_int(pacha_ipc_message_syscall(PACHA_IPC_SYSCALL_CALL, (uint64_t)fd, msg, reply,
+        timeout_ticks, PACHA_WAIT_UNINTERRUPTIBLE, sent));
 }
 
-int pacha_ipc_reply(int reply_fd, const struct pacha_ipc_msg *msg) {
-    if (!msg) return -1;
-    return pacha_status_to_int(pacha_syscall2(PACHA_IPC_SYSCALL_REPLY, (uint64_t)(uint32_t)reply_fd, (uint64_t)(uintptr_t)msg));
+int pacha_ipc_reply_recv(pacha_fd_t fd, const struct pacha_ipc_msg *reply,
+    struct pacha_ipc_msg *next, uint64_t timeout_ticks, int *replied) {
+    if (replied) *replied = 0;
+    if (!reply || !next) return PACHA_ERR_INVALID;
+    return pacha_status_to_int(pacha_ipc_message_syscall(PACHA_IPC_SYSCALL_REPLY_RECV, (uint64_t)fd, reply, next,
+        timeout_ticks, PACHA_WAIT_UNINTERRUPTIBLE, replied));
 }
 
-int pacha_process_create(uint64_t rights, uint32_t flags,
+pacha_fd_t pacha_ipc_reply_extract(void) {
+    return pacha_fd_result(pacha_syscall0(PACHA_IPC_SYSCALL_REPLY_EXTRACT));
+}
+
+int pacha_ipc_reply(pacha_fd_t reply_fd, const struct pacha_ipc_msg *msg) {
+    if (!msg) return -1;
+    return pacha_status_to_int(pacha_ipc_message_syscall(PACHA_IPC_SYSCALL_REPLY, (uint64_t)reply_fd, msg, 0, 0, 0, 0));
+}
+
+pacha_fd_t pacha_process_create(uint64_t rights, uint32_t flags,
     const struct pacha_process_fd_grant *grants, uint64_t count) {
     if (count > PACHA_PROCESS_CREATE_MAX_GRANTS || (count && !grants)) return -1;
-    return pacha_fd_result_to_int(pacha_syscall5(PACHA_PROCESS_SYSCALL_CREATE,
+    return pacha_fd_result(pacha_syscall5(PACHA_PROCESS_SYSCALL_CREATE,
         0, rights, flags, (uint64_t)(uintptr_t)grants, count));
 }
 
-int pacha_process_clone(uint64_t rights, uint32_t flags) {
-    return pacha_fd_result_to_int(pacha_syscall2(PACHA_PROCESS_SYSCALL_CLONE, rights, flags));
+pacha_fd_t pacha_process_clone(uint64_t rights, uint32_t flags) {
+    return pacha_fd_result(pacha_syscall2(PACHA_PROCESS_SYSCALL_CLONE, rights, flags));
 }
 
-int pacha_thread_create(int process_fd, uint64_t entry_rip, uint64_t stack_rsp, uint64_t flags, uint64_t fs_base, uint64_t rights) {
-    return pacha_fd_result_to_int(pacha_syscall6(
+pacha_fd_t pacha_thread_create(pacha_fd_t process_fd, uint64_t entry_rip, uint64_t stack_rsp, uint64_t flags, uint64_t fs_base, uint64_t rights) {
+    return pacha_fd_result(pacha_syscall6(
         PACHA_THREAD_SYSCALL_CREATE,
-        (uint64_t)(uint32_t)process_fd,
+        (uint64_t)process_fd,
         entry_rip,
         stack_rsp,
         flags,
@@ -82,19 +95,19 @@ int pacha_thread_create(int process_fd, uint64_t entry_rip, uint64_t stack_rsp, 
     ));
 }
 
-int pacha_thread_start(int thread_fd) {
-    return pacha_status_to_int(pacha_syscall1(PACHA_THREAD_SYSCALL_START, (uint64_t)(uint32_t)thread_fd));
+int pacha_thread_start(pacha_fd_t thread_fd) {
+    return pacha_status_to_int(pacha_syscall1(PACHA_THREAD_SYSCALL_START, (uint64_t)thread_fd));
 }
 
-int pacha_thread_get_context(int thread_fd, struct pacha_thread_context *context) {
+int pacha_thread_get_context(pacha_fd_t thread_fd, struct pacha_thread_context *context) {
     return pacha_status_to_int(pacha_syscall4(PACHA_THREAD_SYSCALL_CONTEXT,
-        (uint64_t)(uint32_t)thread_fd, PACHA_THREAD_CONTEXT_GET,
+        (uint64_t)thread_fd, PACHA_THREAD_CONTEXT_GET,
         (uint64_t)(uintptr_t)context, sizeof(*context)));
 }
 
-int pacha_thread_set_context(int thread_fd, const struct pacha_thread_context *context) {
+int pacha_thread_set_context(pacha_fd_t thread_fd, const struct pacha_thread_context *context) {
     return pacha_status_to_int(pacha_syscall4(PACHA_THREAD_SYSCALL_CONTEXT,
-        (uint64_t)(uint32_t)thread_fd, PACHA_THREAD_CONTEXT_SET,
+        (uint64_t)thread_fd, PACHA_THREAD_CONTEXT_SET,
         (uint64_t)(uintptr_t)context, sizeof(*context)));
 }
 
@@ -102,8 +115,8 @@ int pacha_thread_set_gs_base(uint64_t gs_base) {
     return pacha_status_to_int(pacha_syscall1(PACHA_THREAD_SYSCALL_SET_GS_BASE, gs_base));
 }
 
-int pacha_thread_signal(int thread_fd, unsigned int notification) {
-    return pacha_status_to_int(pacha_syscall2(PACHA_THREAD_SYSCALL_SIGNAL, (uint64_t)(uint32_t)thread_fd, notification));
+int pacha_thread_signal(pacha_fd_t thread_fd, unsigned int notification) {
+    return pacha_status_to_int(pacha_syscall2(PACHA_THREAD_SYSCALL_SIGNAL, (uint64_t)thread_fd, notification));
 }
 
 int pacha_thread_register_fault(uint64_t entry_rip, uint64_t stack_base, uint64_t stack_size) {
@@ -111,13 +124,13 @@ int pacha_thread_register_fault(uint64_t entry_rip, uint64_t stack_base, uint64_
         PACHA_PROCESS_SIGNAL_CTL_REGISTER_FAULT, entry_rip, stack_base, stack_size));
 }
 
-long pacha_process_map(int process_fd, int vmo_fd, uint64_t target_va, uint64_t size, uint64_t prot, uint64_t vmo_offset) {
+long pacha_process_map(pacha_fd_t process_fd, pacha_fd_t vmo_fd, uint64_t target_va, uint64_t size, uint64_t prot, uint64_t vmo_offset) {
     return pacha_process_map_flags(process_fd, vmo_fd, target_va, size, prot, vmo_offset, PACHA_PROCESS_MAP_SHARED);
 }
 
 long pacha_process_map_flags(
-    int process_fd,
-    int vmo_fd,
+    pacha_fd_t process_fd,
+    pacha_fd_t vmo_fd,
     uint64_t target_va,
     uint64_t size,
     uint64_t prot,
@@ -126,8 +139,8 @@ long pacha_process_map_flags(
 {
     return pacha_syscall6(
         PACHA_PROCESS_SYSCALL_MAP,
-        (uint64_t)(uint32_t)process_fd,
-        (uint64_t)(uint32_t)vmo_fd,
+        (uint64_t)process_fd,
+        (uint64_t)vmo_fd,
         target_va,
         size,
         prot,
@@ -135,19 +148,19 @@ long pacha_process_map_flags(
     );
 }
 
-int pacha_process_unmap(int process_fd, uint64_t target_va, uint64_t size, uint64_t flags) {
+int pacha_process_unmap(pacha_fd_t process_fd, uint64_t target_va, uint64_t size, uint64_t flags) {
     return pacha_status_to_int(pacha_syscall4(PACHA_PROCESS_SYSCALL_UNMAP,
-        (uint64_t)(uint32_t)process_fd, target_va, size, flags));
+        (uint64_t)process_fd, target_va, size, flags));
 }
 
 int pacha_process_map_batch(
-    int process_fd,
+    pacha_fd_t process_fd,
     const struct pacha_process_map_batch_entry *entries,
     uint64_t entry_count)
 {
     return pacha_status_to_int(pacha_syscall3(
         PACHA_PROCESS_SYSCALL_MAP_BATCH,
-        (uint64_t)(uint32_t)process_fd,
+        (uint64_t)process_fd,
         (uint64_t)(uintptr_t)entries,
         entry_count
     ));
@@ -157,33 +170,33 @@ long pacha_getrandom(void *buf, uint64_t len, uint64_t flags) {
     return pacha_syscall3(PACHA_RUNTIME_SYSCALL_GETRANDOM, (uint64_t)(uintptr_t)buf, len, flags);
 }
 
-int pacha_fd_get_info(int fd, struct pacha_fd_info *out) {
+int pacha_fd_get_info(pacha_fd_t fd, struct pacha_fd_info *out) {
     if (!out) return -1;
-    return pacha_status_to_int(pacha_syscall2(PACHA_FD_SYSCALL_GET_INFO, (uint64_t)(uint32_t)fd, (uint64_t)(uintptr_t)out));
+    return pacha_status_to_int(pacha_syscall2(PACHA_FD_SYSCALL_GET_INFO, (uint64_t)fd, (uint64_t)(uintptr_t)out));
 }
 
-int pacha_fd_close(int fd) {
-    return pacha_status_to_int(pacha_syscall1(PACHA_FD_SYSCALL_CLOSE, (uint64_t)(uint32_t)fd));
+int pacha_fd_close(pacha_fd_t fd) {
+    return pacha_status_to_int(pacha_syscall1(PACHA_FD_SYSCALL_CLOSE, (uint64_t)fd));
 }
 
-long pacha_fd_read(int fd, void *buf, uint64_t len) {
-    return pacha_syscall3(PACHA_FD_SYSCALL_READ, (uint64_t)(uint32_t)fd, (uint64_t)(uintptr_t)buf, len);
+long pacha_fd_read(pacha_fd_t fd, void *buf, uint64_t len) {
+    return pacha_syscall3(PACHA_FD_SYSCALL_READ, (uint64_t)fd, (uint64_t)(uintptr_t)buf, len);
 }
 
-long pacha_fd_write(int fd, const void *buf, uint64_t len) {
-    return pacha_syscall3(PACHA_FD_SYSCALL_WRITE, (uint64_t)(uint32_t)fd, (uint64_t)(uintptr_t)buf, len);
+long pacha_fd_write(pacha_fd_t fd, const void *buf, uint64_t len) {
+    return pacha_syscall3(PACHA_FD_SYSCALL_WRITE, (uint64_t)fd, (uint64_t)(uintptr_t)buf, len);
 }
 
-long pacha_fd_readv(int fd, const struct pacha_iovec *iov, uint64_t iov_count) {
-    return pacha_syscall3(PACHA_FD_SYSCALL_READV, (uint64_t)(uint32_t)fd, (uint64_t)(uintptr_t)iov, iov_count);
+long pacha_fd_readv(pacha_fd_t fd, const struct pacha_iovec *iov, uint64_t iov_count) {
+    return pacha_syscall3(PACHA_FD_SYSCALL_READV, (uint64_t)fd, (uint64_t)(uintptr_t)iov, iov_count);
 }
 
-long pacha_fd_writev(int fd, const struct pacha_iovec *iov, uint64_t iov_count) {
-    return pacha_syscall3(PACHA_FD_SYSCALL_WRITEV, (uint64_t)(uint32_t)fd, (uint64_t)(uintptr_t)iov, iov_count);
+long pacha_fd_writev(pacha_fd_t fd, const struct pacha_iovec *iov, uint64_t iov_count) {
+    return pacha_syscall3(PACHA_FD_SYSCALL_WRITEV, (uint64_t)fd, (uint64_t)(uintptr_t)iov, iov_count);
 }
 
-long pacha_fd_fcntl(int fd, uint64_t cmd, uint64_t arg0, uint64_t arg1) {
-    return pacha_syscall4(PACHA_FD_SYSCALL_FCNTL, (uint64_t)(uint32_t)fd, cmd, arg0, arg1);
+long pacha_fd_fcntl(pacha_fd_t fd, uint64_t cmd, uint64_t arg0, uint64_t arg1) {
+    return pacha_syscall4(PACHA_FD_SYSCALL_FCNTL, (uint64_t)fd, cmd, arg0, arg1);
 }
 
 long pacha_fd_poll(struct pacha_pollfd *fds, uint64_t count) {
@@ -221,7 +234,7 @@ long pacha_fd_wait_many(struct pacha_pollfd *fds, uint64_t count, uint64_t timeo
     }
 }
 
-int pacha_service_wait_init(struct pacha_service_wait_set *set, int endpoint_fd) {
+int pacha_service_wait_init(struct pacha_service_wait_set *set, pacha_fd_t endpoint_fd) {
     if (set == NULL || endpoint_fd < 16) return -1;
     memset(set, 0, sizeof(*set));
     set->count = 1;
@@ -230,7 +243,7 @@ int pacha_service_wait_init(struct pacha_service_wait_set *set, int endpoint_fd)
     return 0;
 }
 
-int pacha_service_wait_add(struct pacha_service_wait_set *set, int fd, uint32_t events) {
+int pacha_service_wait_add(struct pacha_service_wait_set *set, pacha_fd_t fd, uint32_t events) {
     if (set == NULL || fd < 16 || events == 0 || set->count >= PACHA_SERVICE_WAIT_MAX_FDS)
         return -1;
     set->fds[set->count].fd = fd;
@@ -281,20 +294,20 @@ long pacha_fd_wait_many_batched(struct pacha_pollfd *fds, uint64_t total,
 
 uint64_t pacha_service_wait_revents(
     const struct pacha_service_wait_set *set,
-    int fd)
+    pacha_fd_t fd)
 {
     if (set == NULL || fd < 16) return 0;
     for (uint64_t i = 0; i < set->count; i++)
-        if (set->fds[i].fd == fd) return set->fds[i].revents;
+        if (set->fds[i].fd == (uint64_t)fd) return set->fds[i].revents;
     return 0;
 }
 
-int pacha_eventfd_create(uint64_t initial_value, uint64_t rights, uint32_t fd_flags) {
-    return pacha_fd_result_to_int(pacha_syscall3(PACHA_FD_SYSCALL_EVENTFD_CREATE, initial_value, rights, fd_flags));
+pacha_fd_t pacha_eventfd_create(uint64_t initial_value, uint64_t rights, uint32_t fd_flags) {
+    return pacha_fd_result(pacha_syscall3(PACHA_FD_SYSCALL_EVENTFD_CREATE, initial_value, rights, fd_flags));
 }
 
-int pacha_timerfd_create(uint64_t initial_ns, uint64_t interval_ns, uint64_t rights, uint32_t fd_flags) {
-    return pacha_fd_result_to_int(pacha_syscall6(
+pacha_fd_t pacha_timerfd_create(uint64_t initial_ns, uint64_t interval_ns, uint64_t rights, uint32_t fd_flags) {
+    return pacha_fd_result(pacha_syscall6(
         PACHA_FD_SYSCALL_TIMERFD_CREATE,
         PACHA_TIMERFD_CLOCK_MONOTONIC,
         0,
@@ -305,7 +318,7 @@ int pacha_timerfd_create(uint64_t initial_ns, uint64_t interval_ns, uint64_t rig
     ));
 }
 
-int pacha_timerfd_settime(int fd, uint64_t initial_ns, uint64_t interval_ns, uint64_t flags) {
+int pacha_timerfd_settime(pacha_fd_t fd, uint64_t initial_ns, uint64_t interval_ns, uint64_t flags) {
     struct pacha_timer_spec {
         uint64_t interval_sec;
         uint64_t interval_nsec;
@@ -320,22 +333,22 @@ int pacha_timerfd_settime(int fd, uint64_t initial_ns, uint64_t interval_ns, uin
     };
     return pacha_status_to_int(pacha_syscall4(
         PACHA_FD_SYSCALL_TIMERFD_SETTIME,
-        (uint64_t)(uint32_t)fd,
+        (uint64_t)fd,
         flags,
         (uint64_t)(uintptr_t)&spec,
         0
     ));
 }
 
-int pacha_vmo_create(uint64_t size, uint64_t rights, uint32_t flags) {
-    return pacha_fd_result_to_int(pacha_syscall3(PACHA_FD_SYSCALL_VMO_CREATE, size, rights, flags));
+pacha_fd_t pacha_vmo_create(uint64_t size, uint64_t rights, uint32_t flags) {
+    return pacha_fd_result(pacha_syscall3(PACHA_FD_SYSCALL_VMO_CREATE, size, rights, flags));
 }
 
-int pacha_vmo_create_page_view(int parent_fd, const uint64_t *page_indices,
+pacha_fd_t pacha_vmo_create_page_view(pacha_fd_t parent_fd, const uint64_t *page_indices,
                                uint64_t page_count, uint64_t rights, uint32_t flags) {
-    return pacha_fd_result_to_int(pacha_syscall5(
+    return pacha_fd_result(pacha_syscall5(
         PACHA_FD_SYSCALL_VMO_CREATE_PAGE_VIEW,
-        (uint64_t)(uint32_t)parent_fd,
+        (uint64_t)parent_fd,
         (uint64_t)(uintptr_t)page_indices,
         page_count,
         rights,
@@ -343,8 +356,8 @@ int pacha_vmo_create_page_view(int parent_fd, const uint64_t *page_indices,
     ));
 }
 
-int pacha_vmo_create_contiguous(uint64_t size, uint64_t rights, uint32_t flags) {
-    return pacha_fd_result_to_int(pacha_syscall4(
+pacha_fd_t pacha_vmo_create_contiguous(uint64_t size, uint64_t rights, uint32_t flags) {
+    return pacha_fd_result(pacha_syscall4(
         PACHA_CAPSULE_SYSCALL_DMA_POOL_CREATE,
         size,
         rights,
@@ -353,17 +366,17 @@ int pacha_vmo_create_contiguous(uint64_t size, uint64_t rights, uint32_t flags) 
     ));
 }
 
-int pacha_vmo_grow(int fd, uint64_t new_capacity) {
+int pacha_vmo_grow(pacha_fd_t fd, uint64_t new_capacity) {
     return pacha_status_to_int(pacha_syscall2(PACHA_FD_SYSCALL_VMO_GROW,
-        (uint64_t)(uint32_t)fd, new_capacity));
+        (uint64_t)fd, new_capacity));
 }
 
-int pacha_vmo_revoke(int fd) {
-    return pacha_status_to_int(pacha_syscall1(PACHA_FD_SYSCALL_VMO_REVOKE, (uint64_t)(uint32_t)fd));
+int pacha_vmo_revoke(pacha_fd_t fd) {
+    return pacha_status_to_int(pacha_syscall1(PACHA_FD_SYSCALL_VMO_REVOKE, (uint64_t)fd));
 }
 
-void *pacha_mmap(int fd, uint64_t size, uint64_t prot, uint64_t flags, uint64_t offset) {
-    const long result = pacha_syscall6(PACHA_VM_SYSCALL_MMAP, (uint64_t)(uint32_t)fd, 0, size, prot, flags, offset);
+void *pacha_mmap(pacha_fd_t fd, uint64_t size, uint64_t prot, uint64_t flags, uint64_t offset) {
+    const long result = pacha_syscall6(PACHA_VM_SYSCALL_MMAP, (uint64_t)fd, 0, size, prot, flags, offset);
     if (result < 4096) return (void *)0;
     return (void *)(uintptr_t)result;
 }
@@ -378,8 +391,8 @@ int pacha_munmap(void *addr, uint64_t size) {
     return pacha_status_to_int(pacha_syscall2(PACHA_VM_SYSCALL_MUNMAP, (uint64_t)(uintptr_t)addr, size));
 }
 
-static long pacha_mmap_raw(int fd, uint64_t size, uint64_t prot, uint64_t flags, uint64_t offset) {
-    return pacha_syscall6(PACHA_VM_SYSCALL_MMAP, (uint64_t)(uint32_t)fd, 0, size, prot, flags, offset);
+static long pacha_mmap_raw(pacha_fd_t fd, uint64_t size, uint64_t prot, uint64_t flags, uint64_t offset) {
+    return pacha_syscall6(PACHA_VM_SYSCALL_MMAP, (uint64_t)fd, 0, size, prot, flags, offset);
 }
 
 uint64_t pacha_mmap_pkey_flags(uint64_t flags, uint32_t pkey) {
@@ -503,7 +516,7 @@ static int pacha_ipc_ring_pop(struct pacha_ipc_fast_ring *ring, struct pacha_ipc
     return 0;
 }
 
-static int pacha_ipc_normal_send_entry(int fd, const struct pacha_ipc_fast_entry *entry) {
+static int pacha_ipc_normal_send_entry(pacha_fd_t fd, const struct pacha_ipc_fast_entry *entry) {
     if (fd < 16 || !entry) return -1;
     const struct pacha_ipc_msg msg = {
         .word0 = entry->op,
@@ -514,7 +527,7 @@ static int pacha_ipc_normal_send_entry(int fd, const struct pacha_ipc_fast_entry
     return pacha_ipc_send(fd, &msg);
 }
 
-static int pacha_ipc_normal_recv_entry(int fd, struct pacha_ipc_fast_entry *out) {
+static int pacha_ipc_normal_recv_entry(pacha_fd_t fd, struct pacha_ipc_fast_entry *out) {
     if (fd < 16 || !out) return -1;
     struct pacha_ipc_msg msg = {0};
     const int status = pacha_ipc_recv(fd, &msg);
@@ -553,8 +566,8 @@ static int pacha_ipc_fast_pkey_available(uint32_t flags, uint32_t pkey, struct p
 
 static int pacha_ipc_fast_map_pkey_rings(
     struct pacha_ipc_fast_channel *fast,
-    int req_fd,
-    int comp_fd,
+    pacha_fd_t req_fd,
+    pacha_fd_t comp_fd,
     uint32_t pkey,
     int offer_side
 ) {
@@ -592,7 +605,7 @@ static void pacha_ipc_fast_init_ring_pair(struct pacha_ipc_fast_channel *fast) {
     if (fast->backend == PACHA_IPC_BACKEND_PKEY_RING) pacha_ipc_pkey_close(fast->pkey, saved);
 }
 
-int pacha_ipc_fast_channel_init_local(struct pacha_ipc_fast_channel *fast, int channel_fd, uint32_t flags, uint32_t pkey) {
+int pacha_ipc_fast_channel_init_local(struct pacha_ipc_fast_channel *fast, pacha_fd_t channel_fd, uint32_t flags, uint32_t pkey) {
     if (!fast) return -1;
     *fast = (struct pacha_ipc_fast_channel){
         .channel_fd = channel_fd,
@@ -615,8 +628,8 @@ int pacha_ipc_fast_channel_init_local(struct pacha_ipc_fast_channel *fast, int c
 
     const uint64_t rights = PACHA_FD_RIGHT_TRANSFER | PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_MAP_READ | PACHA_FD_RIGHT_MAP_WRITE;
     const uint64_t ring_size = pacha_page_align_up(sizeof(struct pacha_ipc_fast_ring));
-    const int req_fd = pacha_vmo_create(ring_size, rights, 0);
-    const int comp_fd = pacha_vmo_create(ring_size, rights, 0);
+    const pacha_fd_t req_fd = pacha_vmo_create(ring_size, rights, 0);
+    const pacha_fd_t comp_fd = pacha_vmo_create(ring_size, rights, 0);
     if (req_fd < 16 || comp_fd < 16) {
         fast->fallback_reason = PACHA_IPC_FAST_FALLBACK_VMO_CREATE_FAILED;
         if (channel_fd >= 16 && !requires_pkey) return 0;
@@ -632,7 +645,7 @@ int pacha_ipc_fast_channel_init_local(struct pacha_ipc_fast_channel *fast, int c
     return 0;
 }
 
-int pacha_ipc_fast_channel_init_normal(struct pacha_ipc_fast_channel *fast, int channel_fd) {
+int pacha_ipc_fast_channel_init_normal(struct pacha_ipc_fast_channel *fast, pacha_fd_t channel_fd) {
     if (!fast || channel_fd < 16) return -1;
     *fast = (struct pacha_ipc_fast_channel){
         .channel_fd = channel_fd,
@@ -647,7 +660,7 @@ int pacha_ipc_fast_channel_init_normal(struct pacha_ipc_fast_channel *fast, int 
     return 0;
 }
 
-int pacha_ipc_fast_channel_offer(struct pacha_ipc_fast_channel *fast, int control_fd, uint32_t flags, uint32_t pkey) {
+int pacha_ipc_fast_channel_offer(struct pacha_ipc_fast_channel *fast, pacha_fd_t control_fd, uint32_t flags, uint32_t pkey) {
     if (!fast) return -1;
     const int status = pacha_ipc_fast_channel_init_local(fast, control_fd, flags, pkey);
     if (status != 0) return status;
@@ -687,7 +700,7 @@ int pacha_ipc_fast_channel_offer(struct pacha_ipc_fast_channel *fast, int contro
     return pacha_ipc_send(control_fd, &msg);
 }
 
-int pacha_ipc_fast_channel_accept(struct pacha_ipc_fast_channel *fast, int control_fd, uint32_t flags, uint32_t pkey) {
+int pacha_ipc_fast_channel_accept(struct pacha_ipc_fast_channel *fast, pacha_fd_t control_fd, uint32_t flags, uint32_t pkey) {
     if (!fast) return -1;
     *fast = (struct pacha_ipc_fast_channel){
         .channel_fd = control_fd,
@@ -719,7 +732,7 @@ int pacha_ipc_fast_channel_accept(struct pacha_ipc_fast_channel *fast, int contr
     const uint32_t effective_pkey = pkey != 0 ? pkey : remote_pkey;
     const int can_pkey = pacha_ipc_fast_pkey_available(effective_flags, effective_pkey, fast);
     if (can_pkey <= 0) return can_pkey < 0 ? -2 : 0;
-    return pacha_ipc_fast_map_pkey_rings(fast, (int)fds[0].fd, (int)fds[1].fd, effective_pkey, 0);
+    return pacha_ipc_fast_map_pkey_rings(fast, (pacha_fd_t)fds[0].fd, (pacha_fd_t)fds[1].fd, effective_pkey, 0);
 }
 
 int pacha_ipc_fast_channel_ready(const struct pacha_ipc_fast_channel *fast) {

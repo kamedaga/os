@@ -1,4 +1,9 @@
+const mmio = @import("memory/mmio.zig");
+const builtin = @import("builtin");
+const lock_diagnostics = @import("sync/lock_diagnostics.zig");
 const std = @import("std");
+const address_types = @import("memory/addresses.zig");
+const copy_profile = @import("lock_profile.zig");
 const perf = @import("smp_perf.zig");
 const kernel = @import("kernel.zig");
 const kernel_log = @import("kernel_log.zig");
@@ -6,6 +11,11 @@ const scheduler = @import("scheduler_connection.zig");
 const smp = @import("smp.zig");
 const user_vm = @import("memory/user_vm.zig");
 const ram_cache = @import("memory/ram_cache_policy.zig");
+const window_ways = @import("arch/x86_64/platform.zig").phys_copy_window_ways;
+
+const CpuSet = @import("cpu_set.zig").CpuSet;
+const residency = @import("tlb_residency.zig");
+const bootstrap_cpu_rows = if (builtin.is_test) 4 else 1;
 
 pub const Hooks = struct {
     state: *kernel.KernelState,
@@ -53,6 +63,10 @@ pub fn hasRamCachePolicyLocked() bool {
     return snapshot.policy.len != 0 or snapshot.pending.len != 0;
 }
 
+// The guard is returned by value. Its intrusive record must stay at a
+// stable per-CPU address, not move with the caller's guard value.
+var copy_window_records_seed: [if (lock_diagnostics.enabled) bootstrap_cpu_rows else 0]lock_diagnostics.Record = @splat(.{});
+var copy_window_records: []lock_diagnostics.Record = &copy_window_records_seed;
 const PhysCopyWindowGuard = struct {
     cpu_slot: usize,
     interrupts_were_enabled: bool = false,
@@ -69,30 +83,42 @@ const PhysCopyWindowGuard = struct {
 
     fn lock() PhysCopyWindowGuard {
         const restore_interrupts = interruptsEnabled();
-        asm volatile ("cli" ::: .{ .memory = true });
+        if (!builtin.is_test) asm volatile ("cli" ::: .{ .memory = true });
+        const cpu = boundedCurrentCpuSlot();
+        if (comptime lock_diagnostics.enabled) {
+            lock_diagnostics.beforeAcquire(&copy_window_records[cpu], .{ .class = .copy_window, .order = cpu });
+            lock_diagnostics.acquired(&copy_window_records[cpu], .{ .class = .copy_window, .order = cpu });
+        }
         return .{
-            .cpu_slot = boundedCurrentCpuSlot(),
+            .cpu_slot = cpu,
             .interrupts_were_enabled = restore_interrupts,
         };
     }
 
     fn unlock(self: PhysCopyWindowGuard) void {
+        if (comptime lock_diagnostics.enabled) {
+            if (boundedCurrentCpuSlot() != self.cpu_slot) lock_diagnostics.failure(error.ContextMovedCpu);
+            lock_diagnostics.assertOwned(&copy_window_records[self.cpu_slot]);
+        }
         // Non-WB RAM copies may leave WC stores buffered even when no device
         // VMA was involved. Finish them before allowing a transition IPI.
-        if (user_copy_hooks_ready and
-            (user_copy_hooks_storage.phys_copy_window_pt[self.cpu_slot] & 0x98) != 0)
+        if (window_non_wb_used[self.cpu_slot] != 0) {
             asm volatile ("mfence" ::: .{ .memory = true });
-        if (self.interrupts_were_enabled) asm volatile ("sti" ::: .{ .memory = true });
+            window_non_wb_used[self.cpu_slot] = 0;
+        }
+        if (comptime lock_diagnostics.enabled) lock_diagnostics.releasing(&copy_window_records[self.cpu_slot]);
+        if (!builtin.is_test and self.interrupts_were_enabled) asm volatile ("sti" ::: .{ .memory = true });
     }
 };
 
 fn boundedCurrentCpuSlot() usize {
     const cpu_slot = scheduler.currentCpu();
-    return if (cpu_slot < smp.max_cpus) cpu_slot else 0;
+    return if (cpu_slot < window_victim.len) cpu_slot else 0;
 }
 
 const TlbShootdownLock = struct {
     value: u8 = 0,
+    diagnostic_record: lock_diagnostics.Record = .{},
 
     fn interruptsEnabled() bool {
         var flags: u64 = 0;
@@ -106,7 +132,14 @@ const TlbShootdownLock = struct {
 
     fn lock(self: *TlbShootdownLock) void {
         while (true) {
-            if (@cmpxchgWeak(u8, &self.value, 0, 1, .acquire, .monotonic) == null) return;
+            const diagnostic_if = lock_diagnostics.maskInterrupts();
+            lock_diagnostics.beforeAcquire(&self.diagnostic_record, .{ .class = .tlb_shootdown });
+            if (@cmpxchgWeak(u8, &self.value, 0, 1, .acquire, .monotonic) == null) {
+                lock_diagnostics.acquired(&self.diagnostic_record, .{ .class = .tlb_shootdown });
+                lock_diagnostics.restoreInterrupts(diagnostic_if);
+                return;
+            }
+            lock_diagnostics.restoreInterrupts(diagnostic_if);
             while (@atomicLoad(u8, &self.value, .monotonic) != 0) {
                 // A competing initiator may be waiting for this CPU's ack.
                 asm volatile ("sti; pause; cli" ::: .{ .memory = true });
@@ -115,78 +148,125 @@ const TlbShootdownLock = struct {
     }
 
     fn unlock(self: *TlbShootdownLock) void {
+        const diagnostic_if = lock_diagnostics.maskInterrupts();
+        defer lock_diagnostics.restoreInterrupts(diagnostic_if);
+        lock_diagnostics.releasing(&self.diagnostic_record);
         @atomicStore(u8, &self.value, 0, .release);
     }
 };
 
+// X serializes senders. A receiver reads ONLY its own mailbox; publication
+// and ACK bracket descriptor lifetime, including delayed/coalesced IPIs.
+const Mailbox = struct {
+    cr3: u64 = 0,
+    range: TlbRange = .{},
+    retire_base: u64 = 0,
+    retire_size: u64 = 0,
+    flush_caches: bool = false,
+    published: u64 = 0,
+    ack: u64 = 0,
+
+    fn pending(self: *Mailbox) u64 {
+        const generation = @atomicLoad(u64, &self.published, .acquire);
+        return if (generation == @atomicLoad(u64, &self.ack, .monotonic)) 0 else generation;
+    }
+
+    fn nextGeneration(self: *Mailbox) u64 {
+        const previous = @atomicLoad(u64, &self.published, .monotonic);
+        std.debug.assert(previous == @atomicLoad(u64, &self.ack, .acquire));
+        // Per-mailbox sequence: a CPU omitted for a global counter's complete
+        // wrap must not mistake its old ACK for a newly targeted request.
+        return if (previous == std.math.maxInt(u64)) 1 else previous + 1;
+    }
+};
+var mailbox_seed: [bootstrap_cpu_rows]Mailbox = @splat(.{});
+var mailboxes: []Mailbox = &mailbox_seed;
+var target_seed: [CpuSet.wordCount(bootstrap_cpu_rows)]usize = @splat(0);
+var shootdown_targets = CpuSet{ .words = &target_seed, .capacity = bootstrap_cpu_rows };
+
+pub fn initCpuStorage(count: usize) !void {
+    const grow = @import("diagnostic_cpu_storage.zig").grow;
+    mailboxes = try grow(Mailbox, mailboxes, count, .{});
+    tlb_shootdown_active = try grow(u8, tlb_shootdown_active, count, 0);
+    window_victim = try grow(u8, window_victim, count, 0);
+    window_non_wb_used = try grow(u8, window_non_wb_used, count, 0);
+    if (comptime lock_diagnostics.enabled)
+        copy_window_records = try grow(lock_diagnostics.Record, copy_window_records, count, .{});
+    const words = try @import("arch/x86_64/cpu_runtime.zig").alloc(usize, CpuSet.wordCount(count));
+    shootdown_targets = CpuSet.init(words, count);
+}
+
 var tlb_shootdown_lock: TlbShootdownLock = .{};
-var tlb_shootdown_target_cr3: u64 = 0;
-var tlb_shootdown_flush_caches: u8 = 0;
-var tlb_shootdown_retire_phys_base: u64 = 0;
-var tlb_shootdown_retire_phys_size: u64 = 0;
-var tlb_shootdown_generation: u64 = 0;
-var tlb_shootdown_ack: [smp.max_cpus]u64 = [_]u64{0} ** smp.max_cpus;
+var tlb_cost_measured: bool = false;
+// GDB may change this only with all vCPUs stopped, outside measurement windows.
+// Zero forces full; the read clamps to 256 so full-AS/parent requests stay full.
+// Normal/profile builds have no dynamic setting and no storage for it.
+var tlb_range_checked_limit: [if (lock_diagnostics.enabled) 1 else 0]usize = @splat(TlbRange.page_limit);
 // Local interrupt completion may copy into a COW mapping and initiate another
 // shootdown. Keep it out of this CPU's non-recursive lock interval, including
 // acquisition waits. Maintenance IPIs and device event publication still run.
-var tlb_shootdown_active: [smp.max_cpus]u8 = [_]u8{0} ** smp.max_cpus;
+var tlb_shootdown_active_seed: [bootstrap_cpu_rows]u8 = @splat(0);
+var tlb_shootdown_active: []u8 = &tlb_shootdown_active_seed;
 
+const slot_table = @import("memory/slot_table.zig");
 const WcWindowLease = struct {
-    sequence: u64 = 0,
     base: u64 = 0,
     size: u64 = 0,
-    active: u8 = 0,
 };
-const wc_window_lease_capacity = 128;
-var wc_window_leases: [wc_window_lease_capacity]WcWindowLease =
-    [_]WcWindowLease{.{}} ** wc_window_lease_capacity;
-var wc_window_active_count: u16 = 0;
+var wc_window_leases: slot_table.SlotTable(WcWindowLease) = .{};
+var wc_window_leaf: slot_table.Leaf = .{};
+var wc_window_active_count: usize = 0;
 
-/// The state lock serializes writers. Readers in the pinned copy window use
-/// the sequence so a rapid close/reprobe cannot mix an old active bit with a
-/// new physical range. Token zero means no lease.
-pub fn acquireWcPhysicalWindowLease(base: u64, size: u64) ?u16 {
+var test_wc_allocator: ?@import("memory/owned_storage.zig").Allocator = null;
+
+fn wcLeaseAllocator() @import("memory/owned_storage.zig").Allocator {
+    if (builtin.is_test) return test_wc_allocator orelse slot_table.hostTestAllocator();
+    return @import("memory/identity_allocator.zig").allocator(user_copy_hooks_storage.free_list);
+}
+// Next way to evict when every way of a CPU holds another page. Only touched
+// by that CPU inside its IRQ-disabled copy guard.
+var window_victim_seed: [bootstrap_cpu_rows]u8 = @splat(0);
+var window_victim: []u8 = &window_victim_seed;
+// Set when the current guard used a non-WB way. A retained non-WB way that the
+// guard did not touch has no stores in flight, so the unlock fence keys on use.
+var window_non_wb_used_seed: [bootstrap_cpu_rows]u8 = @splat(0);
+var window_non_wb_used: []u8 = &window_non_wb_used_seed;
+
+/// K serializes writers and owns tokens; the directory leaf excludes copy
+/// readers through the entire range check. Allocation/returns run outside it.
+/// Token zero means no lease; this is internal storage, not a syscall ABI.
+pub fn acquireWcPhysicalWindowLease(base: u64, size: u64) ?u64 {
     if (size == 0 or ((base | size) & 4095) != 0 or
         base > std.math.maxInt(u64) - size) return null;
-    for (&wc_window_leases, 0..) |*slot, index| {
-        if (@atomicLoad(u8, &slot.active, .acquire) != 0) continue;
-        _ = @atomicRmw(u64, &slot.sequence, .Add, 1, .acq_rel);
-        @atomicStore(u64, &slot.base, base, .monotonic);
-        @atomicStore(u64, &slot.size, size, .monotonic);
-        @atomicStore(u8, &slot.active, 1, .release);
-        _ = @atomicRmw(u64, &slot.sequence, .Add, 1, .release);
-        _ = @atomicRmw(u16, &wc_window_active_count, .Add, 1, .release);
-        return @intCast(index + 1);
-    }
-    return null;
+    const added = wc_window_leases.allocate(wcLeaseAllocator(), &wc_window_leaf, std.math.maxInt(u32)) catch return null;
+    const flags = wc_window_leaf.lock();
+    added.value.* = .{ .base = base, .size = size };
+    _ = @atomicRmw(usize, &wc_window_active_count, .Add, 1, .release);
+    wc_window_leaf.unlock(flags);
+    return @as(u64, added.ref.index) + 1;
 }
 
-pub fn releaseWcPhysicalWindowLease(token: u16) void {
-    if (token == 0 or token > wc_window_leases.len) unreachable;
-    const slot = &wc_window_leases[token - 1];
-    if (@atomicLoad(u8, &slot.active, .acquire) == 0) unreachable;
-    _ = @atomicRmw(u64, &slot.sequence, .Add, 1, .acq_rel);
-    @atomicStore(u8, &slot.active, 0, .release);
-    _ = @atomicRmw(u64, &slot.sequence, .Add, 1, .release);
-    _ = @atomicRmw(u16, &wc_window_active_count, .Sub, 1, .release);
+pub fn releaseWcPhysicalWindowLease(token: u64) void {
+    if (token == 0 or token - 1 > std.math.maxInt(u32)) unreachable;
+    // K keeps the resource alive while remove withdraws it under the leaf.
+    const slot = wc_window_leases.get(@intCast(token - 1)) orelse unreachable;
+    wc_window_leases.remove(slot, &wc_window_leaf);
+    _ = @atomicRmw(usize, &wc_window_active_count, .Sub, 1, .release);
 }
 
 fn wcPhysicalWindowLeaseBlocks(page: u64) bool {
-    // In the ordinary system there are no WC leases; keep RAM copy traffic
-    // off the physical-range scan. A concurrent first acquire is followed by
-    // an all-CPU retirement IPI before its WC PTE becomes visible.
-    if (@atomicLoad(u16, &wc_window_active_count, .acquire) == 0) return false;
-    for (&wc_window_leases) |*slot| {
-        const first = @atomicLoad(u64, &slot.sequence, .acquire);
-        // A reader may run from an interrupt on the CPU updating this slot.
-        // Fail closed for the few instructions of the update; spinning here
-        // would deadlock the interrupted writer.
-        if ((first & 1) != 0) return true;
-        const active = @atomicLoad(u8, &slot.active, .acquire) != 0;
-        const base = @atomicLoad(u64, &slot.base, .monotonic);
-        const size = @atomicLoad(u64, &slot.size, .monotonic);
-        if (first != @atomicLoad(u64, &slot.sequence, .acquire)) return true;
-        if (active and page >= base and page - base < size) return true;
+    // The first acquire is followed by all-CPU retirement before WC PTE
+    // publication. No leases keeps ordinary RAM copy off the directory path.
+    if (@atomicLoad(usize, &wc_window_active_count, .acquire) == 0) return false;
+    // Writers mask IRQs and do no allocation/callback/IPI work under this
+    // leaf. Copy -> directory is therefore acyclic, and concurrent readers
+    // serialize without spuriously denying an unrelated physical page.
+    const flags = wc_window_leaf.lock();
+    defer wc_window_leaf.unlock(flags);
+    var iterator = wc_window_leases.iterator();
+    while (iterator.next()) |entry| {
+        const slot = entry.value;
+        if (page >= slot.base and page - slot.base < slot.size) return true;
     }
     return false;
 }
@@ -218,11 +298,14 @@ pub fn testSetTlbShootdownActive(cpu: usize, active: bool) void {
 }
 
 test "shootdown interrupt guard is CPU local and clears independently" {
-    const before = tlb_shootdown_active;
-    defer tlb_shootdown_active = before;
-    @memset(&tlb_shootdown_active, 0);
+    const before = try std.testing.allocator.dupe(u8, tlb_shootdown_active);
+    defer {
+        @memcpy(tlb_shootdown_active, before);
+        std.testing.allocator.free(before);
+    }
+    @memset(tlb_shootdown_active, 0);
     const cpu = boundedCurrentCpuSlot();
-    const other = (cpu + 1) % smp.max_cpus;
+    const other = (cpu + 1) % window_victim.len;
     testSetTlbShootdownActive(other, true);
     try std.testing.expect(!tlbShootdownActiveOnCurrentCpu());
     testSetTlbShootdownActive(cpu, true);
@@ -242,36 +325,40 @@ fn maxStaticEnd(a: usize, b: usize) usize {
 
 pub fn kernelStaticStorageEndAddr() usize {
     var end: usize = 0;
+    if (comptime lock_diagnostics.enabled) end = maxStaticEnd(end, staticStorageEnd(@TypeOf(copy_window_records), &copy_window_records));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(user_copy_hooks_storage), &user_copy_hooks_storage));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(user_copy_hooks_ready), &user_copy_hooks_ready));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(ram_cache_snapshot), &ram_cache_snapshot));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(tlb_shootdown_lock), &tlb_shootdown_lock));
-    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(tlb_shootdown_target_cr3), &tlb_shootdown_target_cr3));
-    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(tlb_shootdown_flush_caches), &tlb_shootdown_flush_caches));
-    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(tlb_shootdown_retire_phys_base), &tlb_shootdown_retire_phys_base));
-    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(tlb_shootdown_retire_phys_size), &tlb_shootdown_retire_phys_size));
-    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(tlb_shootdown_generation), &tlb_shootdown_generation));
-    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(tlb_shootdown_ack), &tlb_shootdown_ack));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(tlb_cost_measured), &tlb_cost_measured));
+    if (comptime lock_diagnostics.enabled) end = maxStaticEnd(end, staticStorageEnd(@TypeOf(tlb_range_checked_limit), &tlb_range_checked_limit));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(tlb_shootdown_active), &tlb_shootdown_active));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(wc_window_leases), &wc_window_leases));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(wc_window_leaf), &wc_window_leaf));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(wc_window_active_count), &wc_window_active_count));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(window_victim), &window_victim));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(window_non_wb_used), &window_non_wb_used));
     return end;
 }
 
 pub fn mapKernelRuntimeStorage(map_identity_range: *const fn (u64, usize) bool) bool {
+    if (comptime lock_diagnostics.enabled) {
+        if (!map_identity_range(@intFromPtr(&copy_window_records), @sizeOf(@TypeOf(copy_window_records)))) return false;
+    }
     if (!map_identity_range(@intFromPtr(&user_copy_hooks_storage), @sizeOf(@TypeOf(user_copy_hooks_storage)))) return false;
     if (!map_identity_range(@intFromPtr(&user_copy_hooks_ready), @sizeOf(@TypeOf(user_copy_hooks_ready)))) return false;
     if (!map_identity_range(@intFromPtr(&ram_cache_snapshot), @sizeOf(@TypeOf(ram_cache_snapshot)))) return false;
     if (!map_identity_range(@intFromPtr(&tlb_shootdown_lock), @sizeOf(@TypeOf(tlb_shootdown_lock)))) return false;
-    if (!map_identity_range(@intFromPtr(&tlb_shootdown_target_cr3), @sizeOf(@TypeOf(tlb_shootdown_target_cr3)))) return false;
-    if (!map_identity_range(@intFromPtr(&tlb_shootdown_flush_caches), @sizeOf(@TypeOf(tlb_shootdown_flush_caches)))) return false;
-    if (!map_identity_range(@intFromPtr(&tlb_shootdown_retire_phys_base), @sizeOf(@TypeOf(tlb_shootdown_retire_phys_base)))) return false;
-    if (!map_identity_range(@intFromPtr(&tlb_shootdown_retire_phys_size), @sizeOf(@TypeOf(tlb_shootdown_retire_phys_size)))) return false;
-    if (!map_identity_range(@intFromPtr(&tlb_shootdown_generation), @sizeOf(@TypeOf(tlb_shootdown_generation)))) return false;
-    if (!map_identity_range(@intFromPtr(&tlb_shootdown_ack), @sizeOf(@TypeOf(tlb_shootdown_ack)))) return false;
+    if (!map_identity_range(@intFromPtr(&tlb_cost_measured), @sizeOf(@TypeOf(tlb_cost_measured)))) return false;
+    if (comptime lock_diagnostics.enabled) {
+        if (!map_identity_range(@intFromPtr(&tlb_range_checked_limit), @sizeOf(@TypeOf(tlb_range_checked_limit)))) return false;
+    }
     if (!map_identity_range(@intFromPtr(&tlb_shootdown_active), @sizeOf(@TypeOf(tlb_shootdown_active)))) return false;
     if (!map_identity_range(@intFromPtr(&wc_window_leases), @sizeOf(@TypeOf(wc_window_leases)))) return false;
+    if (!map_identity_range(@intFromPtr(&wc_window_leaf), @sizeOf(@TypeOf(wc_window_leaf)))) return false;
     if (!map_identity_range(@intFromPtr(&wc_window_active_count), @sizeOf(@TypeOf(wc_window_active_count)))) return false;
+    if (!map_identity_range(@intFromPtr(&window_victim), @sizeOf(@TypeOf(window_victim)))) return false;
+    if (!map_identity_range(@intFromPtr(&window_non_wb_used), @sizeOf(@TypeOf(window_non_wb_used)))) return false;
     return true;
 }
 
@@ -291,16 +378,43 @@ fn mapPhysPageForKernelAccess(page_paddr: u64, cpu_slot: usize) ?[*]u8 {
 
 const PhysWindowCache = union(enum) { ram, uncached_mmio, device: u3 };
 
+const MappedWindow = struct {
+    ptr: [*]u8,
+    /// PT index (cpu * window_ways + way); device copies retire exactly this.
+    slot: usize,
+    /// False when an identical retained PTE was reused without INVLPG.
+    remapped: bool,
+};
+
+const window_paddr_mask: u64 = 0x000f_ffff_ffff_f000;
+
+fn windowSlotVa(slot: usize) u64 {
+    if (!builtin.is_test) return @import("arch/x86_64/platform.zig").perCpuWindowVa(slot / window_ways, slot % window_ways);
+    return getHooks().phys_copy_window_va + @as(u64, @intCast(slot)) * 4096;
+}
+
+fn windowEntry(slot: usize) *u64 {
+    if (!builtin.is_test) return @import("arch/x86_64/platform.zig").perCpuWindowEntry(slot / window_ways, slot % window_ways);
+    return &getHooks().phys_copy_window_pt[slot];
+}
+
 fn mapPhysPageWithCache(page_paddr: u64, cpu_slot: usize, cache: PhysWindowCache) ?[*]u8 {
+    return (mapPhysWindow(page_paddr, cpu_slot, cache) orelse return null).ptr;
+}
+
+fn mapPhysWindow(page_paddr: u64, cpu_slot: usize, cache: PhysWindowCache) ?MappedWindow {
     const h = getHooks();
     const page_base = page_paddr & ~@as(u64, 0xFFF);
-    // This window retains its last PTE. Once a physical page is leased as
-    // WC, neither generic RAM copy nor explicit UC access may recreate a
-    // conflicting live alias. The transition IPI retires the old PTE first.
+    // Each CPU retains up to window_ways PTEs. Once a physical page is leased
+    // as WC, neither generic RAM copy nor explicit UC access may recreate a
+    // conflicting live alias. The transition IPI retires every matching way
+    // first (retirePhysCopyWindowOnCurrentCpu), so these decisions must run
+    // before a retained way can be reused.
     if (cache != .device and wcPhysicalWindowLeaseBlocks(page_base)) return null;
     if (page_base >= h.physical_map_limit) return null;
-    if (cpu_slot >= smp.max_cpus or cpu_slot >= h.phys_copy_window_pt.len) return null;
-    const window_va = h.phys_copy_window_va + (@as(u64, @intCast(cpu_slot)) * 4096);
+    if (cpu_slot >= window_victim.len) return null;
+    const first_slot = cpu_slot * window_ways;
+    if (builtin.is_test and first_slot + window_ways > h.phys_copy_window_pt.len) return null;
     // PCD|PWT selects PAT entry 3 (UC); MMIO callers prove that encoding and
     // alias compatibility before mapping. RAM continues to use entry 0.
     var pat: u3 = switch (cache) {
@@ -321,16 +435,54 @@ fn mapPhysPageWithCache(page_paddr: u64, cpu_slot: usize, cache: PhysWindowCache
     const cache_flags = (@as(u64, pat & 3) << 3) | (@as(u64, pat >> 2) << 7);
     const desired = page_base | h.page_present | h.page_rw | cache_flags;
     const accessed_dirty: u64 = (1 << 5) | (1 << 6);
-    // The guard pins this CPU and excludes reentry. Reusing its current
-    // mapping requires neither a PTE store nor local TLB invalidation.
-    if ((h.phys_copy_window_pt[cpu_slot] & ~accessed_dirty) != desired) {
-        h.phys_copy_window_pt[cpu_slot] = desired;
-        h.invlpg(window_va);
+    // The guard pins this CPU and excludes reentry. Reusing an identical way
+    // requires neither a PTE store nor local TLB invalidation.
+    var same_page: ?usize = null;
+    var empty: ?usize = null;
+    for (first_slot..first_slot + window_ways) |slot| {
+        const entry = windowEntry(slot).*;
+        if ((entry & ~accessed_dirty) == desired) return publishWindow(slot, desired, false);
+        if ((entry & h.page_present) == 0) {
+            if (empty == null) empty = slot;
+        } else if ((entry & window_paddr_mask) == page_base) {
+            same_page = slot;
+        }
     }
-    return @ptrFromInt(window_va);
+    // A page whose memory type changed replaces its own way in place: one CPU
+    // never holds two aliases of one physical page with different types.
+    const slot = same_page orelse empty orelse blk: {
+        const way = window_victim[cpu_slot] % window_ways;
+        window_victim[cpu_slot] = @intCast((way + 1) % window_ways);
+        break :blk first_slot + way;
+    };
+    windowEntry(slot).* = desired;
+    const invalidate_start = copy_profile.copyTimestamp();
+    h.invlpg(windowSlotVa(slot));
+    copy_profile.copyEnd(.invlpg, invalidate_start);
+    if (comptime @import("builtin").is_test) assertOneWayPerPage(first_slot);
+    return publishWindow(slot, desired, true);
 }
 
-fn physWindowAddr(addr: u64, access_len: usize, cpu_slot: usize) ?u64 {
+fn publishWindow(slot: usize, pte: u64, remapped: bool) MappedWindow {
+    // Non-WB stores may still be buffered when the guard ends; record the use
+    // before the pointer escapes so unlock fences them.
+    if ((pte & 0x98) != 0) window_non_wb_used[slot / window_ways] = 1;
+    return .{ .ptr = @ptrFromInt(windowSlotVa(slot)), .slot = slot, .remapped = remapped };
+}
+
+fn assertOneWayPerPage(first_slot: usize) void {
+    const h = getHooks();
+    for (first_slot..first_slot + window_ways) |a| {
+        if ((windowEntry(a).* & h.page_present) == 0) continue;
+        for (a + 1..first_slot + window_ways) |b| {
+            if ((windowEntry(b).* & h.page_present) == 0) continue;
+            std.debug.assert((windowEntry(a).* & window_paddr_mask) !=
+                (windowEntry(b).* & window_paddr_mask));
+        }
+    }
+}
+
+fn physWindowAddr(addr: u64, access_len: usize, cpu_slot: usize) ?[*]u8 {
     const h = getHooks();
     if (access_len == 0 or access_len > 4096) return null;
     const offset: usize = @intCast(addr & 0xFFF);
@@ -338,7 +490,7 @@ fn physWindowAddr(addr: u64, access_len: usize, cpu_slot: usize) ?u64 {
     const last_addr, const overflow = @addWithOverflow(addr, @as(u64, @intCast(access_len - 1)));
     if (overflow != 0 or last_addr >= h.physical_map_limit) return null;
     const page = mapPhysPageForKernelAccess(addr, cpu_slot) orelse return null;
-    return @intFromPtr(page) + offset;
+    return page + offset;
 }
 
 fn allocatePreparedFaultPage(
@@ -514,10 +666,16 @@ pub fn resolveNativeVmaCowMappingWithAddressSpaceLocked(
             break :blk state.commitNativeVmaCowMapping(principal, plan, candidate, free_list);
         };
         if (mapping) |resolved| {
-            if (resolved.paddr != candidate) free_list.appendPage(0, candidate) catch {};
+            if (resolved.paddr != candidate) free_list.appendPage(candidate) catch |err| switch (err) {
+                error.PageQuarantined => {},
+                else => @panic("invalid PMM return"),
+            };
             return resolved;
         }
-        free_list.appendPage(0, candidate) catch {};
+        free_list.appendPage(candidate) catch |err| switch (err) {
+            error.PageQuarantined => {},
+            else => @panic("invalid PMM return"),
+        };
     }
     logCowResolutionFailure(state, free_list, principal, page_va, "commit_retry", last_plan);
     return null;
@@ -531,6 +689,8 @@ pub fn resolveNativeVmaFaultMappingWithAddressSpaceLocked(
     write_access: bool,
     instruction_fetch: bool,
 ) ?kernel.NativeVmaFaultMapping {
+    const profile_start = copy_profile.copyTimestamp();
+    defer copy_profile.copyEnd(.page_fault, profile_start);
     var attempt: usize = 0;
     while (attempt < 2) : (attempt += 1) {
         const plan = blk: {
@@ -561,21 +721,48 @@ pub fn resolveNativeVmaFaultMappingWithAddressSpaceLocked(
             break :blk state.commitNativeVmaFaultMapping(principal, plan, candidate, free_list);
         };
         if (mapping) |resolved| {
-            if (resolved.paddr != candidate) free_list.appendPage(0, candidate) catch {};
+            if (resolved.paddr != candidate) free_list.appendPage(candidate) catch |err| switch (err) {
+                error.PageQuarantined => {},
+                else => @panic("invalid PMM return"),
+            };
             return resolved;
         }
         kernel_log.writeFmt("vm: fault commit retry principal={} va=0x{x} attempt={}\n", .{ @intFromEnum(principal), page_va, attempt });
-        free_list.appendPage(0, candidate) catch {};
+        free_list.appendPage(candidate) catch |err| switch (err) {
+            error.PageQuarantined => {},
+            else => @panic("invalid PMM return"),
+        };
     }
     return null;
 }
 
 // Both private callers hold the address-space lock through cache selection
 // and the physical copy. Reacquiring it here adds no lifetime protection.
-fn ensureUserPageMappedForCopyWithAddressSpaceLocked(principal: kernel.PrincipalId, page_va: u64, write_access: bool) ?u64 {
-    if (user_vm.lookupUserMappedPaddrForAccessWithAddressSpaceLocked(
+const CopyPage = struct { paddr: address_types.PhysicalAddress, cache: PhysWindowCache };
+
+fn ensureUserPageMappedForCopyWithAddressSpaceLocked(principal: kernel.PrincipalId, page: address_types.UserVirtualAddress, write_access: bool) ?CopyPage {
+    const pa = resolveCopyPhysicalPageWithAddressSpaceLocked(principal, page, write_access) orelse return null;
+    // COW can split/replace a VMA. Borrow the final entry only after resolving
+    // the page, and keep A through classification and the actual copy.
+    const start = copy_profile.copyTimestamp();
+    defer copy_profile.copyEnd(.cache, start);
+    const entry = getHooks().state.vmaEntryForVaConst(principal, page.toInt()) orelse
+        return .{ .paddr = pa, .cache = .ram };
+    if (!entry.device_backing) return .{ .paddr = pa, .cache = .ram };
+    // RAM needs no VMO borrow. Device backing still uses shared-VM exclusion
+    // for state/PAT and backing verification, before entering the copy guard.
+    const lock_start = copy_profile.copyTimestamp();
+    user_vm.lockSharedVmObjects();
+    copy_profile.copyEnd(.device_lock, lock_start);
+    defer user_vm.unlockSharedVmObjects();
+    return .{ .paddr = pa, .cache = deviceCopyCache(getHooks().state, entry, page.toInt(), pa.toInt(), write_access) };
+}
+
+fn resolveCopyPhysicalPageWithAddressSpaceLocked(principal: kernel.PrincipalId, page: address_types.UserVirtualAddress, write_access: bool) ?address_types.PhysicalAddress {
+    const page_va = page.toInt();
+    if (user_vm.lookupUserPhysicalPageWithAddressSpaceLocked(
         principal,
-        page_va,
+        page,
         write_access,
         false,
     )) |paddr| return paddr;
@@ -599,7 +786,7 @@ fn ensureUserPageMappedForCopyWithAddressSpaceLocked(principal: kernel.Principal
                 )) return null;
             }
             var paddrs = [_]u64{mapping.paddr};
-            if (user_vm.lookupUserMappedPaddrForAccessWithAddressSpaceLocked(principal, page_va, false, false) != null) {
+            if (user_vm.lookupUserPhysicalPageWithAddressSpaceLocked(principal, page, false, false) != null) {
                 if (!user_vm.remapTrustedUserPaddrsWithProt(
                     principal,
                     page_va,
@@ -612,13 +799,13 @@ fn ensureUserPageMappedForCopyWithAddressSpaceLocked(principal: kernel.Principal
                 paddrs[0..],
                 mapping.prot,
             )) return null;
-            return mapping.paddr;
+            return .fromInt(mapping.paddr);
         }
     }
     // A present read-only PTE is not permission to copy out through its
     // physical address when write lookup/COW resolution above failed.
     if (!write_access) {
-        if (user_vm.lookupUserMappedPaddrForAccessWithAddressSpaceLocked(principal, page_va, false, false)) |paddr| return paddr;
+        if (user_vm.lookupUserPhysicalPageWithAddressSpaceLocked(principal, page, false, false)) |paddr| return paddr;
     }
     const mapping = resolveNativeVmaFaultMappingWithAddressSpaceLocked(
         h.state,
@@ -630,14 +817,14 @@ fn ensureUserPageMappedForCopyWithAddressSpaceLocked(principal: kernel.Principal
     ) orelse return null;
     if (write_access and !mapping.prot.write) return null;
     if (!user_vm.mapNativeVmaFaultPage(principal, page_va, mapping)) return null;
-    return mapping.paddr;
+    return .fromInt(mapping.paddr);
 }
 
 pub fn readPhysU8(addr: u64) ?u8 {
     const window = PhysCopyWindowGuard.lock();
     defer window.unlock();
     const window_addr = physWindowAddr(addr, @sizeOf(u8), window.cpu_slot) orelse return null;
-    const ptr: *volatile u8 = @ptrFromInt(window_addr);
+    const ptr: *volatile u8 = @ptrCast(@alignCast(window_addr));
     return ptr.*;
 }
 
@@ -645,18 +832,20 @@ pub fn readPhysU32(addr: u64) ?u32 {
     const window = PhysCopyWindowGuard.lock();
     defer window.unlock();
     const window_addr = physWindowAddr(addr, @sizeOf(u32), window.cpu_slot) orelse return null;
-    const ptr: *volatile u32 = @ptrFromInt(window_addr);
+    const ptr: *volatile u32 = @ptrCast(@alignCast(window_addr));
     return ptr.*;
 }
 
-fn uncachedMmioWordAddress(addr: u64, cpu_slot: usize) ?u64 {
+inline fn uncachedMmioWordAddress(addr: u64, cpu_slot: usize) ?mmio.Borrow {
     if ((addr & 3) != 0) return null;
     // Check physical address width, all online CPUs' PAT/MTRRs, and low
     // identity aliases. High BARs need explicit UC: firmware may leave their
     // MTRR type WB. Aligned DWORDs cannot cross a page boundary.
     if (!smp.uncachedKernelMmioPageAllowed(addr & ~@as(u64, 4095))) return null;
     const page = mapPhysPageWithCache(addr, cpu_slot, .uncached_mmio) orelse return null;
-    return @intFromPtr(page) + (addr & 4095);
+    // The UC window selection and effective-type proof above authorize only
+    // this DWORD, for the lifetime of the current window guard.
+    return mmio.mappedAfterValidation(page + (addr & 4095), 4, .uc);
 }
 
 /// The caller must first authorize the register's BAR and exact byte range.
@@ -665,7 +854,7 @@ pub fn readUncachedMmioU32(addr: u64) ?u32 {
     const window = PhysCopyWindowGuard.lock();
     defer window.unlock();
     const window_addr = uncachedMmioWordAddress(addr, window.cpu_slot) orelse return null;
-    return @as(*volatile u32, @ptrFromInt(window_addr)).*;
+    return window_addr.read(u32, 0);
 }
 
 /// The same BAR authority and cache proof as readUncachedMmioU32 apply.
@@ -673,7 +862,7 @@ pub fn writeUncachedMmioU32(addr: u64, value: u32) bool {
     const window = PhysCopyWindowGuard.lock();
     defer window.unlock();
     const window_addr = uncachedMmioWordAddress(addr, window.cpu_slot) orelse return false;
-    @as(*volatile u32, @ptrFromInt(window_addr)).* = value;
+    window_addr.write(u32, 0, value);
     return true;
 }
 
@@ -681,7 +870,7 @@ pub fn readPhysU64(addr: u64) ?u64 {
     const window = PhysCopyWindowGuard.lock();
     defer window.unlock();
     const window_addr = physWindowAddr(addr, @sizeOf(u64), window.cpu_slot) orelse return null;
-    const ptr: *volatile u64 = @ptrFromInt(window_addr);
+    const ptr: *volatile u64 = @ptrCast(@alignCast(window_addr));
     return ptr.*;
 }
 
@@ -689,12 +878,14 @@ pub fn writePhysU8(addr: u64, value: u8) bool {
     const window = PhysCopyWindowGuard.lock();
     defer window.unlock();
     const window_addr = physWindowAddr(addr, @sizeOf(u8), window.cpu_slot) orelse return false;
-    const ptr: *volatile u8 = @ptrFromInt(window_addr);
+    const ptr: *volatile u8 = @ptrCast(@alignCast(window_addr));
     ptr.* = value;
     return true;
 }
 
 pub fn zeroPhysicalPage(page_paddr: u64) bool {
+    const stage_sample = if (comptime @import("lock_profile.zig").enabled) @import("lock_profile.zig").stageBegin() else {};
+    defer if (comptime @import("lock_profile.zig").enabled) @import("lock_profile.zig").stageEnd(.zero, stage_sample);
     if ((page_paddr & 0xFFF) != 0) return false;
     const window = PhysCopyWindowGuard.lock();
     defer window.unlock();
@@ -709,7 +900,7 @@ pub fn zeroPhysicalPage(page_paddr: u64) bool {
 fn readPhysicalBytesInWindow(paddr: u64, dest: []u8, cpu_slot: usize) bool {
     if (dest.len == 0) return true;
     const address = physWindowAddr(paddr, dest.len, cpu_slot) orelse return false;
-    const source: [*]const u8 = @ptrFromInt(address);
+    const source: [*]const u8 = address;
     @memcpy(dest, source[0..dest.len]);
     return true;
 }
@@ -717,7 +908,7 @@ fn readPhysicalBytesInWindow(paddr: u64, dest: []u8, cpu_slot: usize) bool {
 fn writePhysicalBytesInWindow(paddr: u64, source: []const u8, cpu_slot: usize) bool {
     if (source.len == 0) return true;
     const address = physWindowAddr(paddr, source.len, cpu_slot) orelse return false;
-    const dest: [*]u8 = @ptrFromInt(address);
+    const dest: [*]u8 = address;
     @memcpy(dest[0..source.len], source);
     return true;
 }
@@ -740,107 +931,67 @@ fn copyPhysicalPageInWindow(dst_paddr: u64, src_paddr: u64, cpu_slot: usize) boo
     const h = getHooks();
     if (((dst_paddr | src_paddr) & 4095) != 0 or
         dst_paddr >= h.physical_map_limit or src_paddr >= h.physical_map_limit) return false;
-    // One slot per CPU: remapping the destination invalidates the source
-    // pointer. A kernel-stack page keeps their lifetimes strictly separate.
+    // Mapping the destination may evict the source's way (or reuse it when
+    // both are the same page), so the source pointer is dead once the
+    // destination is mapped. A kernel-stack page keeps their lifetimes apart.
     var bytes: [4096]u8 = undefined;
     if (!readPhysicalBytesInWindow(src_paddr, &bytes, cpu_slot)) return false;
     return writePhysicalBytesInWindow(dst_paddr, &bytes, cpu_slot);
 }
 
 pub fn copyPhysicalPage(dst_paddr: u64, src_paddr: u64) bool {
+    const stage_sample = if (comptime @import("lock_profile.zig").enabled) @import("lock_profile.zig").stageBegin() else {};
+    defer if (comptime @import("lock_profile.zig").enabled) @import("lock_profile.zig").stageEnd(.copy, stage_sample);
     const window = PhysCopyWindowGuard.lock();
     defer window.unlock();
     return copyPhysicalPageInWindow(dst_paddr, src_paddr, window.cpu_slot);
 }
 
-// The caller holds the address-space lock through the copy. A device PAT is
-// accepted only from the backing of that exact mapped page, never from an
-// arbitrary physical address. Teardown therefore cannot retire its lease.
-fn userPageCopyCache(principal: kernel.PrincipalId, va: u64, paddr: u64, write: bool) PhysWindowCache {
-    user_vm.lockSharedVmObjects();
-    defer user_vm.unlockSharedVmObjects();
-    return userPageCopyCacheWithState(getHooks().state, principal, va, paddr, write);
-}
-
-fn userPageCopyCacheWithState(state: anytype, principal: kernel.PrincipalId, va: u64, paddr: u64, write: bool) PhysWindowCache {
-    const entry = state.vmaEntryForVaConst(principal, va) orelse return .ram;
-    // With the same AS/shared-object exclusion, a backing without a device
-    // PAT can only produce the old RAM result. Do not re-resolve its COW/VMO
-    // pages just to classify it; access/COW and RAM cache leases remain the
-    // checked-copy and physical-window paths' responsibility.
-    if (state.nativeVmoDevicePatSlot(entry.vmo) == null) return .ram;
-    const mapping = state.nativeVmaFaultMapping(principal, va, write, false) orelse return .ram;
+// The retained device VMO cannot retire while A protects this live VMA.
+// Shared-VM protects mutable backing state; only an exact backing/PA match
+// grants its PAT. The device alias is still retired before A is released.
+fn deviceCopyCache(state: anytype, entry: anytype, va: u64, paddr: u64, write: bool) PhysWindowCache {
+    const mapping = state.nativeVmaFaultMappingForEntry(entry, va, write, false) orelse return .ram;
     if (mapping.paddr == paddr) {
         if (mapping.device_pat_slot) |slot| return .{ .device = slot };
     }
     return .ram;
 }
 
-test "copy cache classification skips RAM backing resolution but validates every device candidate" {
+test "device copy PAT requires current permitted backing and exact PA" {
     const Mock = struct {
-        const Entry = struct { vmo: u32 = 41 };
-        const Mapping = struct { paddr: u64, device_pat_slot: ?u3 };
-        entry: ?Entry = .{},
-        pat: ?u3 = null,
-        mapping: ?Mapping = null,
-        calls: [3]usize = .{ 0, 0, 0 },
-        last_write: bool = false,
-        fn vmaEntryForVaConst(self: *@This(), owner: kernel.PrincipalId, va: u64) ?Entry {
-            std.debug.assert(@intFromEnum(owner) == 0 and va == 0x1000);
-            self.calls[0] += 1;
-            return self.entry;
-        }
-        fn nativeVmoDevicePatSlot(self: *@This(), vmo: u32) ?u3 {
-            std.debug.assert(vmo == 41);
-            self.calls[1] += 1;
-            return self.pat;
-        }
-        fn nativeVmaFaultMapping(self: *@This(), owner: kernel.PrincipalId, va: u64, write: bool, exec: bool) ?Mapping {
-            std.debug.assert(@intFromEnum(owner) == 0 and va == 0x1000 and !exec);
-            self.calls[2] += 1;
-            self.last_write = write;
+        mapping: ?struct { paddr: u64, device_pat_slot: ?u3 },
+        fn nativeVmaFaultMappingForEntry(self: *@This(), _: void, _: u64, _: bool, _: bool) @TypeOf(self.mapping) {
             return self.mapping;
         }
     };
-    const owner: kernel.PrincipalId = @enumFromInt(0);
-    var absent = Mock{ .entry = null };
-    try std.testing.expect(userPageCopyCacheWithState(&absent, owner, 0x1000, 0x9000, true) == .ram);
-    try std.testing.expectEqual([3]usize{ 1, 0, 0 }, absent.calls);
-    // Covers no-device PAT, including ordinary RAM, stale or retiring backing.
-    var ram = Mock{ .mapping = .{ .paddr = 0x9000, .device_pat_slot = null } };
-    try std.testing.expect(userPageCopyCacheWithState(&ram, owner, 0x1000, 0x9000, true) == .ram);
-    try std.testing.expectEqual([3]usize{ 1, 1, 0 }, ram.calls);
     for ([_]u3{ 0, 1, 3, 7 }) |pat| {
-        for ([_]bool{ false, true }) |write| {
-            var device = Mock{ .pat = pat, .mapping = .{ .paddr = 0x9000, .device_pat_slot = pat } };
-            try std.testing.expectEqualDeep(PhysWindowCache{ .device = pat }, userPageCopyCacheWithState(&device, owner, 0x1000, 0x9000, write));
-            try std.testing.expectEqual([3]usize{ 1, 1, 1 }, device.calls);
-            try std.testing.expectEqual(write, device.last_write);
-            // Permissions/generation failure still delegates to the full mapping.
-            device.mapping = null;
-            try std.testing.expect(userPageCopyCacheWithState(&device, owner, 0x1000, 0x9000, write) == .ram);
-            device.mapping = .{ .paddr = 0xa000, .device_pat_slot = pat };
-            try std.testing.expect(userPageCopyCacheWithState(&device, owner, 0x1000, 0x9000, write) == .ram);
-            device.mapping = .{ .paddr = 0x9000, .device_pat_slot = null };
-            try std.testing.expect(userPageCopyCacheWithState(&device, owner, 0x1000, 0x9000, write) == .ram);
-            try std.testing.expectEqual(@as(usize, 4), device.calls[2]);
-        }
+        var state = Mock{ .mapping = .{ .paddr = 0x9000, .device_pat_slot = pat } };
+        try std.testing.expectEqualDeep(PhysWindowCache{ .device = pat }, deviceCopyCache(&state, {}, 0x1000, 0x9000, true));
+        try std.testing.expect(deviceCopyCache(&state, {}, 0x1000, 0xa000, true) == .ram);
+        state.mapping.?.device_pat_slot = null;
+        try std.testing.expect(deviceCopyCache(&state, {}, 0x1000, 0x9000, true) == .ram);
+        state.mapping = null;
+        try std.testing.expect(deviceCopyCache(&state, {}, 0x1000, 0x9000, true) == .ram);
     }
 }
 
-fn retireDeviceCopyWindow(cache: PhysWindowCache, cpu: usize) void {
+fn retireDeviceCopyWindow(cache: PhysWindowCache, slot: usize) void {
     if (cache != .device) return;
     // The transient alias must not outlive the VMA whose lease proved its
-    // cache type; draining WC stores also precedes a possible BO unpin.
+    // cache type; draining WC stores also precedes a possible BO unpin. Only
+    // the way this copy used is cleared; other retained ways stay valid.
     asm volatile ("mfence" ::: .{ .memory = true });
     const h = getHooks();
-    h.phys_copy_window_pt[cpu] = 0;
-    h.invlpg(h.phys_copy_window_va + @as(u64, @intCast(cpu)) * 4096);
+    windowEntry(slot).* = 0;
+    const invalidate_start = copy_profile.copyTimestamp();
+    h.invlpg(windowSlotVa(slot));
+    copy_profile.copyEnd(.invlpg, invalidate_start);
 }
 
 // Diagnostic-only mirror keeps the normal copy's code generation untouched.
 // Shared permission/cache/fault/window helpers own all protection decisions.
-fn copyUserWordBytesProfiled(principal: kernel.PrincipalId, src_user_va: u64, dest: []u8) bool {
+fn copyUserWordBytesProfiled(principal: kernel.PrincipalId, source: address_types.UserVirtualAddress, dest: []u8) bool {
     const h = getHooks();
     if (dest.len == 0) return true;
 
@@ -855,30 +1006,36 @@ fn copyUserWordBytesProfiled(principal: kernel.PrincipalId, src_user_va: u64, de
     // Registered first so the timer includes AS/window/CR3 deferred cleanup.
     defer perf.runtimeElapsed(profile, .total_cycles, copy_start);
 
+    const detail_start = copy_profile.copyTimestamp();
+    defer copy_profile.copyEnd(.call, detail_start);
+    const cr3_start = copy_profile.copyTimestamp();
     const original_cr3 = h.read_cr3();
+    copy_profile.copyEnd(.cr3_read, cr3_start);
     if (original_cr3 != h.kernel_cr3_value.*) {
+        const stamp = copy_profile.copyTimestamp();
         h.write_cr3(h.kernel_cr3_value.*);
+        copy_profile.copyEnd(.cr3_write, stamp);
     }
     defer {
         if (original_cr3 != h.kernel_cr3_value.*) {
+            const stamp = copy_profile.copyTimestamp();
             h.write_cr3(original_cr3);
+            copy_profile.copyEnd(.cr3_write, stamp);
         }
     }
 
     var copied: usize = 0;
     while (copied < dest.len) {
         const copied_u64: u64 = @intCast(copied);
-        const cur_va, const va_overflow = @addWithOverflow(src_user_va, copied_u64);
-        if (va_overflow != 0) return false;
-
-        const page_va = cur_va & ~@as(u64, 0xFFF);
-        const page_off: usize = @intCast(cur_va & 0xFFF);
+        const current = source.offset(copied_u64) orelse return false;
+        const page_va = address_types.UserVirtualAddress.fromInt(current.toInt() & ~@as(u64, 0xFFF));
+        const page_off: usize = @intCast(current.toInt() & 0xFFF);
         if (comptime perf.enabled) {
             const lock_start = perf.runtimeTimestamp(profile);
-            const locked = user_vm.lockAddressSpace(principal);
+            const locked = profileLockAddressSpace(principal);
             perf.runtimeElapsed(profile, .lock_wait_cycles, lock_start);
             if (!locked) return false;
-        } else if (!user_vm.lockAddressSpace(principal)) return false;
+        } else if (!profileLockAddressSpace(principal)) return false;
         defer {
             if (comptime perf.enabled) {
                 const unlock_start = perf.runtimeTimestamp(profile);
@@ -886,32 +1043,28 @@ fn copyUserWordBytesProfiled(principal: kernel.PrincipalId, src_user_va: u64, de
                 perf.runtimeElapsed(profile, .unlock_cycles, unlock_start);
             } else user_vm.unlockAddressSpace(principal);
         }
-        const page_paddr = if (comptime perf.enabled) blk: {
+        const hold_start = copy_profile.copyTimestamp();
+        defer copy_profile.copyEnd(.as_hold, hold_start);
+        const resolved = if (comptime perf.enabled) blk: {
             perf.runtimeAdd(profile, .body_calls, 1);
             const lookup_start = perf.runtimeTimestamp(profile);
-            const mapped_page = ensureUserPageMappedForCopyWithAddressSpaceLocked(principal, page_va, false);
+            const mapped_page = profileResolve(principal, page_va, false);
             perf.runtimeElapsed(profile, .body_cycles, lookup_start);
             break :blk mapped_page orelse return false;
-        } else ensureUserPageMappedForCopyWithAddressSpaceLocked(principal, page_va, false) orelse return false;
-        const cache = if (comptime perf.enabled) blk: {
-            perf.runtimeAdd(profile, .copy_calls, 1);
-            const cache_start = perf.runtimeTimestamp(profile);
-            const cache = userPageCopyCache(principal, page_va, page_paddr, false);
-            perf.runtimeElapsed(profile, .copy_cycles, cache_start);
-            break :blk cache;
-        } else userPageCopyCache(principal, page_va, page_paddr, false);
-        if (page_paddr >= h.physical_map_limit) return false;
+        } else profileResolve(principal, page_va, false) orelse return false;
+        const page_paddr = resolved.paddr;
+        const cache = resolved.cache;
+        if (page_paddr.toInt() >= h.physical_map_limit) return false;
 
         const page_remaining: usize = 4096 - page_off;
         const total_remaining: usize = dest.len - copied;
         const chunk_len: usize = if (total_remaining < page_remaining) total_remaining else page_remaining;
 
         const page_off_u64: u64 = @intCast(page_off);
-        const src_paddr, const paddr_overflow = @addWithOverflow(page_paddr, page_off_u64);
-        if (paddr_overflow != 0 or src_paddr >= h.physical_map_limit) return false;
+        const src_paddr = page_paddr.offset(page_off_u64) orelse return false;
+        if (src_paddr.toInt() >= h.physical_map_limit) return false;
         if (chunk_len == 0) return false;
-        const last_paddr, const last_overflow = @addWithOverflow(src_paddr, @as(u64, @intCast(chunk_len - 1)));
-        if (last_overflow != 0 or last_paddr >= h.physical_map_limit) return false;
+        if (!src_paddr.rangeFits(chunk_len, h.physical_map_limit)) return false;
 
         {
             perf.runtimeAdd(profile, .claim_calls, 1);
@@ -919,28 +1072,28 @@ fn copyUserWordBytesProfiled(principal: kernel.PrincipalId, src_user_va: u64, de
             // Runs after retirement and IRQ restoration; elapsed time may
             // include interrupts after STI, not just window CPU instructions.
             defer perf.runtimeElapsed(profile, .claim_cycles, window_start);
+            const guard_start = copy_profile.copyTimestamp();
             const window = PhysCopyWindowGuard.lock();
+            copy_profile.copyEnd(.guard, guard_start);
             defer window.unlock();
+            const mapped_window = profileWindow(src_paddr.toInt(), window.cpu_slot, cache);
+            if (profile != null) {
+                if (mapped_window) |mapped|
+                    perf.runtimeAdd(profile, if (mapped.remapped) .claimed else .no_claim, 1)
+                else
+                    perf.runtimeAdd(profile, .invalid, 1);
+            }
+            const mapped = mapped_window orelse return false;
             defer {
-                retireDeviceCopyWindow(cache, window.cpu_slot);
+                retireDeviceCopyWindow(cache, mapped.slot);
                 if (comptime perf.enabled) {
                     if (cache == .device) perf.runtimeAdd(profile, .reserved, 1);
                 }
             }
-            const src_page = if (comptime perf.enabled) blk: {
-                const pte_before = if (profile != null) h.phys_copy_window_pt[window.cpu_slot] else 0;
-                const mapped_window = mapPhysPageWithCache(src_paddr, window.cpu_slot, cache);
-                if (profile != null) {
-                    if (mapped_window != null) {
-                        const accessed_dirty: u64 = (1 << 5) | (1 << 6);
-                        const changed = ((pte_before ^ h.phys_copy_window_pt[window.cpu_slot]) & ~accessed_dirty) != 0;
-                        perf.runtimeAdd(profile, if (changed) .claimed else .no_claim, 1);
-                    } else perf.runtimeAdd(profile, .invalid, 1);
-                }
-                break :blk mapped_window orelse return false;
-            } else mapPhysPageWithCache(src_paddr, window.cpu_slot, cache) orelse return false;
-            const src: [*]const u8 = @ptrCast(src_page + page_off);
+            const src: [*]const u8 = @ptrCast(mapped.ptr + page_off);
+            const memcpy_start = copy_profile.copyTimestamp();
             @memcpy(dest[copied .. copied + chunk_len], src[0..chunk_len]);
+            copy_profile.copyEnd(.memcpy, memcpy_start);
         }
         copied += chunk_len;
     }
@@ -948,54 +1101,72 @@ fn copyUserWordBytesProfiled(principal: kernel.PrincipalId, src_user_va: u64, de
 }
 
 pub fn copyUserBytesFromVa(principal: kernel.PrincipalId, src_user_va: u64, dest: []u8) bool {
+    return copyFromUser(principal, .fromInt(src_user_va), dest);
+}
+
+pub fn copyFromUser(principal: kernel.PrincipalId, source: address_types.UserVirtualAddress, dest: []u8) bool {
+    const stage_sample = if (comptime @import("lock_profile.zig").enabled) @import("lock_profile.zig").stageBegin() else {};
+    defer if (comptime @import("lock_profile.zig").enabled) @import("lock_profile.zig").stageEnd(.copy, stage_sample);
     if (comptime perf.enabled) {
-        if (dest.len == 4) return copyUserWordBytesProfiled(principal, src_user_va, dest);
+        if (dest.len == 4) return copyUserWordBytesProfiled(principal, source, dest);
     }
     const h = getHooks();
     if (dest.len == 0) return true;
 
+    const detail_start = copy_profile.copyTimestamp();
+    defer copy_profile.copyEnd(.call, detail_start);
+    const cr3_start = copy_profile.copyTimestamp();
     const original_cr3 = h.read_cr3();
+    copy_profile.copyEnd(.cr3_read, cr3_start);
     if (original_cr3 != h.kernel_cr3_value.*) {
+        const stamp = copy_profile.copyTimestamp();
         h.write_cr3(h.kernel_cr3_value.*);
+        copy_profile.copyEnd(.cr3_write, stamp);
     }
     defer {
         if (original_cr3 != h.kernel_cr3_value.*) {
+            const stamp = copy_profile.copyTimestamp();
             h.write_cr3(original_cr3);
+            copy_profile.copyEnd(.cr3_write, stamp);
         }
     }
 
     var copied: usize = 0;
     while (copied < dest.len) {
         const copied_u64: u64 = @intCast(copied);
-        const cur_va, const va_overflow = @addWithOverflow(src_user_va, copied_u64);
-        if (va_overflow != 0) return false;
-
-        const page_va = cur_va & ~@as(u64, 0xFFF);
-        const page_off: usize = @intCast(cur_va & 0xFFF);
-        if (!user_vm.lockAddressSpace(principal)) return false;
+        const current = source.offset(copied_u64) orelse return false;
+        const page_va = address_types.UserVirtualAddress.fromInt(current.toInt() & ~@as(u64, 0xFFF));
+        const page_off: usize = @intCast(current.toInt() & 0xFFF);
+        if (!profileLockAddressSpace(principal)) return false;
         defer user_vm.unlockAddressSpace(principal);
-        const page_paddr = ensureUserPageMappedForCopyWithAddressSpaceLocked(principal, page_va, false) orelse return false;
-        const cache = userPageCopyCache(principal, page_va, page_paddr, false);
-        if (page_paddr >= h.physical_map_limit) return false;
+        const hold_start = copy_profile.copyTimestamp();
+        defer copy_profile.copyEnd(.as_hold, hold_start);
+        const resolved = profileResolve(principal, page_va, false) orelse return false;
+        const page_paddr = resolved.paddr;
+        const cache = resolved.cache;
+        if (page_paddr.toInt() >= h.physical_map_limit) return false;
 
         const page_remaining: usize = 4096 - page_off;
         const total_remaining: usize = dest.len - copied;
         const chunk_len: usize = if (total_remaining < page_remaining) total_remaining else page_remaining;
 
         const page_off_u64: u64 = @intCast(page_off);
-        const src_paddr, const paddr_overflow = @addWithOverflow(page_paddr, page_off_u64);
-        if (paddr_overflow != 0 or src_paddr >= h.physical_map_limit) return false;
+        const src_paddr = page_paddr.offset(page_off_u64) orelse return false;
+        if (src_paddr.toInt() >= h.physical_map_limit) return false;
         if (chunk_len == 0) return false;
-        const last_paddr, const last_overflow = @addWithOverflow(src_paddr, @as(u64, @intCast(chunk_len - 1)));
-        if (last_overflow != 0 or last_paddr >= h.physical_map_limit) return false;
+        if (!src_paddr.rangeFits(chunk_len, h.physical_map_limit)) return false;
 
         {
+            const guard_start = copy_profile.copyTimestamp();
             const window = PhysCopyWindowGuard.lock();
+            copy_profile.copyEnd(.guard, guard_start);
             defer window.unlock();
-            defer retireDeviceCopyWindow(cache, window.cpu_slot);
-            const src_page = mapPhysPageWithCache(src_paddr, window.cpu_slot, cache) orelse return false;
-            const src: [*]const u8 = @ptrCast(src_page + page_off);
+            const mapped = profileWindow(src_paddr.toInt(), window.cpu_slot, cache) orelse return false;
+            defer retireDeviceCopyWindow(cache, mapped.slot);
+            const src: [*]const u8 = @ptrCast(mapped.ptr + page_off);
+            const memcpy_start = copy_profile.copyTimestamp();
             @memcpy(dest[copied .. copied + chunk_len], src[0..chunk_len]);
+            copy_profile.copyEnd(.memcpy, memcpy_start);
         }
         copied += chunk_len;
     }
@@ -1003,32 +1174,47 @@ pub fn copyUserBytesFromVa(principal: kernel.PrincipalId, src_user_va: u64, dest
 }
 
 pub fn copyBytesToUserVa(principal: kernel.PrincipalId, dest_user_va: u64, src: []const u8) bool {
+    return copyToUser(principal, .fromInt(dest_user_va), src);
+}
+
+pub fn copyToUser(principal: kernel.PrincipalId, destination: address_types.UserVirtualAddress, src: []const u8) bool {
+    const stage_sample = if (comptime @import("lock_profile.zig").enabled) @import("lock_profile.zig").stageBegin() else {};
+    defer if (comptime @import("lock_profile.zig").enabled) @import("lock_profile.zig").stageEnd(.copy, stage_sample);
     const h = getHooks();
     if (src.len == 0) return true;
 
+    const detail_start = copy_profile.copyTimestamp();
+    defer copy_profile.copyEnd(.call, detail_start);
+    const cr3_start = copy_profile.copyTimestamp();
     const original_cr3 = h.read_cr3();
+    copy_profile.copyEnd(.cr3_read, cr3_start);
     if (original_cr3 != h.kernel_cr3_value.*) {
+        const stamp = copy_profile.copyTimestamp();
         h.write_cr3(h.kernel_cr3_value.*);
+        copy_profile.copyEnd(.cr3_write, stamp);
     }
     defer {
         if (original_cr3 != h.kernel_cr3_value.*) {
+            const stamp = copy_profile.copyTimestamp();
             h.write_cr3(original_cr3);
+            copy_profile.copyEnd(.cr3_write, stamp);
         }
     }
 
     var copied: usize = 0;
     while (copied < src.len) {
         const copied_u64: u64 = @intCast(copied);
-        const cur_va, const va_overflow = @addWithOverflow(dest_user_va, copied_u64);
-        if (va_overflow != 0) return false;
-
-        const page_va = cur_va & ~@as(u64, 0xFFF);
-        const page_off: usize = @intCast(cur_va & 0xFFF);
-        if (!user_vm.lockAddressSpace(principal)) return false;
+        const current = destination.offset(copied_u64) orelse return false;
+        const page_va = address_types.UserVirtualAddress.fromInt(current.toInt() & ~@as(u64, 0xFFF));
+        const page_off: usize = @intCast(current.toInt() & 0xFFF);
+        if (!profileLockAddressSpace(principal)) return false;
         defer user_vm.unlockAddressSpace(principal);
-        const page_paddr = ensureUserPageMappedForCopyWithAddressSpaceLocked(principal, page_va, true) orelse return false;
-        const cache = userPageCopyCache(principal, page_va, page_paddr, true);
-        if (page_paddr >= h.physical_map_limit) return false;
+        const hold_start = copy_profile.copyTimestamp();
+        defer copy_profile.copyEnd(.as_hold, hold_start);
+        const resolved = profileResolve(principal, page_va, true) orelse return false;
+        const page_paddr = resolved.paddr;
+        const cache = resolved.cache;
+        if (page_paddr.toInt() >= h.physical_map_limit) return false;
 
         const page_remaining: usize = 4096 - page_off;
         const total_remaining: usize = src.len - copied;
@@ -1036,18 +1222,21 @@ pub fn copyBytesToUserVa(principal: kernel.PrincipalId, dest_user_va: u64, src: 
         if (chunk_len == 0) return false;
 
         const page_off_u64: u64 = @intCast(page_off);
-        const dst_paddr, const paddr_overflow = @addWithOverflow(page_paddr, page_off_u64);
-        if (paddr_overflow != 0 or dst_paddr >= h.physical_map_limit) return false;
-        const last_paddr, const last_overflow = @addWithOverflow(dst_paddr, @as(u64, @intCast(chunk_len - 1)));
-        if (last_overflow != 0 or last_paddr >= h.physical_map_limit) return false;
+        const dst_paddr = page_paddr.offset(page_off_u64) orelse return false;
+        if (dst_paddr.toInt() >= h.physical_map_limit) return false;
+        if (!dst_paddr.rangeFits(chunk_len, h.physical_map_limit)) return false;
 
         {
+            const guard_start = copy_profile.copyTimestamp();
             const window = PhysCopyWindowGuard.lock();
+            copy_profile.copyEnd(.guard, guard_start);
             defer window.unlock();
-            defer retireDeviceCopyWindow(cache, window.cpu_slot);
-            const dst_page = mapPhysPageWithCache(dst_paddr, window.cpu_slot, cache) orelse return false;
-            const dst: [*]u8 = @ptrCast(dst_page + page_off);
+            const mapped = profileWindow(dst_paddr.toInt(), window.cpu_slot, cache) orelse return false;
+            defer retireDeviceCopyWindow(cache, mapped.slot);
+            const dst: [*]u8 = @ptrCast(mapped.ptr + page_off);
+            const memcpy_start = copy_profile.copyTimestamp();
             @memcpy(dst[0..chunk_len], src[copied .. copied + chunk_len]);
+            copy_profile.copyEnd(.memcpy, memcpy_start);
         }
         copied += chunk_len;
     }
@@ -1066,11 +1255,69 @@ pub fn readUserU64(principal: kernel.PrincipalId, src_user_va: u64) ?u64 {
     return std.mem.readInt(u64, buf[0..], .little);
 }
 
+// Zero pages means whole context. Overflow, kernel/shared roots and large
+// spans must never accidentally become a smaller invalidation.
+const TlbRange = struct {
+    start: u64 = 0,
+    pages: u64 = 0,
+    // Same-boot mprotect + untouched working-set refill (16/256 pages, 7:1):
+    // one page beat full in all three paired groups; 2..16 were inconsistent,
+    // and >=32 lost in every weighted pair. Keep only the supported prefix,
+    // then check end-to-end two-boot profiles; warm INVPCID cost alone is not
+    // a threshold argument. Parent/shared-root requests remain full.
+    const page_limit = 1;
+    fn init(va: u64, bytes: usize) TlbRange {
+        if (bytes == 0) return .{};
+        const last, const overflow = @addWithOverflow(va, bytes - 1);
+        if (overflow != 0) return .{};
+        const first = va & ~@as(u64, 4095);
+        const pages = ((last - first) >> 12) + 1;
+        // Snapshot once while creating the request; receivers use only the
+        // immutable published page count, never this diagnostic setting.
+        const limit = if (comptime lock_diagnostics.enabled) blk: {
+            const pointer: *volatile usize = &tlb_range_checked_limit[0];
+            break :blk @min(pointer.*, 256);
+        } else page_limit;
+        if (pages > limit) return .{};
+        return .{ .start = first, .pages = pages };
+    }
+};
+
+fn flushCr3RangeOnCurrentCpu(target_cr3: u64, range: TlbRange) void {
+    const h = getHooks();
+    if (range.pages == 0) return flushCr3ContextOnCurrentCpu(target_cr3);
+    if (h.read_cr3() == target_cr3) {
+        for (0..@intCast(range.pages)) |page| h.invlpg(range.start + page * 4096);
+    } else if (!builtin.is_test and @import("arch/x86_64/platform.zig").hasInvpcid()) {
+        for (0..@intCast(range.pages)) |page|
+            @import("arch/x86_64/platform.zig").invalidatePcidAddress(@truncate(target_cr3 & 0xfff), range.start + page * 4096);
+    } else flushCr3ContextOnCurrentCpu(target_cr3);
+}
+
+// Keep CPU-set policy at one boundary. Include dormant PCIDs; each selected
+// CPU must ACK its own mailbox before that descriptor may be reused.
+fn shootdownTargetCpuSet(cr3: u64, force_all: bool) CpuSet {
+    // Publication is sticky; the paired entrant MFENCE plus mandatory first
+    // flushing load covers a registration after this snapshot.
+    residency.fenceBeforeSnapshot();
+    shootdown_targets.clear();
+    const online = smp.onlineCpuSet();
+    for (0..online.capacity) |cpu| {
+        if (online.contains(cpu) and (force_all or residency.contains(cpu, cr3)))
+            shootdown_targets.insert(cpu);
+    }
+    return shootdown_targets;
+}
+
+fn maintenanceWriteCr3(cr3: u64) void {
+    if (builtin.is_test) getHooks().write_cr3(cr3) else @import("arch/x86_64/platform.zig").writeCr3ForMaintenance(cr3);
+}
+
 fn flushCr3ContextOnCurrentCpu(target_cr3: u64) void {
     const h = getHooks();
     const current_cr3 = h.read_cr3();
-    h.write_cr3(target_cr3);
-    if (current_cr3 != target_cr3) h.write_cr3(current_cr3);
+    maintenanceWriteCr3(target_cr3);
+    if (current_cr3 != target_cr3) maintenanceWriteCr3(current_cr3);
 }
 
 fn flushCurrentCpuCaches() void {
@@ -1085,28 +1332,35 @@ fn retirePhysCopyWindowOnCurrentCpu(base: u64, size_bytes: u64) void {
     if (size_bytes == 0) return;
     const h = getHooks();
     const cpu_slot = boundedCurrentCpuSlot();
-    if (cpu_slot >= h.phys_copy_window_pt.len) return;
-    const entry = h.phys_copy_window_pt[cpu_slot];
-    if ((entry & h.page_present) == 0) return;
-    const paddr = entry & 0x000f_ffff_ffff_f000;
-    if (paddr < base or paddr - base >= size_bytes) return;
-    h.phys_copy_window_pt[cpu_slot] = 0;
-    h.invlpg(h.phys_copy_window_va + @as(u64, @intCast(cpu_slot)) * 4096);
+    const first_slot = cpu_slot * window_ways;
+    if (builtin.is_test and first_slot + window_ways > h.phys_copy_window_pt.len) return;
+    // Every retained way may alias the range; leaving one would keep a stale
+    // memory type live after the transition acknowledges this CPU.
+    for (first_slot..first_slot + window_ways) |slot| {
+        const entry = windowEntry(slot).*;
+        if ((entry & h.page_present) == 0) continue;
+        const paddr = entry & window_paddr_mask;
+        if (paddr < base or paddr - base >= size_bytes) continue;
+        windowEntry(slot).* = 0;
+        const invalidate_start = copy_profile.copyTimestamp();
+        h.invlpg(windowSlotVa(slot));
+        copy_profile.copyEnd(.invlpg, invalidate_start);
+    }
 }
 
 /// Called from the scheduler IPI with the kernel page table active.
 pub fn acknowledgePendingTlbShootdown() void {
-    const cpu_slot = smp.currentCpuSlot();
-    if (cpu_slot >= tlb_shootdown_ack.len) return;
-    const generation = @atomicLoad(u64, &tlb_shootdown_generation, .acquire);
-    if (generation == 0 or @atomicLoad(u64, &tlb_shootdown_ack[cpu_slot], .monotonic) == generation) return;
+    const cpu = smp.currentCpuSlot();
+    if (cpu >= mailboxes.len) return;
+    const box = &mailboxes[cpu];
+    const generation = box.pending();
+    if (generation == 0) return;
     perf.add(.tlb_received, 1);
-    const target_cr3 = @atomicLoad(u64, &tlb_shootdown_target_cr3, .monotonic);
-    retirePhysCopyWindowOnCurrentCpu(@atomicLoad(u64, &tlb_shootdown_retire_phys_base, .monotonic), @atomicLoad(u64, &tlb_shootdown_retire_phys_size, .monotonic));
-    if (target_cr3 != 0) flushCr3ContextOnCurrentCpu(target_cr3);
-    if (@atomicLoad(u8, &tlb_shootdown_flush_caches, .monotonic) != 0)
-        flushCurrentCpuCaches();
-    @atomicStore(u64, &tlb_shootdown_ack[cpu_slot], generation, .release);
+    retirePhysCopyWindowOnCurrentCpu(box.retire_base, box.retire_size);
+    if (box.cr3 != 0) flushCr3RangeOnCurrentCpu(box.cr3, box.range);
+    if (box.flush_caches) flushCurrentCpuCaches();
+    // All reads and hardware effects finish before the sender may overwrite.
+    @atomicStore(u64, &box.ack, generation, .release);
 }
 
 fn shootdownCr3Context(target_cr3: u64) void {
@@ -1118,7 +1372,22 @@ fn shootdownCr3ContextWithCache(target_cr3: u64, flush_caches: bool) void {
 }
 
 fn shootdownCr3ContextWithOptions(target_cr3: u64, flush_caches: bool, retire_base: u64, retire_size: u64) void {
+    shootdownRequest(target_cr3, .{}, flush_caches, retire_base, retire_size, true);
+}
+
+fn shootdownRequest(target_cr3: u64, requested_range: TlbRange, flush_caches: bool, retire_base: u64, retire_size: u64, force_all: bool) void {
     if (target_cr3 == 0) return;
+    // Check before taking X: a remote initiator can already need our ACK.
+    lock_diagnostics.assertCanWaitForIpi();
+    // Host callers test admission without executing CR3/APIC operations.
+    if (builtin.is_test and @hasDecl(@import("root"), "lockDiagnosticsIpiWaitReached")) {
+        @import("root").lockDiagnosticsIpiWaitReached();
+        return;
+    }
+    // Diagnostic-only warm invalidation cost; never part of profile windows.
+    // Log after X unlock so the log lock cannot extend the ACK critical path.
+    var costs: ?[8]u64 = null;
+    defer if (costs) |values| kernel_log.writeFmt("tlb-cost: full={d} pages1={d} pages2={d} pages4={d} pages8={d} pages16={d} pages32={d} pages64={d}\n", .{ values[0], values[1], values[2], values[3], values[4], values[5], values[6], values[7] });
     const restore_interrupts = TlbShootdownLock.interruptsEnabled();
     defer if (restore_interrupts) asm volatile ("sti" ::: .{ .memory = true });
     asm volatile ("cli" ::: .{ .memory = true });
@@ -1132,34 +1401,56 @@ fn shootdownCr3ContextWithOptions(target_cr3: u64, flush_caches: bool, retire_ba
     perf.elapsed(.tlb_lock_wait_cycles, lock_start);
     perf.add(.tlb_requests, 1);
     defer tlb_shootdown_lock.unlock();
+    if (comptime lock_diagnostics.enabled) {
+        const platform = @import("arch/x86_64/platform.zig");
+        if (!tlb_cost_measured and (target_cr3 & 0xfff) != 0 and platform.hasInvpcid()) {
+            tlb_cost_measured = true;
+            var values: [8]u64 = @splat(std.math.maxInt(u64));
+            for (0..8) |_| {
+                for (0..8) |index| {
+                    asm volatile ("lfence" ::: .{ .memory = true });
+                    const begin = platform.readTimestampCounter();
+                    // Exercise the actual receiver path, including current
+                    // CR3 and per-CPU feature checks, not just the opcode.
+                    flushCr3RangeOnCurrentCpu(target_cr3, .{
+                        .start = 0x1000,
+                        .pages = if (index == 0) 0 else @as(u64, 1) << @intCast(index - 1),
+                    });
+                    asm volatile ("lfence" ::: .{ .memory = true });
+                    values[index] = @min(values[index], platform.readTimestampCounter() - begin);
+                }
+            }
+            costs = values;
+        }
+    }
 
-    // A CPU can enter this CR3 after a "currently running" snapshot but
-    // before the changed PTE is flushed. Broadcast to every online CPU so
-    // both current users and concurrent entrants observe the new mapping.
-    const target_cpu_mask = smp.onlineCpuMask();
-
-    var generation = @atomicLoad(u64, &tlb_shootdown_generation, .monotonic) +% 1;
-    if (generation == 0) generation = 1;
-    @atomicStore(u64, &tlb_shootdown_target_cr3, target_cr3, .monotonic);
-    @atomicStore(u8, &tlb_shootdown_flush_caches, @intFromBool(flush_caches), .monotonic);
-    @atomicStore(u64, &tlb_shootdown_retire_phys_base, retire_base, .monotonic);
-    @atomicStore(u64, &tlb_shootdown_retire_phys_size, retire_size, .monotonic);
-    @atomicStore(u64, &tlb_shootdown_generation, generation, .release);
+    const all = force_all or (target_cr3 & 4095) == 0 or flush_caches or retire_size != 0;
+    const targets = shootdownTargetCpuSet(target_cr3, all);
+    const range: TlbRange = if ((target_cr3 & 4095) == 0 or flush_caches or retire_size != 0) .{} else requested_range;
+    const local = smp.currentCpuSlot();
+    for (0..targets.capacity) |cpu| {
+        if (!targets.contains(cpu) or cpu == local) continue;
+        const box = &mailboxes[cpu];
+        const generation = box.nextGeneration();
+        box.cr3 = target_cr3;
+        box.range = range;
+        box.retire_base = retire_base;
+        box.retire_size = retire_size;
+        box.flush_caches = flush_caches;
+        @atomicStore(u64, &box.published, generation, .release);
+    }
 
     const current_cpu = smp.currentCpuSlot();
     retirePhysCopyWindowOnCurrentCpu(retire_base, retire_size);
-    flushCr3ContextOnCurrentCpu(target_cr3);
+    flushCr3RangeOnCurrentCpu(target_cr3, range);
     if (flush_caches) flushCurrentCpuCaches();
-    if (current_cpu < tlb_shootdown_ack.len) {
-        @atomicStore(u64, &tlb_shootdown_ack[current_cpu], generation, .release);
-    }
 
     const send_start = perf.timestamp();
-    perf.add(.tlb_targets, @popCount(target_cpu_mask) -| 1);
+    perf.add(.tlb_targets, targets.count() - @intFromBool(targets.contains(current_cpu)));
     var cpu_slot: usize = 0;
-    const broadcast_sent = smp.interruptAllOtherOnlineCpus(target_cpu_mask);
-    while (!broadcast_sent and cpu_slot < smp.max_cpus and cpu_slot < 64) : (cpu_slot += 1) {
-        const targeted = (target_cpu_mask & (@as(u64, 1) << @intCast(cpu_slot))) != 0;
+    const broadcast_sent = smp.interruptAllOtherOnlineCpus(targets);
+    while (!broadcast_sent and cpu_slot < targets.capacity) : (cpu_slot += 1) {
+        const targeted = targets.contains(cpu_slot);
         if (!targeted or cpu_slot == current_cpu) continue;
         while (!smp.interruptCpu(cpu_slot)) {
             asm volatile ("sti; pause; cli" ::: .{ .memory = true });
@@ -1167,14 +1458,17 @@ fn shootdownCr3ContextWithOptions(target_cr3: u64, flush_caches: bool, retire_ba
     }
 
     perf.elapsed(.tlb_send_cycles, send_start);
+    const ack_sample = if (comptime @import("lock_profile.zig").enabled) @import("lock_profile.zig").stageBegin() else {};
+    defer if (comptime @import("lock_profile.zig").enabled) @import("lock_profile.zig").stageEnd(.ipi_ack, ack_sample);
     const ack_start = perf.timestamp();
     defer perf.elapsed(.tlb_ack_wait_cycles, ack_start);
     cpu_slot = 0;
-    while (cpu_slot < smp.max_cpus and cpu_slot < 64) : (cpu_slot += 1) {
-        const targeted = (target_cpu_mask & (@as(u64, 1) << @intCast(cpu_slot))) != 0;
+    while (cpu_slot < targets.capacity) : (cpu_slot += 1) {
+        const targeted = targets.contains(cpu_slot);
         if (!targeted or cpu_slot == current_cpu) continue;
         var spins: u32 = 0;
-        while (@atomicLoad(u64, &tlb_shootdown_ack[cpu_slot], .acquire) != generation) {
+        const generation = @atomicLoad(u64, &mailboxes[cpu_slot].published, .monotonic);
+        while (@atomicLoad(u64, &mailboxes[cpu_slot].ack, .acquire) != generation) {
             spins +%= 1;
             if ((spins & 0xFFF) == 0) {
                 // Lost or coalesced IPIs must not turn correctness into a
@@ -1200,14 +1494,12 @@ pub fn synchronizeUserMemoryForPrincipal(principal: kernel.PrincipalId) bool {
 }
 
 pub fn flushTlbForCr3Va(target_cr3: u64, va: u64) void {
-    _ = va;
-    shootdownCr3Context(target_cr3);
+    shootdownRequest(target_cr3, TlbRange.init(va, 1), false, 0, 0, false);
 }
 
 pub fn flushTlbForCr3Range(target_cr3: u64, va: u64, size_bytes: usize) void {
-    _ = va;
     if (size_bytes == 0) return;
-    shootdownCr3Context(target_cr3);
+    shootdownRequest(target_cr3, TlbRange.init(va, size_bytes), false, 0, 0, false);
 }
 
 /// Final phase of a physical memory-type transition. All old aliases must
@@ -1228,6 +1520,11 @@ pub fn retirePhysCopyWindowsForRange(kernel_cr3: u64, paddr: u64, size_bytes: us
     shootdownCr3ContextWithOptions(kernel_cr3, false, paddr, @intCast(size_bytes));
 }
 
+/// AS teardown/PCID reuse is the incarnation fence, including dormant roots.
+pub fn retireUserTlbForPrincipal(principal: kernel.PrincipalId) void {
+    shootdownCr3Context(getHooks().user_space_cr3_for_principal(principal));
+}
+
 pub fn flushUserTlbForPrincipalVa(principal: kernel.PrincipalId, va: u64) void {
     const h = getHooks();
     const target_cr3 = h.user_space_cr3_for_principal(principal);
@@ -1241,23 +1538,41 @@ pub fn flushUserTlbForPrincipalRange(principal: kernel.PrincipalId, va: u64, siz
 }
 
 test "copy window reads writes and copies RAM above the identity limit" {
+    // One backing buffer per way: a page's bytes live in its way while mapped
+    // and are written back when that way is replaced or retired, so a copy
+    // whose source and destination occupy different ways is really checked.
     const Mock = struct {
         const addresses = [_]u64{ 0x2000, (16 << 30) + 4096, 20 << 30 };
         var pages: [3][4096]u8 = undefined;
-        var window: [4096]u8 align(4096) = undefined;
+        var windows: [window_ways][4096]u8 align(4096) = undefined;
         var pt: [512]u64 = [_]u64{0} ** 512;
-        var current: ?usize = null;
+        var current: [window_ways]?usize = [_]?usize{null} ** window_ways;
+        fn writeBack(slot: usize) void {
+            if (current[slot]) |old| @memcpy(&pages[old], &windows[slot]);
+            current[slot] = null;
+        }
         fn invalidate(va: u64) void {
-            std.debug.assert(va == @intFromPtr(&window));
-            if (current) |old| @memcpy(&pages[old], &window);
-            const physical = pt[0] & ~@as(u64, 4095);
+            const slot: usize = @intCast((va - @intFromPtr(&windows)) / 4096);
+            std.debug.assert(slot < window_ways);
+            writeBack(slot);
+            if ((pt[slot] & 1) == 0) return;
+            const physical = pt[slot] & ~@as(u64, 4095);
             for (addresses, 0..) |address, index| {
                 if (physical != address) continue;
-                @memcpy(&window, &pages[index]);
-                current = index;
+                @memcpy(&windows[slot], &pages[index]);
+                current[slot] = index;
                 return;
             }
             unreachable;
+        }
+        fn sync() void {
+            for (current, 0..) |page, slot| if (page) |index| @memcpy(&pages[index], &windows[slot]);
+        }
+        fn slotOf(address: u64) ?usize {
+            for (pt[0..window_ways], 0..) |entry, slot| {
+                if ((entry & 1) != 0 and (entry & ~@as(u64, 4095)) == address) return slot;
+            }
+            return null;
         }
     };
     const saved_ready = user_copy_hooks_ready;
@@ -1267,7 +1582,8 @@ test "copy window reads writes and copies RAM above the identity limit" {
         user_copy_hooks_ready = saved_ready;
     }
     Mock.pt = [_]u64{0} ** 512;
-    Mock.current = null;
+    Mock.current = [_]?usize{null} ** window_ways;
+    window_victim[0] = 0;
     for (&Mock.pages, 0..) |*page, index| {
         for (page, 0..) |*byte, offset| byte.* = @truncate(offset * 37 + index * 13);
     }
@@ -1275,7 +1591,7 @@ test "copy window reads writes and copies RAM above the identity limit" {
         .state = undefined,
         .free_list = undefined,
         .physical_map_limit = 1 << 46,
-        .phys_copy_window_va = @intFromPtr(&Mock.window),
+        .phys_copy_window_va = @intFromPtr(&Mock.windows),
         .page_present = 1,
         .page_rw = 2,
         .kernel_cr3_value = undefined,
@@ -1288,27 +1604,34 @@ test "copy window reads writes and copies RAM above the identity limit" {
     var bytes: [4096]u8 = undefined;
     const source = Mock.pages[1];
     try std.testing.expect(copyPhysicalPageInWindow(Mock.addresses[2], Mock.addresses[1], 0));
+    // Source and destination stay mapped in distinct ways of CPU 0.
+    try std.testing.expect(Mock.slotOf(Mock.addresses[1]).? != Mock.slotOf(Mock.addresses[2]).?);
     try std.testing.expect(readPhysicalBytesInWindow(Mock.addresses[2], &bytes, 0));
     try std.testing.expectEqualSlices(u8, &source, &bytes);
     try std.testing.expect(readPhysicalBytesInWindow(Mock.addresses[1], &bytes, 0));
     try std.testing.expectEqualSlices(u8, &source, &bytes);
+    Mock.sync();
     try std.testing.expectEqualSlices(u8, &source, &Mock.pages[2]);
     try std.testing.expect(copyPhysicalPageInWindow(Mock.addresses[0], Mock.addresses[1], 0));
     try std.testing.expect(copyPhysicalPageInWindow(Mock.addresses[2], Mock.addresses[0], 0));
     try std.testing.expect(readPhysicalBytesInWindow(Mock.addresses[2], &bytes, 0));
     try std.testing.expectEqualSlices(u8, &source, &bytes);
+    // Same page as both source and destination reuses one way.
+    try std.testing.expect(copyPhysicalPageInWindow(Mock.addresses[2], Mock.addresses[2], 0));
+    try std.testing.expect(readPhysicalBytesInWindow(Mock.addresses[2], &bytes, 0));
+    try std.testing.expectEqualSlices(u8, &source, &bytes);
     try std.testing.expect(writePhysicalBytesInWindow(Mock.addresses[2] + 4093, &.{ 0x12, 0x34, 0x56 }, 0));
     try std.testing.expect(readPhysicalBytesInWindow(Mock.addresses[2] + 4093, bytes[0..3], 0));
     try std.testing.expectEqualSlices(u8, &.{ 0x12, 0x34, 0x56 }, bytes[0..3]);
-    const before = Mock.window;
-    const before_pte = Mock.pt[0];
+    const before = Mock.windows;
+    const before_pt = Mock.pt;
     try std.testing.expect(!writePhysicalBytesInWindow(Mock.addresses[2] + 4095, &.{ 1, 2 }, 0));
     try std.testing.expect(!readPhysicalBytesInWindow(Mock.addresses[2] + 4095, bytes[0..2], 0));
     try std.testing.expect(!copyPhysicalPageInWindow(Mock.addresses[2] + 1, Mock.addresses[1], 0));
     try std.testing.expect(!copyPhysicalPageInWindow(1 << 46, Mock.addresses[1], 0));
     try std.testing.expect(!readPhysicalBytesInWindow(std.math.maxInt(u64), bytes[0..2], 0));
-    try std.testing.expectEqual(before_pte, Mock.pt[0]);
-    try std.testing.expectEqualSlices(u8, &before, &Mock.window);
+    try std.testing.expectEqualSlices(u64, &before_pt, &Mock.pt);
+    for (before, Mock.windows) |old, now| try std.testing.expectEqualSlices(u8, &old, &now);
 }
 
 test "copy window preserves identical mappings and invalidates every semantic change" {
@@ -1339,69 +1662,100 @@ test "copy window preserves identical mappings and invalidates every semantic ch
         .write_cr3 = undefined,
         .invlpg = Mock.invalidate,
     });
+    window_victim[0] = 0;
+    window_victim[1] = 0;
+    const cpu1_va: u64 = 0x400000 + window_ways * 4096;
     Mock.calls = 0;
     try std.testing.expectEqual(@as(usize, 0x400000), @intFromPtr(mapPhysPageForKernelAccess(0x12345, 0).?));
     try std.testing.expectEqual(@as(u64, 0x12003), pt[0]);
     try std.testing.expectEqual(@as(usize, 1), Mock.calls);
     pt[0] |= (1 << 5) | (1 << 6);
-    _ = mapPhysPageForKernelAccess(0x12000, 0).?;
+    try std.testing.expect(!mapPhysWindow(0x12000, 0, .ram).?.remapped);
     try std.testing.expectEqual(@as(u64, 0x12063), pt[0]);
     try std.testing.expectEqual(@as(usize, 1), Mock.calls);
-    // A second CPU has a distinct slot and virtual window.
-    try std.testing.expectEqual(@as(usize, 0x401000), @intFromPtr(mapPhysPageForKernelAccess(0x13000, 1).?));
-    try std.testing.expectEqual(@as(u64, 0x401000), Mock.last_va);
+    // A second CPU has its own ways and virtual windows.
+    try std.testing.expectEqual(@as(usize, cpu1_va), @intFromPtr(mapPhysPageForKernelAccess(0x13000, 1).?));
+    try std.testing.expectEqual(cpu1_va, Mock.last_va);
+    try std.testing.expectEqual(@as(u64, 0x13003), pt[window_ways]);
     try std.testing.expectEqual(@as(u64, 0x12063), pt[0]);
     for ([_]u6{ 0, 1, 2, 3, 4, 7, 8, 12, 59, 63 }) |bit| {
+        @memset(pt[0..window_ways], 0);
         pt[0] = 0x12063 ^ (@as(u64, 1) << bit);
         Mock.calls = 0;
-        _ = mapPhysPageForKernelAccess(0x12000, 0).?;
-        try std.testing.expectEqual(@as(u64, 0x12003), pt[0]);
-        try std.testing.expectEqual(@as(u64, 0x400000), Mock.last_va);
+        const mapped = mapPhysWindow(0x12000, 0, .ram).?;
+        try std.testing.expect(mapped.remapped);
         try std.testing.expectEqual(@as(usize, 1), Mock.calls);
+        try std.testing.expectEqual(@as(u64, 0x12003), pt[mapped.slot]);
+        try std.testing.expectEqual(windowSlotVa(mapped.slot), Mock.last_va);
+        if (bit == 12) {
+            // A different present page keeps its way; the new page takes a free one.
+            try std.testing.expectEqual(@as(usize, 1), mapped.slot);
+            try std.testing.expectEqual(@as(u64, 0x13063), pt[0]);
+        } else {
+            // Same page with another type or a non-present entry is replaced in place.
+            try std.testing.expectEqual(@as(usize, 0), mapped.slot);
+            for (pt[1..window_ways]) |entry| try std.testing.expectEqual(@as(u64, 0), entry);
+        }
     }
+    @memset(pt[1..window_ways], 0);
     const before = pt;
     Mock.calls = 0;
     try std.testing.expect(mapPhysPageForKernelAccess(1 << 32, 0) == null);
-    try std.testing.expect(mapPhysPageForKernelAccess(0x12000, smp.max_cpus) == null);
+    try std.testing.expect(mapPhysPageForKernelAccess(0x12000, window_victim.len) == null);
     try std.testing.expect(mapPhysPageForKernelAccess(0x12000, 512) == null);
     try std.testing.expectEqualSlices(u64, &before, &pt);
     try std.testing.expectEqual(@as(usize, 0), Mock.calls);
 
-    // The same CPU-local window covers firmware's high 64-bit PCI BARs.
+    // The same CPU-local ways cover firmware's high 64-bit PCI BARs.
     user_copy_hooks_storage.physical_map_limit = 1 << 46;
     const high_bar: u64 = 0x380000000000;
-    try std.testing.expectEqual(@as(?u64, 0x400ffc), physWindowAddr(high_bar + 0xffc, 4, 0));
-    try std.testing.expectEqual(high_bar | 3, pt[0]);
+    try std.testing.expectEqual(@as(usize, 0x401ffc), @intFromPtr(physWindowAddr(high_bar + 0xffc, 4, 0).?));
+    try std.testing.expectEqual(high_bar | 3, pt[1]);
+    try std.testing.expectEqual(@as(u64, 0x12003), pt[0]);
     try std.testing.expectEqual(@as(usize, 1), Mock.calls);
-    try std.testing.expectEqual(before[1], pt[1]);
+    try std.testing.expectEqual(before[window_ways], pt[window_ways]);
     try std.testing.expect(physWindowAddr(high_bar + 0xffd, 4, 0) == null);
     try std.testing.expect(physWindowAddr(1 << 46, 4, 0) == null);
     try std.testing.expect(physWindowAddr(std.math.maxInt(u64), 4, 0) == null);
     try std.testing.expectEqual(@as(usize, 1), Mock.calls);
+    window_non_wb_used[0] = 0;
     _ = mapPhysPageWithCache(high_bar, 0, .uncached_mmio).?;
-    try std.testing.expectEqual(high_bar | 0x1b, pt[0]);
+    try std.testing.expectEqual(high_bar | 0x1b, pt[1]);
     try std.testing.expectEqual(@as(usize, 2), Mock.calls);
+    try std.testing.expectEqual(@as(u8, 1), window_non_wb_used[0]);
+    window_non_wb_used[0] = 0;
     _ = mapPhysPageWithCache(high_bar, 0, .uncached_mmio).?;
     try std.testing.expectEqual(@as(usize, 2), Mock.calls);
-    // Returning to a RAM page must replace the high PFN and invalidate locally.
+    // A hit on a retained non-WB way still requires the unlock fence.
+    try std.testing.expectEqual(@as(u8, 1), window_non_wb_used[0]);
+    window_non_wb_used[0] = 0;
+    // The RAM page kept its own way across the BAR access.
     _ = mapPhysPageForKernelAccess(0x12000, 0).?;
     try std.testing.expectEqual(@as(u64, 0x12003), pt[0]);
-    try std.testing.expectEqual(@as(usize, 3), Mock.calls);
+    try std.testing.expectEqual(@as(usize, 2), Mock.calls);
+    try std.testing.expectEqual(@as(u8, 0), window_non_wb_used[0]);
     retirePhysCopyWindowOnCurrentCpu(0x13000, 4096);
     try std.testing.expectEqual(@as(u64, 0x12003), pt[0]);
-    try std.testing.expectEqual(@as(usize, 3), Mock.calls);
+    try std.testing.expectEqual(@as(usize, 2), Mock.calls);
     retirePhysCopyWindowOnCurrentCpu(0x12000, 4096);
     try std.testing.expectEqual(@as(u64, 0), pt[0]);
+    try std.testing.expectEqual(high_bar | 0x1b, pt[1]);
     try std.testing.expectEqual(@as(u64, 0x400000), Mock.last_va);
-    try std.testing.expectEqual(@as(usize, 4), Mock.calls);
+    try std.testing.expectEqual(@as(usize, 3), Mock.calls);
     const lease = acquireWcPhysicalWindowLease(high_bar, 4096).?;
     defer releaseWcPhysicalWindowLease(lease);
     try std.testing.expect(mapPhysPageForKernelAccess(high_bar, 0) == null);
     try std.testing.expect(mapPhysPageWithCache(high_bar, 0, .uncached_mmio) == null);
-    _ = mapPhysPageWithCache(high_bar, 0, .{ .device = 5 }).?;
-    try std.testing.expectEqual(high_bar | 3 | (1 << 3) | (1 << 7), pt[0]);
-    retireDeviceCopyWindow(.{ .device = 5 }, 0);
-    try std.testing.expectEqual(@as(u64, 0), pt[0]);
+    const device = mapPhysWindow(high_bar, 0, .{ .device = 5 }).?;
+    // The device type replaces the BAR's UC way in place: never two aliases.
+    try std.testing.expectEqual(@as(usize, 1), device.slot);
+    try std.testing.expectEqual(high_bar | 3 | (1 << 3) | (1 << 7), pt[1]);
+    pt[2] = 0x15003;
+    retireDeviceCopyWindow(.{ .device = 5 }, device.slot);
+    try std.testing.expectEqual(@as(u64, 0), pt[1]);
+    try std.testing.expectEqual(@as(u64, 0x15003), pt[2]);
+    pt[2] = 0;
+    window_non_wb_used[0] = 0;
 
     const saved_policy = @atomicLoad(?*const ram_cache.Snapshot, &ram_cache_snapshot, .acquire);
     defer publishRamCacheSnapshot(saved_policy);
@@ -1416,15 +1770,18 @@ test "copy window preserves identical mappings and invalidates every semantic ch
     publishRamCacheSnapshot(&active);
     _ = mapPhysPageForKernelAccess(0x12000, 0).?;
     try std.testing.expectEqual(@as(u64, 0x12083), pt[0]);
+    // CPU 1's retained WB way for the same page is replaced, not duplicated.
     _ = mapPhysPageForKernelAccess(0x13000, 1).?;
-    try std.testing.expectEqual(@as(u64, 0x13083), pt[1]);
+    try std.testing.expectEqual(@as(u64, 0x13083), pt[window_ways]);
+    for (pt[window_ways + 1 .. 2 * window_ways]) |entry| try std.testing.expectEqual(@as(u64, 0), entry);
     try std.testing.expect(mapPhysPageWithCache(0x12000, 0, .uncached_mmio) == null);
 
     const pending: ram_cache.Snapshot = .{ .policy = &cached, .pending = &cached };
     publishRamCacheSnapshot(&pending);
     const pending_before = pt;
+    // A retained way must not bypass a pending transition.
     try std.testing.expect(mapPhysPageForKernelAccess(0x12000, 0) == null);
-    try std.testing.expect(mapPhysPageWithCache(0x12000, 0, .{ .device = 4 }) == null);
+    try std.testing.expect(mapPhysWindow(0x12000, 0, .{ .device = 4 }) == null);
     try std.testing.expectEqualSlices(u64, &pending_before, &pt);
     // The production writer retires these windows and waits for every CPU
     // before exposing the replacement. Host tests do not execute real IPIs.
@@ -1433,6 +1790,8 @@ test "copy window preserves identical mappings and invalidates every semantic ch
     publishRamCacheSnapshot(&restored);
     _ = mapPhysPageForKernelAccess(0x12000, 0).?;
     try std.testing.expectEqual(@as(u64, 0x12003), pt[0]);
+    window_non_wb_used[0] = 0;
+    window_non_wb_used[1] = 0;
 }
 
 test "copy-window retirement may cover sparse holes without changing other windows" {
@@ -1478,4 +1837,253 @@ test "copy-window retirement may cover sparse holes without changing other windo
     retirePhysCopyWindowOnCurrentCpu(0x12000, 0x4000);
     try std.testing.expectEqual(@as(u64, 0x16003), pt[0]);
     try std.testing.expectEqual(@as(usize, 2), Mock.invalidations);
+
+    // Every way of this CPU is scanned; other CPUs' ways are left alone.
+    pt[0] = 0x12003;
+    pt[1] = 0x16003;
+    pt[2] = 0x15003;
+    pt[3] = 0;
+    pt[window_ways] = 0x12003;
+    Mock.invalidations = 0;
+    retirePhysCopyWindowOnCurrentCpu(0x12000, 0x4000);
+    try std.testing.expectEqual(@as(u64, 0), pt[0]);
+    try std.testing.expectEqual(@as(u64, 0x16003), pt[1]);
+    try std.testing.expectEqual(@as(u64, 0), pt[2]);
+    try std.testing.expectEqual(@as(u64, 0x12003), pt[window_ways]);
+    try std.testing.expectEqual(@as(usize, 2), Mock.invalidations);
+    // A page retired from a way remaps on its next use.
+    try std.testing.expect(mapPhysWindow(0x12000, 0, .ram).?.remapped);
+    try std.testing.expectEqual(@as(usize, 3), Mock.invalidations);
+}
+
+test "copy window evicts round-robin only when every way holds another page" {
+    const Mock = struct {
+        var invalidations: usize = 0;
+        fn invalidate(_: u64) void {
+            invalidations += 1;
+        }
+    };
+    const saved: ?Hooks = if (user_copy_hooks_ready) user_copy_hooks_storage else null;
+    const saved_policy = @atomicLoad(?*const ram_cache.Snapshot, &ram_cache_snapshot, .acquire);
+    defer {
+        if (saved) |h| init(h) else user_copy_hooks_ready = false;
+        publishRamCacheSnapshot(saved_policy);
+    }
+    publishRamCacheSnapshot(null);
+    var pt = [_]u64{0} ** 512;
+    init(.{
+        .state = undefined,
+        .free_list = undefined,
+        .physical_map_limit = 1 << 32,
+        .phys_copy_window_va = 0x400000,
+        .page_present = 1,
+        .page_rw = 2,
+        .kernel_cr3_value = undefined,
+        .user_space_cr3_for_principal = undefined,
+        .phys_copy_window_pt = &pt,
+        .read_cr3 = undefined,
+        .write_cr3 = undefined,
+        .invlpg = Mock.invalidate,
+    });
+    window_victim[0] = 0;
+    Mock.invalidations = 0;
+    for (0..window_ways) |way| {
+        const mapped = mapPhysWindow(0x20000 + way * 4096, 0, .ram).?;
+        try std.testing.expectEqual(way, mapped.slot);
+    }
+    try std.testing.expectEqual(window_ways, Mock.invalidations);
+    // Hits on every way need no PTE store or invalidation.
+    for (0..window_ways) |way| {
+        const mapped = mapPhysWindow(0x20000 + way * 4096, 0, .ram).?;
+        try std.testing.expect(!mapped.remapped);
+        try std.testing.expectEqual(way, mapped.slot);
+    }
+    try std.testing.expectEqual(window_ways, Mock.invalidations);
+    const first = mapPhysWindow(0x40000, 0, .ram).?;
+    const second = mapPhysWindow(0x41000, 0, .ram).?;
+    try std.testing.expectEqual(@as(usize, 0), first.slot);
+    try std.testing.expectEqual(@as(usize, 1), second.slot);
+    try std.testing.expectEqual(window_ways + 2, Mock.invalidations);
+    try std.testing.expectEqual(@as(u64, 0x22003), pt[2]);
+    // A free way left by a retire is used before evicting a live one.
+    pt[3] = 0;
+    try std.testing.expectEqual(@as(usize, 3), mapPhysWindow(0x42000, 0, .ram).?.slot);
+    try std.testing.expectEqual(@as(u64, 0x22003), pt[2]);
+}
+
+test "lock ordering shootdown actual lock and per CPU copy window record" {
+    if (!lock_diagnostics.enabled) return;
+    var lock_state: TlbShootdownLock = .{};
+    lock_state.lock();
+    try std.testing.expectEqual(lock_diagnostics.order.Class.tlb_shootdown, lock_diagnostics.testCpu().head.?.key.class);
+    try lock_diagnostics.testCpu().assertCanWaitForIpi();
+    const guard = PhysCopyWindowGuard.lock();
+    try std.testing.expectEqual(lock_diagnostics.order.Class.copy_window, lock_diagnostics.testCpu().head.?.key.class);
+    try std.testing.expectError(error.IpiWaitWithBlockingLock, lock_diagnostics.testCpu().assertCanWaitForIpi());
+    guard.unlock();
+    lock_state.unlock();
+    lock_diagnostics.assertRootEmpty();
+}
+
+test "lock ordering shootdown actual wait entrance admits window locks" {
+    if (!lock_diagnostics.enabled) return;
+    const root = @import("root");
+    const before = root.ipi_admissions;
+    var lock_state: TlbShootdownLock = .{};
+    lock_state.lock();
+    shootdownCr3ContextWithOptions(4096, false, 0, 0);
+    lock_state.unlock();
+    try std.testing.expectEqual(before + 1, root.ipi_admissions);
+    lock_diagnostics.assertRootEmpty();
+}
+
+test "WC physical window leases exceed 128 and reclaim bodies after final release" {
+    const Reader = struct {
+        stop: bool = false,
+        fn run(self: *@This()) void {
+            while (!@atomicLoad(bool, &self.stop, .acquire)) {
+                // The pinned lease must remain observable through every
+                // directory publication and empty-body return below.
+                std.debug.assert(wcPhysicalWindowLeaseBlocks(0xf0000000));
+            }
+        }
+    };
+    const pinned = acquireWcPhysicalWindowLease(0xf0000000, 4096).?;
+    var reader = Reader{};
+    const thread = try std.Thread.spawn(.{}, Reader.run, .{&reader});
+    var joined = false;
+    defer if (!joined) {
+        @atomicStore(bool, &reader.stop, true, .release);
+        thread.join();
+    };
+    var tokens: [129]u64 = undefined;
+    for (&tokens, 0..) |*token, index| token.* = acquireWcPhysicalWindowLease(0x20000000 + index * 8192, 4096).?;
+    for (0..tokens.len) |index| {
+        try std.testing.expect(wcPhysicalWindowLeaseBlocks(0x20000000 + index * 8192));
+        try std.testing.expect(!wcPhysicalWindowLeaseBlocks(0x20001000 + index * 8192));
+    }
+    for (tokens) |token| releaseWcPhysicalWindowLease(token);
+    @atomicStore(bool, &reader.stop, true, .release);
+    thread.join();
+    joined = true;
+    releaseWcPhysicalWindowLease(pinned);
+    try std.testing.expect(wc_window_leases.body_owner.published == null);
+    try std.testing.expectEqual(@as(usize, 0), wc_window_leases.live);
+    try std.testing.expectEqual(@as(usize, 0), wc_window_active_count);
+    try std.testing.expect(!wcPhysicalWindowLeaseBlocks(0x20000000));
+    wc_window_leases.deinit();
+}
+
+test "WC physical window leases growth failure leaves no active token and can retry" {
+    const Fail = struct {
+        fn acquire(_: *anyopaque, _: usize) ?@import("memory/owned_storage.zig").MappedExtent {
+            return null;
+        }
+        fn release(_: *anyopaque, _: @import("memory/owned_storage.zig").PhysicalExtent) bool {
+            unreachable;
+        }
+    };
+    wc_window_leases.deinit();
+    var context: u8 = 0;
+    test_wc_allocator = .{ .context = &context, .acquire = Fail.acquire, .release = Fail.release };
+    defer test_wc_allocator = null;
+    try std.testing.expect(acquireWcPhysicalWindowLease(4096, 4096) == null);
+    try std.testing.expectEqual(@as(usize, 0), wc_window_active_count);
+    test_wc_allocator = null;
+    const token = acquireWcPhysicalWindowLease(4096, 4096).?;
+    releaseWcPhysicalWindowLease(token);
+    wc_window_leases.deinit();
+}
+
+test "copy window TLB range alignment overflow and full threshold" {
+    try std.testing.expectEqual(@as(u64, 1), TlbRange.init(4095, 1).pages);
+    // Crossing a page boundary exceeds the measured one-page limit.
+    try std.testing.expectEqual(@as(u64, 0), TlbRange.init(4095, 2).pages);
+    try std.testing.expectEqual(@as(u64, 0x2000), TlbRange.init(0x2345, 8).start);
+    try std.testing.expectEqual(@as(u64, TlbRange.page_limit), TlbRange.init(0, TlbRange.page_limit * 4096).pages);
+    try std.testing.expectEqual(@as(u64, 0), TlbRange.init(0, TlbRange.page_limit * 4096 + 1).pages);
+    try std.testing.expectEqual(@as(u64, 0), TlbRange.init(~@as(u64, 0), 2).pages);
+    try std.testing.expectEqual(@as(u64, 0), TlbRange.init(0, 1 << 47).pages);
+}
+
+test "copy window TLB receiver uses local pages and dormant CR3 fallback" {
+    const Mock = struct {
+        var current: u64 = 0;
+        var writes: usize = 0;
+        var pages: [4]u64 = undefined;
+        var count: usize = 0;
+        fn read() u64 {
+            return current;
+        }
+        fn write(value: u64) void {
+            current = value;
+            writes += 1;
+        }
+        fn invalidate(value: u64) void {
+            pages[count] = value;
+            count += 1;
+        }
+    };
+    const saved_hooks = user_copy_hooks_storage;
+    const saved_ready = user_copy_hooks_ready;
+    defer {
+        user_copy_hooks_storage = saved_hooks;
+        user_copy_hooks_ready = saved_ready;
+    }
+    user_copy_hooks_storage = undefined;
+    user_copy_hooks_storage.read_cr3 = Mock.read;
+    user_copy_hooks_storage.write_cr3 = Mock.write;
+    user_copy_hooks_storage.invlpg = Mock.invalidate;
+    user_copy_hooks_ready = true;
+    Mock.current = 0x1001;
+    Mock.writes = 0;
+    Mock.count = 0;
+    // The checked refill experiment also exercises multi-page descriptors.
+    flushCr3RangeOnCurrentCpu(0x1001, .{ .start = 0x2000, .pages = 2 });
+    try std.testing.expectEqualSlices(u64, &.{ 0x2000, 0x3000 }, Mock.pages[0..Mock.count]);
+    try std.testing.expectEqual(@as(usize, 0), Mock.writes);
+    // A dormant PCID must still be invalidated; host has no INVPCID, so the
+    // old target-load/restore sequence is required even on another CPU/AS.
+    flushCr3RangeOnCurrentCpu(0x2002, TlbRange.init(0x2000, 4096));
+    try std.testing.expectEqual(@as(usize, 2), Mock.writes);
+    try std.testing.expectEqual(@as(u64, 0x1001), Mock.current);
+    flushCr3RangeOnCurrentCpu(0x1001, .{});
+    try std.testing.expectEqual(@as(usize, 3), Mock.writes);
+}
+
+test "shootdown mailbox lifetime excludes non-target CPUs and survives wrap" {
+    var boxes: [72]Mailbox = @splat(.{});
+    const selected = &boxes[71];
+    selected.cr3 = 0x1001;
+    @atomicStore(u64, &selected.published, selected.nextGeneration(), .release);
+    try std.testing.expectEqual(@as(u64, 1), selected.pending());
+    try std.testing.expectEqual(@as(u64, 0), boxes[0].pending());
+    // ACK is the last reader action; only then may the same mailbox advance.
+    @atomicStore(u64, &selected.ack, selected.pending(), .release);
+    try std.testing.expectEqual(@as(u64, 0), selected.pending());
+    try std.testing.expectEqual(@as(u64, 2), selected.nextGeneration());
+    selected.published = std.math.maxInt(u64);
+    selected.ack = selected.published;
+    const wrapped = selected.nextGeneration();
+    try std.testing.expectEqual(@as(u64, 1), wrapped);
+    @atomicStore(u64, &selected.published, wrapped, .release);
+    try std.testing.expectEqual(wrapped, selected.pending());
+    // A delayed IPI on an omitted CPU cannot read another CPU's new request.
+    try std.testing.expectEqual(@as(u64, 0), boxes[0].pending());
+}
+
+fn profileLockAddressSpace(principal: kernel.PrincipalId) bool {
+    const start = copy_profile.copyTimestamp();
+    defer copy_profile.copyEnd(.as_lock, start);
+    return user_vm.lockAddressSpace(principal);
+}
+fn profileResolve(principal: kernel.PrincipalId, page: address_types.UserVirtualAddress, write: bool) ?CopyPage {
+    const start = copy_profile.copyTimestamp();
+    defer copy_profile.copyEnd(.resolve, start);
+    return ensureUserPageMappedForCopyWithAddressSpaceLocked(principal, page, write);
+}
+fn profileWindow(pa: u64, cpu: usize, cache: PhysWindowCache) ?MappedWindow {
+    const start = copy_profile.copyTimestamp();
+    defer copy_profile.copyEnd(.window, start);
+    return mapPhysWindow(pa, cpu, cache);
 }

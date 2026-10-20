@@ -10,22 +10,22 @@ static unsigned created, replies, closed_request, closed_reply, closed_endpoint;
 static int reply_error, expect_result;
 static kb2_fs_response_t observed;
 
-int pacha_ipc_recv(int fd, struct pacha_ipc_msg *message)
+int pacha_ipc_recv(pacha_fd_t fd, struct pacha_ipc_msg *message)
 {
     assert(fd==60 && message->fd_capacity>=2);
     message->word0=KB2_FILESYSTEM_OP_CLIENT_REGISTER;
     message->word1=sizeof(memory);message->word2=KB2_FILESYSTEM_RESPONSE_SIZE;
-    message->word3=7;message->fd_count=2;
+    message->word3=7;message->fd_count=1;
     message->fds[0]=(struct pacha_ipc_fd){.fd=80};
-    message->fds[1]=(struct pacha_ipc_fd){.fd=70};return 0;
+    return 0;
 }
-int pacha_fd_get_info(int fd, struct pacha_fd_info *info)
+int pacha_fd_get_info(pacha_fd_t fd, struct pacha_fd_info *info)
 {
     assert(fd==70 || fd==80);
     *info=(struct pacha_fd_info){.kind=fd==70 ? PACHA_FD_KIND_REPLY : PACHA_FD_KIND_VMO,
         .size=sizeof(memory)};return 0;
 }
-void *pacha_mmap(int fd,uint64_t size,uint64_t protection,uint64_t flags,uint64_t offset)
+void *pacha_mmap(pacha_fd_t fd,uint64_t size,uint64_t protection,uint64_t flags,uint64_t offset)
 {
     assert(fd==80 && size==sizeof(memory) && !offset);
     assert(protection==(PACHA_PROT_READ|PACHA_PROT_WRITE) && flags==PACHA_MMAP_SHARED);
@@ -36,7 +36,7 @@ int pacha_munmap(void *address,uint64_t size)
     assert(address==memory && size==sizeof(memory));return 0;
 }
 int filed_client_create(filed_runtime_t *rt,const kb2_fs_request_t *request,
-    const uint8_t *bytes,size_t size,int *fd,uint64_t *id)
+    const uint8_t *bytes,size_t size,pacha_fd_t *fd,uint64_t *id)
 {
     assert(!rt->actor && size==sizeof(memory));
     kb2_fs_request_t decoded;
@@ -45,9 +45,10 @@ int filed_client_create(filed_runtime_t *rt,const kb2_fs_request_t *request,
     assert(request->offset==1234 && request->second_handle==555);
     ++created;*fd=90;*id=42;return 0;
 }
-int pacha_ipc_reply(int fd,const struct pacha_ipc_msg *message)
+int pacha_ipc_reply(pacha_fd_t fd,const struct pacha_ipc_msg *message)
 {
-    assert(fd==70);++replies;
+    if (reply_error && !message->word0) return reply_error;
+    assert(fd==PACHA_IPC_REPLY_IMPLICIT);++replies;
     assert(message->word0==KB2_FILESYSTEM_OP_CLIENT_REGISTER && message->word3==7);
     assert(message->word2==KB2_FILESYSTEM_RESPONSE_SIZE);
     assert((int64_t)message->word1==expect_result);
@@ -70,7 +71,7 @@ int pacha_ipc_reply(int fd,const struct pacha_ipc_msg *message)
     }
     return reply_error;
 }
-int pacha_fd_close(int fd)
+int pacha_fd_close(pacha_fd_t fd)
 {
     if(fd==70) ++closed_reply;
     else if(fd==80) ++closed_request;
@@ -93,14 +94,14 @@ int filed_storage_exec_close(filed_runtime_t *a,uint64_t b) { abort(); }
 int filed_client_credentials(filed_runtime_t *a,const kb2_fs_request_t *b,const uint8_t *c,size_t d) { abort(); }
 int filed_client_release(filed_runtime_t *a,struct filed_client *b) { abort(); }
 int filed_owner_control(filed_runtime_t *a,kb2_fs_request_t *b,const uint8_t *c,size_t d,kb2_fs_response_t *e) { abort(); }
-int pacha_vmo_create(uint64_t a,uint64_t b,uint32_t c) { abort(); }
-long pacha_fd_fcntl(int a,uint64_t b,uint64_t c,uint64_t d) { abort(); }
+pacha_fd_t pacha_vmo_create(uint64_t a,uint64_t b,uint32_t c) { abort(); }
+long pacha_fd_fcntl(pacha_fd_t a,uint64_t b,uint64_t c,uint64_t d) { abort(); }
 long pacha_syscall2(uint64_t a,uint64_t b,uint64_t c) { abort(); }
 int ph_fs_channel_layout(const struct ph_fs_channel_config *a,size_t *b,size_t *c) { abort(); }
 int ph_fs_channel_bind(struct ph_fs_channel *a,void *b,size_t c,const struct ph_fs_channel_config *d,kb2_vq_side_t e,const kb2_vq_atomic_ops_t *f,kb2_vq_chain_t **g,uint16_t *h) { abort(); }
 const kb2_vq_atomic_ops_t kb2_vq_x86_64_atomics={0};
-int filed_exec_handle(filed_runtime_t *a,filed_handle_id_t b,const filed_exec_path_t *c,const int *d,uint64_t e,int f,int *g,int *h) { abort(); }
-int filed_exec_linux_lpr_prepare_self(filed_runtime_t *a,filed_handle_id_t b,const filed_exec_path_t *c,int *d,int *e) { abort(); }
+int filed_exec_handle(filed_runtime_t *a,filed_handle_id_t b,const filed_exec_path_t *c,const pacha_fd_t *d,uint64_t e,pacha_fd_t f,pacha_fd_t *g,pacha_fd_t *h) { abort(); }
+int filed_exec_linux_lpr_prepare_self(filed_runtime_t *a,filed_handle_id_t b,const filed_exec_path_t *c,pacha_fd_t *d,pacha_fd_t *e) { abort(); }
 #pragma GCC diagnostic pop
 
 static void encode_request(void)
@@ -113,12 +114,12 @@ int main(void)
 {
     filed_runtime_t runtime={0};
     encode_request();assert(!filed_receive(&runtime,60));
-    assert(created==1 && replies==1 && closed_request==1 && closed_reply==1 && !closed_endpoint);
+    assert(created==1 && replies==1 && closed_request==1 && closed_reply==0 && !closed_endpoint);
     encode_request();reply_error=-EIO;assert(filed_receive(&runtime,60)==-EIO);
-    assert(created==2 && replies==2 && closed_request==2 && closed_reply==2 && closed_endpoint==1);
+    assert(created==2 && replies==2 && closed_request==2 && closed_reply==0 && closed_endpoint==1);
     encode_request();reply_error=0;expect_result=-EPERM;
     struct filed_client client={0};runtime.actor=&client;
     assert(!filed_receive(&runtime,60));
-    assert(created==2 && replies==3 && closed_request==3 && closed_reply==3 && closed_endpoint==1);
+    assert(created==2 && replies==3 && closed_request==3 && closed_reply==0 && closed_endpoint==1);
     puts("filed actual CLIENT_REGISTER reply: exact least-privilege rights / CLOEXEC / failed-send cleanup / private authority PASS");
 }
