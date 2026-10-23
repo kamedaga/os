@@ -104,6 +104,45 @@ __attribute__((noreturn)) void main(void)
     CHECK(*(volatile unsigned char *)(uintptr_t)view_map == 73);
     CHECK(call(PACHA_VM_SYSCALL_MUNMAP, view_map, 4096, 0, 0, 0, 0) == 0);
     refs(fd, 1, 2);
+    *(volatile unsigned char *)(uintptr_t)(owner + 4096) = 89;
+    *(volatile unsigned char *)(uintptr_t)(owner + 8192) = 107;
+    uint64_t indices[2] = {0, PACHA_VMO_PAGE_VIEW_HOLE};
+    const uint64_t mutable = call(PACHA_FD_SYSCALL_VMO_CREATE_PAGE_VIEW,
+        fd, (uintptr_t)indices, 2, (rights & ~PACHA_FD_RIGHT_SHARE) | PACHA_FD_RIGHT_REVOKE,
+        PACHA_VMO_PAGE_VIEW_SPARSE, 0);
+    CHECK(mutable >= 16 && mutable < PACHA_THREAD_SELF_FD);
+    const uint64_t alias_a = call(PACHA_VM_SYSCALL_MMAP, mutable, 0, 8192,
+        PACHA_PROT_READ | PACHA_PROT_WRITE, PACHA_MMAP_SHARED, 0);
+    const uint64_t alias_b = call(PACHA_VM_SYSCALL_MMAP, mutable, 0, 8192,
+        PACHA_PROT_READ, PACHA_MMAP_SHARED, 0);
+    CHECK(alias_a >= 4096 && alias_b >= 4096 && alias_a != alias_b);
+    CHECK(*(volatile unsigned char *)(uintptr_t)alias_a == 73);
+    CHECK(*(volatile unsigned char *)(uintptr_t)alias_b == 73);
+    indices[0] = 1; indices[1] = 2;
+    const uint64_t reader = call(PACHA_FD_SYSCALL_DUP, mutable, 16,
+        PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_MAP_READ, 0, 0, 0);
+    CHECK(reader >= 16 && reader < PACHA_THREAD_SELF_FD);
+    CHECK(call(PACHA_FD_SYSCALL_VMO_REFRESH_PAGE_VIEW, reader, fd,
+        (uintptr_t)indices, 2, 0, 0) != 0);
+    CHECK(*(volatile unsigned char *)(uintptr_t)alias_a == 73);
+    CHECK(call(PACHA_FD_SYSCALL_VMO_REFRESH_PAGE_VIEW, mutable, fd,
+        (uintptr_t)indices, 2, 0, 0) == 0);
+    CHECK(*(volatile unsigned char *)(uintptr_t)alias_a == 89);
+    CHECK(*(volatile unsigned char *)(uintptr_t)alias_b == 89);
+    CHECK(*(volatile unsigned char *)(uintptr_t)(alias_a + 4096) == 107);
+    *(volatile unsigned char *)(uintptr_t)alias_a = 127;
+    CHECK(*(volatile unsigned char *)(uintptr_t)(owner + 4096) == 127);
+    CHECK(*(volatile unsigned char *)(uintptr_t)alias_b == 127);
+    indices[1] = PACHA_VMO_PAGE_VIEW_HOLE;
+    CHECK(call(PACHA_FD_SYSCALL_VMO_REFRESH_PAGE_VIEW, mutable, fd,
+        (uintptr_t)indices, 2, 0, 0) == 0);
+    CHECK(*(volatile unsigned char *)(uintptr_t)alias_b == 127);
+    close_fd(reader);
+    CHECK(call(PACHA_VM_SYSCALL_MUNMAP, alias_a, 8192, 0, 0, 0, 0) == 0);
+    CHECK(call(PACHA_VM_SYSCALL_MUNMAP, alias_b, 8192, 0, 0, 0, 0) == 0);
+    close_fd(mutable);
+    refs(fd, 1, 2);
+    log_text("NATIVE_VMO_REFRESH=PASS aliases/hole-fill/clear/rights/parent-write\n");
     CHECK(call(PACHA_VM_SYSCALL_MUNMAP, owner, 12288, 0, 0, 0, 0) == 0);
     refs(fd, 1, 1);
     close_fd(fd);

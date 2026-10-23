@@ -43,7 +43,10 @@ pub const vmo_cache_uc_minus: u64 = 1;
 pub const vmo_cache_uc: u64 = 2;
 pub const vmo_cache_wc: u64 = 3;
 pub const syscall_vmo_create_page_view: u64 = 63;
-pub const syscall_vmo_revoke: u64 = 64;
+// Fixed-length borrowed backing replacement; requires both the revocation
+// capability and the same parent's SHARE + original maximum MAP authority.
+pub const syscall_vmo_refresh_page_view: u64 = 64;
+pub const syscall_vmo_revoke: u64 = 65;
 pub const syscall_fd_last: u64 = syscall_vmo_revoke;
 pub const syscall_fd_count: u64 = syscall_fd_last - syscall_fd_first + 1;
 
@@ -60,7 +63,11 @@ pub const known_flags_mask: u32 =
 // CREATE only, not an FD flag: capacity is zero-filled on first access rather
 // than physically reserved at creation. Allocation failure may occur at fault.
 pub const vmo_create_zero_on_demand: u64 = 1 << 4;
-pub const vmo_create_known_flags_mask: u64 = known_flags_mask | vmo_create_zero_on_demand;
+// VMO_CREATE(size=RDI, rights=RSI, flags=RDX) with this flag creates an
+// unpopulated pager VMO. A zero rights mask grants attach/map-read/map-write
+// in addition to the common control rights; EXEC requires explicit authority.
+pub const vmo_create_pager: u64 = 1 << 5;
+pub const vmo_create_known_flags_mask: u64 = known_flags_mask | vmo_create_zero_on_demand | vmo_create_pager;
 
 pub const right_inspect: u64 = 1 << 0;
 pub const right_dup: u64 = 1 << 1;
@@ -105,10 +112,13 @@ pub const known_common_rights_mask: u64 =
 
 // VMO_CREATE_PAGE_VIEW(parent_fd, page_indices, page_count, rights, flags)
 // takes an array of parent-VMO page indices. A view may only map or transport
-// the borrowed pages; it cannot execute, read/write through FD offsets, resize,
+// the borrowed pages; it cannot read/write through FD offsets, resize,
 // share again, or act as a pager.
 pub const vmo_page_view_index_size: u64 = 8;
-pub const vmo_page_view_known_flags_mask: u64 = known_flags_mask;
+// Explicit holes are unavailable borrowed backing, never anonymous zero-fill.
+pub const vmo_page_view_sparse: u64 = 1 << 4;
+pub const vmo_page_view_hole: u64 = 0xffff_ffff_ffff_ffff;
+pub const vmo_page_view_known_flags_mask: u64 = known_flags_mask | vmo_page_view_sparse;
 pub const vmo_page_view_rights_mask: u64 =
     right_inspect |
     right_dup |
@@ -116,6 +126,7 @@ pub const vmo_page_view_rights_mask: u64 =
     right_close |
     right_map_read |
     right_map_write |
+    right_map_exec |
     right_revoke;
 
 pub const fd_kind_none: u64 = 0;
@@ -134,6 +145,7 @@ pub const fd_kind_irq: u64 = 12;
 pub const fd_kind_timer: u64 = 13;
 pub const fd_kind_serial: u64 = 14;
 pub const fd_kind_pipe: u64 = 15;
+pub const fd_kind_pager_port: u64 = 16;
 
 pub const fd_info_kind_offset: u64 = 0;
 pub const fd_info_rights_offset: u64 = 8;

@@ -1827,6 +1827,8 @@ int termd_linux_tty_island_init(
         const int load_status = filed_client_load_module_image(
             FILED_CLIENT_ENDPOINT_FD, module_paths[i], module_names[i], &loaded);
         if (load_status != 0) {
+            printf("[termd] module image load failed path=%s status=%d\n",
+                module_paths[i],load_status);
             island->load_status = -22;
             return 0;
         }

@@ -5,6 +5,7 @@ const std = @import("std");
 pub const smp_profile_enabled = @import("smp_profile_options").enabled;
 pub const b3_profile_enabled = @import("ipc_profile_options").b3_enabled;
 pub const ipc_profile_enabled = @import("ipc_profile_options").ipc_enabled;
+pub const wake_trace_enabled = @import("ipc_profile_options").wake_trace_enabled;
 pub const kernel_log_ring_enabled = @import("kernel_log_ring_options").log_ring_enabled;
 pub const kernel_reference_checks_enabled = @import("kernel_lock_check_options").reference_checks_enabled;
 pub const kernel_lock_checks_enabled = @import("kernel_lock_check_options").lock_checks_enabled;

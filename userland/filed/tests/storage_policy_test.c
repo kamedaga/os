@@ -13,6 +13,8 @@ static int bad_size;
 static unsigned ordinary_calls,owner_calls;
 static size_t read_budget=20000;
 static int read_error;
+static uint32_t snapshot_generation=17, snapshot_valid=1;
+static uint64_t snapshot_cookie=31;
 static unsigned read_calls;
 static int exchange(struct filed_storage_owner *owner,const uint8_t *input,
     size_t size,uint8_t *output,size_t capacity,size_t *used,int control)
@@ -33,11 +35,28 @@ static int exchange(struct filed_storage_owner *owner,const uint8_t *input,
     } else if(request.opcode==KB2_FILESYSTEM_OP_PREAD) {
         assert(request.length<=read_budget && capacity==KB2_FILESYSTEM_RESPONSE_SIZE+request.length);
         ++read_calls;
+        if (request.mode==KB2_FILESYSTEM_SNAPSHOT_QUERY) {
+            response.handle=snapshot_cookie;response.service=snapshot_valid ? KB2_FILESYSTEM_SNAPSHOT_VALID : 0;
+        }
         response.result=read_error ? read_error : (int64_t)request.length;
         response.data_length=read_error ? 0 : request.length;
         for(size_t i=0;i<response.data_length;++i)
             output[KB2_FILESYSTEM_RESPONSE_SIZE+i]=(uint8_t)(request.offset+i);
     } else if(request.opcode==KB2_FILESYSTEM_OP_STATX) {
+        if (request.mode==KB2_FILESYSTEM_SNAPSHOT_QUERY) {
+            assert(!control && request.flags==0x1000);
+            response.data_length=KB2_FILESYSTEM_SNAPSHOT_STAT_SIZE;
+            memset(output+KB2_FILESYSTEM_RESPONSE_SIZE,0,KB2_FILESYSTEM_SNAPSHOT_STAT_SIZE);
+            uint8_t *meta=output+KB2_FILESYSTEM_RESPONSE_SIZE;
+            for(unsigned i=0;i<4;++i) meta[i]=(uint8_t)(snapshot_generation>>(8*i));
+            meta[4]=(uint8_t)snapshot_valid;
+            for(unsigned i=0;i<8;++i) meta[8+i]=(uint8_t)(snapshot_cookie>>(8*i));
+            uint8_t *stat=meta+KB2_FILESYSTEM_SNAPSHOT_STAT_STATX_OFFSET;
+            stat[KB2_FILESYSTEM_STATX_INO_OFFSET]=8;
+            stat[KB2_FILESYSTEM_STATX_SIZE_OFFSET]=99;
+            stat[KB2_FILESYSTEM_STATX_NLINK_OFFSET]=1;
+            goto encoded;
+        }
         assert(control);
         response.data_length=KB2_FILESYSTEM_STATX_SIZE;
         memset(output+KB2_FILESYSTEM_RESPONSE_SIZE,0,KB2_FILESYSTEM_STATX_SIZE);
@@ -54,6 +73,7 @@ static int exchange(struct filed_storage_owner *owner,const uint8_t *input,
                     (uint8_t)(mount_flags>>(8*i));
         }
     }
+encoded:
     assert(!kb2_fs_response_encode(output,capacity,&response));
     *used=KB2_FILESYSTEM_RESPONSE_SIZE+(size_t)response.data_length;return 0;
 }
@@ -136,5 +156,22 @@ int main(void)
     assert(!filed_storage_exec_stat(&runtime,42,&stat) && stat.size==99);
     assert(!filed_storage_exec_close(&runtime,42));
     assert(owner_calls==12 && ordinary_calls==11);
+    unsigned before=ordinary_calls;
+    assert(!filed_storage_snapshot_stat(&runtime,42,&stat));
+    assert(ordinary_calls==before+1 && stat.inode_generation==17 && stat.snapshot_valid &&
+        stat.change_cookie==31 && stat.inode==8 && stat.size==99);
+    int valid=1;
+    assert(!filed_storage_snapshot_pread(&runtime,42,0,data,8,&got,&stat,&valid) && valid);
+    assert(ordinary_calls==before+2 && got==8);
+    ++snapshot_cookie;valid=1;
+    assert(!filed_storage_snapshot_pread(&runtime,42,0,data,8,&got,&stat,&valid) && !valid);
+    snapshot_cookie=31;snapshot_valid=0;valid=1;
+    assert(!filed_storage_snapshot_pread(&runtime,42,0,data,8,&got,&stat,&valid) && !valid);
+    assert(!filed_storage_snapshot_stat(&runtime,42,&stat) && !stat.snapshot_valid);
+    snapshot_valid=1;snapshot_generation=0;
+    assert(!filed_storage_snapshot_stat(&runtime,42,&stat) && stat.snapshot_valid && !stat.inode_generation);
+    valid=1;
+    assert(!filed_storage_snapshot_pread(&runtime,42,0,data,8,&got,&stat,&valid) && valid);
+    puts("filed snapshot stat/pread: real metadata in one exchange each, changed/missing cookie and legitimate zero generation: PASS");
     puts("filed private EXEC_OPEN owner RPC / executable mmap noexec policy: PASS");
 }

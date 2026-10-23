@@ -121,6 +121,9 @@ pub fn build(b: *std.Build) void {
     memory_test.addFileArg(b.path("../tests/run-kernel-memory-unit.sh"));
     test_step.dependOn(&memory_test.step);
     test_step.dependOn(&run_unit_tests.step);
+    const tlb_protocol_test = b.addSystemCommand(&.{"python3"});
+    tlb_protocol_test.addFileArg(b.path("../tests/test_tlb_lazy_protocol.py"));
+    test_step.dependOn(&tlb_protocol_test.step);
     b.step("test-state", "Run kernel state lifecycle tests").dependOn(&run_unit_tests.step);
 
     const address_boundary_check = b.addSystemCommand(&.{"python3"});
@@ -260,7 +263,7 @@ pub fn build(b: *std.Build) void {
     // Real syscall dispatch links x86 trap assembly; the self-hosted backend
     // cannot encode it. Host fixtures fail if those privileged entries execute.
     const vm_test_filter = b.option([]const u8, "vm-test-filter", "Filter native VM host tests");
-    const mmio_overlay_tests = b.addTest(.{ .root_module = mmio_overlay_mod, .filters = if (vm_test_filter) |filter| &.{filter} else &.{ "MMIO overlay", "VM Hooks reject", "RAM cache source", "RAM cache preparation", "CPU membership", "MADT", "resident roots", "both registration", "shootdown mailbox", "generated syscall" }, .use_llvm = true });
+    const mmio_overlay_tests = b.addTest(.{ .root_module = mmio_overlay_mod, .filters = if (vm_test_filter) |filter| &.{filter} else &.{ "MMIO overlay", "VM Hooks reject", "RAM cache source", "RAM cache preparation", "CPU membership", "MADT", "resident roots", "both registration", "zero retention", "CPU storage preserves", "shootdown mailbox", "generated syscall", "direct syscall entry", "direct IPC kinds" }, .use_llvm = true });
     mmio_overlay_tests.stack_size = 64 * 1024 * 1024;
     const run_mmio_overlay = b.addRunArtifact(mmio_overlay_tests);
     test_step.dependOn(&run_mmio_overlay.step);
@@ -522,7 +525,9 @@ pub fn build(b: *std.Build) void {
         .use_llvm = true,
         .filters = &.{"futex"},
     });
-    test_step.dependOn(&b.addRunArtifact(futex_runtime_tests).step);
+    const futex_runtime_run = b.addRunArtifact(futex_runtime_tests);
+    test_step.dependOn(&futex_runtime_run.step);
+    b.step("test-pager-futex", "Test fault-free futex comparison under lock").dependOn(&futex_runtime_run.step);
 
     const smp_test_mod = b.createModule(.{
         .root_source_file = b.path("src/smp.zig"),
@@ -537,6 +542,7 @@ pub fn build(b: *std.Build) void {
     stack_paint_options.addOption(bool, "stack_high_water_enabled", b.option(bool, "stack-high-water", "Paint unused CPU stacks at boot for host-side high-water diagnostics") orelse false);
     const kernel_debug = b.option(bool, "kernel-debug", "Keep kernel debug information and symbols in the boot ELF") orelse false;
     const kernel_lock_check_options = b.addOptions();
+    kernel_lock_check_options.addOption(bool, "user_return_checks_enabled", kernel_debug);
     kernel_lock_check_options.addOption(bool, "reference_checks_enabled", b.option(bool, "kernel-reference-checks", "Compare maintained references with old table scans (migration only)") orelse false);
     const lock_checks = b.option(bool, "kernel-lock-checks", "Diagnose audited lock order and IRQ ownership (not production profiling)") orelse false;
     kernel_lock_check_options.addOption(bool, "lock_checks_enabled", lock_checks);
@@ -548,6 +554,8 @@ pub fn build(b: *std.Build) void {
     const ipc_profile_options = b.addOptions();
     ipc_profile_options.addOption(bool, "b3_enabled", b.option(bool, "b3-profile", "Single CPU bounded syscall path experiment; no production ABI") orelse false);
     ipc_profile_options.addOption(bool, "ipc_enabled", b.option(bool, "ipc-profile", "Enable per-CPU native IPC diagnostic counters") orelse false);
+    const wake_trace_enabled = b.option(bool, "wake-trace", "Enable bounded per-CPU wake timelines for stopped-QEMU diagnosis") orelse false;
+    ipc_profile_options.addOption(bool, "wake_trace_enabled", wake_trace_enabled);
     const normal_checkpoint_options = b.addOptions();
     normal_checkpoint_options.addOption([]const u8, "name", "off");
     const limine_mod = b.createModule(.{
@@ -559,7 +567,7 @@ pub fn build(b: *std.Build) void {
         .red_zone = false,
         // Profile snapshots resolve exact ELF symbols. Keep this host artifact;
         // strip its boot copy and verify identical PT_LOAD bytes before boot.
-        .strip = !kernel_debug and !smp_profile_enabled,
+        .strip = !kernel_debug and !smp_profile_enabled and !wake_trace_enabled,
     });
     const kernel_boot_api_mod = b.createModule(.{
         .root_source_file = b.path("src/bootloader_api.zig"),
@@ -573,11 +581,13 @@ pub fn build(b: *std.Build) void {
     _ = diag_font_files.addCopyFile(b.path("../.artifacts/third_party/libvterm-0.3.3/build/font.psf"), "font.psf");
     kernel_boot_api_mod.addImport("boot_diag_font", b.createModule(.{ .root_source_file = diag_font_source }));
     kernel_boot_api_mod.addImport("kernel_abi_root", kernel_abi_root_mod);
+    const kernel_lock_options_mod = kernel_lock_check_options.createModule();
+    kernel_boot_api_mod.addImport("kernel_lock_check_options", kernel_lock_options_mod);
     limine_mod.addImport("kernel_abi_root", kernel_abi_root_mod);
     limine_mod.addOptions("smp_profile_options", smp_profile_options);
     limine_mod.addOptions("ipc_profile_options", ipc_profile_options);
     limine_mod.addOptions("kernel_log_ring_options", log_ring_options);
-    limine_mod.addOptions("kernel_lock_check_options", kernel_lock_check_options);
+    limine_mod.addImport("kernel_lock_check_options", kernel_lock_options_mod);
     limine_mod.addOptions("stack_paint_options", stack_paint_options);
     limine_mod.addOptions("boot_checkpoint_options", normal_checkpoint_options);
     limine_mod.addImport("kernel_boot_api", kernel_boot_api_mod);

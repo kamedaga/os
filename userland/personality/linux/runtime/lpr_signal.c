@@ -1,5 +1,6 @@
 #include "lpr_filed_internal.h"
 #include <personality/lpr_signal_stack.h>
+#include "lpr_wait_trace.h"
 
 __asm__(
     ".pushsection .text\n"
@@ -19,6 +20,22 @@ void lpr_linux_signal_hint_reset_for_fork_child(void)
      * inherited word may read 0. */
     lpr_native_pending_hint = 1;
     lpr_native_pending_hint_active = 0;
+    lpr_signal_thread_state_t *state = lpr_signal_thread_state_current();
+    state->native_pending_hint = 1;
+    state->native_pending_hint_active = 0;
+}
+
+void lpr_linux_register_thread_signal_hint(lpr_signal_thread_state_t *state)
+{
+    if (state == 0 || state->native_pending_hint_active) return;
+    /* Register a slot owned by this thread. Its storage stays mapped until
+     * process teardown, so a delayed kernel publication is only a stale 1. */
+    state->native_pending_hint = 1;
+    if (lpr_pacha_syscall2(
+            PACHAOS_SYSCALL_PROCESS_SIGNAL_CTL,
+            PACHAOS_PROCESS_SIGNAL_CTL_SET_THREAD_PENDING_HINT,
+            (uint64_t)(uintptr_t)&state->native_pending_hint) == PACHAOS_SYSCALL_OK)
+        state->native_pending_hint_active = 1;
 }
 
 enum {
@@ -135,6 +152,8 @@ _Static_assert(
     "native signal runtime stack must not overlap the Linux signal frame");
 
 extern void lpr_async_signal_entry(void);
+extern void lpr_fault_entry(void);
+extern void lpr_signal_enter_handler(void);
 extern void lpr_async_signal_restorer(void);
 extern void lpr_syscall_entry(void);
 extern char lpr_runtime_text_start[];
@@ -227,9 +246,26 @@ void lpr_linux_signal_runtime_init(void)
      * their slot in lpr_clone_thread_bootstrap(), and a fork child clears
      * runtime_registered, so its first syscall still comes through here. */
     if (lpr_linux_signal_runtime_registered) {
+        /* A lone thread can reuse its published slot without GETTID. Keep
+         * the frame pointer valid even if an async signal arrives mid-call.
+         * The 1->2 and 2->1 transitions invalidate or bypass this shortcut. */
+        if (__atomic_load_n(&lpr_state.thread_count, __ATOMIC_ACQUIRE) == 1u) {
+            lpr_signal_thread_state_t *state = lpr_signal_thread_state_single_cached();
+            if (state == 0) {
+                state = lpr_signal_thread_state_current();
+                lpr_signal_thread_state_single_publish(state);
+            }
+            const struct lpr_linux_user_frame *frame = lpr_current_linux_user_frame();
+            if (frame != 0)
+                ((struct lpr_linux_user_frame *)frame)->runtime_signal_state =
+                    (uint64_t)(uintptr_t)state;
+        } else {
+            (void)lpr_signal_thread_state_current();
+        }
         return;
     }
     lpr_signal_thread_state_prepare_current();
+    lpr_linux_fault_runtime_init();
     const int64_t status = lpr_pacha_syscall6(
         PACHAOS_SYSCALL_PROCESS_SIGNAL_CTL,
         PACHAOS_PROCESS_SIGNAL_CTL_REGISTER,
@@ -239,6 +275,10 @@ void lpr_linux_signal_runtime_init(void)
         LPR_ZPOLINE_PAGE_VA,
         LPR_ZPOLINE_PAGE_VA + LPR_ZPOLINE_PAGE_SIZE);
     if (status == PACHAOS_SYSCALL_OK) {
+        lpr_signal_thread_state_t *single_state = lpr_signal_thread_state_current();
+        lpr_linux_register_thread_signal_hint(single_state);
+        if (__atomic_load_n(&lpr_state.thread_count, __ATOMIC_ACQUIRE) == 1u)
+            lpr_signal_thread_state_single_publish(single_state);
         /* Best effort: the hint only removes a syscall.  Letting it gate
          * registration would turn an optimisation failure into a runtime that
          * re-registers on every syscall.  Without it every intercepted Linux
@@ -262,6 +302,59 @@ void lpr_linux_signal_runtime_init(void)
             lpr_linux_signal_runtime_registered = 1;
         }
     }
+}
+
+void lpr_linux_fault_runtime_init(void)
+{
+    lpr_signal_thread_state_t *state = lpr_signal_thread_state_current();
+    // Native fork snapshots the address space and these ownership records
+    // together. Exclude it from allocation through publication, and from
+    // unregistration through unmap/withdrawal; a stale copied VA is not a
+    // capability to unmap a sibling's stack in the child.
+    lpr_state_lock(&lpr_state.signal.fault_registry_lock);
+    if (state->fault_registered) {
+        lpr_state_unlock(&lpr_state.signal.fault_registry_lock);
+        return;
+    }
+    if (!state->fault_stack) {
+        const int64_t stack = lpr_pacha_syscall6(PACHAOS_SYSCALL_MMAP, 0, 0,
+            LPR_SIGNAL_FAULT_STACK_BYTES, PACHAOS_PROT_READ | PACHAOS_PROT_WRITE,
+            PACHAOS_MMAP_PRIVATE | PACHAOS_MMAP_ANONYMOUS, 0);
+        if (stack < 4096) {
+            (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_PROCESS_EXIT, 128u + 11u);
+            for (;;) {}
+        }
+        state->fault_stack = (uint64_t)stack;
+    }
+    if (lpr_pacha_syscall4(PACHAOS_SYSCALL_PROCESS_SIGNAL_CTL,
+        PACHAOS_PROCESS_SIGNAL_CTL_REGISTER_FAULT, (uintptr_t)lpr_fault_entry,
+        state->fault_stack, LPR_SIGNAL_FAULT_STACK_BYTES) != PACHAOS_SYSCALL_OK) {
+        (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_PROCESS_EXIT, 128u + 11u);
+        for (;;) {}
+    }
+    state->fault_registered = 1;
+    lpr_state_unlock(&lpr_state.signal.fault_registry_lock);
+}
+
+void lpr_linux_fault_runtime_destroy(void)
+{
+    lpr_signal_thread_state_t *state = lpr_signal_thread_state_current();
+    lpr_state_lock(&lpr_state.signal.fault_registry_lock);
+    if (state->fault_registered && lpr_pacha_syscall4(PACHAOS_SYSCALL_PROCESS_SIGNAL_CTL,
+        PACHAOS_PROCESS_SIGNAL_CTL_REGISTER_FAULT, 0, 0, 0) != PACHAOS_SYSCALL_OK) {
+        (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_PROCESS_EXIT, 128u + 11u);
+        for (;;) {}
+    }
+    state->fault_registered = 0;
+    if (state->fault_stack) {
+        if (lpr_pacha_syscall2(PACHAOS_SYSCALL_MUNMAP, state->fault_stack,
+            LPR_SIGNAL_FAULT_STACK_BYTES) != PACHAOS_SYSCALL_OK) {
+            (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_PROCESS_EXIT, 128u + 11u);
+            for (;;) {}
+        }
+        state->fault_stack = 0;
+    }
+    lpr_state_unlock(&lpr_state.signal.fault_registry_lock);
 }
 
 int64_t lpr_linux_sync_native_signal_mask(void)
@@ -467,13 +560,19 @@ int64_t lpr_linux_rt_sigtimedwait(
 void lpr_linux_deliver_native_pending_frame_after_wait(
     int64_t interrupted_result, unsigned *wait_not_ready)
 {
-    /* The kernel keeps one hint word per process, but a pending signal belongs
-     * to one thread.  With a sibling running, clearing the word here could
-     * consume the hint published for that sibling, which would then return to
-     * Linux code without asking.  Trust it only while this is the only thread;
-     * siblings never clear it, so the word can only gain a stale 1 meanwhile. */
-    const int use_hint = lpr_native_pending_hint_active &&
-        __atomic_load_n(&lpr_state.thread_count, __ATOMIC_ACQUIRE) <= 1u;
+    struct lpr_linux_user_frame *interrupted_frame =
+        (struct lpr_linux_user_frame *)lpr_current_linux_user_frame();
+    if (interrupted_frame == 0) return;
+    lpr_signal_thread_state_t *state = interrupted_frame->runtime_signal_state ?
+        (lpr_signal_thread_state_t *)(uintptr_t)interrupted_frame->runtime_signal_state : 0;
+    const int thread_hint = state != 0 && state->native_pending_hint_active;
+    /* A registered thread slot may be cleared by its owner. The older
+     * process-wide word is only safe to clear while no sibling can own a
+     * pending signal; otherwise a sibling's publication could be lost. */
+    const int use_hint = thread_hint || (lpr_native_pending_hint_active &&
+        __atomic_load_n(&lpr_state.thread_count, __ATOMIC_ACQUIRE) <= 1u);
+    volatile uint32_t *hint = thread_hint ? &state->native_pending_hint :
+        &lpr_native_pending_hint;
     /* The interrupting kernel pending bit precedes the wake, but its hint
      * copyout runs after the wake. A resumed wait can therefore see 0 before
      * publication: skipping the query here would consume that interruption
@@ -481,16 +580,14 @@ void lpr_linux_deliver_native_pending_frame_after_wait(
      * only ordinary completions may take the advisory-zero fast path. */
     if (use_hint && !(wait_not_ready && *wait_not_ready) &&
         interrupted_result != -LPR_LINUX_EINTR &&
-        lpr_native_pending_hint == 0) return;
-    struct lpr_linux_user_frame *interrupted_frame =
-        (struct lpr_linux_user_frame *)lpr_current_linux_user_frame();
-    if (interrupted_frame == 0) return;
+        *hint == 0) return;
     /* Cleared before the ask: a signal queued while the syscall runs makes the
      * kernel set it again, so nothing is lost. */
-    if (use_hint) lpr_native_pending_hint = 0;
+    if (use_hint) *hint = 0;
     if (wait_not_ready) *wait_not_ready = 0;
     const uint64_t saved_rax = interrupted_frame->rax;
     interrupted_frame->rax = (uint64_t)interrupted_result;
+    lpr_wait_trace_record(7, saved_rax, (uint64_t)(uintptr_t)hint);
     // A successful DELIVER_PENDING_FRAME redirects directly to the native
     // signal entry, so the interrupted dispatch and its stack-local frame
     // anchor are abandoned together.
@@ -498,6 +595,7 @@ void lpr_linux_deliver_native_pending_frame_after_wait(
         PACHAOS_SYSCALL_PROCESS_SIGNAL_CTL,
         PACHAOS_PROCESS_SIGNAL_CTL_DELIVER_PENDING_FRAME,
         (uint64_t)(uintptr_t)interrupted_frame);
+    lpr_wait_trace_record(8, saved_rax, (uint64_t)interrupted_result);
     // Reached only when no signal frame was installed.
     interrupted_frame->rax = saved_rax;
 }
@@ -563,7 +661,7 @@ static void lpr_signal_context_from_linux(
     lpr_memcpy(native->x_state, ucontext->fpregs_mem, sizeof(ucontext->fpregs_mem));
 }
 
-void *lpr_linux_async_signal_prepare(void *native_raw)
+static void *lpr_signal_prepare(void *native_raw, uint64_t stack_top, int synchronous)
 {
     lpr_pacha_signal_frame_t *native = (lpr_pacha_signal_frame_t *)native_raw;
     if (native == 0 || native->magic != PACHAOS_PROCESS_SIGNAL_FRAME_MAGIC ||
@@ -588,7 +686,7 @@ void *lpr_linux_async_signal_prepare(void *native_raw)
     lpr_linux_sigaction_record_t *action = &lpr_linux_sigactions[sig];
     lpr_signal_thread_state_t *thread_state =
         lpr_signal_thread_state_current();
-    if (__atomic_load_n(
+    if (!synchronous && __atomic_load_n(
             &thread_state->sigwait_active,
             __ATOMIC_ACQUIRE) != 0u)
     {
@@ -661,7 +759,6 @@ void *lpr_linux_async_signal_prepare(void *native_raw)
         lpr_linux_exit_for_signal(sig);
     }
 
-    uint64_t stack_top = (uint64_t)(uintptr_t)native;
     const int already_on_altstack = lpr_signal_sp_on_altstack(native->context.rsp);
     const int altstack_enabled =
         (lpr_linux_altstack_flags & LPR_LINUX_SS_DISABLE) == 0 &&
@@ -730,6 +827,55 @@ void *lpr_linux_async_signal_prepare(void *native_raw)
         action->handler = LPR_LINUX_SIG_DFL;
     }
     return body;
+}
+
+void *lpr_linux_async_signal_prepare(void *native_raw)
+{
+    return lpr_signal_prepare(native_raw, (uint64_t)(uintptr_t)native_raw, 0);
+}
+
+static uint32_t lpr_fault_linux_signal(uint64_t vector, uint64_t error_code)
+{
+    switch (vector) {
+    case 0: case 9: case 16: case 19: return 8; // Arithmetic exceptions.
+    case 1: case 3: return 5; // Debug / INT3 are traps, not illegal opcodes.
+    case 6: return 4;
+    case 11: case 12: case 17: return 7; // Segment / alignment bus errors.
+    case 14: return error_code & PACHAOS_FAULT_ERROR_BACKING_UNAVAILABLE ? 7 : 11;
+    default: return 11;
+    }
+}
+
+_Noreturn void lpr_linux_fault_prepare(void *raw)
+{
+    struct lpr_fault_frame {
+        lpr_pacha_signal_frame_t signal;
+        uint64_t vector, error_code, address;
+    } *fault = raw;
+    if (!fault || fault->signal.magic != PACHAOS_PROCESS_SIGNAL_FRAME_MAGIC ||
+        fault->signal.size != PACHAOS_PROCESS_FAULT_FRAME_SIZE || fault->signal.signo ||
+        fault->signal.xstate_features != PACHAOS_PROCESS_SIGNAL_XSTATE_FEATURE_MASK)
+        lpr_linux_exit_for_signal(11);
+    const uint32_t sig = lpr_fault_linux_signal(fault->vector, fault->error_code);
+    if (lpr_linux_sigactions[sig].handler == LPR_LINUX_SIG_IGN ||
+        (lpr_linux_signal_mask & lpr_linux_signal_bit(sig)))
+        lpr_linux_exit_for_signal(sig);
+    lpr_pacha_signal_frame_t synthetic;
+    lpr_memcpy(&synthetic, &fault->signal, sizeof(synthetic));
+    synthetic.size = sizeof(synthetic);
+    synthetic.signo = sig;
+    lpr_linux_signal_frame_t *body = lpr_signal_prepare(&synthetic,
+        synthetic.context.rsp, 1);
+    body->info.si_code = sig == 7 ? 2 : fault->vector == 14 && (fault->error_code & 1) ? 2 : 1;
+    body->info.payload[0] = fault->address;
+    // Complete the ORIGINAL native fault before arbitrary handler code runs.
+    // Otherwise a second synchronous fault inside that handler could not be
+    // delivered. The ordinary Linux signal frame retains every original GPR
+    // and XState byte for rt_sigreturn; only this immediate return is redirected.
+    fault->signal.context.rip = (uintptr_t)lpr_signal_enter_handler;
+    fault->signal.context.rax = (uintptr_t)body;
+    fault->signal.context.rsp = (uintptr_t)body - 8;
+    lpr_native_signal_return(&fault->signal);
 }
 
 _Noreturn void lpr_linux_rt_sigreturn_body(void *body_raw)

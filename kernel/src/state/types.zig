@@ -219,6 +219,7 @@ pub const KernelObjectKind = enum(u16) {
     timer = 13,
     serial = 14,
     pipe = 15,
+    pager_port = 16,
 };
 
 pub const TaskObjectState = enum(u8) {
@@ -382,6 +383,7 @@ pub const KernelObjectPayload = union(KernelObjectKind) {
     timer: TimerObject,
     serial: SerialObject,
     pipe: PipeEndpointObject,
+    pager_port: PagerPortRef,
 };
 
 // Only revoke-traversable objects need holder edges. The payload edge is
@@ -1279,9 +1281,9 @@ pub const native_page_size: u64 = 4096;
 pub const NativeVmoKind = enum(u8) {
     none = 0,
     anonymous = 1,
-    /// A read/write, non-executable scatter view of pages owned by an
-    /// anonymous parent VMO. The view owns only its page-index metadata; its
-    /// parent reference owns the physical pages.
+    /// A capability-bounded scatter view of an anonymous parent's pages.
+    /// Explicit sparse holes are unavailable backing. The view owns metadata
+    /// only; parent ownership and external borrowers' page pins are distinct.
     page_view = 2,
     /// Borrowed BAR pages, never allocator-owned RAM. Admission and cache
     /// leases must be established before this backing can acquire VMAs.
@@ -1290,6 +1292,89 @@ pub const NativeVmoKind = enum(u8) {
     /// kernel reference keeps it alive; it is mapped shared and read-only only,
     /// and is excluded from DMA pinning, cache policy, growth and page views.
     kernel_page = 4,
+    // Pages enter this VMO only through an authorized pager supply. In
+    // particular an absent entry cannot take the anonymous zero-fill path.
+    pager = 5,
+};
+
+pub const PagerPortRef = struct {
+    index: u32 = 0,
+    generation: u32 = 0,
+    pub fn isNull(self: PagerPortRef) bool { return self.generation == 0; }
+};
+
+pub const PagerRequestRef = struct {
+    index: u32 = 0,
+    generation: u32 = 0,
+    pub fn isNull(self: PagerRequestRef) bool { return self.generation == 0; }
+};
+pub const PagerWaiterRef = struct {
+    index: u32 = 0,
+    generation: u32 = 0,
+    pub fn isNull(self: PagerWaiterRef) bool { return self.generation == 0; }
+};
+pub const PagerReleaseRef = struct {
+    index: u32 = 0,
+    generation: u32 = 0,
+    pub fn isNull(self: PagerReleaseRef) bool { return self.generation == 0; }
+};
+
+// K and the shared-VM lock can each enter pager state, but every list below
+// has one writer domain: KernelState.pager_lock. Never keep a pointer from a
+// slot after releasing that lock unless a retained VMO/FD pins its lifetime.
+pub const PagerPortSlot = struct {
+    generation: u32 = 1,
+    live: bool = false,
+    owner: PrincipalRaw = 0,
+    attach_count: u32 = 0,
+    queued_faults: u32 = 0,
+    first_fault: PagerRequestRef = .{},
+    last_fault: PagerRequestRef = .{},
+    first_unpublished: PagerRequestRef = .{},
+    last_unpublished: PagerRequestRef = .{},
+    first_release: PagerReleaseRef = .{},
+    last_release: PagerReleaseRef = .{},
+    waiting: PagerWaiterRef = .{},
+    first_request: PagerRequestRef = .{},
+};
+pub const PagerRequestSlot = struct {
+    generation: u32 = 1,
+    active: bool = false,
+    vmo: NativeVmoRef = .{},
+    port: PagerPortRef = .{},
+    page_index: u32 = 0,
+    request_id: u64 = 0,
+    wait_started_ns: u64 = 0,
+    access: u32 = 0,
+    status: enum(u8) { pending, failed } = .pending,
+    reason: u32 = 0,
+    retained: bool = false,
+    published: bool = false,
+    queue: enum(u2) { none, fault, unpublished } = .none,
+    prev: PagerRequestRef = .{},
+    next: PagerRequestRef = .{},
+    next_failed: PagerRequestRef = .{},
+    next_port: PagerRequestRef = .{},
+    prev_port: PagerRequestRef = .{},
+    waiters: PagerWaiterRef = .{},
+};
+pub const PagerWaiterSlot = struct {
+    generation: u32 = 1,
+    owner: PrincipalId = default_process_principal,
+    thread_index: usize = 0,
+    thread_generation: u32 = 0,
+    token: u64 = 0,
+    resume_rax: u64 = @import("kernel_abi_root").pager_abi.wait_wake_retry_status,
+    next: PagerWaiterRef = .{},
+};
+pub const PagerReleaseSlot = struct {
+    generation: u32 = 1,
+    key: u64 = 0,
+    attach_generation: u64 = 0,
+    port: PagerPortRef = .{},
+    vmo: NativeVmoRef = .{}, // weak: final drop moves this tombstone to queue
+    queued: bool = false,
+    next: PagerReleaseRef = .{},
 };
 
 pub const DeviceMemoryCache = enum(u8) { uc, wc };
@@ -1335,7 +1420,21 @@ pub const NativeVmoSlot = struct {
     page_store: backing_index.Store = .{},
     page_store_owner: u64 = 0,
     has_page_store: bool = false,
+    // A separate sparse index keeps pending/failed pager request identity by
+    // page. Its values are encoded request refs, never physical addresses.
+    pager_request_store: backing_index.Store = .{},
+    pager_request_start: BackingRef = .{},
     zero_on_demand: bool = false,
+    pager_port: PagerPortRef = .{},
+    pager_key: u64 = 0,
+    pager_attach_generation: u64 = 0,
+    pager_owner: PrincipalRaw = 0,
+    pager_release: PagerReleaseRef = .{},
+    pager_failed_head: PagerRequestRef = .{},
+    // Borrowed backing may be replaced, but neither a hole nor an attenuated
+    // updater FD may enlarge the authority established at publication.
+    page_view_sparse: bool = false,
+    page_view_max_prot: VmaProt = .{ .read = true, .write = true },
     // Cached RAM cannot be recycled at final drop under an inner VM lock.
     // The outer retirement path restores WB before returning owned pages.
     ram_cache_state: enum(u8) { wb, cached, retiring } = .wb,
@@ -1431,6 +1530,9 @@ pub const VmaEntry = struct {
     device_backing: bool = false,
     references: ?*VmaReferences = null,
     active: bool = false,
+    // Position in the owning table's swap-with-last list, never a VMA slot.
+    // Fork/split publication replaces the source snapshot's position.
+    active_position: u32 = 0,
     start_va: u64 = 0,
     size_bytes: u64 = 0,
     prot: VmaProt = .{},
@@ -1455,6 +1557,8 @@ pub const VmaTable = struct {
     reference_slots: slot_storage.SlotTable(VmaReferences) = .{},
     reference_owner: u32 = 0,
     reference_generation: u32 = 0,
+    // Mark mask 1 is reserved for one munmap's pre-mutation overlap set.
+    // The owning VM transaction + K exclude other users; no marks survive it.
     entries: slot_storage.SlotTable(VmaEntry) = .{},
     allocator: ?@import("../memory/owned_storage.zig").Allocator = null,
     active_indices: slot_storage.SlotTable(u32) = .{},
@@ -1494,6 +1598,39 @@ pub const VmaTable = struct {
             if (entry.start_va >= end) cursor = entry.references.?.address_node.child[0] else if (entry.endVa() <= start) cursor = entry.references.?.address_node.child[1] else return true;
         }
         return false;
+    }
+
+    pub const OverlapIterator = struct {
+        table: *VmaTable,
+        cursor: ?*VmaEntry,
+        start: u64,
+        end: u64,
+        previous_end: ?u64 = null,
+
+        pub fn next(self: *OverlapIterator) ?*VmaEntry {
+            const entry = self.cursor orelse return null;
+            if (entry.start_va >= self.end) return null;
+            std.debug.assert(entry.active and entry.endVa() > self.start);
+            if (self.previous_end) |end| std.debug.assert(end <= entry.start_va);
+            self.previous_end = entry.endVa();
+            self.cursor = self.table.address_index.successor(entry);
+            if (self.cursor) |next_entry| std.debug.assert(entry.endVa() <= next_entry.start_va);
+            return entry;
+        }
+    };
+
+    /// O(log N + overlaps), valid only while the VM transaction keeps the
+    /// published disjoint ranges stable. Finish the walk before any mutation:
+    /// split publication can temporarily contain equal-start fragments.
+    pub fn overlapping(self: *VmaTable, start: u64, end: u64) OverlapIterator {
+        var first: ?*VmaEntry = null;
+        if (start < end) {
+            first = self.address_index.lastAtOrBefore(.{ .start = start, .slot = std.math.maxInt(u32) });
+            if (first) |entry| {
+                if (entry.endVa() <= start) first = self.address_index.successor(entry);
+            } else first = self.address_index.first;
+        }
+        return .{ .table = self, .cursor = first, .start = start, .end = end };
     }
 };
 

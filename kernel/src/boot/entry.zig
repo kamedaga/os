@@ -137,6 +137,7 @@ fn kernelStaticStorageEndAddr() usize {
     end = maxStaticEnd(end, xstate_runtime.staticEnd());
     end = maxStaticEnd(end, smp.kernelStaticStorageEndAddr());
     end = maxStaticEnd(end, @import("../smp_perf.zig").staticEnd());
+    end = maxStaticEnd(end, @import("../wake_trace.zig").staticEnd());
     end = maxStaticEnd(end, @import("../sync/lock_diagnostics.zig").staticEnd());
     end = maxStaticEnd(end, x86_platform.kernelStaticStorageEndAddr());
     return end;
@@ -598,10 +599,8 @@ fn enterUserModeIretq(user_entry_va: u64, user_rsp: u64) noreturn {
     const user_ss: u64 = boot_static.gdt_user_data_selector | 0x3;
     const user_rflags: u64 = boot_static.user_entry_rflags;
     const kernel_transition_rsp = x86_platform.ring0StackTop();
-    const first_user_cr3 = scheduler.currentCr3();
-    // BSP first entry has no preceding return helper. Publish residency before
-    // the load as on every later return; this first load remains flushing.
-    _ = @import("../tlb_residency.zig").enter(smp.currentCpuSlot(), first_user_cr3);
+    // First entry uses the same publication/fence API, with a flushing load.
+    const first_user_cr3 = x86_platform.userReturnCr3(scheduler.currentCr3(), true);
 
     xstate_runtime.restoreCurrentThreadXState();
 
@@ -615,9 +614,10 @@ fn enterUserModeIretq(user_entry_va: u64, user_rsp: u64) noreturn {
 
     asm volatile (
         \\mov %[k_rsp], %%rsp
-        \\lea user_return_iret_frame(%rip), %%rsp
         \\mov %[ucr3], %%rax
         \\mov %%rax, %%cr3
+    ++ traps.asmAssertUserCr3() ++
+        \\lea user_return_iret_frame(%rip), %%rsp
         \\iretq
         :
         : [k_rsp] "r" (kernel_transition_rsp),
@@ -953,6 +953,8 @@ fn wireRuntimeSubsystems(state: *kernel.KernelState, memory_stats: boot_static.M
         .write_user_u64 = user_copy.writeUserU64,
         .copy_user_bytes_from_va = user_copy.copyUserBytesFromVa,
         .copy_bytes_to_user_va = user_copy.copyBytesToUserVa,
+        .probe_user_range = user_copy.probeUserRange,
+        .resident_read_user_u32 = user_copy.readUserU32Resident,
         .wake_waiting_thread_for_principal = scheduler.wakeMailboxWaiter,
         .thread_wake_target_is_live = scheduler.threadWakeTargetIsLive,
         .wake_waiting_thread_generation = scheduler.wakeIfWaitingGeneration,

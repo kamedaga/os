@@ -9,6 +9,11 @@
 
 struct filed_storage_owner;
 struct ph_fs_channel_config;
+/* Take exactly the authenticated attachment for a successful shared export.
+ * Errors retain received capabilities for owner cleanup, never lose them. */
+int filed_storage_owner_take_shared(struct filed_storage_owner *, uint64_t id,
+    uint64_t sequence, uint64_t length, pacha_fd_t *fd);
+int filed_storage_owner_cancel_shared(struct filed_storage_owner *);
 
 int filed_storage_owner_create(pacha_fd_t bootfs_fd, uint64_t bootfs_size,
     const storage_filed_bootstrap_t *bootstrap, struct filed_storage_owner **out);

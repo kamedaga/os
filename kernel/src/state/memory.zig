@@ -118,7 +118,7 @@ const initRuntimeStorage = types.initRuntimeStorage;
 // extents without either borrower exclusion or PMM return.
 fn initializeStorageInPlace(self: anytype) void {
     @memset(std.mem.asBytes(self), 0);
-    inline for (.{ "fd_objects", "pipes", "native_vmos", "ipc_endpoints", "ipc_channels", "ipc_replies", "task_fd_waiters", "fd_wait_groups", "fd_wait_group_links", "fd_wait_group_thread_counts", "irq_publish_slots" }) |name| @field(self, name) = .{};
+    inline for (.{ "fd_objects", "pipes", "native_vmos", "ipc_endpoints", "ipc_channels", "ipc_replies", "task_fd_waiters", "fd_wait_groups", "fd_wait_group_links", "fd_wait_group_thread_counts", "irq_publish_slots", "pager_ports", "pager_requests", "pager_waiters", "pager_releases" }) |name| @field(self, name) = .{};
     self.fd_process_capacity = types.process_count;
     self.process_timers = .{};
     // Force the first lock release to publish the (empty) timer deadline.

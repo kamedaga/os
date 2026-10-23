@@ -10,7 +10,7 @@ mkdir -p .artifacts/fs-cutover-filed-tests
   -Ikobox2/protocol/include -Ikobox2/protocol/generated/include \
   -Iuserland/filed/include -Iuserland/libipc/include -Iuserland/libpacha/include \
   -Iuserland/personality/include -Iuserland/storage/include \
-  userland/filed/tests/session_detach_test.c userland/filed/src/exec_payload.c \
+  userland/filed/tests/session_detach_test.c userland/filed/src/snapshot_cache.c userland/filed/tests/pager_stub.c userland/filed/src/exec_payload.c \
   userland/kobox2_owner/fs_channel.c kobox2/protocol/src/filesystem.c \
   kobox2/protocol/src/protocol.c kobox2/protocol/src/virtqueue.c \
   kobox2/protocol/src/virtqueue_memory.c kobox2/protocol/arch/x86_64/virtqueue_atomic.c \

@@ -8,6 +8,7 @@
 #include "support/string.h"
 #include "support/syscall.h"
 #include "support/mmap_profile.h"
+#include "lpr_wait_trace.h"
 #include <pacha/ipc.h>
 #include <pacha/status.h>
 #include <pacha/trace.h>
@@ -2037,8 +2038,13 @@ static int64_t lpr_map_private_zero_range(
      * including when mprotect runs after the initial non-executable mmap. */
     const uint64_t rights = PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_MAP_READ |
         PACHA_FD_RIGHT_MAP_WRITE | (executable ? PACHA_FD_RIGHT_MAP_EXEC : 0);
+    /* Zero-on-demand, like Linux anonymous memory. An eager VMO allocated and
+     * zeroed the whole span (85 MiB for WebKit) although a file image then
+     * overlays most of it, and the remaining tail mapping kept every one of
+     * those pages alive. Faults allocate only the pages actually touched. */
     const int64_t vmo = lpr_pacha_syscall3(PACHAOS_SYSCALL_VMO_CREATE,
-        map_len, rights, PACHA_FD_FLAG_PRIVATE | PACHA_FD_FLAG_CLOEXEC);
+        map_len, rights, PACHA_FD_FLAG_PRIVATE | PACHA_FD_FLAG_CLOEXEC |
+            PACHAOS_VMO_CREATE_ZERO_ON_DEMAND);
     if (vmo < 16) return vmo;
     const int64_t mapped = lpr_drm_native_mmap(vmo, addr, map_len, prot,
         (map_flags | PACHAOS_MMAP_PRIVATE) &
@@ -2134,9 +2140,10 @@ int64_t lpr_backend_mmap(uint64_t addr, uint64_t len, uint64_t prot, uint64_t fl
             /* The shared VMO's transferred rights are the lifetime ceiling
              * for mprotect, not merely the initial PTE protection.  Derive
              * write authority from the open file description and seals;
-             * Filed still validates it with pwrite_prepare before issuing
-             * MAP_WRITE.  Readable Filed mappings may later become RX under
-             * the existing executable-file policy. */
+             * FileD authenticates the caller; Linux validates file mode,
+             * seals, noexec and mmap admission before granting that ceiling.
+             * Readable mappings may later become RX only if the returned
+             * native capability actually delegates executable authority. */
             const int writable =
                 (file->flags & LPR_LINUX_O_ACCMODE) == LPR_LINUX_O_RDWR &&
                 !lpr_memfd_write_is_sealed(file->reserved1);
@@ -2147,6 +2154,7 @@ int64_t lpr_backend_mmap(uint64_t addr, uint64_t len, uint64_t prot, uint64_t fl
                 map_len,
                 writable,
                 executable,
+                (uint32_t)prot,
                 &file_size);
             map_profile[1] = lpr_map_profile_clock();
             (void)file_size;
@@ -2168,7 +2176,7 @@ int64_t lpr_backend_mmap(uint64_t addr, uint64_t len, uint64_t prot, uint64_t fl
                 map_len,
                 lpr_linux_prot_to_pacha(prot),
                 pacha_flags,
-                offset);
+                0); // Shared export is a range view; Linux offset is consumed by FileD.
             map_profile[2] = lpr_map_profile_clock();
             (void)lpr_pacha_syscall1(
                 PACHAOS_SYSCALL_FD_CLOSE,
@@ -2241,7 +2249,8 @@ int64_t lpr_backend_mmap(uint64_t addr, uint64_t len, uint64_t prot, uint64_t fl
         const uint64_t snapshot_length = offset < whole_file_bytes ? direct_file_map_len :
             (whole_file_bytes < 4096 ? whole_file_bytes : 4096);
         int64_t authorized_vmo = -1;
-        uint64_t authorized_loaded = 0;
+        int authorized_pager = 0, pager_rx_mapping = 0;
+        uint64_t authorized_loaded = 0, authorized_offset = 0;
         if (executable) {
             /* A local anonymous copy cannot establish the file's execution
              * authority. Obtain a positive FILE_VMO EXEC grant before any
@@ -2252,7 +2261,8 @@ int64_t lpr_backend_mmap(uint64_t addr, uint64_t len, uint64_t prot, uint64_t fl
                 return -LPR_LINUX_EINVAL;
             if (!requested_end) return -LPR_LINUX_EOVERFLOW;
             authorized_vmo = lpr_linux_file_vmo(
-                fd, snapshot_offset, snapshot_length, 1, &authorized_loaded);
+                fd, snapshot_offset, snapshot_length, 1, &authorized_loaded, &authorized_offset,
+                &authorized_pager);
             if (authorized_vmo < 16)
                 return authorized_vmo < 0 ? authorized_vmo : -LPR_LINUX_EIO;
         }
@@ -2294,16 +2304,20 @@ int64_t lpr_backend_mmap(uint64_t addr, uint64_t len, uint64_t prot, uint64_t fl
             whole_file_bytes != 0 &&
             (whole_file_map_len >= requested_end || split_file_image))
         {
-            uint64_t loaded = 0;
+            uint64_t loaded = 0, vmo_offset = 0;
+            int file_pager = 0;
             profile_stage = lpr_startup_profile_stage_begin();
             int64_t file_vmo_fd;
             if (authorized_vmo >= 16) {
                 file_vmo_fd = authorized_vmo;
                 authorized_vmo = -1;
                 loaded = authorized_loaded;
+                vmo_offset = authorized_offset;
+                file_pager = authorized_pager;
             } else {
                 file_vmo_fd = lpr_linux_file_vmo(
-                    fd, snapshot_offset, snapshot_length, 0, &loaded);
+                    fd, snapshot_offset, snapshot_length, 0, &loaded, &vmo_offset,
+                    &file_pager);
             }
             const uint64_t file_vmo_cycles = lpr_startup_profile_stage_end(
                 LPR_STARTUP_MMAP_STAGE_FILE_VMO, profile_stage);
@@ -2317,7 +2331,7 @@ int64_t lpr_backend_mmap(uint64_t addr, uint64_t len, uint64_t prot, uint64_t fl
                     direct_file_map_len,
                     initial_prot,
                     direct_map_flags,
-                    0,
+                    vmo_offset,
                     executable);
                 lpr_startup_profile_stage_end(
                     LPR_STARTUP_MMAP_STAGE_NATIVE_MMAP, profile_stage);
@@ -2331,6 +2345,7 @@ int64_t lpr_backend_mmap(uint64_t addr, uint64_t len, uint64_t prot, uint64_t fl
                     const uint64_t available = loaded;
                     done = available < len ? available : len;
                     mapped_prot = initial_prot;
+                    pager_rx_mapping = executable && file_pager;
                     if (file_vmo_fd >= 16) {
                         (void)lpr_pacha_syscall1(
                             PACHAOS_SYSCALL_FD_CLOSE,
@@ -2442,7 +2457,10 @@ int64_t lpr_backend_mmap(uint64_t addr, uint64_t len, uint64_t prot, uint64_t fl
             (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, (uint64_t)(uint32_t)vmo_fd);
         }
 private_file_mapping_ready:
-        if ((prot & LPR_LINUX_PROT_EXEC) != 0 && done != 0) {
+        /* filed validates every RX page against the manifest before supply.
+         * The pager VMO contains canonical patched bytes from the start. */
+        if ((prot & LPR_LINUX_PROT_EXEC) != 0 && done != 0 &&
+            !pager_rx_mapping) {
             struct lpr_patch_mapping_result patch_result;
             const struct lpr_patch_mapping_request patch_request = {
                 .start_va = (uint64_t)mapped,
@@ -3796,6 +3814,57 @@ static void lpr_diag_attach_once(void)
     if (attach_status != 0) lpr_diag_attach_attempted = attach_status;
 }
 
+#if defined(LPR_WAIT_TRACE) && LPR_WAIT_TRACE
+typedef struct {
+    uint64_t tsc, nr, value, stack;
+    uint32_t cpu, stage;
+} lpr_wait_trace_row_t;
+static lpr_wait_trace_row_t lpr_wait_trace_rows[4096];
+static uint64_t lpr_wait_trace_head;
+static int lpr_wait_trace_enabled;
+
+void lpr_wait_trace_record(uint32_t stage, uint64_t nr, uint64_t value)
+{
+    if (!lpr_wait_trace_enabled) return;
+    if (nr != LPR_LINUX_SYS_FUTEX && nr != LPR_LINUX_SYS_POLL &&
+        nr != LPR_LINUX_SYS_PPOLL && nr != LPR_LINUX_SYS_EPOLL_WAIT &&
+        nr != LPR_LINUX_SYS_READ && nr != LPR_LINUX_SYS_WRITE) return;
+    uint32_t lo, hi, cpu;
+    __asm__ volatile("lfence; rdtscp; lfence" : "=a"(lo), "=d"(hi), "=c"(cpu) :: "memory");
+    const uint64_t index = __atomic_fetch_add(&lpr_wait_trace_head, 1, __ATOMIC_RELAXED);
+    lpr_wait_trace_rows[index % 4096] = (lpr_wait_trace_row_t){
+        .tsc = ((uint64_t)hi << 32) | lo, .nr = nr, .value = value,
+        .stack = (uint64_t)(uintptr_t)__builtin_frame_address(0),
+        .cpu = cpu, .stage = stage,
+    };
+}
+
+void lpr_wait_trace_dump(void)
+{
+    if (!lpr_wait_trace_enabled) return;
+    const uint64_t count = lpr_wait_trace_head < 64 ? lpr_wait_trace_head : 64;
+    for (uint64_t i = lpr_wait_trace_head - count; i < lpr_wait_trace_head; ++i) {
+        const lpr_wait_trace_row_t *row = &lpr_wait_trace_rows[i % 4096];
+        char line[192]; char *out = line; const char *end = line + sizeof(line);
+        out = lpr_mmap_diag_append_text(out, end, "WAITTRACE ");
+        out = lpr_mmap_diag_append_u64(out, end, row->tsc);
+        out = lpr_mmap_diag_append_text(out, end, " ");
+        out = lpr_mmap_diag_append_u64(out, end, row->cpu);
+        out = lpr_mmap_diag_append_text(out, end, " ");
+        out = lpr_mmap_diag_append_u64(out, end, row->stage);
+        out = lpr_mmap_diag_append_text(out, end, " ");
+        out = lpr_mmap_diag_append_u64(out, end, row->nr);
+        out = lpr_mmap_diag_append_text(out, end, " ");
+        out = lpr_mmap_diag_append_u64(out, end, row->value);
+        out = lpr_mmap_diag_append_text(out, end, " ");
+        out = lpr_mmap_diag_append_u64(out, end, row->stack);
+        if (out < end) *out++ = '\n';
+        (void)lpr_pacha_syscall2(PACHAOS_SYSCALL_LOG,
+            (uint64_t)(uintptr_t)line, (uint64_t)(out - line));
+    }
+}
+#endif
+
 static int64_t lpr_dispatch_syscall_inner(const lpr_syscall_entry_t *entry,
                                           const struct lpr_linux_user_frame *frame,
                                           uint64_t a0,
@@ -3819,7 +3888,9 @@ static int64_t lpr_dispatch_syscall_inner(const lpr_syscall_entry_t *entry,
         result = lpr_linux_clone_frame(
             frame, 0x4000ull | 0x100ull | 17u, 0, 0, 0, 0);
     } else {
+        lpr_wait_trace_record(3, entry->nr, 0);
         result = entry->handler(a0, a1, a2, a3, a4, a5, wait_not_ready);
+        lpr_wait_trace_record(4, entry->nr, (uint64_t)result);
     }
     lpr_diag_leave();
     return result;
@@ -3843,7 +3914,16 @@ int64_t lpr_dispatch_syscall_frame(struct lpr_linux_user_frame *frame,
                                    uint64_t a3,
                                    uint64_t a4,
                                    uint64_t a5) {
+#if defined(LPR_WAIT_TRACE) && LPR_WAIT_TRACE
+    if (nr == 39u && a0 == 0x574149545052494dull) {
+        lpr_wait_trace_enabled = 1;
+        return 0;
+    }
+#endif
     unsigned wait_not_ready = 0; /* This invocation only; never stored in thread state. */
+    lpr_wait_trace_record(1, nr, (uint64_t)(uintptr_t)frame);
+    if (nr == LPR_LINUX_SYS_EXIT_GROUP || nr == LPR_LINUX_SYS_EXIT)
+        lpr_wait_trace_dump();
     /* The dynamic linker enters us for ARCH_SET_FS before musl has a usable
      * thread pointer. Registering native signal delivery first creates a
      * race: a pending signal can enter the LPR trampoline on the registration
@@ -3859,6 +3939,7 @@ int64_t lpr_dispatch_syscall_frame(struct lpr_linux_user_frame *frame,
         return result;
     }
     lpr_linux_signal_runtime_init();
+    lpr_wait_trace_record(2, nr, 0);
 #if defined(LPR_GUI_PROFILE) && LPR_GUI_PROFILE
     lpr_gui_init();
     const int gui_main = lpr_gui_selected && !lpr_gui_dumped &&
@@ -4040,9 +4121,11 @@ int64_t lpr_dispatch_syscall_frame(struct lpr_linux_user_frame *frame,
     lpr_vm_origin_diag(nr, frame, a1, a3, a4, result);
 #endif
     (void)lpr_linux_dispatch_pending_signals_with_result(result);
+    lpr_wait_trace_record(5, nr, (uint64_t)result);
     if (result == -LPR_LINUX_ENOSYS) {
         lpr_trace_enosys_syscall(nr, a0, a1, a2, a3, a4, a5);
     }
     lpr_linux_deliver_native_pending_frame_after_wait(result, &wait_not_ready);
+    lpr_wait_trace_record(6, nr, wait_not_ready);
     return result;
 }

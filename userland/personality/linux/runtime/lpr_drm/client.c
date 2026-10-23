@@ -1437,7 +1437,7 @@ static int64_t lpr_drm_prime_import(uint64_t drm_handle, uint64_t prime_fd, uint
         import_size = ((uint64_t)st.st_size + 4095u) & ~4095ull;
         uint64_t file_size = 0;
         const int64_t shared_vmo_fd = lpr_linux_shared_file_vmo(
-            prime_fd, 0, import_size, 1, 0, &file_size);
+            prime_fd, 0, import_size, 1, 0, PACHAOS_PROT_READ | PACHAOS_PROT_WRITE, &file_size);
         if (shared_vmo_fd < 16) return shared_vmo_fd;
         if (file_size < (uint64_t)st.st_size) {
             (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)shared_vmo_fd);
@@ -1485,7 +1485,7 @@ static int64_t lpr_udmabuf_create(uint64_t drm_handle, uint64_t arg, unsigned *w
     if (st.st_size <= 0 || create->size > (uint64_t)st.st_size) return -LPR_LINUX_EINVAL;
     uint64_t file_size = 0;
     const int64_t native_fd = lpr_linux_shared_file_vmo(
-        create->memfd, create->offset, create->size, 1, 0, &file_size);
+        create->memfd, create->offset, create->size, 1, 0, PACHAOS_PROT_READ | PACHAOS_PROT_WRITE, &file_size);
     if (native_fd < 16) return native_fd;
     if (file_size < create->size) {
         (void)lpr_close_native_fd_if_open((uint64_t)native_fd);

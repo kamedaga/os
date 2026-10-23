@@ -71,6 +71,7 @@ static pacha_fd_t create_inherited_vmo_from_bytes(const void *data, uint64_t siz
     const uint64_t rights =
         PACHA_FD_RIGHT_INSPECT |
         PACHA_FD_RIGHT_TRANSFER |
+        PACHA_FD_RIGHT_DUP |
         PACHA_FD_RIGHT_SET_FLAGS |
         PACHA_FD_RIGHT_CLOSE |
         PACHA_FD_RIGHT_READ |
@@ -94,6 +95,18 @@ static pacha_fd_t create_inherited_vmo_from_bytes(const void *data, uint64_t siz
     memset(mapped, 0, (size_t)map_size);
     memcpy(mapped, data, (size_t)size);
     (void)pacha_munmap(mapped, map_size);
+    /* Every boot image handed to seed0root must be ordinary anonymous VMO
+     * backing. Pager VMOs reject direct FD_READ, even with READ authority. */
+    const pacha_fd_t probe=pacha_fd_fcntl(fd,PACHA_FD_FCNTL_DUP,16,
+        PACHA_FD_RIGHT_READ|PACHA_FD_RIGHT_CLOSE);
+    unsigned char first=0;
+    const int ordinary=probe>=16 && pacha_fd_read(probe,&first,1)==1 &&
+        first==*(const unsigned char *)data;
+    if (probe>=16) (void)pacha_fd_close(probe);
+    if (!ordinary) {
+        (void)pacha_fd_close(fd);
+        return -5;
+    }
     return fd;
 }
 

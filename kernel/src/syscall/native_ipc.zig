@@ -828,6 +828,7 @@ fn callSync(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, fr
     const generation = scheduler.currentThreadGeneration() orelse return sc.syscall_err_invalid;
     _ = state.ensureIpcBlock(proc, index, generation) catch |err| return mapError(err);
     const token = scheduler.reserveCurrentWaitToken(generation) orelse return sc.syscall_err_invalid;
+    @import("../wake_trace.zig").record(.ipc_call_enter, input.rdi, token, index);
     const caller: kernel.ThreadWakeTarget = .{ .owner = proc, .thread_index = index, .thread_generation = generation, .wait_token = token, .recv_memory = receive.memory, .recv_fd_capacity = receive.capacity };
     const fd: kernel.Fd = @intCast(frame.rdi);
     const direct = directSend(h, state, proc, fd, msg, caller);
@@ -870,7 +871,9 @@ fn callSync(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, fr
         return sc.syscall_err_closed;
     }
     state.releaseIpcCallReference(ref);
+    @import("../wake_trace.zig").record(.ipc_wait_begin, fd, token, index);
     if (timeout != 0 and switchIpc(h, frame, flags, token, if (timeout == fd_abi.wait_forever) 0 else timeout, if (direct) |d| d.target else null, null)) return frame.rax;
+    @import("../wake_trace.zig").record(.ipc_wait_end, fd, token, index);
     scheduler.cancelCurrentWaitToken(generation, token);
     if (scheduler.detachIpcOutgoing(index, generation, proc, &body.outgoing)) {
         state.ipcCancelCall(ref, h.free_list);
@@ -900,6 +903,7 @@ fn sendReply(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, f
     b3.end(102, b3_peer);
     const ref = body.ref;
     const target = body.caller;
+    @import("../wake_trace.zig").record(.ipc_reply_enter, fd, target.wait_token, index);
     // Validate and retain attachments before claiming. A rejected sender keeps
     // MOVE ownership and the server can retry a corrected reply.
     var prepared = blk_metric: {

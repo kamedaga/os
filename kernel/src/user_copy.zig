@@ -181,12 +181,29 @@ const Mailbox = struct {
 };
 var mailbox_seed: [bootstrap_cpu_rows]Mailbox = @splat(.{});
 var mailboxes: []Mailbox = &mailbox_seed;
+var copy_absent_seed: [bootstrap_cpu_rows]?u64 = @splat(null);
+var copy_absent_va: []?u64 = &copy_absent_seed;
+const ProbeCoverage = struct {
+    const Range = struct { first: u64 = 0, last: u64 = 0 };
+    active: bool = false,
+    owner: kernel.PrincipalId = @enumFromInt(0),
+    count: usize = 0,
+    ranges: [32]Range = @splat(.{}),
+    fn contains(self: *const ProbeCoverage, va: u64) bool {
+        for (self.ranges[0..self.count]) |range| if (va >= range.first and va <= range.last) return true;
+        return false;
+    }
+};
+var probe_coverage_seed: [bootstrap_cpu_rows]ProbeCoverage = @splat(.{});
+var probe_coverage: []ProbeCoverage = &probe_coverage_seed;
 var target_seed: [CpuSet.wordCount(bootstrap_cpu_rows)]usize = @splat(0);
 var shootdown_targets = CpuSet{ .words = &target_seed, .capacity = bootstrap_cpu_rows };
 
 pub fn initCpuStorage(count: usize) !void {
     const grow = @import("diagnostic_cpu_storage.zig").grow;
     mailboxes = try grow(Mailbox, mailboxes, count, .{});
+    copy_absent_va = try grow(?u64, copy_absent_va, count, null);
+    probe_coverage = try grow(ProbeCoverage, probe_coverage, count, .{});
     tlb_shootdown_active = try grow(u8, tlb_shootdown_active, count, 0);
     window_victim = try grow(u8, window_victim, count, 0);
     window_non_wb_used = try grow(u8, window_non_wb_used, count, 0);
@@ -740,6 +757,103 @@ pub fn resolveNativeVmaFaultMappingWithAddressSpaceLocked(
 // and the physical copy. Reacquiring it here adds no lifetime protection.
 const CopyPage = struct { paddr: address_types.PhysicalAddress, cache: PhysWindowCache };
 
+pub fn beginSyscallCopyTracking(owner: kernel.PrincipalId) void {
+    const slot = boundedCurrentCpuSlot();
+    copy_absent_va[slot] = null;
+    probe_coverage[slot].active = true;
+    probe_coverage[slot].owner = owner;
+    probe_coverage[slot].count = 0;
+}
+
+pub const CopyAbsent = struct { va: u64, was_probed: bool };
+pub fn takeSyscallCopyAbsent() ?CopyAbsent {
+    const slot = boundedCurrentCpuSlot();
+    const va = copy_absent_va[slot];
+    copy_absent_va[slot] = null;
+    const was_probed = if (va) |address| probe_coverage[slot].contains(address) else false;
+    probe_coverage[slot].active = false;
+    return if (va) |address| .{ .va = address, .was_probed = was_probed } else null;
+}
+
+test "pager user copy probe violation detector rejects unprobed page" {
+    const slot = boundedCurrentCpuSlot();
+    beginSyscallCopyTracking(@enumFromInt(1));
+    copy_absent_va[slot] = 0x2000;
+    const missed = takeSyscallCopyAbsent().?;
+    try std.testing.expectEqual(@as(u64, 0x2000), missed.va);
+    try std.testing.expect(!missed.was_probed);
+
+    beginSyscallCopyTracking(@enumFromInt(1));
+    probe_coverage[slot].ranges[0] = .{ .first = 0x1000, .last = 0x2fff };
+    probe_coverage[slot].count = 1;
+    copy_absent_va[slot] = 0x2000;
+    try std.testing.expect(takeSyscallCopyAbsent().?.was_probed);
+
+    beginSyscallCopyTracking(@enumFromInt(1));
+    copy_absent_va[slot] = 0;
+    try std.testing.expectEqual(@as(u64, 0), takeSyscallCopyAbsent().?.va);
+}
+
+fn requestPagerForCopyWithAddressSpaceLocked(principal: kernel.PrincipalId, page: address_types.UserVirtualAddress, write_access: bool) void {
+    user_vm.lockSharedVmObjects();
+    defer user_vm.unlockSharedVmObjects();
+    const fault = getHooks().state.pendingPagerFaultPage(principal, page.toInt(), write_access, false) orelse return;
+    const outcome = getHooks().state.requestPagerFault(fault.vmo, fault.index,
+        if (write_access) @import("kernel_abi_root").pager_abi.access_write else @import("kernel_abi_root").pager_abi.access_read,
+        principal, 0, 0, 0, 0) catch return;
+    if (outcome == .pending) {
+        const slot = boundedCurrentCpuSlot();
+        // A sender may copy into another principal's previously registered
+        // IPC/poll buffer. Its own syscall cannot return that principal's VA.
+        if (probe_coverage[slot].active and probe_coverage[slot].owner == principal)
+            copy_absent_va[slot] = page.toInt();
+    }
+}
+
+pub const ProbeResult = union(enum) {
+    resident,
+    invalid_address,
+    backing_absent: u64,
+};
+
+/// This is called before a syscall acquires its state lock or changes a
+/// resource. A missing pager page is requested under AS -> shared VM -> pager
+/// exclusion, then the locks are dropped. The caller returns its VA to user
+/// mode, where a read fault supplies the page before the syscall is retried.
+pub fn probeUserRange(principal: kernel.PrincipalId, start_va: u64, length: usize, write_access: bool) ProbeResult {
+    if (length == 0) return .resident;
+    const last, const overflow = @addWithOverflow(start_va, @as(u64, @intCast(length - 1)));
+    if (overflow != 0) return .invalid_address;
+    const coverage = &probe_coverage[boundedCurrentCpuSlot()];
+    if (coverage.active) {
+        if (coverage.count >= coverage.ranges.len) return .invalid_address;
+        coverage.ranges[coverage.count] = .{ .first = start_va, .last = last };
+        coverage.count += 1;
+    }
+    var page_va = start_va & ~@as(u64, 4095);
+    const last_page = last & ~@as(u64, 4095);
+    while (true) {
+        if (!user_vm.lockAddressSpace(principal)) return .invalid_address;
+        const page = address_types.UserVirtualAddress.fromInt(page_va);
+        const mapped = profileResolve(principal, page, write_access);
+        if (mapped == null) {
+            user_vm.lockSharedVmObjects();
+            const candidate = getHooks().state.pendingPagerFaultPage(principal, page_va, write_access, false);
+            const outcome = if (candidate) |fault|
+                getHooks().state.requestPagerFault(fault.vmo, fault.index,
+                    if (write_access) @import("kernel_abi_root").pager_abi.access_write else @import("kernel_abi_root").pager_abi.access_read,
+                    principal, 0, 0, 0, 0) catch .invalid
+            else .invalid;
+            user_vm.unlockSharedVmObjects();
+            user_vm.unlockAddressSpace(principal);
+            if (outcome == .pending) return .{ .backing_absent = page_va };
+            if (outcome != .already_present) return .invalid_address;
+        } else user_vm.unlockAddressSpace(principal);
+        if (page_va == last_page) return .resident;
+        page_va += 4096;
+    }
+}
+
 fn ensureUserPageMappedForCopyWithAddressSpaceLocked(principal: kernel.PrincipalId, page: address_types.UserVirtualAddress, write_access: bool) ?CopyPage {
     const pa = resolveCopyPhysicalPageWithAddressSpaceLocked(principal, page, write_access) orelse return null;
     // COW can split/replace a VMA. Borrow the final entry only after resolving
@@ -1050,8 +1164,14 @@ fn copyUserWordBytesProfiled(principal: kernel.PrincipalId, source: address_type
             const lookup_start = perf.runtimeTimestamp(profile);
             const mapped_page = profileResolve(principal, page_va, false);
             perf.runtimeElapsed(profile, .body_cycles, lookup_start);
-            break :blk mapped_page orelse return false;
-        } else profileResolve(principal, page_va, false) orelse return false;
+            break :blk mapped_page orelse {
+                requestPagerForCopyWithAddressSpaceLocked(principal, page_va, false);
+                return false;
+            };
+        } else profileResolve(principal, page_va, false) orelse {
+            requestPagerForCopyWithAddressSpaceLocked(principal, page_va, false);
+            return false;
+        };
         const page_paddr = resolved.paddr;
         const cache = resolved.cache;
         if (page_paddr.toInt() >= h.physical_map_limit) return false;
@@ -1104,6 +1224,20 @@ pub fn copyUserBytesFromVa(principal: kernel.PrincipalId, src_user_va: u64, dest
     return copyFromUser(principal, .fromInt(src_user_va), dest);
 }
 
+/// Futex comparison is made under the futex lock. The entry probe has already
+/// faulted the page in; this path must never allocate, queue a pager request,
+/// or wait while the futex lock is held.
+pub fn readUserU32Resident(principal: kernel.PrincipalId, user_va: u64) ?u32 {
+    if ((user_va & 3) != 0) return null;
+    if (!user_vm.lockAddressSpace(principal)) return null;
+    defer user_vm.unlockAddressSpace(principal);
+    const page = address_types.UserVirtualAddress.fromInt(user_va & ~@as(u64, 4095));
+    const paddr = user_vm.lookupUserPhysicalPageWithAddressSpaceLocked(principal, page, false, false) orelse return null;
+    const address, const overflow = @addWithOverflow(paddr.toInt(), user_va & 4095);
+    if (overflow != 0) return null;
+    return readPhysU32(address);
+}
+
 pub fn copyFromUser(principal: kernel.PrincipalId, source: address_types.UserVirtualAddress, dest: []u8) bool {
     const stage_sample = if (comptime @import("lock_profile.zig").enabled) @import("lock_profile.zig").stageBegin() else {};
     defer if (comptime @import("lock_profile.zig").enabled) @import("lock_profile.zig").stageEnd(.copy, stage_sample);
@@ -1141,7 +1275,10 @@ pub fn copyFromUser(principal: kernel.PrincipalId, source: address_types.UserVir
         defer user_vm.unlockAddressSpace(principal);
         const hold_start = copy_profile.copyTimestamp();
         defer copy_profile.copyEnd(.as_hold, hold_start);
-        const resolved = profileResolve(principal, page_va, false) orelse return false;
+        const resolved = profileResolve(principal, page_va, false) orelse {
+            requestPagerForCopyWithAddressSpaceLocked(principal, page_va, false);
+            return false;
+        };
         const page_paddr = resolved.paddr;
         const cache = resolved.cache;
         if (page_paddr.toInt() >= h.physical_map_limit) return false;
@@ -1211,7 +1348,10 @@ pub fn copyToUser(principal: kernel.PrincipalId, destination: address_types.User
         defer user_vm.unlockAddressSpace(principal);
         const hold_start = copy_profile.copyTimestamp();
         defer copy_profile.copyEnd(.as_hold, hold_start);
-        const resolved = profileResolve(principal, page_va, true) orelse return false;
+        const resolved = profileResolve(principal, page_va, true) orelse {
+            requestPagerForCopyWithAddressSpaceLocked(principal, page_va, true);
+            return false;
+        };
         const page_paddr = resolved.paddr;
         const cache = resolved.cache;
         if (page_paddr.toInt() >= h.physical_map_limit) return false;
@@ -1294,16 +1434,25 @@ fn flushCr3RangeOnCurrentCpu(target_cr3: u64, range: TlbRange) void {
     } else flushCr3ContextOnCurrentCpu(target_cr3);
 }
 
-// Keep CPU-set policy at one boundary. Include dormant PCIDs; each selected
-// CPU must ACK its own mailbox before that descriptor may be reused.
+// The requester cannot return/reuse pages until every CPU that may execute P
+// in user mode ACKs a post-PTE-change flush, and every other CPU owes a flushing
+// load before next executing P. Zero rows stay zero even after an IPI flush.
 fn shootdownTargetCpuSet(cr3: u64, force_all: bool) CpuSet {
-    // Publication is sticky; the paired entrant MFENCE plus mandatory first
-    // flushing load covers a registration after this snapshot.
     residency.fenceBeforeSnapshot();
     shootdown_targets.clear();
     const online = smp.onlineCpuSet();
+    const context = residency.UserContext.fromCr3(cr3);
+    const local = smp.currentCpuSlot();
+    if (!force_all) {
+        for (0..online.capacity) |cpu| {
+            if (online.contains(cpu) and cpu != local)
+                residency.invalidateRetained(cpu, context);
+        }
+    }
+    // ALL online CPUs, independent of rows: a previous request may have
+    // cleared an active CPU's row; it can refill TLBs without a CR3 reload.
     for (0..online.capacity) |cpu| {
-        if (online.contains(cpu) and (force_all or residency.contains(cpu, cr3)))
+        if (online.contains(cpu) and (force_all or residency.isActive(cpu, context)))
             shootdown_targets.insert(cpu);
     }
     return shootdown_targets;

@@ -9,6 +9,7 @@ pub const Class = enum {
     futex,
     address_space,
     shared_vm,
+    pager,
     vmo_backing,
     tlb_shootdown,
     vtd,

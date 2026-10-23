@@ -202,6 +202,7 @@ const struct lpr_linux_user_frame *lpr_fork_child_bootstrap(void)
      * code can observe them, then publish the child process identity. */
     lpr_linux_apply_pending_fork_child();
     lpr_process_fork_lock = 0;
+    lpr_linux_signal_runtime_init();
     return &lpr_fork_child_return_frame;
 }
 
@@ -307,6 +308,9 @@ static void lpr_thread_count_start(void)
 
 static void lpr_thread_count_start_failed(void)
 {
+    /* A failed start can restore count==1; force the survivor to republish
+     * its slot before a later signal entry uses the fast pointer. */
+    lpr_signal_thread_state_single_invalidate();
     (void)__atomic_sub_fetch(&lpr_state.thread_count, 1u, __ATOMIC_ACQ_REL);
 }
 
@@ -316,6 +320,7 @@ void lpr_thread_after_fork_child(void)
      * PRIVATE capabilities were excluded by native fork; do not close the
      * copied FD numbers or traverse another thread's inherited record. */
     lpr_memset(&lpr_state.threads, 0, sizeof(lpr_state.threads));
+    lpr_signal_thread_state_single_invalidate();
     __atomic_store_n(&lpr_state.thread_count, 1u, __ATOMIC_RELEASE);
     /* The child inherits the parent's "signal runtime already registered" flag,
      * which would otherwise skip re-registration and leave the child with no
@@ -408,6 +413,9 @@ void lpr_linux_unmapself_exit(uint64_t base, uint64_t size)
     if (record != 0) {
         clear_tid = record->child_tid;
         last_thread = lpr_thread_record_remove(record);
+        /* Clear before publishing count==1. The exiting slot is not the
+         * survivor, and its storage is released later in this function. */
+        lpr_signal_thread_state_single_invalidate();
         (void)__atomic_sub_fetch(&lpr_state.thread_count, 1u, __ATOMIC_ACQ_REL);
     }
     lpr_state_unlock(&lpr_state.threads.lock_word);
@@ -506,6 +514,8 @@ void lpr_clone_thread_bootstrap(lpr_thread_record_t *record)
     }
     const uint32_t tid = (uint32_t)raw_tid;
     lpr_signal_thread_state_t *signal_state = lpr_signal_thread_state_current();
+    lpr_linux_fault_runtime_init();
+    lpr_linux_register_thread_signal_hint(signal_state);
     const pacha_fd_t signal_fd = lpr_thread_open_signal_fd();
     if (signal_fd < 0) {
         lpr_clone_thread_bootstrap_abort("signal-capability", signal_fd);
@@ -779,11 +789,15 @@ static int64_t lpr_linux_clone_frame_impl(const struct lpr_linux_user_frame *use
      * coherent table, never an allocator's half-published record. The child
      * resets this inherited lock before committing its prepared snapshot. */
     lpr_fd_table_lock(&lpr_control_fd_table);
+    // Last userland lock before native VM snapshot: stack allocation and
+    // withdrawal cannot leave a copied raw VA referring to reused memory.
+    lpr_state_lock(&lpr_state.signal.fault_registry_lock);
     const int64_t ret = lpr_pacha_syscall3(
         PACHAOS_SYSCALL_PROCESS_CLONE,
         child_process_rights,
         PACHA_PROCESS_CLONE_CURRENT_THREAD | PACHA_PROCESS_CLONE_USER_FRAME,
         (uint64_t)(uintptr_t)&native_child_frame);
+    lpr_state_unlock(&lpr_state.signal.fault_registry_lock);
     lpr_fd_table_unlock(&lpr_control_fd_table);
     lpr_drm_mapping_fork_unlock();
     lpr_unix_cache_fork_unlock();

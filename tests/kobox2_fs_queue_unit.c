@@ -28,6 +28,12 @@ static int client_receive_error[2];
 static int client_readable[2]; /* WAIT_MANY reports this doorbell readable. */
 static int client_latched[2]; /* The kernel notify latch of this doorbell. */
 static kobox_linux_fs_publish_fn mock_publish;
+static struct kobox_linux_fs_shared_ops mock_shared;
+static uint64_t shared_extra = UINT64_C(1) | (UINT64_C(1) << 32);
+static unsigned shared_queries, shared_revokes;
+static int shared_revoke_failure;
+static int shared_refresh_failure;
+static struct ph_ipc_packet shared_attachment;
 static int defer_collect;
 static _Thread_local uint64_t notification_mask;
 static _Thread_local unsigned lock_depth;
@@ -83,6 +89,13 @@ long pacha_syscall2(uint64_t op, uint64_t a, uint64_t b) {
     }
 #endif
     if (op == PACHA_FD_SYSCALL_GET_INFO) {
+        if (a == 200) {
+            struct pacha_fd_info *info = (void *)(uintptr_t)b;
+            *info = (struct pacha_fd_info){.kind = PACHA_FD_KIND_VMO,
+                .extra = shared_extra};
+            ++shared_queries;
+            return 0;
+        }
         if (a == 100 || a == 101 || a == 30 || a == 31) {
             struct pacha_fd_info *info = (void *)(uintptr_t)b;
             *info = (struct pacha_fd_info){.kind = PACHA_FD_KIND_CHANNEL,
@@ -101,6 +114,23 @@ long pacha_syscall2(uint64_t op, uint64_t a, uint64_t b) {
         assert(found);
     }
     return 0;
+}
+
+long pacha_syscall1(uint64_t op, uint64_t fd) {
+    assert(fd == 200 && (op == PACHA_FD_SYSCALL_CLOSE || op == PACHA_FD_SYSCALL_VMO_REVOKE));
+    if (op == PACHA_FD_SYSCALL_VMO_REVOKE) {
+        ++shared_revokes;
+        return shared_revoke_failure ? PACHA_SYSCALL_ERR_INVALID : 0;
+    }
+    return 0;
+}
+
+long pacha_syscall5(uint64_t op, uint64_t parent, uint64_t pages,
+    uint64_t count, uint64_t rights, uint64_t flags) {
+    assert(op == PACHA_FD_SYSCALL_VMO_CREATE_PAGE_VIEW && parent == (uint64_t)ph_core.ram_fd);
+    assert(pages && count && (rights & PACHA_FD_RIGHT_REVOKE));
+    assert(flags == (PACHA_FD_FLAG_PRIVATE | PACHA_FD_FLAG_CLOEXEC | PACHA_VMO_PAGE_VIEW_SPARSE));
+    return 200;
 }
 
 long pacha_syscall3(uint64_t op, uint64_t a, uint64_t b, uint64_t c) {
@@ -125,6 +155,10 @@ long pacha_syscall6(uint64_t op, uint64_t a, uint64_t b, uint64_t c,
 }
 
 long pacha_syscall4(uint64_t op, uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    if (op == PACHA_FD_SYSCALL_VMO_REFRESH_PAGE_VIEW) {
+        assert(a == 200 && b == (uint64_t)ph_core.ram_fd && c && d == 2);
+        return shared_refresh_failure ? PACHA_SYSCALL_ERR_INVALID : 0;
+    }
     assert(op == PACHA_FD_SYSCALL_WAIT_MANY && b && b <= 256 && !d);
     struct pacha_pollfd *events = (void *)(uintptr_t)a;
     assert(events[0].fd == 40);
@@ -180,6 +214,12 @@ int ph_ipc_destroy(struct ph_ipc *ipc, uint64_t generation) {
 }
 
 int ph_ipc_send(struct ph_ipc *ipc, struct ph_ipc_packet *packet) {
+    if (packet->operation == PH_FS_SHARED_ATTACHMENT) {
+        assert(lock_depth == 1 && packet->fd_count == 1 && packet->fds[0].fd == 200);
+        assert(packet->generation == 7 && !(packet->fds[0].rights & PACHA_FD_RIGHT_REVOKE));
+        shared_attachment = *packet;
+        return 0;
+    }
     assert(!lock_depth);
     if (ipc && ipc->fd == 30) {
         assert(packet->operation == 1 && packet->generation == 7 && !packet->fd_count);
@@ -233,8 +273,15 @@ static int reply(const void *bytes, size_t size, void *out, size_t capacity,
             r.opcode == KB2_FILESYSTEM_OP_PREAD ||
             r.opcode == KB2_FILESYSTEM_OP_STATX ||
             r.opcode == KB2_FILESYSTEM_OP_CLOSE ||
-            r.opcode == KB2_FILESYSTEM_OP_CLIENT_CREDENTIALS);
+            r.opcode == KB2_FILESYSTEM_OP_CLIENT_CREDENTIALS ||
+            r.opcode == KB2_FILESYSTEM_OP_SHARED_FILE_VMO);
         owner_calls++;
+        if (r.opcode == KB2_FILESYSTEM_OP_SHARED_FILE_VMO) {
+            uint64_t pages[] = {1, PACHA_VMO_PAGE_VIEW_HOLE};
+            assert(!mock_shared.create(mock_shared.context, r.client, r.sequence,
+                pages, 2, r.flags, &response.handle));
+            response.result = 4096;
+        }
         if (r.opcode == KB2_FILESYSTEM_OP_EXEC_OPEN) response.handle = 88;
         if (r.opcode == KB2_FILESYSTEM_OP_PREAD) {
             response.result = (int64_t)r.length;
@@ -360,6 +407,16 @@ static int mock_serve(struct kobox_linux_fs_workers *pool) {
     assert(pool == (void *)2468 && !mock_jobs && !mock_outstanding); ++mock_served; return 0;
 }
 static int mock_close(struct kobox_linux_fs_workers *pool) { assert(pool == (void *)2468); return 0; }
+static int mock_shared_bind(struct kobox_linux_fs_service *service,
+    const struct kobox_linux_fs_shared_ops *ops) {
+    assert(service == (void *)1234 && ops->budget_bytes && ops->context);
+    mock_shared = *ops;
+    return 0;
+}
+static int mock_shared_close(struct kobox_linux_fs_service *service) {
+    assert(service == (void *)1234);
+    return 0;
+}
 static int mock_destroy(struct kobox_linux_fs_workers *pool) {
     assert(pool == (void *)2468 && !mock_outstanding && !mock_jobs); return 0;
 }
@@ -370,6 +427,8 @@ void *ph_image_lookup(void *core, const char *name) {
 #define EXPORT(entry, function) if (!strcmp(name, entry)) { \
     __auto_type address = &function; memcpy(&symbol, &address, sizeof(symbol)); return symbol; }
     EXPORT("kobox_linux_fs_workers_create", mock_create)
+    EXPORT("kobox_linux_fs_service_shared_bind", mock_shared_bind)
+    EXPORT("kobox_linux_fs_service_shared_close", mock_shared_close)
     EXPORT("kobox_linux_fs_workers_submit", mock_submit)
     EXPORT("kobox_linux_fs_workers_submit_control", mock_control)
     EXPORT("kobox_linux_fs_workers_serve", mock_serve)
@@ -816,6 +875,19 @@ int main(void) {
     struct kobox_linux_io_service io = {.filesystem = (void *)1234};
     assert(!service.dispatch && !service.next && !service.poll_ready);
     assert(!service.start(service.context, &io));
+    uint64_t shared_id, shared_pages[] = { 1, PACHA_VMO_PAGE_VIEW_HOLE };
+    assert(!mock_shared.create(mock_shared.context, 7, 999, shared_pages, 2, 1, &shared_id));
+    // Before publication the owner's 1/1 snapshot is NOT proof of expiry:
+    // FileD has not yet received the authority that it is about to transfer.
+    assert(mock_shared.retire(mock_shared.context, shared_id, 0) == 0);
+    assert(!shared_queries && !shared_revokes);
+    shared_revoke_failure = 1;
+    assert(mock_shared.retire(mock_shared.context, shared_id, 1) == -EBUSY);
+    assert(shared_revokes == 1);
+    assert(mock_shared.refresh(mock_shared.context, shared_id, shared_pages, 2) == -ESTALE);
+    shared_revoke_failure = 0;
+    assert(mock_shared.retire(mock_shared.context, shared_id, 1) == 1);
+    assert(shared_revokes == 2);
     struct driver drivers[2];
     memset(drivers, 0, sizeof(drivers));
     kb2_vq_chain_t *slots[2][8] = {{0}};
@@ -897,6 +969,29 @@ int main(void) {
     assert(data_calls == 5 && owner_calls == 6);
     direct_clients(&service, &drivers[1]);
     many_client_wait(&queue, &service);
+    {
+        kb2_fs_request_t r = {.opcode = KB2_FILESYSTEM_OP_SHARED_FILE_VMO,
+            .generation = 7, .sequence = 10000, .client = 7,
+            .credential_generation = 1, .handle = 42, .length = 8192, .flags = 3};
+        assert(!kb2_fs_request_encode(request, sizeof(request), sizeof(request), &r));
+        struct ph_fs_channel_wait callbacks = {.context = &drivers[1], .notify = notify, .wait = wait};
+        size_t used;
+        assert(!ph_fs_channel_call(&drivers[1].channel, request, sizeof(request),
+            response, sizeof(response), &used, &callbacks));
+        kb2_fs_response_t reply;
+        assert(!kb2_fs_response_decode(response, used, &reply) && reply.result == 4096);
+        assert(shared_attachment.value == reply.handle && shared_attachment.correlation == r.sequence);
+        shared_extra = UINT64_C(2) | (UINT64_C(1) << 32);
+        assert(mock_shared.retire(mock_shared.context, reply.handle, 0) == 0);
+        shared_extra = UINT64_C(1) | (UINT64_C(2) << 32);
+        assert(mock_shared.retire(mock_shared.context, reply.handle, 0) == 0);
+        shared_refresh_failure = 1;
+        assert(mock_shared.refresh(mock_shared.context, reply.handle, shared_pages, 2) == -EIO);
+        shared_refresh_failure = 0;
+        assert(!mock_shared.refresh(mock_shared.context, reply.handle, shared_pages, 2));
+        shared_extra = UINT64_C(1) | (UINT64_C(1) << 32);
+        assert(mock_shared.retire(mock_shared.context, reply.handle, 0) == 1);
+    }
     assert(service.advance(service.context, &io, NULL, true) == 1);
     assert(!service.finish(service.context, &io));
     assert(!service.stop(service.context));

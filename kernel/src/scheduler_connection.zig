@@ -5,6 +5,7 @@ const deadline_index = @import("memory/deadline_index.zig");
 const std = @import("std");
 const lock_diagnostics = @import("sync/lock_diagnostics.zig");
 const perf = @import("smp_perf.zig");
+const wake_trace = @import("wake_trace.zig");
 const builtin = @import("builtin");
 const kernel = @import("kernel.zig");
 const kernel_runtime = @import("kernel_runtime.zig");
@@ -238,6 +239,10 @@ pub const ThreadContext = struct {
     signal_inhibit_secondary_start: u64 = 0,
     signal_inhibit_secondary_end: u64 = 0,
     signal_owner: bool = false,
+    // T owns this address for the current thread generation. A publisher may
+    // finish its copyout after T is dropped; writing a stale 1 into a reused
+    // LPR signal slot is only a false positive, never a false negative.
+    signal_pending_hint_va: u64 = 0,
     fault_entry: u64 = 0,
     fault_stack_base: u64 = 0,
     fault_stack_size: u64 = 0,
@@ -719,6 +724,7 @@ fn verifiedWakeThreadGenerationPreferred(
         ctx.cpu_slot = target_cpu;
         break :wake_locked true;
     };
+    if (woke) wake_trace.record(.ready_publish, thread_index, 0, thread_index);
     if (woke and target_cpu != currentCpu()) {
         // Notification commit retains K/E/T until publication. Return only a
         // CPU number so its caller can end E before the coalesced wake edge.
@@ -3804,6 +3810,7 @@ fn initializeThreadContextLocked(
     // sibling but is never the process signal owner; only an explicit REGISTER
     // (the main/event-loop thread) claims ownership.
     ctx.signal_owner = false;
+    ctx.signal_pending_hint_va = 0;
     ctx.fault_entry = 0;
     ctx.fault_stack_base = 0;
     ctx.fault_stack_size = 0;
@@ -5825,6 +5832,7 @@ pub fn installExecContextForCurrentThread(
         ctx.signal_inhibit_secondary_start = 0;
         ctx.signal_inhibit_secondary_end = 0;
         ctx.signal_owner = false;
+        ctx.signal_pending_hint_va = 0;
         ctx.fault_entry = 0;
         ctx.fault_stack_base = 0;
         ctx.fault_stack_size = 0;
@@ -6049,6 +6057,7 @@ fn switchToGenerationLockedWithRegisters(comptime Registers: type, next_thread: 
         restoreSwitchSourceLocked(Registers, current_thread, current_generation, frame);
         return false;
     }
+    wake_trace.record(.context_switch, next_thread, current_thread, next_thread);
     return true;
 }
 
@@ -7280,11 +7289,14 @@ fn completeIpcNotifyWaiterAndHandoffWithInstall(
     if (uncontended) {
         // The fused path rechecks every condition under the CPU and runqueue
         // locks; this sample only avoids taking them when it cannot succeed.
+        wake_trace.record(.fused_try, thread_index, wait_token, thread_index);
         if (tryFusedKeyedWakeLocked(install, .capability_checked, frame, thread_index, generation, owner, wait_token, resume_rax, sender_rax)) |handed_off| {
+            wake_trace.record(if (handed_off) .fused_commit else .fused_reject, thread_index, wait_token, thread_index);
             // A failed install rolled the waiter back to runnable on this
             // CPU; its completion stands.
             return if (handed_off) .handed_off else .published;
         }
+        wake_trace.record(.fused_reject, thread_index, wait_token, thread_index);
     }
     if (claimWaitTokenCompletionLocked(thread_index, generation, owner, wait_token) != .claimed) return .stale;
     return switch (publishClaimedWaitLocked(thread_index, generation, owner, wait_token, resume_rax, cpu, null)) {
@@ -7327,9 +7339,12 @@ fn wakeIfWaitingTokenAndHandoffWithInstall(
             break :blk if (uncontended) cpu else null;
         } else null;
         if (preferred != null) {
+            wake_trace.record(.fused_try, thread_index, wait_token, thread_index);
             if (tryFusedKeyedWakeLocked(install, .same_process, frame, thread_index, generation, owner, wait_token, resume_rax, sender_rax)) |handed_off| {
+                wake_trace.record(if (handed_off) .fused_commit else .fused_reject, thread_index, wait_token, thread_index);
                 return .{ .wake = .woke, .handed_off = handed_off };
             }
+            wake_trace.record(.fused_reject, thread_index, wait_token, thread_index);
         }
         // A miss has not consumed the wait. Preserve ordinary early-wake,
         // stopped-thread and failed-publication behavior. Fusion's completed
@@ -8314,6 +8329,7 @@ fn claimWaitTokenCompletionLocked(
     setWakeTickLocked(ctx, 0);
     setThreadHotWaitState(thread_index, true, 0, ctx.ready);
     setThreadHotCompletionClaimed(thread_index, false);
+    wake_trace.record(.wait_claim, @intFromEnum(owner), wait_token, thread_index);
     return .claimed;
 }
 
@@ -8612,6 +8628,7 @@ fn deliverSignalLocked(state: *kernel.KernelState, process_generation: ?u32, pri
         _ = verifiedWakeThreadGeneration(target, generation);
     }
     const cpu_slot = ctx.cpu_slot;
+    const thread_hint_va = ctx.signal_pending_hint_va;
     scheduler_state.thread_table.unlock();
     // Publish only after dropping thread_table: the copyout may take the
     // target's address-space lock, break COW and wait for TLB-shootdown acks,
@@ -8631,6 +8648,13 @@ fn deliverSignalLocked(state: *kernel.KernelState, process_generation: ?u32, pri
         }
     } else {
         publishPendingSignalHint(principal);
+    }
+    // Only the target thread clears this word. The LPR slot storage remains
+    // mapped until process teardown; a late 1 after thread exit is harmless
+    // even if the slot has been reused by a later thread.
+    if (thread_hint_va != 0) {
+        var pending: u32 = 1;
+        copyPendingSignalHint(principal, thread_hint_va, std.mem.asBytes(&pending));
     }
     // A CPU-bound target need not make another syscall to observe a signal.
     // If it migrates during publication, the normal return/tick path still
@@ -8686,8 +8710,15 @@ pub fn setCurrentSignalBlockedMask(blocked_mask: u64) bool {
     ctx.signal_blocked_mask = blocked_mask;
     const should_publish = firstUnblockedPendingSignal(ctx) != 0;
     const principal = ctx.owner_process;
+    const thread_hint_va = ctx.signal_pending_hint_va;
     scheduler_state.thread_table.unlock();
-    if (should_publish) publishPendingSignalHint(principal);
+    if (should_publish) {
+        publishPendingSignalHint(principal);
+        if (thread_hint_va != 0) {
+            var pending: u32 = 1;
+            copyPendingSignalHint(principal, thread_hint_va, std.mem.asBytes(&pending));
+        }
+    }
     return true;
 }
 
@@ -8712,6 +8743,28 @@ pub fn setCurrentSignalPendingHint(hint_va: u64) bool {
     return true;
 }
 
+pub fn setCurrentThreadSignalPendingHint(hint_va: u64) bool {
+    scheduler_state.thread_table.lock();
+    const ctx = threadContextLocked(currentThread()) orelse {
+        scheduler_state.thread_table.unlock();
+        return false;
+    };
+    if (!ctx.allocated or ctx.signal_entry == 0) {
+        scheduler_state.thread_table.unlock();
+        return false;
+    }
+    ctx.signal_pending_hint_va = hint_va;
+    const pending = firstUnblockedPendingSignal(ctx) != 0;
+    const principal = ctx.owner_process;
+    scheduler_state.thread_table.unlock();
+    // User copy may fault and acquire AS; never perform it with T held.
+    if (pending and hint_va != 0) {
+        var value: u32 = 1;
+        copyPendingSignalHint(principal, hint_va, std.mem.asBytes(&value));
+    }
+    return true;
+}
+
 pub fn copyCurrentThreadStateToGeneration(target_thread: usize, generation: u32, owner: kernel.PrincipalId) bool {
     scheduler_state.thread_table.lock();
     defer scheduler_state.thread_table.unlock();
@@ -8725,6 +8778,9 @@ pub fn copyCurrentThreadStateToGeneration(target_thread: usize, generation: u32,
     target.signal_inhibit_secondary_start = source.signal_inhibit_secondary_start;
     target.signal_inhibit_secondary_end = source.signal_inhibit_secondary_end;
     target.signal_owner = false;
+    // The child (thread or forked process) must register its own slot. A VA
+    // copied from the parent could be retired or reused before child startup.
+    target.signal_pending_hint_va = 0;
     target.x_state = source.x_state;
     target.pkru = source.pkru;
     return true;
@@ -9147,6 +9203,8 @@ test "thread storage generational operations reject reused identity and wrong ow
     const source_ctx = threadContextMutable(source.index).?;
     installCurrentContextLocked(&scheduler_state.cpus[0], source.index, source_ctx);
     source_ctx.signal_entry = 0x4000;
+    try std.testing.expect(setCurrentThreadSignalPendingHint(0x5678));
+    try std.testing.expectEqual(@as(u64, 0x5678), source_ctx.signal_pending_hint_va);
     source_ctx.x_state[160] = 0x73;
     source_ctx.pkru = 3;
     const old = allocateSuspendedThread(owner, &table, frame, &free_list).?;
@@ -9182,6 +9240,7 @@ test "thread storage generational operations reject reused identity and wrong ow
     try std.testing.expectEqual(source_ctx.x_state, ctx.x_state);
     try std.testing.expectEqual(source_ctx.pkru, ctx.pkru);
     try std.testing.expectEqual(source_ctx.signal_entry, ctx.signal_entry);
+    try std.testing.expectEqual(@as(u64, 0), ctx.signal_pending_hint_va);
     var image: process_abi.ThreadUserContext = undefined;
     try std.testing.expect(getControlledThreadContext(fresh.index, fresh.generation, owner, &image));
     image.registers.rax = 123;

@@ -6,6 +6,7 @@ const ipc_abi = abi_root.ipc_abi;
 const process_abi = abi_root.process_abi;
 const runtime_abi = abi_root.runtime_abi;
 const vm_abi = abi_root.vm_abi;
+const pager_abi = abi_root.pager_abi;
 
 pub const syscall_log: u64 = 1;
 pub const syscall_kernel_log_read: u64 = 2;
@@ -72,7 +73,13 @@ pub const syscall_vmo_create: u64 = fd_abi.syscall_vmo_create;
 pub const syscall_vmo_grow: u64 = fd_abi.syscall_vmo_grow;
 pub const syscall_vmo_cache_policy: u64 = fd_abi.syscall_vmo_cache_policy;
 pub const syscall_vmo_create_page_view: u64 = fd_abi.syscall_vmo_create_page_view;
+pub const syscall_vmo_refresh_page_view: u64 = fd_abi.syscall_vmo_refresh_page_view;
 pub const syscall_vmo_revoke: u64 = fd_abi.syscall_vmo_revoke;
+pub const syscall_pager_port_create: u64 = pager_abi.syscall_pager_port_create;
+pub const syscall_pager_attach: u64 = pager_abi.syscall_pager_attach;
+pub const syscall_pager_wait: u64 = pager_abi.syscall_pager_wait;
+pub const syscall_pager_supply: u64 = pager_abi.syscall_pager_supply;
+pub const syscall_pager_fail: u64 = pager_abi.syscall_pager_fail;
 pub const syscall_mmap: u64 = vm_abi.syscall_mmap;
 pub const syscall_munmap: u64 = vm_abi.syscall_munmap;
 pub const syscall_mprotect: u64 = vm_abi.syscall_mprotect;
@@ -121,6 +128,11 @@ pub const syscall_err_alloc: u64 = 3;
 pub const syscall_err_map: u64 = 4;
 pub const syscall_err_empty: u64 = 5;
 pub const syscall_err_closed: u64 = 6;
+// Shared by status and byte-count syscalls. Ordinary native errors occupy
+// small positive values (or their negatives for byte counts); this distinct
+// negative value leaves both result classes unambiguous. RDX carries the VA
+// to read in user mode before retrying the same syscall.
+pub const syscall_err_pager_absent: u64 = @bitCast(@as(i64, -4096));
 
 test "native syscall numbers are contiguous" {
     const std = @import("std");
@@ -188,7 +200,13 @@ test "native syscall numbers are contiguous" {
         syscall_vmo_grow,
         syscall_vmo_cache_policy,
         syscall_vmo_create_page_view,
+        syscall_vmo_refresh_page_view,
         syscall_vmo_revoke,
+        syscall_pager_port_create,
+        syscall_pager_attach,
+        syscall_pager_wait,
+        syscall_pager_supply,
+        syscall_pager_fail,
         syscall_mmap,
         syscall_munmap,
         syscall_mprotect,

@@ -2,11 +2,13 @@
 #include "filed/storage_owner.h"
 #include "filed/live_bootstrap.h"
 #include "pacha/ipc.h"
+#include "pacha/syscall.h"
 #include <errno.h>
+#include <elf.h>
 #include <limits.h>
 #include <string.h>
 
-static pacha_fd_t bootstrap_fd(char **argv)
+static pacha_fd_t bootstrap_fd(char **argv,filed_runtime_t *rt)
 {
     if (!argv) return -EINVAL;
     char **p=argv;
@@ -15,13 +17,20 @@ static pacha_fd_t bootstrap_fd(char **argv)
     while (*p) ++p;
     ++p;
     const uint64_t *aux=(const uint64_t *)(const void *)p;
+    uint64_t phent=0;
+    pacha_fd_t bootstrap=-ENOENT;
     for (unsigned i=0;i<64;++i) {
         if (!aux[2*i]) break;
+        if (aux[2*i]==AT_PHDR) rt->executable_phdr=aux[2*i+1];
+        if (aux[2*i]==AT_PHNUM) rt->executable_phnum=aux[2*i+1];
+        if (aux[2*i]==AT_PHENT) phent=aux[2*i+1];
         if (aux[2*i]==PACHA_AT_BOOTSTRAP_FD)
-            return aux[2*i+1]>=16 && aux[2*i+1]<PACHA_THREAD_SELF_FD ?
+            bootstrap=aux[2*i+1]>=16 && aux[2*i+1]<PACHA_THREAD_SELF_FD ?
                 (int)aux[2*i+1] : -EINVAL;
     }
-    return -ENOENT;
+    if (phent!=sizeof(Elf64_Phdr) || !rt->executable_phdr ||
+        !rt->executable_phnum || rt->executable_phnum>128) return -EINVAL;
+    return bootstrap;
 }
 void filed_runtime_init(filed_runtime_t *rt)
 {
@@ -37,7 +46,7 @@ void filed_runtime_init(filed_runtime_t *rt)
 int filed_runtime_bootstrap(filed_runtime_t *rt,char **argv)
 {
     if (!rt) return -EINVAL;
-    pacha_fd_t fd=bootstrap_fd(argv);
+    pacha_fd_t fd=bootstrap_fd(argv,rt);
     if (fd<16) return fd;
     rt->bootstrap_fd=fd;
     struct pacha_fd_info info;
@@ -51,6 +60,14 @@ int filed_runtime_bootstrap(filed_runtime_t *rt,char **argv)
         bootstrap.unix_path_fd<16 || bootstrap.unix_path_fd>=PACHA_THREAD_SELF_FD ||
         bootstrap.bootfs_fd<16 || bootstrap.bootfs_fd>=PACHA_THREAD_SELF_FD ||
         !bootstrap.bootfs_size) return -EINVAL;
+    /* At 8 GiB this covers the measured 519 MiB boot distinct set while
+     * retaining at most 768 MiB. Smaller machines retain at most RAM/8. */
+    pacha_system_info_t memory={0};
+    if (!pacha_syscall1(PACHA_RUNTIME_SYSCALL_SYSTEM_INFO,(uintptr_t)&memory)) {
+        rt->snapshots.limit=memory.total_usable_memory_bytes/8;
+        if (rt->snapshots.limit>UINT64_C(768)*1024*1024)
+            rt->snapshots.limit=UINT64_C(768)*1024*1024;
+    }
     rt->bootstrap=bootstrap;
     rt->client_endpoint_fd=(pacha_fd_t)bootstrap.control_fd;
     rt->unix_path_fd=(pacha_fd_t)bootstrap.unix_path_fd;

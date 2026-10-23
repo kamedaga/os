@@ -159,15 +159,48 @@ var bootstrap_user_return_flush: [1]u8 = .{0};
 var user_return_flush: []u8 = &bootstrap_user_return_flush;
 
 pub export fn userReturnCr3ForCurrentCpuFromAsm() callconv(.c) u64 {
+    @import("wake_trace.zig").record(.user_return, 0, 0, scheduler.currentThread());
     scheduler.notifyDiagnosticUserReturn();
     const cr3 = scheduler.currentCr3();
     const cpu = boundedCurrentCpuSlot();
-    if (user_return_flush[cpu] != 0) {
-        user_return_flush[cpu] = 0;
-        _ = @import("tlb_residency.zig").enter(cpu, cr3);
-        return cr3;
-    }
-    return x86_platform.userCr3NoFlush(cr3);
+    const force_flush = user_return_flush[cpu] != 0;
+    user_return_flush[cpu] = 0;
+    return x86_platform.userReturnCr3(cr3, force_flush);
+}
+
+// Callers proved CS.RPL=3 (syscall is unconditionally ring 3). Kernel-entry
+// branches deliberately bypass this helper, preserving return-window active.
+pub export fn leaveUserFromAsm() callconv(.c) void {
+    @import("tlb_residency.zig").leaveUser(smp.currentCpuSlot());
+}
+
+/// Preserve live operands/GPRs around the checked-build assertion; all code
+/// remains scalar after XRSTOR. Production adds no call or stack traffic.
+pub fn asmAssertUserCr3() []const u8 {
+    if (!x86_platform.userReturnChecksEnabled()) return "\n";
+    return "\n" ++
+        \\push %rax
+        \\push %rcx
+        \\push %rdx
+        \\push %rsi
+        \\push %rdi
+        \\push %r8
+        \\push %r9
+        \\push %r10
+        \\push %r11
+        \\push %r15
+    ++ asmCallAligned("assertUserCr3LoadedFromAsm") ++
+        \\pop %r15
+        \\pop %r11
+        \\pop %r10
+        \\pop %r9
+        \\pop %r8
+        \\pop %rdi
+        \\pop %rsi
+        \\pop %rdx
+        \\pop %rcx
+        \\pop %rax
+    ++ "\n";
 }
 
 /// The syscall return's single call: install the current thread's bases and
@@ -322,7 +355,7 @@ fn asmExceptionWithErrorHandlerBody(comptime vec_number: u64) []const u8 {
             \\and $0x3, %rax
             \\cmp $0x3, %rax
             \\jne 1f
-        , .{}) ++ asmCallAligned("saveCurrentThreadXState") ++ std.fmt.comptimePrint(
+        , .{}) ++ asmCallAligned("leaveUserFromAsm") ++ asmCallAligned("saveCurrentThreadXState") ++ std.fmt.comptimePrint(
         \\mov ${d}, %rcx
         \\mov %r12, %rdx
     , .{vec_number}) ++
@@ -461,6 +494,7 @@ pub export fn userReturnToSavedFrame() callconv(.naked) noreturn {
         \\# Keep user RAX live across the CR3 switch; R10 is restored below.
         \\mov 112(%rsi), %rax
         \\mov %r10, %cr3
+    ++ asmAssertUserCr3() ++
         \\mov 0(%rsi), %r15
         \\mov 8(%rsi), %r14
         \\mov 16(%rsi), %r13
@@ -561,6 +595,8 @@ pub export fn syscallDirectIpcEntry() callconv(.naked) noreturn {
         \\push %r11
         \\push %rax
         \\mov %rax, %rcx
+    ++ asmCallAligned("leaveUserFromAsm") ++
+        \\mov (%rsp), %rcx
     ++ asmCallAligned("syscallDirectIpcPrepare") ++
         \\mov (%rsp), %r10
         \\mov %rbx, 104(%r10)
@@ -582,6 +618,7 @@ pub export fn syscallDirectIpcEntry() callconv(.naked) noreturn {
     ++ asmCallAligned("syscallUserReturnCr3FromAsm") ++
         \\mov %r12, %rsi
         \\mov %rax, %cr3
+    ++ asmAssertUserCr3() ++
         \\mov 0(%rsi), %r15
         \\mov 8(%rsi), %r14
         \\mov 16(%rsi), %r13
@@ -614,6 +651,8 @@ pub export fn syscallEntryCommon() callconv(.naked) noreturn {
             \\push %r12
         ++ b3.stamp(2) ++
             \\mov %r12, %rcx
+        ++ asmCallAligned("leaveUserFromAsm") ++
+            \\mov %r12, %rcx
         ++ b3.stamp(3) ++ asmCallAligned("syscallIpcScalarDispatch") ++
             \\test %rax, %rax
             \\jnz 1f
@@ -642,7 +681,7 @@ pub export fn syscallEntryCommon() callconv(.naked) noreturn {
             \\lea 120(%r12), %rdi
         ++ (if (b3.enabled) "" else "\nmov 112(%rsi), %rax\n") ++ b3.stamp(6) ++ (if (b3.enabled) "\nmov %r10, 88(%r11)\n" else "") ++
             \\mov %r10, %cr3
-        ++ b3.stamp(7) ++ b3.stamp(8) ++ (if (b3.enabled) "\nmov 112(%rsi), %rax\n" else "") ++
+        ++ asmAssertUserCr3() ++ b3.stamp(7) ++ b3.stamp(8) ++ (if (b3.enabled) "\nmov 112(%rsi), %rax\n" else "") ++
             \\mov 0(%rsi), %r15
             \\mov 8(%rsi), %r14
             \\mov 16(%rsi), %r13
@@ -662,18 +701,27 @@ pub export fn syscallEntryCommon() callconv(.naked) noreturn {
     );
 }
 
+// The page-fault stub branches on these results. A parked fault resumes from
+// the saved user frame and retries the instruction after SUPPLY; it must not
+// return through the old per-CPU exception work frame.
+const page_fault_unhandled: u64 = 0;
+const page_fault_retry_instruction: u64 = 1;
+const page_fault_resume_saved_frame: u64 = 2;
+
 pub export fn pageFaultDispatch(frame: *ExceptionTrapFrame) callconv(.winapi) u64 {
     const cr2 = x86_platform.readCr2();
     const ec = frame.error_code;
     const user_mode = (ec & (1 << 2)) != 0;
-    if (!user_mode or !user_vm.isUserCanonicalVa(cr2)) return 0;
-    if (!kernel_runtime.kernel_state_ready) return 0;
+    if (!user_mode or !user_vm.isUserCanonicalVa(cr2)) return page_fault_unhandled;
+    @import("wake_trace.zig").record(.page_fault, cr2, ec, scheduler.currentThread());
+    if (!kernel_runtime.kernel_state_ready) return page_fault_unhandled;
     const principal = scheduler.currentPrincipal();
     const fault_page_va = cr2 & ~@as(u64, 4095);
     const write_access = (ec & (1 << 1)) != 0;
     const instruction_fetch = (ec & (1 << 4)) != 0;
-    if (!user_vm.lockAddressSpace(principal)) return 0;
-    defer user_vm.unlockAddressSpace(principal);
+    if (!user_vm.lockAddressSpace(principal)) return page_fault_unhandled;
+    var address_locked = true;
+    defer if (address_locked) user_vm.unlockAddressSpace(principal);
     user_vm.reclaimEmptyUserPtSlotsForFaultWithAddressSpaceLocked(principal, fault_page_va);
     if (write_access) {
         const cow_mapping = user_copy.resolveNativeVmaCowMappingWithAddressSpaceLocked(
@@ -686,12 +734,12 @@ pub export fn pageFaultDispatch(frame: *ExceptionTrapFrame) callconv(.winapi) u6
         );
         if (cow_mapping) |mapping| {
             if (mapping.invalidate_size_bytes != 0) {
-                if (mapping.invalidate_size_bytes > std.math.maxInt(usize)) return 0;
+                if (mapping.invalidate_size_bytes > std.math.maxInt(usize)) return page_fault_unhandled;
                 if (!user_vm.invalidatePresentUserLinearRegionPtes(
                     principal,
                     mapping.invalidate_start_va,
                     @intCast(mapping.invalidate_size_bytes),
-                )) return 0;
+                )) return page_fault_unhandled;
             }
             var paddrs = [_]u64{mapping.paddr};
             if (user_vm.lookupUserMappedPaddrForVa(principal, fault_page_va) != null) {
@@ -700,14 +748,14 @@ pub export fn pageFaultDispatch(frame: *ExceptionTrapFrame) callconv(.winapi) u6
                     fault_page_va,
                     paddrs[0..],
                     mapping.prot,
-                )) return 1;
+                )) return page_fault_retry_instruction;
             } else if (user_vm.mapLazyUserPaddrsWithProt(
                 principal,
                 fault_page_va,
                 paddrs[0..],
                 mapping.prot,
             )) {
-                return 1;
+                return page_fault_retry_instruction;
             }
         }
     }
@@ -724,7 +772,7 @@ pub export fn pageFaultDispatch(frame: *ExceptionTrapFrame) callconv(.winapi) u6
         // a recycled principal reuses its PCID and page-table storage, and a
         // paging-structure cache can still hold a replaced shared table (for
         // example after seedPdSlotFromExistingPdp). User returns normally keep
-        // the PCID's TLB entries (userCr3NoFlush), so mark this CPU's next
+        // the PCID's TLB entries (userReturnCr3), so mark this CPU's next
         // return to flush explicitly; correctness must not depend on the #PF
         // invalidating only the faulting address. Retry only when the present
         // PTE proves that this exact access is legal. Never retry
@@ -739,7 +787,7 @@ pub export fn pageFaultDispatch(frame: *ExceptionTrapFrame) callconv(.winapi) u6
                 instruction_fetch,
             );
         if (stale_permitted_translation) user_return_flush[boundedCurrentCpuSlot()] = 1;
-        return if (not_present_fault or stale_permitted_translation) 1 else 0;
+        return if (not_present_fault or stale_permitted_translation) page_fault_retry_instruction else page_fault_unhandled;
     }
     const fault_mapping = user_copy.resolveNativeVmaFaultMappingWithAddressSpaceLocked(
         kernel_runtime.kernel_state_global,
@@ -760,9 +808,86 @@ pub export fn pageFaultDispatch(frame: *ExceptionTrapFrame) callconv(.winapi) u6
             )
         else
             user_vm.mapNativeVmaFaultPage(principal, fault_page_va, mapping);
-        if (mapped) return 1;
+        if (mapped) return page_fault_retry_instruction;
     }
-    return 0;
+    // A pager fault may sleep only after AS/shared-VM exclusion ends. Reserve
+    // T's token before re-entering those locks so an early SUPPLY is latched;
+    // the second lookup makes an intervening munmap/MAP_FIXED win cleanly.
+    user_vm.lockSharedVmObjects();
+    const candidate = kernel_runtime.kernel_state_global.pendingPagerFaultPage(principal, fault_page_va, write_access, instruction_fetch);
+    user_vm.unlockSharedVmObjects();
+    if (candidate != null) {
+        user_vm.unlockAddressSpace(principal);
+        address_locked = false;
+        const generation = scheduler.currentThreadGeneration() orelse return page_fault_unhandled;
+        const token = scheduler.reserveCurrentWaitToken(generation) orelse return page_fault_unhandled;
+        if (!user_vm.lockAddressSpace(principal)) {
+            scheduler.cancelCurrentWaitToken(generation, token);
+            return page_fault_unhandled;
+        }
+        address_locked = true;
+        user_vm.lockSharedVmObjects();
+        const checked = kernel_runtime.kernel_state_global.pendingPagerFaultPage(principal, fault_page_va, write_access, instruction_fetch);
+        const same = if (checked) |now|
+            now.vmo.index == candidate.?.vmo.index and now.vmo.generation == candidate.?.vmo.generation and now.index == candidate.?.index
+        else false;
+        const access: u32 = if (instruction_fetch) @import("kernel_abi_root").pager_abi.access_execute else if (write_access) @import("kernel_abi_root").pager_abi.access_write else @import("kernel_abi_root").pager_abi.access_read;
+        const outcome = if (same) kernel_runtime.kernel_state_global.requestPagerFault(
+            candidate.?.vmo, candidate.?.index, access, principal, scheduler.currentThread(), generation, token, frame.rax,
+        ) catch {
+            // Allocation failure is terminal for this fault. Retrying the
+            // instruction would spin forever without a request or waiter.
+            user_vm.unlockSharedVmObjects();
+            scheduler.cancelCurrentWaitToken(generation, token);
+            return page_fault_unhandled;
+        } else .invalid;
+        user_vm.unlockSharedVmObjects();
+        if (outcome == .pending) {
+            // ExceptionTrapFrame includes error_code. Copy only the ordinary
+            // user frame before scheduler handoff; neither the IST stack nor
+            // this CPU's reusable work frame is retained by the waiter.
+            var resumed: TrapFrame = undefined;
+            inline for (std.meta.fields(TrapFrame)) |field| @field(resumed, field.name) = @field(frame, field.name);
+            user_vm.unlockAddressSpace(principal);
+            address_locked = false;
+            const blocked = scheduler.blockCurrentThreadPreferred(&resumed, true, false, token, 0, resumed.rax, null, null);
+            if (!blocked) scheduler.cancelCurrentWaitToken(generation, token);
+            stagePendingSignalForUserReturn(&resumed);
+            fatalExceptionResumeWorkFrameForCurrentCpuFromAsm().* = resumed;
+            return page_fault_resume_saved_frame;
+        }
+        scheduler.cancelCurrentWaitToken(generation, token);
+        if (outcome == .failed) {
+            frame.error_code |= process_abi.fault_error_backing_unavailable;
+            return page_fault_unhandled;
+        }
+        return page_fault_retry_instruction;
+    }
+    // SUPPLY can publish after the first fault lookup but before the pending
+    // predicate above. There is then no request to join, yet this AS still
+    // lacks a PTE. Recheck the canonical VMO and install its page now; without
+    // this second lookup the user fault is incorrectly fatal.
+    user_vm.lockSharedVmObjects();
+    const supplied_during_fault = kernel_runtime.kernel_state_global.nativeVmaFaultMapping(principal, fault_page_va, write_access, instruction_fetch);
+    user_vm.unlockSharedVmObjects();
+    if (supplied_during_fault) |mapping| {
+        var paddrs = [_]u64{mapping.paddr};
+        const mapped = if (fault_page_va == 0 and mapping.prot.read and !mapping.prot.write and mapping.prot.exec)
+            user_vm.mapLazyLowPageZeroPaddrsWithProt(principal, fault_page_va, paddrs[0..], mapping.prot)
+        else
+            user_vm.mapNativeVmaFaultPage(principal, fault_page_va, mapping);
+        if (mapped)
+            return page_fault_retry_instruction;
+    }
+    if (frame.cs & 3 == 3) {
+        user_vm.lockSharedVmObjects();
+        const unavailable = kernel_runtime.kernel_state_global.nativeVmaFaultBackingUnavailable(principal, fault_page_va, ec);
+        user_vm.unlockSharedVmObjects();
+        // Preserve the cause NOW, while AS/shared-VM exclusion still fixes
+        // the faulting view. A later fatal-dispatch lookup would race refresh.
+        if (unavailable) frame.error_code |= process_abi.fault_error_backing_unavailable;
+    }
+    return page_fault_unhandled;
 }
 
 pub export fn exceptionWithErrorCommon(vec: u64, frame: *const ExceptionTrapFrame) callconv(.winapi) noreturn {
@@ -773,6 +898,7 @@ pub export fn exceptionWithErrorCommon(vec: u64, frame: *const ExceptionTrapFram
 
 pub export fn fatalUserExceptionWithErrorDispatch(vec: u64, frame: *const ExceptionTrapFrame) callconv(.winapi) void {
     asm volatile ("cli");
+    if (vec == 7) @import("wake_trace.zig").record(.device_not_available, frame.rip, frame.error_code, scheduler.currentThread());
     var context: TrapFrame = undefined;
     inline for (std.meta.fields(TrapFrame)) |field| @field(context, field.name) = @field(frame, field.name);
     const address = if (vec == 14) asm volatile ("mov %%cr2, %[value]"
@@ -1072,6 +1198,7 @@ inline fn schedulerMaintenanceIpiBody() void {
 }
 
 pub export fn schedulerWakeIpiDispatch(frame: *TrapFrame) callconv(.winapi) void {
+    @import("wake_trace.zig").record(.ipi_receive, 0, 0, scheduler.currentThread());
     smp.receiveNotifyWake();
     const diagnostic_scope = lock_diagnostics.enterInterrupt((frame.cs & 3) == 3);
     const profile_from_user = if (@import("lock_profile.zig").enabled) (frame.cs & 3) == 3 else false;
@@ -1133,16 +1260,20 @@ pub export fn pageFaultHandlerStub() callconv(.naked) noreturn {
         \\and $0x3, %rax
         \\cmp $0x3, %rax
         \\jne 9f
-    ++ asmCallAligned("saveCurrentThreadXState") ++ asmCallAligned("pageFaultWorkFrameForCurrentCpuFromAsm") ++
+    ++ asmCallAligned("leaveUserFromAsm") ++ asmCallAligned("saveCurrentThreadXState") ++ asmCallAligned("pageFaultWorkFrameForCurrentCpuFromAsm") ++
         \\mov %rax, %r12
     ++ asmCopyStackFrameToWorkFramePointer(exception_trap_frame_qword_count) ++
         \\mov %r12, %rcx
-    ++ asmCallAligned("pageFaultDispatch") ++
+    ++ asmCallAligned("pageFaultDispatch") ++ std.fmt.comptimePrint("\ncmp ${d}, %rax\n", .{page_fault_resume_saved_frame}) ++
+        \\je 7f
         \\test %rax, %rax
         \\jz 8f
     ++ asmCallAligned("restoreCurrentThreadXState") ++
         \\mov %r12, %rax
     ++ asmStageUserReturnFromWorkFramePointer(exception_trap_frame_iret_offset) ++
+        \\jmp userReturnToSavedFrame
+        \\7:
+    ++ asmCallAligned("restoreCurrentThreadXState") ++ asmCallAligned("fatalExceptionResumeWorkFrameForCurrentCpuFromAsm") ++ asmStageUserReturnFromWorkFramePointer(trap_frame_iret_offset) ++
         \\jmp userReturnToSavedFrame
         \\8:
         \\mov $14, %rcx
@@ -1235,7 +1366,7 @@ pub export fn timerInterruptHandlerStub() callconv(.naked) noreturn {
             \\and $0x3, %rax
             \\cmp $0x3, %rax
             \\jne 9f
-        ++ asmCopyUserInterruptFrameToCpuWorkFrame("timer_interrupt_work_frames") ++
+        ++ asmCallAligned("leaveUserFromAsm") ++ asmCopyUserInterruptFrameToCpuWorkFrame("timer_interrupt_work_frames") ++
             \\mov (%rsp), %r12
             \\mov %r12, %rcx
         ++ asmCallAligned("timerInterruptDispatch") ++
@@ -1288,7 +1419,7 @@ pub export fn timerInterruptHandlerStub() callconv(.naked) noreturn {
             \\and $0x3, %rax
             \\cmp $0x3, %rax
             \\jne 9f
-        ++ asmCopyUserInterruptFrameToCpuWorkFrame("timer_interrupt_work_frames") ++
+        ++ asmCallAligned("leaveUserFromAsm") ++ asmCopyUserInterruptFrameToCpuWorkFrame("timer_interrupt_work_frames") ++
             asmCallAligned("saveCurrentThreadXState") ++
             \\mov (%rsp), %r12
             \\mov %r12, %rcx
@@ -1346,7 +1477,7 @@ pub export fn deviceInterruptHandlerStub() callconv(.naked) noreturn {
             \\and $0x3, %rax
             \\cmp $0x3, %rax
             \\jne 9f
-        ++ asmCopyUserInterruptFrameToCpuWorkFrame("timer_interrupt_work_frames") ++
+        ++ asmCallAligned("leaveUserFromAsm") ++ asmCopyUserInterruptFrameToCpuWorkFrame("timer_interrupt_work_frames") ++
             \\mov (%rsp), %r12
             \\mov %r12, %rcx
         ++ asmCallAligned("deviceInterruptDispatch") ++
@@ -1399,7 +1530,7 @@ pub export fn deviceInterruptHandlerStub() callconv(.naked) noreturn {
             \\and $0x3, %rax
             \\cmp $0x3, %rax
             \\jne 9f
-        ++ asmCopyUserInterruptFrameToCpuWorkFrame("timer_interrupt_work_frames") ++
+        ++ asmCallAligned("leaveUserFromAsm") ++ asmCopyUserInterruptFrameToCpuWorkFrame("timer_interrupt_work_frames") ++
             asmCallAligned("saveCurrentThreadXState") ++
             \\mov (%rsp), %r12
             \\mov %r12, %rcx
@@ -1456,7 +1587,7 @@ pub export fn schedulerWakeIpiHandlerStub() callconv(.naked) noreturn {
         \\and $0x3, %rax
         \\cmp $0x3, %rax
         \\jne 9f
-    ++ asmCopyUserInterruptFrameToCpuWorkFrame("timer_interrupt_work_frames") ++
+    ++ asmCallAligned("leaveUserFromAsm") ++ asmCopyUserInterruptFrameToCpuWorkFrame("timer_interrupt_work_frames") ++
         asmCallAligned("saveCurrentThreadXState") ++
         \\mov (%rsp), %r12
         \\mov %r12, %rcx
@@ -1611,7 +1742,7 @@ pub export fn divideErrorHandlerStub() callconv(.naked) noreturn {
         \\and $0x3, %rax
         \\cmp $0x3, %rax
         \\jne 1f
-    ++ asmCallAligned("saveCurrentThreadXState") ++
+    ++ asmCallAligned("leaveUserFromAsm") ++ asmCallAligned("saveCurrentThreadXState") ++
         \\mov $0, %rcx
         \\mov %r12, %rdx
     ++ asmCallAligned("fatalUserTrapDispatch") ++ asmCallAligned("restoreCurrentThreadXState") ++ asmCallAligned("fatalExceptionResumeWorkFrameForCurrentCpuFromAsm") ++ asmStageUserReturnFromWorkFramePointer(trap_frame_iret_offset) ++
@@ -1651,7 +1782,7 @@ pub export fn breakpointHandlerStub() callconv(.naked) noreturn {
         \\and $0x3, %rax
         \\cmp $0x3, %rax
         \\jne 1f
-    ++ asmCallAligned("saveCurrentThreadXState") ++
+    ++ asmCallAligned("leaveUserFromAsm") ++ asmCallAligned("saveCurrentThreadXState") ++
         \\mov $3, %rcx
         \\mov %r12, %rdx
     ++ asmCallAligned("fatalUserTrapDispatch") ++ asmCallAligned("restoreCurrentThreadXState") ++ asmCallAligned("fatalExceptionResumeWorkFrameForCurrentCpuFromAsm") ++ asmStageUserReturnFromWorkFramePointer(trap_frame_iret_offset) ++
@@ -1691,7 +1822,7 @@ pub export fn invalidOpcodeHandlerStub() callconv(.naked) noreturn {
         \\and $0x3, %rax
         \\cmp $0x3, %rax
         \\jne 1f
-    ++ asmCallAligned("saveCurrentThreadXState") ++
+    ++ asmCallAligned("leaveUserFromAsm") ++ asmCallAligned("saveCurrentThreadXState") ++
         \\mov $6, %rcx
         \\mov %r12, %rdx
     ++ asmCallAligned("fatalUserTrapDispatch") ++ asmCallAligned("restoreCurrentThreadXState") ++ asmCallAligned("fatalExceptionResumeWorkFrameForCurrentCpuFromAsm") ++ asmStageUserReturnFromWorkFramePointer(trap_frame_iret_offset) ++

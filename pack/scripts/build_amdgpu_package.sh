@@ -24,6 +24,10 @@ fi
 canonical="$repo_root/.artifacts/kobox2-amdgpu-canonical"
 mapping="$repo_root/.artifacts/kobox2-amdgpu-mapping"
 
+# Package the current core and module inventory, not whichever profile happened
+# to be left by a previous manual build.
+bash "$repo_root/pack/scripts/build_amdgpu_profile.sh"
+bash "$repo_root/pack/scripts/fetch_amdgpu_firmware.sh"
 if [[ ! -f "$runtime/linux-boot-runtime.so" || ! -f "$inventory" ||
       ! -d "$firmware" ]]; then
     echo 'Build the AMDGPU profile and fetch pinned firmware first' >&2

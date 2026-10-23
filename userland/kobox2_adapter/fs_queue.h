@@ -7,11 +7,13 @@
 #include "../kobox2_owner/fs_channel.h"
 #include "boot/fs_service.h"
 #include "boot/fs_worker.h"
+#include "boot/fs_shared.h"
 
 #define PH_FS_QUEUE_RIGHTS (PACHA_FD_RIGHT_INSPECT | PACHA_FD_RIGHT_MAP_READ | \
     PACHA_FD_RIGHT_MAP_WRITE)
 
 struct ph_fs_queue_request;
+struct ph_fs_shared_export;
 struct ph_fs_queue_lane {
     struct ph_fs_channel channel;
     kb2_vq_chain_t **slots;
@@ -49,6 +51,12 @@ struct ph_fs_queue {
     struct ph_fs_queue_lane lanes[3];
     kb2_vq_atomic_ops_t atomics;
     struct kobox_linux_fs_workers *workers;
+    struct kobox_linux_fs_service *filesystem;
+    int (*shared_bind)(struct kobox_linux_fs_service *, const struct kobox_linux_fs_shared_ops *);
+    int (*shared_close)(struct kobox_linux_fs_service *);
+    struct ph_fs_shared_export *shared_exports;
+    atomic_uint shared_lock;
+    uint64_t next_shared;
     struct kobox_linux_fs_worker_config worker_config;
     int (*create)(struct kobox_linux_fs_service *,
         const struct kobox_linux_fs_worker_config *, struct kobox_linux_fs_workers **);

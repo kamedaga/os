@@ -89,11 +89,16 @@ int64_t lpr_pacha_status_to_errno(int64_t s) { return pacha_kernel_status_to_err
 int64_t lpr_pacha_syscall3(uint64_t nr,uint64_t a,uint64_t b,uint64_t c)
 {
     if(nr==PACHAOS_SYSCALL_VMO_CREATE) {
-        assert(c==0 || c==(PACHA_FD_FLAG_PRIVATE|PACHA_FD_FLAG_CLOEXEC));
         assert(b & PACHA_FD_RIGHT_MAP_WRITE);
         if (!(b & PACHA_FD_RIGHT_INSPECT)) {
+            /* 0: the eagerly filled local-copy fallback. Zero tails and
+             * reservations must be zero-on-demand; an eager VMO would
+             * allocate and zero the whole span up front. */
+            assert(c==0 || c==(PACHA_FD_FLAG_PRIVATE|PACHA_FD_FLAG_CLOEXEC|
+                PACHAOS_VMO_CREATE_ZERO_ON_DEMAND));
             local_rights=b; local_bytes=a; return 70;
         }
+        assert(c==0 || c==(PACHA_FD_FLAG_PRIVATE|PACHA_FD_FLAG_CLOEXEC));
         assert(!rpc_memory); rpc_size=a; return 40;
     }
     assert(nr==PACHAOS_SYSCALL_MPROTECT);

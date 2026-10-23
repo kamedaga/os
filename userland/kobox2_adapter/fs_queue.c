@@ -23,6 +23,133 @@ struct ph_fs_queue_request {
 #endif
 };
 
+struct ph_fs_shared_export {
+    struct ph_fs_shared_export *next;
+    uint64_t id, client, sequence, rights;
+    pacha_fd_t fd;
+    enum { FS_EXPORT_PENDING, FS_EXPORT_ACTIVE, FS_EXPORT_RETIRING } state;
+};
+
+static uint64_t shared_lock(struct ph_fs_queue *queue) {
+    uint64_t mask = 0;
+    PH_OK(ph_notifications_save(&mask));
+    ph_lock(&queue->shared_lock);
+    return mask;
+}
+static void shared_unlock(struct ph_fs_queue *queue, uint64_t mask) {
+    ph_unlock(&queue->shared_lock);
+    PH_OK(ph_notifications_restore(mask));
+}
+static struct ph_fs_shared_export **shared_find(struct ph_fs_queue *queue, uint64_t id) {
+    struct ph_fs_shared_export **link = &queue->shared_exports;
+    while (*link && (*link)->id != id) link = &(*link)->next;
+    return link;
+}
+
+static int shared_create(void *context, uint64_t client, uint64_t sequence,
+    const uint64_t *pages, size_t count, uint64_t flags, uint64_t *id) {
+    struct ph_fs_queue *queue = context;
+    if (!count || flags & ~UINT64_C(3)) return -EINVAL;
+    for (size_t i = 0; i < count; ++i)
+        if (pages[i] != PACHA_VMO_PAGE_VIEW_HOLE &&
+            pages[i] >= ph_core.ram_size / PH_PAGE_SIZE) return -EPROTO;
+    struct ph_fs_shared_export *view = ph_alloc(sizeof(*view));
+    if (!view) return -ENOMEM;
+    uint64_t rights = PACHA_FD_RIGHT_INSPECT | PACHA_FD_RIGHT_DUP |
+        PACHA_FD_RIGHT_TRANSFER | PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_MAP_READ;
+    if (flags & 1) rights |= PACHA_FD_RIGHT_MAP_WRITE;
+    if (flags & 2) rights |= PACHA_FD_RIGHT_MAP_EXEC;
+    long fd = pacha_syscall5(PACHA_FD_SYSCALL_VMO_CREATE_PAGE_VIEW,
+        ph_core.ram_fd, (uintptr_t)pages, count, rights | PACHA_FD_RIGHT_REVOKE,
+        PACHA_FD_FLAG_CLOEXEC | PACHA_FD_FLAG_PRIVATE | PACHA_VMO_PAGE_VIEW_SPARSE);
+    if (fd < 16) { ph_free(view, sizeof(*view)); return -ENOMEM; }
+    uint64_t mask = shared_lock(queue);
+    if (queue->next_shared == UINT64_MAX) {
+        shared_unlock(queue, mask);
+        PH_CHECK(!pacha_syscall1(PACHA_FD_SYSCALL_CLOSE, fd));
+        ph_free(view, sizeof(*view));
+        return -EOVERFLOW;
+    }
+    *view = (struct ph_fs_shared_export){.id = ++queue->next_shared,
+        .client = client, .sequence = sequence, .fd = fd, .rights = rights,
+        .next = queue->shared_exports, .state = FS_EXPORT_PENDING};
+    queue->shared_exports = view;
+    *id = view->id;
+    shared_unlock(queue, mask);
+    return 0;
+}
+
+static int shared_refresh(void *context, uint64_t id, const uint64_t *pages, size_t count) {
+    struct ph_fs_queue *queue = context;
+    for (size_t i = 0; i < count; ++i)
+        if (pages[i] != PACHA_VMO_PAGE_VIEW_HOLE &&
+            pages[i] >= ph_core.ram_size / PH_PAGE_SIZE) return -EPROTO;
+    uint64_t mask = shared_lock(queue);
+    struct ph_fs_shared_export *view = *shared_find(queue, id);
+    int error = !view || view->state == FS_EXPORT_RETIRING ? -ESTALE :
+        pacha_syscall4(PACHA_FD_SYSCALL_VMO_REFRESH_PAGE_VIEW, view->fd,
+            ph_core.ram_fd, (uintptr_t)pages, count) ? -EIO : 0;
+    shared_unlock(queue, mask);
+    return error;
+}
+
+static int shared_retire(void *context, uint64_t id, int force) {
+    struct ph_fs_queue *queue = context;
+    uint64_t mask = shared_lock(queue);
+    struct ph_fs_shared_export **link = shared_find(queue, id), *view = *link;
+    int result = 0;
+    if (!view) { result = -ESTALE; goto out; }
+    if (!force && view->state == FS_EXPORT_PENDING) goto out;
+    if (!force && view->state == FS_EXPORT_ACTIVE) {
+        struct pacha_fd_info info;
+        if (pacha_syscall2(PACHA_FD_SYSCALL_GET_INFO, view->fd, (uintptr_t)&info)) {
+            result = -EIO; goto out;
+        }
+        // This is stronger than treating an arbitrary refcount snapshot as a
+        // lease: we are the ONLY creator and never republish an ACTIVE view.
+        // Queued IPC, pending fork/fault retains and VMAs count as owners.
+        // With 1/1 no external authority can create a future reference. The
+        // irreversible RETIRING transition is serialized with every refresh
+        // and publication, and the FD cannot be closed/reused behind it.
+        if ((info.extra & PACHA_VMO_INFO_OBJECT_REFS_MASK) != 1 ||
+            (info.extra >> PACHA_VMO_INFO_NATIVE_REFS_SHIFT) != 1) goto out;
+    }
+    view->state = FS_EXPORT_RETIRING;
+    if (pacha_syscall1(PACHA_FD_SYSCALL_VMO_REVOKE, view->fd)) {
+        result = -EBUSY;
+        goto out; // Keep native inventory AND Linux pins for a later retry.
+    }
+    *link = view->next;
+    ph_free(view, sizeof(*view));
+    result = 1; // REVOKE removed owner FD and waited for every alias TLB ACK.
+out:
+    shared_unlock(queue, mask);
+    return result;
+}
+
+static int shared_publish(struct ph_fs_queue *queue, struct ph_ipc *ipc,
+    const void *bytes, size_t used) {
+    kb2_fs_response_t response;
+    if (kb2_fs_response_decode(bytes, used, &response)) return -EPROTO;
+    if (response.opcode != KB2_FILESYSTEM_OP_SHARED_FILE_VMO || response.result < 0) return 0;
+    uint64_t mask = shared_lock(queue);
+    struct ph_fs_shared_export *view = *shared_find(queue, response.handle);
+    int error = -EPROTO;
+    if (!view || view->state != FS_EXPORT_PENDING || view->sequence != response.sequence)
+        goto out;
+    struct ph_ipc_packet packet = {.operation = PH_FS_SHARED_ATTACHMENT,
+        .generation = queue->config[0].generation, .correlation = view->sequence,
+        .value = view->id, .fd_count = 1, .fds = {{.fd = view->fd,
+            .rights = view->rights, .flags = PACHA_FD_FLAG_CLOEXEC}}};
+    error = ph_ipc_send(ipc, &packet);
+    // Successful enqueue owns a reference even before FileD receives it.
+    // No ACTIVE view is ever exported again, including error retries.
+    if (!error) view->state = FS_EXPORT_ACTIVE;
+out:
+    shared_unlock(queue, mask);
+    return error;
+}
+
 /* A notification can schedule another fiber on this same logical CPU. Defer
  * that entry while holding shared ring metadata, otherwise it could wait for
  * the interrupted holder. Neither Linux/VFS calls nor IPC run under this lock. */
@@ -422,7 +549,10 @@ static int collect_one(struct ph_fs_queue *queue, struct ph_ipc *ipc) {
     } else if (execution) {
         if (request->client) { client_fault(queue, request->client); result = 0; }
         else result = fault(queue);
-    } else result = publish(queue, request, ipc, response, used);
+    } else {
+        result = request->client ? 0 : shared_publish(queue, ipc, response, used);
+        if (!result) result = publish(queue, request, ipc, response, used);
+    }
     int freed = queue->release_work(queue->workers, work);
     request_release(queue, request);
     return result ? result : freed ? freed : PH_LIFECYCLE_SERVICE_PROGRESS;
@@ -657,7 +787,12 @@ static int start(void *context, void *linux_service) {
     struct ph_fs_queue *queue = context;
     struct kobox_linux_io_service *io = linux_service;
     if (!io || !io->filesystem) return -EINVAL;
-    int error = queue->create(io->filesystem, &queue->worker_config, &queue->workers);
+    queue->filesystem = io->filesystem;
+    struct kobox_linux_fs_shared_ops shared_ops = {.context = queue,
+        .budget_bytes = ph_core.ram_size / 8, .create = shared_create,
+        .refresh = shared_refresh, .retire = shared_retire};
+    int error = queue->shared_bind(io->filesystem, &shared_ops);
+    if (!error) error = queue->create(io->filesystem, &queue->worker_config, &queue->workers);
     if (error) return error;
     /* Lone requests run on the receiving task itself; a sleeping one lends
      * reception to the lifecycle deputy instead of stopping this ring. */
@@ -707,6 +842,7 @@ static int finish(void *context, void *linux_service) {
     if (!queue->workers) return 0;
     PH_CHECK(!queue->inflight);
     int error = queue->close(queue->workers);
+    if (!error) error = queue->shared_close(queue->filesystem);
     if (!error) error = queue->destroy(queue->workers);
     if (!error) queue->workers = NULL;
     return error;
@@ -857,6 +993,7 @@ int ph_fs_queue_init(struct ph_fs_queue *queue, void *core,
         return -EINVAL;
     memset(queue, 0, sizeof(*queue));
     atomic_flag_clear(&queue->watch_lock);
+    atomic_init(&queue->shared_lock, 0);
     for (unsigned i = 0; i < 3; ++i) {
         atomic_init(&queue->lanes[i].retiring, 0);
         atomic_init(&queue->lanes[i].ring_lock, 0);
@@ -884,6 +1021,8 @@ int ph_fs_queue_init(struct ph_fs_queue *queue, void *core,
     memcpy(&queue->member, &symbol, sizeof(queue->member)); \
 } while (0)
     LOAD(create, "kobox_linux_fs_workers_create");
+    LOAD(shared_bind, "kobox_linux_fs_service_shared_bind");
+    LOAD(shared_close, "kobox_linux_fs_service_shared_close");
     LOAD(submit, "kobox_linux_fs_workers_submit");
     LOAD(submit_control, "kobox_linux_fs_workers_submit_control");
     LOAD(serve, "kobox_linux_fs_workers_serve");
@@ -913,7 +1052,7 @@ int ph_fs_queue_init(struct ph_fs_queue *queue, void *core,
 
 int ph_fs_queue_finish(struct ph_fs_queue *queue) {
     if (!queue) return -EINVAL;
-    if (queue->workers || queue->inflight || queue->wake_tx.fd || queue->wake_rx.fd ||
+    if (queue->shared_exports || queue->workers || queue->inflight || queue->wake_tx.fd || queue->wake_rx.fd ||
         queue->wake_tx.rejected.fd_count || queue->wake_rx.rejected.fd_count) return -EBUSY;
     while (queue->clients) {
         struct ph_fs_client_queue *client = queue->clients;

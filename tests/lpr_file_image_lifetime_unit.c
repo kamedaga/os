@@ -39,9 +39,9 @@ int64_t lpr_fs_call(kb2_fs_request_t *request, const char *path,
 int main(void)
 {
     uint64_t loaded = 0;
-    const int64_t first = lpr_linux_file_vmo(3, 4096, 88301568, 0, &loaded);
+    const int64_t first = lpr_linux_file_vmo(3, 4096, 88301568, 0, &loaded, NULL);
     assert(first == 40 && loaded == 88301568 && calls == 1 && !closes);
-    const int64_t second = lpr_linux_file_vmo(3, 4096, 88301568, 0, &loaded);
+    const int64_t second = lpr_linux_file_vmo(3, 4096, 88301568, 0, &loaded, NULL);
     /* No optional image cache retains a hidden native descriptor. Every
      * snapshot has explicit ownership handed directly to the mmap caller. */
     assert(second == 41 && calls == 2 && !closes);
@@ -49,9 +49,9 @@ int main(void)
     assert(calls == 3 && !closes);
     close_result = -5;
     assert(lpr_filed_close_handle(123) == -5 && calls == 4 && !closes);
-    assert(lpr_linux_shared_file_vmo(3, 0, 4096, 1, 0, &loaded) == -LPR_LINUX_EOPNOTSUPP);
+    assert(lpr_linux_shared_file_vmo(3, 0, 4096, 1, 0, 3, &loaded) == -LPR_LINUX_EOPNOTSUPP);
     assert(!loaded && calls == 5 && !closes);
-    assert(lpr_linux_file_vmo(4, 4096, 88301568, 0, &loaded) == -LPR_LINUX_EBADF);
+    assert(lpr_linux_file_vmo(4, 4096, 88301568, 0, &loaded, NULL) == -LPR_LINUX_EBADF);
     assert(calls == 5 && !loaded);
     assert(!lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, first));
     assert(!lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, second));

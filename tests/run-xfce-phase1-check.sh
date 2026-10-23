@@ -5,6 +5,7 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 xfce_root="${repo_root}/.artifacts/userland-fixtures/alpine-xfce-root"
 lock="${repo_root}/tools/manifests/alpine-xfce-v3.22-x86_64.lock"
 writer_lock="${repo_root}/tools/manifests/alpine-libreoffice-v3.22-x86_64.lock"
+browser_lock="${repo_root}/tools/manifests/alpine-epiphany-v3.22-x86_64.lock"
 manifest="${repo_root}/.artifacts/manifests/rootfs.generated.txt"
 linux_musl="${repo_root}/.artifacts/userland-fixtures/lpr-linux-musl-libc.so"
 clang_root="${repo_root}/.artifacts/userland-fixtures/alpine-clang-root"
@@ -16,9 +17,9 @@ cd "${repo_root}"
 bash tools/build_wsl_alpine_xfce.sh
 
 package_count="$(awk '$1 !~ /^#/ { count++ } END { print count + 0 }' \
-  "${lock}" "${writer_lock}")"
+  "${lock}" "${writer_lock}" "${browser_lock}")"
 locked_count="$(awk '$1 == "#" && $2 == "package-count" { count += $3 } END { print count + 0 }' \
-  "${lock}" "${writer_lock}")"
+  "${lock}" "${writer_lock}" "${browser_lock}")"
 [[ -n "${locked_count}" && "${package_count}" == "${locked_count}" ]] || {
   echo "Xfce package lock count mismatch: metadata=${locked_count:-missing} entries=${package_count}" >&2
   exit 1
@@ -26,6 +27,8 @@ locked_count="$(awk '$1 == "#" && $2 == "package-count" { count += $3 } END { pr
 cmp "${lock}" "${xfce_root}/usr/share/pacha/xfce-packages.lock"
 cmp "${writer_lock}" \
   "${xfce_root}/usr/share/pacha/libreoffice-packages.lock"
+cmp "${browser_lock}" \
+  "${xfce_root}/usr/share/pacha/epiphany-packages.lock"
 
 for required in \
   bin/busybox \
@@ -89,7 +92,7 @@ grep -Fxq 'https://dl-cdn.alpinelinux.org/alpine/v3.22/main' \
   "${xfce_root}/etc/apk/repositories"
 grep -Fxq 'https://dl-cdn.alpinelinux.org/alpine/v3.22/community' \
   "${xfce_root}/etc/apk/repositories"
-grep -Fxq 'apk-tools=2.14.10-r0' "${xfce_root}/etc/apk/world"
+grep -Fxq 'apk-tools=2.14.12-r0' "${xfce_root}/etc/apk/world"
 grep -Fxq 'xfce4=4.20-r0' "${xfce_root}/etc/apk/world"
 grep -Fxq 'gtk4.0-demo=4.18.6-r0' "${xfce_root}/etc/apk/world"
 grep -Fxq '127.0.0.1 localhost localhost.localdomain pachaos' \
@@ -111,7 +114,7 @@ python3 tools/rootfs_overlay.py library-view \
   "${apk_library_view}" \
   "${xfce_root}" "${mesa_root}" "${input_root}" "${clang_root}" "${pine2_root}"
 "${linux_musl}" --library-path "${apk_library_view}" \
-  "${xfce_root}/sbin/apk" --version | grep -Fq 'apk-tools 2.14.10'
+  "${xfce_root}/sbin/apk" --version | grep -Fq 'apk-tools 2.14.12'
 for installed_package in apk-tools alpine-keys xfce4 xfwm4 gtk4.0-demo; do
   "${linux_musl}" --library-path "${apk_library_view}" \
     "${xfce_root}/sbin/apk" --root "${xfce_root}" \

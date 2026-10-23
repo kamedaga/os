@@ -9,6 +9,13 @@ int filed_storage_owner_client_bind(struct filed_storage_owner *owner,
 { (void)owner; (void)config; (void)vmo; (void)doorbell; abort(); }
 int filed_storage_owner_client_release(struct filed_storage_owner *owner, uint64_t id)
 { (void)owner; (void)id; abort(); }
+#ifndef FILED_TEST_SHARED_CONTROL
+int filed_storage_owner_take_shared(struct filed_storage_owner *owner,
+    uint64_t id, uint64_t sequence, uint64_t length, pacha_fd_t *fd)
+{ (void)owner; (void)id; (void)sequence; (void)length; (void)fd; abort(); }
+int filed_storage_owner_cancel_shared(struct filed_storage_owner *owner)
+{ (void)owner; abort(); }
+#endif
 int filed_storage_device_route(struct filed_runtime *rt,kb2_fs_request_t *r,
     const void *tail,size_t size,filed_storage_stat_t *stat,uint64_t *handle,uint8_t *wire)
 { (void)rt;(void)r;(void)tail;(void)size;(void)stat;(void)handle;(void)wire;abort(); }

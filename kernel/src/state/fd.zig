@@ -318,6 +318,7 @@ pub fn releaseKernelObjectPayload(self: anytype, slot: *const KernelObjectSlot) 
     if (slot.kind == .vmo) references.Root.disconnect(&slot.reference_state.?.payload_edge, true);
     switch (slot.payload) {
         .vmo => |vmo_ref| self.releaseNativeVmo(vmo_ref),
+        .pager_port => |port_ref| self.pagerPortClosed(port_ref),
         .endpoint => |endpoint_ref| self.clearIpcEndpointSlot(endpoint_ref),
         .channel => |channel_handle| self.releaseIpcChannelHandle(channel_handle),
         .reply => |reply_ref| self.releaseIpcCallAuthority(reply_ref),
@@ -338,6 +339,7 @@ pub fn releaseKernelObjectPayloadWithFreeList(
     if (slot.kind == .vmo) references.Root.disconnect(&slot.reference_state.?.payload_edge, true);
     switch (slot.payload) {
         .vmo => |vmo_ref| self.releaseNativeVmoWithFreeList(vmo_ref, free_list),
+        .pager_port => |port_ref| self.pagerPortClosed(port_ref),
         .endpoint => |endpoint_ref| self.clearIpcEndpointSlotWithFreeList(endpoint_ref, free_list),
         .channel => |channel_handle| self.releaseIpcChannelHandleWithFreeList(channel_handle, free_list),
         .reply => |reply_ref| self.releaseIpcCallAuthority(reply_ref),

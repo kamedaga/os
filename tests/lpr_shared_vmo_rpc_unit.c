@@ -59,7 +59,7 @@ static void *run(void *index)
     slot = (unsigned)(uintptr_t)index;
     uint64_t loaded = 0;
     assert(lpr_linux_shared_file_vmo(10 + slot, slot * 4096, 8192,
-        slot != 0, 1, &loaded) == (int64_t)(200 + slot));
+        slot != 0, 1, 1, &loaded) == (int64_t)(200 + slot));
     assert(loaded == 4096 + slot);
     return NULL;
 }
@@ -78,14 +78,17 @@ int main(void)
     const int64_t expected[] = {0, -38, -12, -5, -5, -5, -13, -5};
     for (failure = 1; failure <= 7; ++failure) {
         uint64_t loaded = 99;
-        assert(lpr_linux_shared_file_vmo(10, 0, 8192, 0, 1, &loaded) == expected[failure]);
+        assert(lpr_linux_shared_file_vmo(10, 0, 8192, 0, 1, 1, &loaded) == expected[failure]);
         assert(!loaded);
     }
     failure = 0;
     uint64_t loaded = 0;
-    assert(lpr_linux_file_vmo(10, 0, 8192, 0, &loaded) == 200 && loaded == 4096);
-    assert(lpr_linux_shared_file_vmo(99, 0, 8192, 0, 1, &loaded) == -LPR_LINUX_EBADF);
+    assert(lpr_linux_file_vmo(10, 0, 8192, 0, &loaded, NULL) == 200 && loaded == 4096);
+    assert(lpr_linux_shared_file_vmo(99, 0, 8192, 0, 1, 1, &loaded) == -LPR_LINUX_EBADF);
     assert(!loaded);
     assert(!pthread_barrier_destroy(&barrier));
     puts("shared VMO cacheless RPC, independent requests and failure propagation: PASS");
 }
+
+int64_t lpr_pacha_syscall1(uint64_t nr,uint64_t fd)
+{ assert(nr==PACHAOS_SYSCALL_FD_CLOSE && fd>=200);return 0; }

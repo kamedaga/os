@@ -389,6 +389,10 @@ typedef struct lpr_process_state {
 } lpr_process_state_t;
 
 typedef struct lpr_signal_thread_state {
+    volatile uint32_t native_pending_hint;
+    uint32_t native_pending_hint_active;
+    uint64_t fault_stack;
+    uint32_t fault_registered;
     uint64_t mask;
     uint64_t pending_mask;
     uint64_t wait_restore_mask;
@@ -409,14 +413,18 @@ typedef struct lpr_signal_thread_state {
 } lpr_signal_thread_state_t;
 
 enum { LPR_SIGNAL_THREAD_SLOT_COUNT = 256 };
-// Keep dynamically grown chunks page-sized after the per-thread RPC scratch.
-enum { LPR_SIGNAL_THREAD_CHUNK_SLOT_COUNT = 14 };
+enum { LPR_SIGNAL_FAULT_STACK_BYTES = 4 * 4096 };
 
 typedef struct lpr_signal_thread_slot {
     volatile uint32_t tid;
     uint32_t reserved0;
     lpr_signal_thread_state_t state;
 } lpr_signal_thread_slot_t;
+
+// Fault state and per-thread RPC scratch grow together; derive the chunk's
+// capacity from its actual slot layout rather than silently exceeding a page.
+enum { LPR_SIGNAL_THREAD_CHUNK_SLOT_COUNT =
+    (4096 - sizeof(void *)) / sizeof(lpr_signal_thread_slot_t) };
 
 typedef struct lpr_signal_thread_chunk {
     struct lpr_signal_thread_chunk *next;
@@ -428,6 +436,7 @@ typedef struct lpr_signal_state {
     volatile uint64_t signalfd_pending_mask;
     volatile uint64_t signalfd_mask_union;
     uint32_t runtime_registered;
+    volatile uint32_t fault_registry_lock;
     volatile uint32_t grow_lock_word;
     uint32_t start_reservations;
     /* Monotonic for this process image: once a thread queues a local signal,
@@ -515,11 +524,15 @@ typedef struct lpr_state {
 
 extern lpr_state_t lpr_state;
 lpr_signal_thread_state_t *lpr_signal_thread_state_current(void);
+lpr_signal_thread_state_t *lpr_signal_thread_state_single_cached(void);
+void lpr_signal_thread_state_single_publish(lpr_signal_thread_state_t *state);
+void lpr_signal_thread_state_single_invalidate(void);
 int lpr_signal_thread_reserve_start(void);
 void lpr_signal_thread_release_start_reservation(void);
 void lpr_signal_thread_state_prepare_current(void);
 void lpr_linux_signal_hint_reset_for_fork_child(void);
 void lpr_signal_thread_state_release_current(void);
+void lpr_linux_register_thread_signal_hint(lpr_signal_thread_state_t *state);
 void lpr_signal_thread_state_after_fork_child(void);
 #define lpr_control_fd_table (lpr_state.fd_table)
 #define lpr_control_entries_initial (lpr_state.fd_storage.entries_initial)
@@ -879,8 +892,8 @@ int64_t lpr_linux_fchmod(uint64_t fd, uint64_t mode);
 int64_t lpr_linux_fchmodat(uint64_t dirfd, uint64_t path_raw, uint64_t mode, uint64_t flags);
 int64_t lpr_linux_fchownat(uint64_t dirfd, uint64_t path, uint64_t owner, uint64_t group, uint64_t flags);
 int64_t lpr_linux_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg);
-int64_t lpr_linux_file_vmo(uint64_t fd, uint64_t file_offset, uint64_t length, int executable, uint64_t *out_loaded);
-int64_t lpr_linux_shared_file_vmo(uint64_t fd, uint64_t file_offset, uint64_t length, int writable, int executable, uint64_t *out_file_size);
+int64_t lpr_linux_file_vmo(uint64_t fd, uint64_t file_offset, uint64_t length, int executable, uint64_t *out_loaded, uint64_t *out_vmo_offset, int *out_pager);
+int64_t lpr_linux_shared_file_vmo(uint64_t fd, uint64_t file_offset, uint64_t length, int writable, int executable, uint32_t initial_prot, uint64_t *out_file_size);
 int64_t lpr_linux_flock(uint64_t fd, uint64_t operation);
 int64_t lpr_linux_fork(void);
 int64_t lpr_linux_fstat(uint64_t fd, uint64_t statbuf, unsigned *wait_not_ready __attribute__((unused)));
@@ -937,6 +950,8 @@ int64_t lpr_linux_rt_sigtimedwait(
     uint64_t sigsetsize, unsigned *wait_not_ready __attribute__((unused)));
 int64_t lpr_linux_sigaltstack(uint64_t ss_raw, uint64_t old_ss_raw);
 void lpr_linux_signal_runtime_init(void);
+void lpr_linux_fault_runtime_init(void);
+void lpr_linux_fault_runtime_destroy(void);
 void lpr_linux_signal_after_fork_child(void);
 void lpr_linux_deliver_native_pending_frame(int64_t interrupted_result);
 /* The output is owned by this call chain, consumed only after pins/RPCs unwind.

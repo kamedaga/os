@@ -19,6 +19,11 @@ class IntegerMoveAudit(unittest.TestCase):
     def test_integer_movq(self):
         self.check(('movq', '$0x800,0x10(%rax)'))
 
+    def test_unsigned_poll_comparison(self):
+        for register in ('%bpl', '%sil'):
+            with self.subTest(register=register):
+                self.check(('setb', register))
+
     def test_vector_moves_rejected(self):
         for operand in ('%mm0,%rax', '%rax,%mm1', '%xmm0,%rax', '%rax,%xmm1'):
             with self.subTest(operand=operand), self.assertRaises(AssertionError):

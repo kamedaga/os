@@ -6,6 +6,7 @@
 #include "filed/client_rights.h"
 #include "filed/storage_owner.h"
 #include "filed/payload.h"
+#include "filed/pager.h"
 #include "pacha/ipc.h"
 #include "pacha/syscall.h"
 #include "../../kobox2_owner/fs_channel.h"
@@ -13,6 +14,7 @@
 #include <kobox2/virtqueue_x86_64.h>
 #include <errno.h>
 #include <limits.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #ifdef FILED_INTERNAL_MICROBENCH
@@ -60,7 +62,7 @@ static int relay(filed_runtime_t *rt,const kb2_fs_request_t *input,
     request.capabilities=0;
     request.groups=(kb2_fs_span_t){0};
     if (rt->request_sequence==UINT64_MAX) { free(copy); return -EOVERFLOW; }
-    request.sequence=++rt->request_sequence;
+    request.sequence=__atomic_add_fetch(&rt->request_sequence,1,__ATOMIC_RELAXED);
     int status=kb2_fs_request_encode(copy,KB2_FILESYSTEM_REQUEST_SIZE,size,&request);
     if (!status) status=filed_storage_exchange(rt,copy,size,output,capacity,used);
     kb2_fs_response_t response;
@@ -89,8 +91,12 @@ static int make_file_vmo(filed_runtime_t *rt,const kb2_fs_request_t *r,
 #ifdef FILED_INTERNAL_MICROBENCH
     uint64_t bench_stage=filed_bench_collect ? filed_bench_tsc() : 0;
 #endif
-    int status=filed_storage_stat(rt,r->handle,&stat);
-    if (status) return status;
+    int status=filed_storage_snapshot_stat(rt,r->handle,&stat);
+    if (status) {
+        fprintf(stderr,"[filed] FILE_VMO snapshot stat handle=%llu status=%d\n",
+            (unsigned long long)r->handle,status);
+        return status;
+    }
     if ((stat.mode & 0170000) != 0100000) return -ENODEV;
     uint64_t length=r->length;
     if ((uint64_t)r->offset > stat.size) return -EINVAL;
@@ -101,12 +107,56 @@ static int make_file_vmo(filed_runtime_t *rt,const kb2_fs_request_t *r,
     uint64_t rights=PACHA_FD_RIGHT_INSPECT|PACHA_FD_RIGHT_CLOSE|
         PACHA_FD_RIGHT_TRANSFER|PACHA_FD_RIGHT_DUP|
         PACHA_FD_RIGHT_MAP_READ|PACHA_FD_RIGHT_MAP_WRITE;
-    if (r->flags & FILED_FILE_VMO_EXEC) rights|=PACHA_FD_RIGHT_MAP_EXEC;
+    /* The private cache owner can prepare future checked EXEC requests.
+     * Reply attenuation independently grants EXEC only after this call's
+     * mount check; no writable capability ever leaves filed. */
+    rights|=PACHA_FD_RIGHT_MAP_EXEC;
+    filed_snapshot_cache_observe(&rt->snapshots,rt->storage_generation,&stat);
+    uint64_t client_rights=rights&~(uint64_t)(PACHA_FD_RIGHT_MAP_WRITE|PACHA_FD_RIGHT_MAP_EXEC);
+    if (r->flags&FILED_FILE_VMO_EXEC) client_rights|=PACHA_FD_RIGHT_MAP_EXEC;
+    /* Unaligned requests retain their exact zero-tail copy semantics. */
+    int reusable=!(r->offset&4095) && (!(r->length&4095) ||
+        r->length>=stat.size-(uint64_t)r->offset);
+    if (!reusable) stat.snapshot_valid=0;
+    uint64_t vmo_offset=0;
+    int cached_pager=0;
+    const int rx=(r->flags&FILED_FILE_VMO_EXEC)!=0;
+    int hit=filed_snapshot_cache_get_variant(&rt->snapshots,&stat,(uint64_t)r->offset,
+        mapped,client_rights,rx,fd,&vmo_offset,&cached_pager);
+    if (hit<0) return hit;
+    ++rt->file_vmo_requests;
+    if (!hit) {
+        ++rt->file_vmo_misses;
+        rt->file_vmo_miss_bytes+=length;
+    }
+    if ((rt->file_vmo_requests&31)==0)
+        fprintf(stderr,"[filed] FILE_VMO_STATS requests=%llu misses=%llu miss_bytes=%llu cache_bytes=%llu\n",
+            (unsigned long long)rt->file_vmo_requests,
+            (unsigned long long)rt->file_vmo_misses,
+            (unsigned long long)rt->file_vmo_miss_bytes,
+            (unsigned long long)filed_snapshot_cache_resident_bytes(&rt->snapshots));
+    if (hit) {
+        response->result=(int64_t)length;response->handle=vmo_offset;
+        response->service=cached_pager ? FILED_FILE_VMO_PAGER : 0;
+        return 0;
+    }
+    if (mapped>64*1024 && reusable) {
+        struct filed_pager_record *record=NULL;
+        status=filed_pager_create(rt,r->handle,(uint64_t)r->offset,mapped,
+            length,rx,&stat,rights,fd,&record);
+        if (status) return status;
+        filed_snapshot_cache_put_pager(&rt->snapshots,&stat,(uint64_t)r->offset,
+            mapped,*fd,record,rx);
+        response->result=(int64_t)length;
+        response->handle=0;
+        response->service=FILED_FILE_VMO_PAGER;
+        return 0;
+    }
 #ifdef FILED_INTERNAL_MICROBENCH
     FILED_BENCH_STAGE(filed_bench_snapshot_cycles,0,bench_stage);
 #endif
     pacha_fd_t vmo=pacha_vmo_create(mapped,rights,0);
-    if (vmo<16) return vmo;
+    if (vmo<16) return vmo<0 ? vmo : -EIO;
 #ifdef FILED_INTERNAL_MICROBENCH
     FILED_BENCH_STAGE(filed_bench_snapshot_cycles,1,bench_stage);
 #endif
@@ -121,23 +171,38 @@ static int make_file_vmo(filed_runtime_t *rt,const kb2_fs_request_t *r,
 #ifdef FILED_INTERNAL_MICROBENCH
     FILED_BENCH_STAGE(filed_bench_snapshot_cycles,3,bench_stage);
 #endif
+    int consistent=stat.snapshot_valid;
     size_t done=0;
     while (!status && done<length) {
         size_t got=0;
-        status=filed_storage_pread(rt,r->handle,(uint64_t)r->offset+done,
-                                    memory+done,(size_t)length-done,&got);
+        status=filed_storage_snapshot_pread(rt,r->handle,(uint64_t)r->offset+done,
+            memory+done,(size_t)length-done,&got,&stat,&consistent);
         if (!status && !got) break;
         done+=got;
     }
+    if (status)
+        fprintf(stderr,"[filed] FILE_VMO snapshot pread handle=%llu done=%zu status=%d\n",
+            (unsigned long long)r->handle,done,status);
 #ifdef FILED_INTERNAL_MICROBENCH
     FILED_BENCH_STAGE(filed_bench_snapshot_cycles,4,bench_stage);
 #endif
-    (void)pacha_munmap(memory,mapped);
+    int unmapped=pacha_munmap(memory,mapped);
+    if (unmapped) {
+        /* An unretired writable fill mapping cannot be silently forgotten.
+         * Stop this owner generation so process teardown releases it; never
+         * publish/cache the VMO or keep accumulating such mappings. */
+        rt->storage_generation=0;
+        if (!status) status=-EIO;
+    }
 #ifdef FILED_INTERNAL_MICROBENCH
     FILED_BENCH_STAGE(filed_bench_snapshot_cycles,5,bench_stage);
 #endif
     if (status) { (void)pacha_fd_close(vmo); return status; }
+    if (consistent && done==length)
+        filed_snapshot_cache_put_variant(&rt->snapshots,&stat,
+            (uint64_t)r->offset,mapped,vmo,rx);
     response->result=(int64_t)done;
+    response->handle=0;
     *fd=vmo;
     return 0;
 }
@@ -302,8 +367,10 @@ static int reserve_session(filed_runtime_t *rt,uint64_t minimum,
     if (!s) return -ENOMEM;
     s->vmo_fd=s->doorbell_fd=-1;
     s->client=rt->actor;
+    filed_mutex_lock(&rt->storage_exchange_lock);
     int status=filed_storage_owner_client_config(rt->storage,rt->actor->id,
         minimum,&s->config);
+    filed_mutex_unlock(&rt->storage_exchange_lock);
     if (status) {
         free(s);
         /* Pre-publication resource pressure is not a sandbox generation fault.
@@ -342,7 +409,9 @@ static int attach_session(filed_runtime_t *rt,const kb2_fs_request_t *r,
     /* Record ambiguous transferred inventory before publication. There is no
      * filed-side mapping, descriptor consumption or payload rewriting. */
     s->attached=1; s->vmo_fd=sources[0]; s->doorbell_fd=sources[1];
+    filed_mutex_lock(&rt->storage_exchange_lock);
     status=filed_storage_owner_client_bind(rt->storage,&s->config,sources[0],sources[1]);
+    filed_mutex_unlock(&rt->storage_exchange_lock);
     if (status) rt->storage_generation=0;
     return status;
 }
@@ -350,7 +419,9 @@ static int release_session(filed_runtime_t *rt,struct filed_session *s)
 {
     int status=0;
     if (!s->remote_released) {
+        filed_mutex_lock(&rt->storage_exchange_lock);
         status=filed_storage_owner_client_release(rt->storage,s->config.channel_id);
+        filed_mutex_unlock(&rt->storage_exchange_lock);
         if (!status) s->remote_released=1;
     }
     if (!status && s->vmo_fd>=16) {
@@ -458,13 +529,39 @@ static int dispatch_wire(filed_runtime_t *rt,const kb2_fs_request_t *r,
         status=exec_request(rt,r,bytes,sources,source_count,fds,fd_count); break;
     case KB2_FILESYSTEM_OP_FILE_VMO:
         if (source_count) status=-EINVAL;
-        else status=make_file_vmo(rt,r,&response,&fds[0]);
+        else {
+            status=make_file_vmo(rt,r,&response,&fds[0]);
+            if (status) fprintf(stderr,"[filed] FILE_VMO failed status=%d handle=%llu length=%llu\n",
+                status,(unsigned long long)r->handle,
+                (unsigned long long)r->length);
+        }
         if (!status) *fd_count=1;
         break;
     case KB2_FILESYSTEM_OP_SHARED_FILE_VMO:
-        /* A private pread snapshot cannot implement MAP_SHARED coherency.
-         * Linux-backed page export belongs to the shmem integration phase. */
-        status=-EOPNOTSUPP; break;
+        if (source_count || r->offset < 0 || !r->length ||
+            (r->length | (uint64_t)r->offset) & 4095 || r->flags & ~UINT64_C(3)) {
+            status=-EINVAL;
+        } else {
+            kb2_fs_request_t control = {.opcode=KB2_FILESYSTEM_OP_SHARED_FILE_VMO,
+                .client=rt->actor ? rt->actor->id : 1,
+                .credential_generation=rt->actor ? rt->actor->credential_generation : 1,
+                .handle=r->handle,.offset=r->offset,.length=r->length,.flags=r->flags,.mask=r->mask};
+            kb2_fs_response_t exported;
+            status=filed_owner_control(rt,&control,NULL,KB2_FILESYSTEM_REQUEST_SIZE,&exported);
+            if (!status) {
+                filed_mutex_lock(&rt->storage_exchange_lock);
+                status=filed_storage_owner_take_shared(rt->storage,
+                    exported.handle,control.sequence,r->length,&fds[0]);
+                filed_mutex_unlock(&rt->storage_exchange_lock);
+            }
+            if (!status) { *fd_count=1; response.result=exported.result; }
+            else {
+                filed_mutex_lock(&rt->storage_exchange_lock);
+                (void)filed_storage_owner_cancel_shared(rt->storage);
+                filed_mutex_unlock(&rt->storage_exchange_lock);
+            }
+        }
+        break;
     case KB2_FILESYSTEM_OP_TRANSFER_DUP: {
         if (source_count!=1) { status=-EINVAL; break; }
         struct filed_lease *lease=calloc(1,sizeof(*lease));
@@ -511,7 +608,7 @@ static int dispatch_wire(filed_runtime_t *rt,const kb2_fs_request_t *r,
     *used=KB2_FILESYSTEM_RESPONSE_SIZE+(size_t)response.data_length;
     return 0;
 }
-static int retained_source(uint32_t opcode,int status)
+static int retained_source(uint32_t opcode,int64_t status)
 {
     return !status && (opcode==KB2_FILESYSTEM_OP_SERVICE_BIND ||
         opcode==KB2_FILESYSTEM_OP_SESSION_ATTACH ||
@@ -558,14 +655,15 @@ int filed_receive(filed_runtime_t *rt,pacha_fd_t endpoint)
             }
         } else status=-ENOMEM;
     }
-    int result=status;
+    int64_t result=status;
     if (!status) {
         kb2_fs_response_t response;
         if (kb2_fs_response_decode(output,used,&response)) result=-EPROTO;
-        else result=(int)response.result;
+        else result=response.result;
     }
     {
         struct pacha_ipc_fd outbound[3]={{0}};
+        int prepare_status=0;
         for (size_t i=0;i<fd_count;++i) {
             uint64_t rights=0;
             if (request.opcode==KB2_FILESYSTEM_OP_CLIENT_REGISTER)
@@ -573,8 +671,22 @@ int filed_receive(filed_runtime_t *rt,pacha_fd_t endpoint)
             else if (request.opcode==KB2_FILESYSTEM_OP_FILE_VMO) {
                 rights=PACHA_FD_RIGHT_INSPECT|PACHA_FD_RIGHT_CLOSE|
                     PACHA_FD_RIGHT_TRANSFER|PACHA_FD_RIGHT_DUP|PACHA_FD_RIGHT_MAP_READ;
-                if (request.flags & FILED_FILE_VMO_WRITE) rights|=PACHA_FD_RIGHT_MAP_WRITE;
+                /* WRITE requests modify their private COW, never this VMO. */
                 if (request.flags & FILED_FILE_VMO_EXEC) rights|=PACHA_FD_RIGHT_MAP_EXEC;
+            } else if (request.opcode==KB2_FILESYSTEM_OP_SHARED_FILE_VMO) {
+                struct pacha_fd_info shared;
+                const uint64_t base=PACHA_FD_RIGHT_INSPECT|PACHA_FD_RIGHT_CLOSE|
+                    PACHA_FD_RIGHT_TRANSFER|PACHA_FD_RIGHT_DUP|PACHA_FD_RIGHT_MAP_READ;
+                const uint64_t allowed=base|PACHA_FD_RIGHT_MAP_WRITE|PACHA_FD_RIGHT_MAP_EXEC;
+                prepare_status=pacha_fd_get_info(fds[i],&shared);
+                if (!prepare_status && (shared.kind!=PACHA_FD_KIND_VMO ||
+                    (shared.rights & base)!=base || shared.rights & ~allowed))
+                    prepare_status=-EPROTO;
+                if (prepare_status) break;
+                // Linux may attenuate requested WRITE/EXEC (seals/noexec).
+                // Forward that actual capability, never process rights or
+                // rights reconstructed from the unattenuated request flags.
+                rights=shared.rights;
             } else if (request.opcode==KB2_FILESYSTEM_OP_EXEC_SELF) {
                 rights=PACHA_FD_RIGHT_INSPECT|PACHA_FD_RIGHT_CLOSE|
                     PACHA_FD_RIGHT_WAIT|PACHA_FD_RIGHT_SET_CONTEXT;
@@ -597,8 +709,9 @@ int filed_receive(filed_runtime_t *rt,pacha_fd_t endpoint)
                 .transfer_flags=PACHA_IPC_TRANSFER_MOVE|PACHA_IPC_TRANSFER_CLOEXEC};
         }
         struct pacha_ipc_msg response={.word0=message.word0,
-            .word1=(uint64_t)(int64_t)result,.word2=status ? 0 : used,
-            .word3=message.word3,.fds=outbound,.fd_count=fd_count};
+            .word1=(uint64_t)(int64_t)(prepare_status ? prepare_status : result),
+            .word2=status || prepare_status ? 0 : used,
+            .word3=message.word3,.fds=outbound,.fd_count=prepare_status ? 0 : fd_count};
         int reply_status=pacha_ipc_reply(reply,&response);
         if (reply_status) {
             const struct pacha_ipc_msg failed = {0};
@@ -606,6 +719,10 @@ int filed_receive(filed_runtime_t *rt,pacha_fd_t endpoint)
             for(size_t i=0;i<fd_count;++i)
                 if (fds[i]>=16) (void)pacha_fd_close(fds[i]);
             status=reply_status;
+        } else if (prepare_status) {
+            for(size_t i=0;i<fd_count;++i)
+                if (fds[i]>=16) (void)pacha_fd_close(fds[i]);
+            status=prepare_status;
         }
     }
     if (mapping) (void)pacha_munmap(mapping,mapped);
@@ -695,6 +812,9 @@ int filed_runtime_serve(filed_runtime_t *rt)
 {
     if(!rt || rt->client_endpoint_fd<16) return -EINVAL;
     for(;;) {
+        if (rt->snapshots.limit || rt->snapshots.count) {
+            filed_snapshot_cache_reserve_fds(&rt->snapshots);
+        }
         size_t count=1;
         for(struct filed_client *c=rt->clients;c;c=c->next) ++count;
         for(struct filed_lease *l=rt->leases;l;l=l->next) ++count;
@@ -710,7 +830,9 @@ int filed_runtime_serve(filed_runtime_t *rt)
             poll[at++]=(struct pacha_pollfd){.fd=c->fd,.events=events};
         for(struct filed_lease *l=rt->leases;l;l=l->next)
             poll[at++]=(struct pacha_pollfd){.fd=l->fd,.events=events};
-        long waited=pacha_fd_wait_many_batched(poll,count,PACHA_FD_WAIT_FOREVER);
+        long waited=pacha_fd_wait_many_batched(poll,count,
+            PACHA_FD_WAIT_FOREVER);
+        if (waited==PACHA_ERR_NOT_READY) { free(poll);continue; }
         if(waited<0) { free(poll); return (int)waited; }
         int status=0;
         /* Resolve each ready descriptor against the live lists again: an
@@ -751,7 +873,7 @@ int filed_runtime_serve(filed_runtime_t *rt)
         rt->actor=NULL;
         free(poll);
         if(status) return status;
-        if(!rt->storage_generation) return -EIO;
+        if(!rt->storage_generation) { filed_snapshot_cache_clear(&rt->snapshots);return -EIO; }
     }
 }
 #ifdef FILED_INTERNAL_MICROBENCH

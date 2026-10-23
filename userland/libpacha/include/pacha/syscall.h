@@ -36,6 +36,10 @@ long pacha_clock_read(uint64_t clock_id, uint64_t *nanoseconds);
 long pacha_futex_wake_wait(uint64_t wake_va, uint64_t wait_va,
     uint32_t expected, uint64_t timeout_ticks, uint64_t flags, uint64_t *wake_count);
 
+/* PAGER_ATTACH returns an opaque generation in RDX on success. */
+long pacha_pager_attach(uint64_t port_fd, uint64_t vmo_fd, uint64_t key,
+    uint64_t flags, uint64_t *generation);
+
 int pacha_status_to_int(long status);
 pacha_fd_t pacha_fd_result(long result);
 

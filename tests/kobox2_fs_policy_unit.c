@@ -19,7 +19,7 @@ int main(void) {
         KB2_FILESYSTEM_RIGHT_LOOKUP | KB2_FILESYSTEM_RIGHT_READ, 0,
         KB2_FILESYSTEM_RIGHT_EXEC | KB2_FILESYSTEM_RIGHT_READ,
         KB2_FILESYSTEM_RIGHT_EXEC | KB2_FILESYSTEM_RIGHT_READ,
-        KB2_FILESYSTEM_RIGHT_READ, 0,
+        KB2_FILESYSTEM_RIGHT_READ, KB2_FILESYSTEM_RIGHT_READ,
         KB2_FILESYSTEM_RIGHT_LOOKUP | KB2_FILESYSTEM_RIGHT_READ,
         0, 0, 0,
         KB2_FILESYSTEM_RIGHT_READ, KB2_FILESYSTEM_RIGHT_READ,
@@ -60,10 +60,24 @@ int main(void) {
            KB2_FS_OPERATION_DATA, lookup);
     expect(KB2_FILESYSTEM_OP_FILE_VMO, 2, KB2_FS_OPERATION_FRONTEND,
            read | KB2_FILESYSTEM_RIGHT_EXEC);
+    expect(KB2_FILESYSTEM_OP_SHARED_FILE_VMO, 1, KB2_FS_OPERATION_FRONTEND, read | write);
+    expect(KB2_FILESYSTEM_OP_SHARED_FILE_VMO, 2, KB2_FS_OPERATION_FRONTEND,
+           read | KB2_FILESYSTEM_RIGHT_EXEC);
+    expect(KB2_FILESYSTEM_OP_SHARED_FILE_VMO, 3, KB2_FS_OPERATION_FRONTEND,
+           read | write | KB2_FILESYSTEM_RIGHT_EXEC);
     expect(0, 0, KB2_FS_OPERATION_INVALID, 0);
     expect(KB2_FILESYSTEM_OPERATION_COUNT + 1, 0, KB2_FS_OPERATION_INVALID, 0);
     expect(UINT32_MAX, 0, KB2_FS_OPERATION_INVALID, 0);
     uint64_t rights;
+    kb2_fs_request_t snapshot={.opcode=KB2_FILESYSTEM_OP_PREAD,.mode=KB2_FILESYSTEM_SNAPSHOT_QUERY};
+    assert(kb2_fs_request_policy(&snapshot,&rights)==KB2_FS_OPERATION_DATA);
+    assert(rights==(KB2_FILESYSTEM_RIGHT_READ|KB2_FILESYSTEM_RIGHT_STAT));
+    snapshot.mode=0;snapshot.mask=0x40000000u;
+    assert(kb2_fs_request_policy(&snapshot,&rights)==KB2_FS_OPERATION_DATA);
+    assert(rights==KB2_FILESYSTEM_RIGHT_READ);
+    snapshot.opcode=KB2_FILESYSTEM_OP_STATX;
+    assert(kb2_fs_request_policy(&snapshot,&rights)==KB2_FS_OPERATION_DATA);
+    assert(rights==KB2_FILESYSTEM_RIGHT_STAT);
     assert(kb2_fs_request_policy(NULL, &rights) == KB2_FS_OPERATION_INVALID);
     kb2_fs_request_t request = {0};
     assert(kb2_fs_request_policy(&request, NULL) == KB2_FS_OPERATION_INVALID);

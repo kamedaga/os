@@ -42,6 +42,25 @@ lpr_state_t lpr_state = {
     },
 };
 
+/* The sole live thread's slot is stable until fork or a thread-count
+ * transition. Those paths clear this before publishing count==1 again. */
+static lpr_signal_thread_state_t *lpr_single_thread_signal_state;
+
+lpr_signal_thread_state_t *lpr_signal_thread_state_single_cached(void)
+{
+    return __atomic_load_n(&lpr_single_thread_signal_state, __ATOMIC_ACQUIRE);
+}
+
+void lpr_signal_thread_state_single_publish(lpr_signal_thread_state_t *state)
+{
+    __atomic_store_n(&lpr_single_thread_signal_state, state, __ATOMIC_RELEASE);
+}
+
+void lpr_signal_thread_state_single_invalidate(void)
+{
+    __atomic_store_n(&lpr_single_thread_signal_state, 0, __ATOMIC_RELEASE);
+}
+
 static _Noreturn void lpr_signal_thread_state_exhausted(void)
 {
     (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_PROCESS_EXIT, 127u);
@@ -302,6 +321,15 @@ void lpr_signal_thread_state_release_current(void)
         PACHAOS_PROCESS_SIGNAL_CTL_SET_MASK,
         UINT64_MAX);
     lpr_signal_thread_slot_t *slot = lpr_signal_thread_slot_current();
+    if (slot->state.native_pending_hint_active) {
+        /* A late signal publication can only set a stale 1 after this
+         * unregister; the slot remains mapped until process teardown. */
+        (void)lpr_pacha_syscall2(
+            PACHAOS_SYSCALL_PROCESS_SIGNAL_CTL,
+            PACHAOS_PROCESS_SIGNAL_CTL_SET_THREAD_PENDING_HINT, 0);
+        slot->state.native_pending_hint_active = 0;
+    }
+    lpr_linux_fault_runtime_destroy();
     lpr_memset(&slot->state, 0, sizeof(slot->state));
     __atomic_store_n(&slot->tid, 0u, __ATOMIC_RELEASE);
 }
@@ -313,6 +341,31 @@ void lpr_signal_thread_state_after_fork_child(void)
         &inherited,
         lpr_signal_thread_state_current(),
         sizeof(inherited));
+    // The parent held this registry lock across native clone. Only this
+    // thread survives here, so the copied locked word has no surviving owner.
+    lpr_state.signal.fault_registry_lock = 0;
+    // Native fork copies VMAs but not sibling threads. Retire their dedicated
+    // fault stacks before clearing slot metadata; the caller's stack is reused
+    // after registering the child's fresh native thread.
+    for (unsigned i = 0; i < sizeof(lpr_state.signal.threads) / sizeof(lpr_state.signal.threads[0]); ++i) {
+        uint64_t stack = lpr_state.signal.threads[i].state.fault_stack;
+        if (stack && stack != inherited.fault_stack)
+            if (lpr_pacha_syscall2(PACHAOS_SYSCALL_MUNMAP, stack, LPR_SIGNAL_FAULT_STACK_BYTES)) {
+                (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_PROCESS_EXIT, 128u + 11u);
+                for (;;) {}
+            }
+    }
+    for (lpr_signal_thread_chunk_t *chunk = __atomic_load_n(&lpr_state.signal.overflow_head, __ATOMIC_ACQUIRE);
+         chunk; chunk = __atomic_load_n(&chunk->next, __ATOMIC_ACQUIRE))
+        for (unsigned i = 0; i < LPR_SIGNAL_THREAD_CHUNK_SLOT_COUNT; ++i) {
+            uint64_t stack = chunk->slots[i].state.fault_stack;
+            if (stack && stack != inherited.fault_stack)
+                if (lpr_pacha_syscall2(PACHAOS_SYSCALL_MUNMAP, stack, LPR_SIGNAL_FAULT_STACK_BYTES)) {
+                    (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_PROCESS_EXIT, 128u + 11u);
+                    for (;;) {}
+                }
+        }
+    inherited.fault_registered = 0;
     lpr_state.signal.grow_lock_word = 0;
     __atomic_store_n(
         &lpr_state.signal.signalfd_pending_mask,

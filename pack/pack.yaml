@@ -2781,6 +2781,8 @@ apps:
       input:
         - "pack/live-amdgpu-probe.conf"
         - "pack/scripts/build_amdgpu_package.sh"
+        - "pack/scripts/build_amdgpu_profile.sh"
+        - "pack/scripts/fetch_amdgpu_firmware.sh"
         - "pack/scripts/build_amdgpu_firmware_bundle.py"
         - "userland/kobox2_adapter"
         - "kobox2/linux-sandbox/kobox"
@@ -2812,9 +2814,12 @@ apps:
     file:
       path: ".artifacts/kobox2-amdgpu-driver.tar.gz"
       rebuild: ["bash", "pack/scripts/build_amdgpu_package.sh"]
-      input:
+      input: &amdgpu_package_inputs
         - "pack/scripts/build_amdgpu_driver_archive.sh"
         - "pack/scripts/build_amdgpu_package.sh"
+        - "pack/scripts/build_amdgpu_profile.sh"
+        - "pack/scripts/fetch_amdgpu_firmware.sh"
+        - "pack/scripts/build_amdgpu_firmware_bundle.py"
         - "pack/live-amdgpu-probe.conf"
         - "userland/kobox2_adapter"
         - "kobox2/linux-sandbox/kobox"
@@ -2834,10 +2839,8 @@ apps:
   amdgpu_driver_archive_digest:
     file:
       path: ".artifacts/kobox2-amdgpu-driver.tar.gz.sha256"
-      rebuild: ["bash", "pack/scripts/build_amdgpu_driver_archive.sh"]
-      input:
-        - ".artifacts/kobox2-amdgpu-driver.tar.gz"
-        - "pack/scripts/build_amdgpu_driver_archive.sh"
+      rebuild: ["bash", "pack/scripts/build_amdgpu_package.sh"]
+      input: *amdgpu_package_inputs
     out: "AMDGPUPKG.SHA256"
   rootfs_vfs:
     role: "service"

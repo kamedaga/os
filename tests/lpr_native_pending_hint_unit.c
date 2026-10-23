@@ -13,6 +13,7 @@ static int publish_during_query;
 static int kernel_pending, deliveries;
 static jmp_buf delivered;
 static int64_t wait_status;
+static lpr_signal_thread_state_t thread_hint_state;
 
 const struct lpr_linux_user_frame *lpr_current_linux_user_frame(void)
 {
@@ -36,7 +37,11 @@ int64_t lpr_pacha_syscall2(uint64_t nr, uint64_t operation, uint64_t argument)
     }
     ++queries;
     queried_rax = active_frame->rax;
-    if (publish_during_query) lpr_native_pending_hint = 1;
+    if (publish_during_query) {
+        if (active_frame->runtime_signal_state)
+            ((lpr_signal_thread_state_t *)(uintptr_t)active_frame->runtime_signal_state)->native_pending_hint = 1;
+        else lpr_native_pending_hint = 1;
+    }
     if (kernel_pending) { kernel_pending = 0; ++deliveries; longjmp(delivered, 1); }
     return 0; /* no claim: the existing dispatch frame must remain reusable */
 }
@@ -73,6 +78,7 @@ static void reset(void)
     wait_status = PACHA_SYSCALL_ERR_NOT_READY;
     lpr_native_pending_hint_active = 1;
     lpr_native_pending_hint = 0;
+    thread_hint_state = (lpr_signal_thread_state_t){0};
 }
 
 int main(void)
@@ -108,6 +114,24 @@ int main(void)
     lpr_native_pending_hint = 0;
     lpr_linux_deliver_native_pending_frame(-LPR_LINUX_EINTR);
     CHECK(queries == 2 && lpr_native_pending_hint == 0 && frame.rax == 123);
+
+    /* A registered thread slot lets siblings skip the native query. The
+     * process-wide fallback above must continue probing when a sibling runs. */
+    reset();
+    lpr_state.thread_count = 2;
+    thread_hint_state.native_pending_hint_active = 1;
+    frame.runtime_signal_state = (uintptr_t)&thread_hint_state;
+    lpr_linux_deliver_native_pending_frame(0);
+    CHECK(queries == 0);
+    thread_hint_state.native_pending_hint = 1;
+    lpr_linux_deliver_native_pending_frame(0);
+    CHECK(queries == 1 && thread_hint_state.native_pending_hint == 0);
+    kernel_pending = 1;
+    if (setjmp(delivered) == 0) {
+        lpr_linux_deliver_native_pending_frame(-LPR_LINUX_EINTR);
+        CHECK(0);
+    }
+    CHECK(queries == 2 && deliveries == 1 && kernel_pending == 0);
 
     reset();
     lpr_native_pending_hint_active = 0;

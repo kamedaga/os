@@ -12,7 +12,7 @@ int64_t lpr_linux_readv(uint64_t fd, uint64_t iov, uint64_t iov_count, unsigned 
 int64_t lpr_linux_pread64(uint64_t fd, uint64_t buf, uint64_t count, uint64_t offset);
 int64_t lpr_linux_pwrite64(uint64_t fd, uint64_t buf, uint64_t count, uint64_t offset);
 int64_t lpr_linux_pread_to_vmo(uint64_t fd, uint64_t vmo_fd, uint64_t vmo_offset, uint64_t count, uint64_t file_offset);
-int64_t lpr_linux_file_vmo(uint64_t fd, uint64_t file_offset, uint64_t length, int executable, uint64_t *out_loaded);
+int64_t lpr_linux_file_vmo(uint64_t fd, uint64_t file_offset, uint64_t length, int executable, uint64_t *out_loaded, uint64_t *out_vmo_offset, int *out_pager);
 int64_t lpr_linux_write(uint64_t fd, uint64_t buf, uint64_t count, unsigned *wait_not_ready __attribute__((unused)));
 int64_t lpr_linux_writev(uint64_t fd, uint64_t iov, uint64_t iov_count, unsigned *wait_not_ready __attribute__((unused)));
 int64_t lpr_linux_close(uint64_t fd);

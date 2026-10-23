@@ -13,6 +13,7 @@ const former_max_task_fd_waiters: usize = 256;
 const std = @import("std");
 const kernel = @import("kernel");
 const fd_abi = @import("kernel_abi_root").fd_abi;
+const pager_abi = @import("kernel_abi_root").pager_abi;
 const ProcessFdGrant = @import("kernel_abi_root").process_abi.ProcessFdGrant;
 
 const KernelState = kernel.KernelState;
@@ -4357,7 +4358,12 @@ test "native VMO slot explicitly budgets its failed-return destination" {
     // Ownership survives PMM rejection; do not overload the parent/device
     // union merely to preserve the old single-cache-line storage target.
     // The internal WC token now encodes every u32 slot plus reserved zero.
-    try std.testing.expect(@sizeOf(kernel.NativeVmoSlot) <= 64 + @sizeOf(*FreePageList) + 8 + @sizeOf(u64) + @sizeOf(kernel.BackingStore) + @sizeOf(*kernel.BackingStore) + @sizeOf(@TypeOf(@as(kernel.NativeVmoSlot, .{}).references)) + @sizeOf(@TypeOf(@as(kernel.NativeVmoSlot, .{}).parent_edge)));
+    const pager_metadata = @sizeOf(kernel.types.PagerPortRef) + 2 * @sizeOf(u64) + @sizeOf(kernel.PrincipalRaw) +
+        @sizeOf(kernel.types.PagerReleaseRef) +
+        @sizeOf(@TypeOf(@as(kernel.NativeVmoSlot, .{}).pager_request_store)) +
+        @sizeOf(@TypeOf(@as(kernel.NativeVmoSlot, .{}).pager_request_start)) +
+        2 * @sizeOf(kernel.types.PagerRequestRef);
+    try std.testing.expect(@sizeOf(kernel.NativeVmoSlot) <= 64 + @sizeOf(*FreePageList) + 8 + @sizeOf(u64) + @sizeOf(kernel.BackingStore) + @sizeOf(*kernel.BackingStore) + @sizeOf(@TypeOf(@as(kernel.NativeVmoSlot, .{}).references)) + @sizeOf(@TypeOf(@as(kernel.NativeVmoSlot, .{}).parent_edge)) + pager_metadata + 8);
 }
 
 test "RAM lifetime ticket prevalidates canonical owner before infallible publication update" {
@@ -4889,7 +4895,224 @@ test "page view borrows scatter pages until its last reference closes" {
     try std.testing.expectEqual(@as(usize, 3), free_list.pageCount());
 }
 
-test "page view mappings are shared non-executable in every map path" {
+test "page view refresh requires same parent and immutable maximum authority" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    var s: KernelState = undefined;
+    try initFdState(&s);
+    defer s.deinitPools();
+    const parent_rights = fdRights(.{ .close = true, .dup = true, .share = true, .map_read = true, .map_write = true, .map_exec = true });
+    const parent_fd = try s.createAnonymousVmoFd(p0, 8192, parent_rights, .{}, 16);
+    const other_fd = try s.createAnonymousVmoFd(p0, 8192, parent_rights, .{}, 16);
+    const parent = s.nativeVmoRefForFd(p0, parent_fd).?;
+    const view = try s.createNativePageView(parent, 1);
+    s.nativeVmoSlot(view).?.page_view_max_prot = .{ .read = true, .write = true, .exec = true };
+    const object = try s.createKernelObject(.vmo, .{ .vmo = view });
+    // An updater may attenuate its own FD, but cannot erase writable/executable
+    // authority already delegated through other FDs or VMAs of the view.
+    const view_fd = try s.installFd(p0, object, fdRights(.{ .close = true, .dup = true, .revoke = true, .map_read = true }), .{}, 16);
+    const read_parent = try s.dupFd(p0, parent_fd, 16, fdRights(.{ .close = true, .share = true, .map_read = true }), .{});
+    const no_share = try s.dupFd(p0, parent_fd, 16, fdRights(.{ .close = true, .map_read = true, .map_write = true, .map_exec = true }), .{});
+    const no_exec = try s.dupFd(p0, parent_fd, 16, fdRights(.{ .close = true, .share = true, .map_read = true, .map_write = true }), .{});
+    const no_revoke = try s.dupFd(p0, view_fd, 16, fdRights(.{ .close = true, .map_read = true }), .{});
+    try std.testing.expectError(KernelError.InvalidState, s.nativePageViewRefreshAuthority(p0, view_fd, other_fd));
+    try std.testing.expectError(KernelError.InvalidState, s.nativePageViewRefreshAuthority(p0, view_fd, read_parent));
+    try std.testing.expectError(KernelError.InvalidState, s.nativePageViewRefreshAuthority(p0, view_fd, no_share));
+    try std.testing.expectError(KernelError.InvalidState, s.nativePageViewRefreshAuthority(p0, view_fd, no_exec));
+    try std.testing.expectError(KernelError.InvalidState, s.nativePageViewRefreshAuthority(p0, no_revoke, parent_fd));
+    try std.testing.expectError(KernelError.InvalidState, s.nativePageViewRefreshAuthority(p0, parent_fd, parent_fd));
+    const authorized = try s.nativePageViewRefreshAuthority(p0, view_fd, parent_fd);
+    try std.testing.expectEqual(view, authorized);
+    // A parent identity includes its generation, not just its reusable slot.
+    s.nativeVmoSlot(view).?.backing.parent.ref.generation +%= 1;
+    try std.testing.expectError(KernelError.InvalidState, s.nativePageViewRefreshAuthority(p0, view_fd, parent_fd));
+    s.nativeVmoSlot(view).?.backing.parent.ref = parent;
+    for ([_]kernel.Fd{ view_fd, no_revoke, read_parent, no_share, no_exec, other_fd, parent_fd }) |fd|
+        try s.closeFd(p0, fd);
+}
+
+test "sparse page view refresh preserves aliases and unavailable holes" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
+    defer s.deinitPools();
+    var free_list = FreePageList{};
+    try free_list.installRegions(&.{.{ .id = 0, .start = 4096, .end = (1 << 40) + (1 << 29) }});
+    const parent = try s.createNativeVmo(.anonymous, 3 * 4096);
+    try s.retainNativeVmo(parent);
+    try s.installNativeVmoPages(parent, 0, &.{ 0x8100_0000, 0x8200_0000, 0x8300_0000 }, null);
+    const view = try s.createNativePageView(parent, 2);
+    s.nativeVmoSlot(view).?.page_view_sparse = true;
+    try s.installNativeVmoPages(view, 0, &.{ 0x8100_0000, 0 }, null);
+    try std.testing.expect(s.nativeVmoIsSparsePageView(view));
+    try std.testing.expect(!s.nativeVmoIsSparsePageView(.{ .index = view.index, .generation = view.generation + 1 }));
+    s.nativeVmoSlot(parent).?.page_view_sparse = true;
+    try std.testing.expect(!s.nativeVmoIsSparsePageView(parent));
+    s.nativeVmoSlot(parent).?.page_view_sparse = false;
+    const object = try s.createKernelObject(.vmo, .{ .vmo = view });
+    const fd = try s.installFd(p0, object, fdRights(.{ .close = true, .map_read = true, .map_write = true }), .{}, 16);
+    _ = try s.mmapFd(p0, fd, 0x4300_0000, 8192, .{ .read = true, .write = true, .pkey = 3 }, .{ .shared = true, .pkey = 3 }, 0);
+    var prepared = try s.prepareFixedFdMmapIntoProcess(p0, fd, p1, 0x4400_0000, 8192, .{ .read = true, .pkey = 5 }, .{ .shared = true, .fixed = true, .pkey = 5 }, 0, &free_list);
+    // Test the same prepare/commit path used by MAP_FIXED without replacing
+    // the hole with anonymous demand-zero backing.
+    s.commitFixedMmapPrepared(&prepared, &free_list);
+    try std.testing.expect(s.nativeVmaFaultMapping(p0, 0x4300_1000, false, false) == null);
+    try std.testing.expect(!s.nativeVmoIsZeroOnDemand(view));
+    try std.testing.expectEqual(@as(?u64, null), s.nativeVmoResolvedPagePaddrOrZero(view, 1));
+
+    try std.testing.expect(s.nativeVmaFaultBackingUnavailable(p0, 0x4300_1000, 4));
+    try std.testing.expect(s.nativeVmaFaultBackingUnavailable(p0, 0x4300_1000, 6));
+    try std.testing.expect(!s.nativeVmaFaultBackingUnavailable(p0, 0x4300_1000, 20));
+    try std.testing.expect(!s.nativeVmaFaultBackingUnavailable(p1, 0x4400_1000, 6));
+    try std.testing.expect(!s.nativeVmaFaultBackingUnavailable(p0, 0x4300_0000, 4));
+    try std.testing.expect(!s.nativeVmaFaultBackingUnavailable(p0, 0x4500_0000, 4));
+    for ([_]u64{ 0, 5, 7, 12, 36, 68, 0x8004, 22 }) |ec|
+        try std.testing.expect(!s.nativeVmaFaultBackingUnavailable(p0, 0x4300_1000, ec));
+    s.nativeVmoSlot(view).?.page_view_sparse = false;
+    try std.testing.expect(!s.nativeVmoIsSparsePageView(view));
+    try std.testing.expect(!s.nativeVmaFaultBackingUnavailable(p0, 0x4300_1000, 4));
+    s.nativeVmoSlot(view).?.page_view_sparse = true;
+    s.nativeVmoSlot(view).?.page_store_owner +%= 1;
+    try std.testing.expect(!s.nativeVmaFaultBackingUnavailable(p0, 0x4300_1000, 4));
+    s.nativeVmoSlot(view).?.page_store_owner -%= 1;
+    try s.setVmaProtRange(p1, 0x4400_0000, 8192, .{ .pkey = 5 });
+    try std.testing.expect(!s.nativeVmaFaultBackingUnavailable(p1, 0x4400_1000, 4));
+    try s.setVmaProtRange(p1, 0x4400_0000, 8192, .{ .read = true, .pkey = 5 });
+
+    const staged = try s.createNativePageView(parent, 2);
+    s.nativeVmoSlot(staged).?.page_view_sparse = true;
+    try s.installNativeVmoPages(staged, 0, &.{ 0, 0x8300_0000 }, null);
+    const Invalidator = struct {
+        calls: usize = 0,
+        fail_at: usize = 0,
+        pub fn invalidate(self: *@This(), _: PrincipalId, _: u64, _: u64) bool {
+            self.calls += 1;
+            return self.calls != self.fail_at;
+        }
+    };
+    var invalidator = Invalidator{ .fail_at = 2 };
+    try std.testing.expectError(KernelError.InvalidState, s.refreshNativePageView(view, staged, &invalidator));
+    try std.testing.expectEqual(@as(usize, 2), invalidator.calls);
+    try std.testing.expectEqual(@as(?u64, 0x8100_0000), s.nativeVmoResolvedPagePaddr(view, 0));
+    try std.testing.expectEqual(@as(?u64, null), s.nativeVmoResolvedPagePaddrOrZero(view, 1));
+    invalidator = .{};
+    try s.refreshNativePageView(view, staged, &invalidator);
+    try std.testing.expect(!s.nativeVmaFaultBackingUnavailable(p0, 0x4300_1000, 4));
+    try std.testing.expectEqual(@as(usize, 2), invalidator.calls);
+    try std.testing.expect(s.nativeVmaFaultMapping(p0, 0x4300_0000, false, false) == null);
+    try std.testing.expectEqual(@as(u64, 0x8300_0000), s.nativeVmaFaultMapping(p0, 0x4300_1000, true, false).?.paddr);
+    try std.testing.expectEqual(@as(u64, 0x8300_0000), s.nativeVmaFaultMapping(p1, 0x4400_1000, false, false).?.paddr);
+    try std.testing.expect(s.nativeVmaFaultMapping(p1, 0x4400_1000, true, false) == null);
+    try std.testing.expectEqual(@as(u4, 3), s.vmaEntryConst(p0, 0x4300_0000).?.prot.pkey);
+    try std.testing.expectEqual(@as(u4, 5), s.vmaEntryConst(p1, 0x4400_0000).?.prot.pkey);
+    s.releaseNativeVmoWithFreeList(staged, &free_list);
+    try std.testing.expectEqual(@as(usize, 0), free_list.pageCount());
+    try s.munmapRangeWithFreeList(p0, 0x4300_0000, 8192, &free_list);
+    try s.munmapRangeWithFreeList(p1, 0x4400_0000, 8192, &free_list);
+    try s.closeFdWithFreeList(p0, fd, &free_list);
+    try std.testing.expectEqual(@as(?u32, 1), s.nativeVmoRefCount(parent));
+    s.releaseNativeVmoWithFreeList(parent, &free_list);
+    try std.testing.expectEqual(@as(usize, 3), free_list.pageCount());
+}
+
+test "page view mremap preserves borrowed identity offsets and refresh after relocation and shrink" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    var s: KernelState = undefined;
+    try initFdState(&s);
+    defer s.deinitPools();
+    var free_list = FreePageList{};
+    try free_list.installRegions(&.{.{ .id = 0, .start = 4096, .end = 1 << 40 }});
+    const parent = try s.createNativeVmo(.anonymous, 4 * 4096);
+    try s.retainNativeVmo(parent);
+    try s.installNativeVmoPages(parent, 0, &.{ 0x8100_0000, 0x8200_0000, 0x8300_0000, 0x8400_0000 }, null);
+    const view = try s.createNativePageView(parent, 4);
+    s.nativeVmoSlot(view).?.page_view_sparse = true;
+    try s.installNativeVmoPages(view, 0, &.{ 0x8100_0000, 0, 0x8300_0000, 0x8400_0000 }, null);
+    const object = try s.createKernelObject(.vmo, .{ .vmo = view });
+    const fd = try s.installFd(p0, object, fdRights(.{ .close = true, .map_read = true, .map_write = true }), .{}, 16);
+    const old: u64 = 0x5000_0000;
+    const alias: u64 = 0x5100_0000;
+    const moved: u64 = 0x5200_0000;
+    _ = try s.mmapFd(p0, fd, old, 16384, .{ .read = true, .write = true, .pkey = 3 }, .{ .shared = true, .pkey = 3 }, 0);
+    _ = try s.mmapFd(p0, fd, alias, 16384, .{ .read = true, .pkey = 5 }, .{ .shared = true, .pkey = 5 }, 0);
+    const source = s.vmaEntryForVaConst(p0, old).?;
+    try std.testing.expect(s.vmaRemapSourceAllowed(source, 8192, 4096));
+    try std.testing.expectError(KernelError.InvalidState, s.prepareMremapWithFreeList(p0, old, 4096, 8192, moved, true, true, &free_list));
+    try std.testing.expectEqual(view, s.vmaEntryForVaConst(p0, old).?.vmo);
+    var rejected = source.*;
+    rejected.flags.private = true;
+    rejected.flags.shared = false;
+    try std.testing.expect(!s.vmaRemapSourceAllowed(&rejected, 8192, 4096));
+    rejected = source.*;
+    rejected.vmo = parent; // A private file snapshot is not a borrowed view.
+    rejected.flags.private = true;
+    rejected.flags.shared = false;
+    try std.testing.expect(!s.vmaRemapSourceAllowed(&rejected, 8192, 4096));
+    rejected = source.*;
+    for ([_]kernel.NativeVmoKind{ .device_memory, .kernel_page }) |kind| {
+        const unsupported = try s.createNativeVmo(kind, 4096);
+        rejected.vmo = unsupported;
+        try std.testing.expect(!s.vmaRemapSourceAllowed(&rejected, 4096, 4096));
+    }
+    const before_abort = s.nativeVmoRefCount(view);
+    var abandoned = try s.prepareMremapWithFreeList(p0, old + 4096, 8192, 4096, moved, true, true, &free_list);
+    try std.testing.expect(s.vmaEntryForVaConst(p0, moved) == null);
+    try std.testing.expectEqual(@as(u64, 16384), s.vmaEntryConst(p0, old).?.size_bytes);
+    s.discardMremapPrepared(&abandoned, &free_list);
+    try std.testing.expectEqual(before_abort, s.nativeVmoRefCount(view));
+    try std.testing.expectEqual(@as(u64, 16384), s.vmaEntryConst(p0, old).?.size_bytes);
+    // Move/shrink the middle of a VMA; both prefix and suffix remain at their
+    // original offsets. Borrowed tail PFNs must not enter the PMM free list.
+    try std.testing.expectEqual(moved, try s.mremapRangeWithFreeList(p0, old + 4096, 8192, 4096, moved, true, true, &free_list));
+    try std.testing.expectEqual(@as(u64, 4096), s.vmaEntryConst(p0, old).?.size_bytes);
+    try std.testing.expectEqual(@as(u64, 3 * 4096), s.vmaEntryConst(p0, old + 3 * 4096).?.vmo_offset);
+    try std.testing.expect(s.vmaEntryForVaConst(p0, old + 4096) == null);
+    const destination = s.vmaEntryConst(p0, moved).?;
+    try std.testing.expectEqual(view, destination.vmo);
+    try std.testing.expectEqual(@as(u64, 4096), destination.vmo_offset);
+    try std.testing.expectEqual(@as(u4, 3), destination.prot.pkey);
+    try std.testing.expectEqual(@as(u4, 3), destination.max_prot.pkey);
+    try std.testing.expect(s.nativeVmaFaultBackingUnavailable(p0, moved, 4));
+    const staged = try s.createNativePageView(parent, 4);
+    s.nativeVmoSlot(staged).?.page_view_sparse = true;
+    try s.installNativeVmoPages(staged, 0, &.{ 0x8100_0000, 0x8200_0000, 0, 0x8400_0000 }, null);
+    const Invalidator = struct {
+        calls: usize = 0,
+        pub fn invalidate(self: *@This(), _: PrincipalId, _: u64, _: u64) bool {
+            self.calls += 1;
+            return true;
+        }
+    };
+    var invalidator = Invalidator{};
+    try s.refreshNativePageView(view, staged, &invalidator);
+    try std.testing.expectEqual(@as(usize, 4), invalidator.calls);
+    try std.testing.expectEqual(@as(u64, 0x8200_0000), s.nativeVmaFaultMapping(p0, moved, true, false).?.paddr);
+    try std.testing.expectEqual(@as(u64, 0x8200_0000), s.nativeVmaFaultMapping(p0, alias + 4096, false, false).?.paddr);
+    try std.testing.expectEqual(@as(u64, 0x8400_0000), s.nativeVmaFaultMapping(p0, old + 3 * 4096, true, false).?.paddr);
+    try std.testing.expectEqual(alias, try s.mremapRangeWithFreeList(p0, alias, 16384, 8192, 0, false, false, &free_list));
+    try std.testing.expectEqual(@as(u4, 5), s.vmaEntryConst(p0, alias).?.prot.pkey);
+    try std.testing.expectEqual(@as(u64, 8192), s.vmaEntryConst(p0, alias).?.size_bytes);
+    const again: u64 = 0x5300_0000;
+    try std.testing.expectEqual(again, try s.mremapRangeWithFreeList(p0, moved, 4096, 4096, again, true, true, &free_list));
+    try std.testing.expect(s.vmaEntryForVaConst(p0, moved) == null);
+    try std.testing.expectEqual(@as(u64, 0x8200_0000), s.nativeVmaFaultMapping(p0, again, true, false).?.paddr);
+    try std.testing.expectEqual(@as(usize, 0), free_list.pageCount());
+    try std.testing.expectEqual(@as(?u64, 0x8300_0000), s.nativeVmoResolvedPagePaddr(parent, 2));
+    s.releaseNativeVmoWithFreeList(staged, &free_list);
+    try s.munmapRangeWithFreeList(p0, old, 16384, &free_list);
+    try s.munmapRangeWithFreeList(p0, alias, 8192, &free_list);
+    try s.munmapRangeWithFreeList(p0, again, 4096, &free_list);
+    try s.closeFdWithFreeList(p0, fd, &free_list);
+    try std.testing.expectEqual(@as(?u32, 1), s.nativeVmoRefCount(parent));
+    try std.testing.expectEqual(@as(usize, 0), free_list.pageCount());
+    s.releaseNativeVmoWithFreeList(parent, &free_list);
+    try std.testing.expectEqual(@as(usize, 4), free_list.pageCount());
+}
+
+test "page view mappings retain their non-executable creation ceiling in every map path" {
     var physical_fixture = try physicalFixture();
     defer physical_fixture.deinit();
     defer kernel.resetDmaRetentionForTest();
@@ -5077,6 +5300,36 @@ test "VMO lifetime snapshot includes queued IPC and requires INSPECT" {
     try expectVmoLifetime(&s, fd, 1, 1);
     try s.closeFdWithFreeList(p0, fd, &free_list);
     try s.closeFdWithFreeList(p0, endpoint, &free_list);
+}
+
+test "preferred mmap arena distinguishes oversized placement from invalid requests" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
+    defer s.deinitPools();
+    const process_abi = @import("kernel_abi_root").process_abi;
+    const base = process_abi.user_aslr_base_va;
+    const span = process_abi.user_aslr_end_va - base;
+    const table = s.getVmaTable(p0) orelse unreachable;
+    table.next_user_map_va = base + process_abi.user_aslr_granule;
+    const cursor = table.next_user_map_va;
+    for ([_]u64{ span + 4096, @as(u64, 128) << 30 }) |bytes| {
+        try std.testing.expectError(KernelError.TableFull, s.findFreeUserMapVa(p0, bytes, 0));
+        try std.testing.expectEqual(cursor, table.next_user_map_va);
+    }
+    try std.testing.expectError(KernelError.InvalidState, s.findFreeUserMapVa(p0, 0, 0));
+    try std.testing.expectError(KernelError.InvalidState, s.findFreeUserMapVa(p0, 4097, 0));
+    try std.testing.expectError(KernelError.InvalidState, s.findFreeUserMapVa(.Device0, span + 4096, 0));
+    try std.testing.expectEqual(cursor, table.next_user_map_va);
+    try std.testing.expectEqual(@as(usize, 0), table.active_count);
+    try std.testing.expectEqual(cursor, try s.findFreeUserMapVa(p0, 4096, 0));
+    // Finding a placement advances the cursor but does not publish a VMA.
+    // An exact-fit request can still wrap to the empty arena's base.
+    try std.testing.expectEqual(base, try s.findFreeUserMapVa(p0, span, 0));
+    try std.testing.expectEqual(process_abi.user_aslr_end_va, table.next_user_map_va);
+    try std.testing.expectEqual(@as(usize, 0), table.active_count);
 }
 
 test "anonymous vmo fd maps through vma ledger without page capability install" {
@@ -9505,4 +9758,672 @@ test "channel FD4200 fits finite backing without four page bodies" {
     }
     try std.testing.expectEqual(@as(usize, 1), backend.largest);
     std.debug.print("CHANNEL_PRESSURE opened={d} peak_pages={d} largest={d}\n", .{ opened, backend.peak, backend.largest });
+}
+
+// The golden stream is generated by the pre-index munmap/preflight/removal
+// implementation. Serialize semantic values, not pointer-bearing reverse links
+// or padding; keep every original VMA field, slot/list order and backing slot.
+const VmaCutOracle = struct {
+    words: std.ArrayList(u64) = .empty,
+    states: usize = 0,
+    fn put(self: *@This(), word: u64) !void {
+        try self.words.append(std.testing.allocator, word);
+    }
+    fn value(self: *@This(), v: anytype) !void {
+        const T = @TypeOf(v);
+        switch (@typeInfo(T)) {
+            .bool => try self.put(@intFromBool(v)),
+            .int, .comptime_int => try self.put(@intCast(v)),
+            .@"enum" => try self.put(@intFromEnum(v)),
+            .optional => {
+                try self.put(@intFromBool(v != null));
+                if (v) |n| try self.value(n);
+            },
+            .@"struct" => inline for (std.meta.fields(T)) |field| {
+                if (comptime !std.mem.eql(u8, field.name, "references") and !std.mem.eql(u8, field.name, "active_position")) try self.value(@field(v, field.name));
+            },
+            else => @compileError("nonsemantic oracle value: " ++ @typeName(T)),
+        }
+    }
+    fn snapshot(self: *@This(), s: *KernelState, free: *FreePageList) !void {
+        try kernel.ReferenceCheck.check(s);
+        try self.put(self.states);
+        self.states += 1;
+        for ([_]PrincipalId{ p0, p1, p2 }) |owner| {
+            const table = s.getVmaTable(owner).?;
+            try expectVmaAddressIndex(s, owner);
+            // The new metadata is checked separately; it cannot change the
+            // canonical legacy stream or the allocation density.
+            if (comptime @hasField(kernel.VmaEntry, "active_position")) try kernel.ReferenceCheck.vmaTable(table);
+            try self.put(table.active_count);
+            try self.put(table.next_user_map_va);
+            for (0..table.active_count) |pos| try self.value(table.active_indices.get(@intCast(pos)).?.*);
+            var entries = table.entries.iterator();
+            while (entries.next()) |item| {
+                try self.value(item.ref);
+                try self.value(item.value.*);
+            }
+            try self.put(std.math.maxInt(u64));
+        }
+        var cows = s.native_cow_tables.iterator();
+        while (cows.next()) |item| {
+            const slot = item.value;
+            try self.value(item.ref);
+            try self.value(slot.active);
+            try self.value(slot.generation);
+            try self.value(slot.ref_count);
+            try self.value(slot.page_count);
+            const ref = kernel.NativeCowTableRef{ .index = item.ref.index, .generation = item.ref.generation };
+            for (0..slot.page_count) |i| try self.value(s.nativeCowPagePaddr(ref, @intCast(i)));
+        }
+        try self.put(std.math.maxInt(u64));
+        var vmos = s.native_vmos.iterator();
+        while (vmos.next()) |item| {
+            const slot = item.value;
+            try self.value(item.ref);
+            try self.value(slot.kind);
+            try self.value(slot.generation);
+            try self.value(slot.ref_count);
+            try self.value(slot.size_bytes);
+            try self.value(slot.page_count);
+            try self.value(slot.zero_on_demand);
+            try self.value(slot.page_view_sparse);
+            try self.value(slot.page_view_max_prot);
+            try self.value(slot.ram_cache_state);
+            try self.value(slot.backing.parent);
+            const ref = kernel.NativeVmoRef{ .index = item.ref.index, .generation = item.ref.generation };
+            for (0..slot.page_count) |i| try self.value(s.nativeVmoPagePaddrOrHole(ref, i));
+        }
+        try self.put(std.math.maxInt(u64));
+        try self.value(free.pageCount());
+        try self.value(free.rangeCount());
+        for (0..free.rangeCount()) |i| {
+            const range = free.rangeAt(i);
+            try self.value(range.region_id);
+            try self.value(range.physical_start);
+            try self.value(range.len);
+        }
+    }
+};
+
+test "VMA cut legacy oracle randomized operations and shared COW fixed remap fork exec failures" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
+    defer s.deinitPools();
+    var free: FreePageList = .{};
+    try free.installRegions(&.{.{ .id = 0, .start = 4096, .end = 16 * 1024 * 1024 }});
+    try free.seedContiguousRange(0x100000, 2048);
+    var oracle: VmaCutOracle = .{};
+    defer oracle.words.deinit(std.testing.allocator);
+    const base: u64 = 0x60000000;
+    const rw = vmaProt(.{ .read = true, .write = true });
+    const flags = mmapFlags(.{ .anonymous = true, .private = true, .fork_cow = true });
+    // Three-way split shares one COW table. Reverse address/slot order by
+    // giving the prefix a higher slot; deleting the middle before trimming the
+    // suffix exercises the uniqueness-sensitive reclamation described in C1.
+    _ = try s.createAnonymousVmaWithPages(p0, base, 6 * 4096, rw, rw, flags, &free);
+    const cow = try s.createNativeCowTable(6, &free);
+    try s.retainNativeCowTable(cow);
+    const entry = @constCast(s.vmaEntryForVaConst(p0, base).?);
+    entry.cow_table = cow;
+    s.refreshVmaReferences(entry);
+    for (0..6) |i| try s.setNativeCowPagePaddr(cow, @intCast(i), try free.popFront(), &free);
+    try s.setVmaProtRange(p0, base + 2 * 4096, 2 * 4096, .{ .read = true });
+    try oracle.snapshot(&s, &free);
+    try s.munmapRangeWithFreeList(p0, base + 4 * 4096, 2 * 4096, &free);
+    try oracle.snapshot(&s, &free);
+    try s.munmapRangeWithFreeList(p0, base + 4096, 3 * 4096, &free);
+    try oracle.snapshot(&s, &free);
+    try s.munmapRangeWithFreeList(p0, base, 6 * 4096, &free);
+    try oracle.snapshot(&s, &free);
+    // MAP_FIXED across many address/slot permutations, including holes.
+    for (0..67) |i| {
+        const n = (i * 31) % 67;
+        const ref = try s.createAnonymousVmaWithPages(p0, base + n * 8192, 4096, rw, rw, flags, &free);
+        try s.installNativeVmoPages(ref, 0, &.{try free.popFront()}, null);
+    }
+    try oracle.snapshot(&s, &free);
+    var fixed = try s.prepareFixedAnonymousMmap(p0, base + 4096, 65 * 8192, rw, rw, flags, &free);
+    s.commitFixedMmapPrepared(&fixed, &free);
+    try oracle.snapshot(&s, &free);
+    try s.munmapRangeWithFreeList(p0, base, 67 * 8192, &free);
+    try oracle.snapshot(&s, &free);
+    // Shrink, a forced MAYMOVE relocation, then FIXED over existing VMAs.
+    _ = try s.createAnonymousVmaWithPages(p0, base, 4 * 4096, rw, rw, flags, &free);
+    _ = try s.mremapRangeWithFreeList(p0, base, 4 * 4096, 3 * 4096, 0, false, false, &free);
+    try oracle.snapshot(&s, &free);
+    _ = try s.createAnonymousVmaWithPages(p0, base + 3 * 4096, 4096, rw, rw, .{ .anonymous = true, .private = true }, &free);
+    var move = try s.prepareMremapWithFreeList(p0, base, 3 * 4096, 4 * 4096, base + 0x200000, true, false, &free);
+    _ = s.commitMremapPrepared(&move, &free);
+    try oracle.snapshot(&s, &free);
+    _ = try s.mremapRangeWithFreeList(p0, base + 0x200000, 4 * 4096, 4 * 4096, base, true, true, &free);
+    try oracle.snapshot(&s, &free);
+    try s.cloneVmaTableForFork(p0, p1);
+    try oracle.snapshot(&s, &free);
+    try s.munmapRangeWithFreeList(p1, base + 4096, 4096, &free);
+    try oracle.snapshot(&s, &free);
+    try s.replaceVmaTableForExec(p2, p1, &free);
+    try oracle.snapshot(&s, &free);
+    try s.munmapRangeWithFreeList(p2, base + 8192, 8192, &free);
+    try oracle.snapshot(&s, &free);
+    for ([_]PrincipalId{ p0, p1, p2 }) |owner| s.releasePrincipalNativeMemory(owner, &free);
+    try oracle.snapshot(&s, &free);
+    // Non-prepared middle TableFull and retain failures leave semantic state.
+    const ref = try s.createAnonymousVmaWithPages(p0, base, 3 * 4096, rw, rw, flags, &free);
+    const table = s.getVmaTable(p0).?;
+    const allocator = table.allocator;
+    while (table.entries.live < table.entries.capacity) {
+        const n = table.entries.live;
+        _ = try s.createAnonymousVmaWithPages(p0, base + 0x400000 + n * 8192, 4096, rw, rw, flags, &free);
+    }
+    var failure: ReferenceFailureAllocator = .{ .upstream = allocator.?, .fail_at = 1 };
+    const failure_before = oracle.words.items.len;
+    try oracle.snapshot(&s, &free);
+    const failure_after = oracle.words.items.len;
+    table.allocator = failure.interface();
+    try std.testing.expectError(KernelError.TableFull, s.munmapRangeWithFreeList(p0, base + 4096, 4096, &free));
+    table.allocator = allocator;
+    try oracle.snapshot(&s, &free);
+    try std.testing.expectEqualSlices(u64, oracle.words.items[failure_before + 1 .. failure_after], oracle.words.items[failure_after + 1 ..]);
+    s.nativeVmoSlot(ref).?.ref_count = std.math.maxInt(u32);
+    try std.testing.expectError(KernelError.TableFull, s.munmapRangeWithFreeList(p0, base + 4096, 4096, &free));
+    s.nativeVmoSlot(ref).?.ref_count = 1;
+    try oracle.snapshot(&s, &free);
+    const fail_cow = try s.createNativeCowTable(3, &free);
+    try s.retainNativeCowTable(fail_cow);
+    const fail_entry = @constCast(s.vmaEntryForVaConst(p0, base).?);
+    fail_entry.cow_table = fail_cow;
+    s.refreshVmaReferences(fail_entry);
+    const cow_before = oracle.words.items.len;
+    try oracle.snapshot(&s, &free);
+    const cow_after = oracle.words.items.len;
+    s.nativeCowTableSlot(fail_cow).?.ref_count = std.math.maxInt(u32);
+    try std.testing.expectError(KernelError.TableFull, s.munmapRangeWithFreeList(p0, base + 4096, 4096, &free));
+    s.nativeCowTableSlot(fail_cow).?.ref_count = 1;
+    try oracle.snapshot(&s, &free);
+    try std.testing.expectEqualSlices(u64, oracle.words.items[cow_before + 1 .. cow_after], oracle.words.items[cow_after + 1 ..]);
+    try s.munmapRangeWithFreeList(p0, base, 3 * 4096, &free);
+    // Every seed mixes fixed replacement, multi-VMA cuts, middle splits,
+    // protection splits/merges, fork/child cuts, exec moves, shrink/fixed move.
+    for ([_]u64{ 1, 0xdeadbeef, 0x766d615f636f77 }) |seed| {
+        var rng = std.Random.DefaultPrng.init(seed);
+        for (0..768) |step| {
+            const start = base + rng.random().uintLessThan(u64, 128) * 4096;
+            const pages = 1 + rng.random().uintLessThan(u64, 9);
+            switch (step % 8) {
+                0, 1 => {
+                    var plan = try s.prepareFixedAnonymousMmap(p0, start, pages * 4096, rw, rw, flags, &free);
+                    s.commitFixedMmapPrepared(&plan, &free);
+                },
+                2 => try s.munmapRangeWithFreeList(p0, start, pages * 4096, &free),
+                3 => {
+                    var plan = try s.prepareMunmapRangeWithFreeList(p0, start, pages * 4096, &free);
+                    s.commitMunmapPrepared(&plan, &free);
+                },
+                4 => if (s.vmaEntryForVaConst(p0, start)) |e| {
+                    try s.setVmaProtRange(p0, start, @min(pages * 4096, e.endVa() - start), if (step % 16 == 4) .{ .read = true } else rw);
+                },
+                5 => {
+                    try s.cloneVmaTableForFork(p0, p1);
+                    try s.munmapRangeWithFreeList(p1, start, pages * 4096, &free);
+                    try oracle.snapshot(&s, &free);
+                    try s.replaceVmaTableForExec(p2, p1, &free);
+                    try s.munmapRangeWithFreeList(p2, start + 4096, pages * 4096, &free);
+                    try oracle.snapshot(&s, &free);
+                    s.releasePrincipalNativeMemory(p2, &free);
+                },
+                6 => if (s.vmaEntryForVaConst(p0, start)) |e| {
+                    const bytes = e.endVa() - start;
+                    if (bytes > 4096) _ = try s.mremapRangeWithFreeList(p0, start, bytes, 4096, 0, false, false, &free);
+                },
+                7 => if (s.vmaEntryForVaConst(p0, start)) |e| {
+                    const bytes = @min(pages * 4096, e.endVa() - start);
+                    _ = try s.mremapRangeWithFreeList(p0, start, bytes, bytes, base + 0x100000, true, true, &free);
+                },
+                else => unreachable,
+            }
+            try oracle.snapshot(&s, &free);
+        }
+        s.releasePrincipalNativeMemory(p0, &free);
+        try oracle.snapshot(&s, &free);
+    }
+    const data = std.mem.sliceAsBytes(oracle.words.items);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(data, &digest, .{});
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    std.debug.print("VMA_ORACLE states={} bytes={} sha256={s}\n", .{ oracle.states, data.len, hex });
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, "../.artifacts/kernel-vma-cut-oracle");
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = "../.artifacts/kernel-vma-cut-oracle/snapshots.bin", .data = data });
+    // Filled from the unchanged legacy implementation; full byte streams are
+    // also compared by the implementation validation harness.
+    try std.testing.expectEqualStrings("a5b9852097f7ab2b294524a257bd1352b9d83d4a55d23ac40a43c6192abadca9", &hex);
+}
+
+test "VMA cut checks reject leftover marks missing tree nodes and incorrect overlap sets" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
+    defer s.deinitPools();
+    var free: FreePageList = .{};
+    _ = try s.createAnonymousVmaWithPages(p0, 0x60000000, 3 * 4096, .{}, .{}, .{ .anonymous = true, .private = true }, &free);
+    const table = s.getVmaTable(p0).?;
+    const slot = table.active_indices.get(0).?.*;
+    const entry = table.entries.get(slot).?;
+    try kernel.ReferenceCheck.vmaTable(table);
+    table.entries.mark(slot, 1, true);
+    try std.testing.expectError(error.VmaMark, kernel.ReferenceCheck.vmaTable(table));
+    try std.testing.expectError(error.VmaMark, kernel.ReferenceCheck.vmaOverlapMarks(table, 0x70000000, 0x70001000));
+    table.entries.mark(slot, 1, false);
+    try std.testing.expectError(error.VmaMark, kernel.ReferenceCheck.vmaOverlapMarks(table, 0x60000000, 0x60001000));
+    table.address_index.remove(entry);
+    try std.testing.expectError(error.Count, kernel.ReferenceCheck.check(&s));
+    // Equal counts must not hide a detached node whose linked flag is corrupt.
+    table.address_index.count = 1;
+    entry.references.?.address_node.key = .{ .start = entry.start_va, .slot = slot };
+    entry.references.?.address_node.linked = true;
+    try std.testing.expectError(error.Missing, kernel.ReferenceCheck.vmaTable(table));
+    table.address_index.count = 0;
+    entry.references.?.address_node.linked = false;
+    table.reindex(entry, slot);
+    try kernel.ReferenceCheck.check(&s);
+    try s.munmapRangeWithFreeList(p0, 0x60001000, 4096, &free);
+    try std.testing.expect(table.entries.firstMarkedAtOrAfter(0) == null);
+    try kernel.ReferenceCheck.check(&s);
+    s.releasePrincipalNativeMemory(p0, &free);
+}
+
+test "pager VMO coalesces fault, publishes one canonical page and releases last reference" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
+    defer s.deinitPools();
+    var free: FreePageList = .{};
+    const base: u64 = 20 << 30;
+    try free.installRegions(&.{.{ .id = 88, .start = base, .end = base + 16 * 4096 }});
+    try free.seedContiguousRange(base, 16);
+    const port_fd = try s.createPagerPortFd(p0, .{}, 16);
+    const port = s.pagerPortRefForFd(p0, port_fd, .{ .pager_fault = true }).?;
+    const vmo_fd = try s.createPagerVmoFd(p0, 8192, fdRights(.{ .dup = true, .close = true, .map_read = true, .map_write = true, .pager_attach = true }), .{}, 16);
+    const ref = s.nativeVmoRefForFd(p0, vmo_fd).?;
+    try std.testing.expectEqual(kernel.NativeVmoKind.pager, s.nativeVmoSlot(ref).?.kind);
+    try std.testing.expect(s.nativeVmoResolvedPagePaddr(ref, 0) == null);
+    try std.testing.expect(s.nativeVmoResolvedPagePaddrOrZero(ref, 0) == null);
+    try std.testing.expectError(KernelError.InvalidState, s.mmapFdIntoProcess(p0, vmo_fd, p1, 0x50000000, 4096, .{ .read = true }, .{ .private = true }, 0));
+    const blind_port = try s.dupFd(p0, port_fd, 16, fdRights(.{ .wait = true, .close = true }), .{});
+    const blind_vmo = try s.dupFd(p0, vmo_fd, 16, fdRights(.{ .map_read = true, .close = true }), .{});
+    try std.testing.expect(s.pagerPortRefForFd(p0, blind_port, .{ .pager_fault = true }) == null);
+    try std.testing.expectError(KernelError.InvalidState, s.attachPagerVmo(p0, blind_port, vmo_fd, 0x12));
+    try std.testing.expectError(KernelError.InvalidState, s.attachPagerVmo(p0, port_fd, blind_vmo, 0x12));
+    try s.closeFdWithFreeList(p0, blind_port, &free);
+    try s.closeFdWithFreeList(p0, blind_vmo, &free);
+    const generation = try s.attachPagerVmo(p0, port_fd, vmo_fd, 0x12);
+    try std.testing.expect(generation != 0);
+    try std.testing.expectError(KernelError.InvalidState, s.mmapFd(p0, vmo_fd, 0x40000000, 4096, .{ .read = true }, .{ .private = true }, 0));
+    _ = try s.mmapFdIntoProcess(p0, vmo_fd, p1, 0x50000000, 4096, .{ .read = true }, .{ .private = true }, 0);
+    _ = try s.mmapFdIntoProcess(p0, vmo_fd, p2, 0x60000000, 4096, .{ .read = true }, .{ .private = true }, 0);
+    try std.testing.expectEqual(.locked_slow_path, s.prepareNativeVmaFaultMapping(p1, 0x50000000, false, false).kind);
+    try std.testing.expectEqual(.pending, try s.requestPagerFault(ref, 0, pager_abi.access_read, p1, 41, 1, 1, 0xabba));
+    try std.testing.expectEqual(.pending, try s.requestPagerFault(ref, 0, pager_abi.access_read, p2, 42, 1, 2, 0xabba));
+    const event = s.peekPagerEvent(port).?;
+    try std.testing.expectEqual(pager_abi.event_fault, event.kind);
+    try std.testing.expectEqual(@as(u64, 0x12), event.key);
+    try std.testing.expect(s.consumePagerEvent(port, event));
+    try std.testing.expect(s.peekPagerEvent(port) == null);
+    const physical = (try s.allocPhysicalPage(&free)).paddr;
+    try s.publishPagerPages(ref, 0, &.{physical}, &free);
+    try std.testing.expectError(KernelError.InvalidState, s.publishPagerPages(ref, 0, &.{physical}, &free));
+    s.completePagerPublishedRange(port, ref, 0x12, generation, 0, 1);
+    try std.testing.expectEqual(physical, s.nativeVmaFaultMapping(p1, 0x50000000, false, false).?.paddr);
+    try std.testing.expectEqual(physical, s.nativeVmaFaultMapping(p2, 0x60000000, false, false).?.paddr);
+    try s.closeFdWithFreeList(p0, vmo_fd, &free);
+    s.releasePrincipalNativeMemory(p1, &free);
+    s.releasePrincipalNativeMemory(p2, &free);
+    const released = s.peekPagerEvent(port).?;
+    try std.testing.expectEqual(pager_abi.event_vmo_release, released.kind);
+    try std.testing.expect(s.consumePagerEvent(port, released));
+    try std.testing.expect(s.peekPagerEvent(port) == null);
+    s.releasePrincipalNativeMemory(p0, &free);
+    try std.testing.expectEqual(@as(usize, 16), free.pageCount());
+}
+
+test "pager copy probe publishes request without scheduler waiter" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
+    defer s.deinitPools();
+    var free: FreePageList = .{};
+    const base: u64 = 20 << 30;
+    try free.installRegions(&.{.{ .id = 88, .start = base, .end = base + 8 * 4096 }});
+    try free.seedContiguousRange(base, 8);
+    const port_fd = try s.createPagerPortFd(p0, .{}, 16);
+    const port = s.pagerPortRefForFd(p0, port_fd, .{ .pager_fault = true }).?;
+    const vmo_fd = try s.createPagerVmoFd(p0, 4096, fdRights(.{ .close = true, .map_read = true, .pager_attach = true }), .{}, 16);
+    const ref = s.nativeVmoRefForFd(p0, vmo_fd).?;
+    const generation = try s.attachPagerVmo(p0, port_fd, vmo_fd, 0x91);
+    _ = try s.mmapFdIntoProcess(p0, vmo_fd, p1, 0x50000000, 4096, .{ .read = true }, .{ .private = true }, 0);
+    try std.testing.expectEqual(.pending, try s.requestPagerFault(ref, 0, pager_abi.access_read, p1, 0, 0, 0, 0));
+    const event = s.peekPagerEvent(port).?;
+    const request_ref = kernel.types.PagerRequestRef{ .index = @truncate(event.request_id), .generation = @truncate(event.request_id >> 32) };
+    const request = s.pager_requests.resolve(.{ .index = request_ref.index, .generation = request_ref.generation }).?;
+    try std.testing.expect(request.waiters.isNull());
+    try std.testing.expect(s.consumePagerEvent(port, event));
+    const physical = (try s.allocPhysicalPage(&free)).paddr;
+    try s.publishPagerPages(ref, 0, &.{physical}, &free);
+    s.completePagerPublishedRange(port, ref, 0x91, generation, 0, 1);
+    try std.testing.expectEqual(physical, s.nativeVmaFaultMapping(p1, 0x50000000, false, false).?.paddr);
+    try s.closeFdWithFreeList(p0, vmo_fd, &free);
+    s.releasePrincipalNativeMemory(p1, &free);
+    const released = s.peekPagerEvent(port).?;
+    try std.testing.expect(s.consumePagerEvent(port, released));
+    s.releasePrincipalNativeMemory(p0, &free);
+    try std.testing.expectEqual(@as(usize, 8), free.pageCount());
+}
+
+test "pager port death fails every pending page and releases waiters" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
+    defer s.deinitPools();
+    var free: FreePageList = .{};
+    const port_fd = try s.createPagerPortFd(p0, .{}, 16);
+    const vmo_fd = try s.createPagerVmoFd(p0, 8192, fdRights(.{ .close = true, .map_read = true, .pager_attach = true }), .{}, 16);
+    const ref = s.nativeVmoRefForFd(p0, vmo_fd).?;
+    _ = try s.attachPagerVmo(p0, port_fd, vmo_fd, 0x29);
+    _ = try s.mmapFdIntoProcess(p0, vmo_fd, p1, 0x50000000, 8192, .{ .read = true }, .{ .private = true }, 0);
+    try std.testing.expectEqual(.pending, try s.requestPagerFault(ref, 0, pager_abi.access_read, p1, 41, 1, 1, 0x44));
+    try std.testing.expectEqual(.pending, try s.requestPagerFault(ref, 4096 / 4096, pager_abi.access_read, p1, 42, 1, 2, 0x55));
+    try std.testing.expectEqual(@as(usize, 2), s.pager_requests.live);
+    try s.closeFdWithFreeList(p0, port_fd, &free);
+    try std.testing.expect(s.pagerPageFailed(ref, 0));
+    try std.testing.expect(s.pagerPageFailed(ref, 1));
+    try std.testing.expectEqual(@as(usize, 0), s.pager_waiters.live);
+    try std.testing.expectEqual(.failed, try s.requestPagerFault(ref, 0, pager_abi.access_read, p1, 43, 1, 3, 0x66));
+    try s.closeFdWithFreeList(p0, vmo_fd, &free);
+    s.releasePrincipalNativeMemory(p1, &free);
+    s.releasePrincipalNativeMemory(p0, &free);
+    try std.testing.expectEqual(@as(usize, 0), s.pager_ports.live);
+    try std.testing.expectEqual(@as(usize, 0), s.pager_requests.live);
+    try std.testing.expectEqual(@as(usize, 0), s.pager_releases.live);
+}
+
+test "pager supply source retain keeps sampled PFN across close and munmap" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
+    defer s.deinitPools();
+    var free: FreePageList = .{};
+    const base: u64 = 0x35_0000;
+    try free.installRegions(&.{.{ .id = 0, .start = base, .end = base + 16 * 4096 }});
+    try free.seedContiguousRange(base, 16);
+    const fd = try s.createAnonymousVmoFdWithPages(p0, 4096,
+        fdRights(.{ .close = true, .map_read = true }), .{}, 16, &free);
+    const ref = s.nativeVmoRefForFd(p0, fd).?;
+    const va: u64 = 0x5700_0000;
+    _ = try s.mmapFd(p0, fd, va, 4096, .{ .read = true }, .{ .private = true }, 0);
+    const sampled = s.nativeVmoResolvedPagePaddr(ref, 0).?;
+    const during_copy = free.pageCount();
+    // This is the interleaving between pagerSupply's PFN snapshot and copy:
+    // another thread closes the FD and removes its last VMA. The temporary
+    // reference must prevent both final return and partial-unmap release.
+    try s.retainNativeVmo(ref);
+    try s.closeFdWithFreeList(p0, fd, &free);
+    try s.munmapRangeWithFreeList(p0, va, 4096, &free);
+    try std.testing.expectEqual(@as(?u64, sampled), s.nativeVmoResolvedPagePaddr(ref, 0));
+    try std.testing.expectEqual(during_copy, free.pageCount());
+    s.releaseNativeVmoWithFreeList(ref, &free);
+    try std.testing.expectEqual(@as(?u32, null), s.nativeVmoRefCount(ref));
+    try std.testing.expectEqual(@as(usize, 16), free.pageCount());
+    s.releasePrincipalNativeMemory(p0, &free);
+}
+
+test "pager attach identity resolves reused key without stale VMO alias" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
+    defer s.deinitPools();
+    var free: FreePageList = .{};
+    const port_fd = try s.createPagerPortFd(p0, .{}, 16);
+    const port = s.pagerPortRefForFd(p0, port_fd, .{ .pager_fault = true }).?;
+    const rights = fdRights(.{ .close = true, .pager_attach = true });
+    const first_fd = try s.createPagerVmoFd(p0, 4096, rights, .{}, 16);
+    const second_fd = try s.createPagerVmoFd(p0, 4096, rights, .{}, 16);
+    const first = s.nativeVmoRefForFd(p0, first_fd).?;
+    const second = s.nativeVmoRefForFd(p0, second_fd).?;
+    const a = try s.attachPagerVmo(p0, port_fd, first_fd, 42);
+    const b = try s.attachPagerVmo(p0, port_fd, second_fd, 42);
+    try std.testing.expect(a != b);
+    try std.testing.expectEqual(first, s.pagerVmoForKey(port, 42, a).?);
+    try std.testing.expectEqual(second, s.pagerVmoForKey(port, 42, b).?);
+    try s.closeFdWithFreeList(p0, first_fd, &free);
+    try std.testing.expect(s.pagerVmoForKey(port, 42, a) == null);
+    try std.testing.expectEqual(second, s.pagerVmoForKey(port, 42, b).?);
+    const release_event = s.peekPagerEvent(port).?;
+    try std.testing.expectEqual(a, release_event.vmo_generation);
+    try std.testing.expect(s.consumePagerEvent(port, release_event));
+    try s.closeFdWithFreeList(p0, second_fd, &free);
+    try s.closeFdWithFreeList(p0, port_fd, &free);
+    s.releasePrincipalNativeMemory(p0, &free);
+}
+
+test "pager release queue survives a full bounded fault queue" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
+    defer s.deinitPools();
+    var free: FreePageList = .{};
+    const port_fd = try s.createPagerPortFd(p0, .{}, 16);
+    const port = s.pagerPortRefForFd(p0, port_fd, .{ .pager_fault = true }).?;
+    const faults_fd = try s.createPagerVmoFd(p0, 257 * 4096, fdRights(.{ .close = true, .map_read = true, .pager_attach = true }), .{}, 16);
+    const faults_ref = s.nativeVmoRefForFd(p0, faults_fd).?;
+    _ = try s.attachPagerVmo(p0, port_fd, faults_fd, 1);
+    const release_fd = try s.createPagerVmoFd(p0, 4096, fdRights(.{ .close = true, .map_read = true, .pager_attach = true }), .{}, 16);
+    _ = try s.attachPagerVmo(p0, port_fd, release_fd, 2);
+    for (0..257) |page| {
+        try std.testing.expectEqual(.pending, try s.requestPagerFault(faults_ref, @intCast(page), pager_abi.access_read, p1, page + 1, 1, page + 1, 0x11));
+    }
+    const port_slot = s.pager_ports.resolve(.{ .index = port.index, .generation = port.generation }).?;
+    try std.testing.expectEqual(@as(u32, 256), port_slot.queued_faults);
+    try s.closeFdWithFreeList(p0, release_fd, &free);
+    const release_event = s.peekPagerEvent(port).?;
+    try std.testing.expectEqual(pager_abi.event_vmo_release, release_event.kind);
+    try std.testing.expectEqual(@as(u64, 2), release_event.key);
+    try std.testing.expect(s.consumePagerEvent(port, release_event));
+    const first = s.peekPagerEvent(port).?;
+    try std.testing.expectEqual(pager_abi.event_fault, first.kind);
+    try std.testing.expect(s.consumePagerEvent(port, first));
+    try std.testing.expectEqual(@as(u32, 256), port_slot.queued_faults);
+    try s.closeFdWithFreeList(p0, port_fd, &free);
+    try s.closeFdWithFreeList(p0, faults_fd, &free);
+    s.releasePrincipalNativeMemory(p0, &free);
+    try std.testing.expectEqual(@as(usize, 0), s.pager_ports.live);
+}
+
+test "pager fork shares missing request and private COW diverges after supply" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
+    defer s.deinitPools();
+    var free: FreePageList = .{};
+    const base: u64 = 0x35_0000;
+    try free.installRegions(&.{.{ .id = 0, .start = base, .end = base + 16 * 4096 }});
+    try free.seedContiguousRange(base, 16);
+    const port_fd = try s.createPagerPortFd(p0, .{}, 16);
+    const port = s.pagerPortRefForFd(p0, port_fd, .{ .pager_fault = true }).?;
+    const vmo_fd = try s.createPagerVmoFd(p0, 4096, fdRights(.{ .close = true, .map_read = true, .map_write = true, .pager_attach = true }), .{}, 16);
+    const ref = s.nativeVmoRefForFd(p0, vmo_fd).?;
+    const generation = try s.attachPagerVmo(p0, port_fd, vmo_fd, 4);
+    const va: u64 = 0x5100_0000;
+    _ = try s.mmapFdIntoProcess(p0, vmo_fd, p1, va, 4096, .{ .read = true, .write = true }, .{ .private = true }, 0);
+    try s.cloneVmaTableForFork(p1, p2);
+    s.markForkCowVmasCommitted(p1);
+    try std.testing.expectEqual(.pending, try s.requestPagerFault(ref, 0, pager_abi.access_read, p1, 41, 1, 1, 1));
+    try std.testing.expectEqual(.pending, try s.requestPagerFault(ref, 0, pager_abi.access_read, p2, 42, 1, 2, 2));
+    const event = s.peekPagerEvent(port).?;
+    try std.testing.expect(s.consumePagerEvent(port, event));
+    try std.testing.expect(s.peekPagerEvent(port) == null);
+    const physical = (try s.allocPhysicalPage(&free)).paddr;
+    try s.publishPagerPages(ref, 0, &.{physical}, &free);
+    s.completePagerPublishedRange(port, ref, 4, generation, 0, 1);
+    try std.testing.expectEqual(physical, s.nativeVmaFaultMapping(p1, va, false, false).?.paddr);
+    try std.testing.expectEqual(physical, s.nativeVmaFaultMapping(p2, va, false, false).?.paddr);
+    try std.testing.expect(!s.nativeVmaFaultMapping(p2, va, false, false).?.prot.write);
+    const child_write = s.ensureNativeVmaCowMappingLockedSlow(p2, va, true, false, &free) orelse unreachable;
+    try std.testing.expect(child_write.paddr != physical);
+    try std.testing.expectEqual(physical, s.nativeVmaFaultMapping(p1, va, false, false).?.paddr);
+    try s.closeFdWithFreeList(p0, vmo_fd, &free);
+    s.releasePrincipalNativeMemory(p2, &free);
+    s.releasePrincipalNativeMemory(p1, &free);
+    try std.testing.expectEqual(pager_abi.event_vmo_release, s.peekPagerEvent(port).?.kind);
+    try s.closeFdWithFreeList(p0, port_fd, &free);
+    s.releasePrincipalNativeMemory(p0, &free);
+    try std.testing.expectEqual(@as(usize, 16), free.pageCount());
+}
+
+test "pager supply after MAP_FIXED replacement cannot alter the new VMA" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
+    defer s.deinitPools();
+    var free: FreePageList = .{};
+    const base: u64 = 0x35_0000;
+    try free.installRegions(&.{.{ .id = 0, .start = base, .end = base + 16 * 4096 }});
+    try free.seedContiguousRange(base, 16);
+    const port_fd = try s.createPagerPortFd(p0, .{}, 16);
+    const port = s.pagerPortRefForFd(p0, port_fd, .{ .pager_fault = true }).?;
+    const pager_fd = try s.createPagerVmoFd(p0, 4096, fdRights(.{ .close = true, .map_read = true, .pager_attach = true }), .{}, 16);
+    const pager_ref = s.nativeVmoRefForFd(p0, pager_fd).?;
+    const generation = try s.attachPagerVmo(p0, port_fd, pager_fd, 9);
+    const va: u64 = 0x5300_0000;
+    _ = try s.mmapFdIntoProcess(p0, pager_fd, p1, va, 4096, .{ .read = true }, .{ .private = true }, 0);
+    try std.testing.expectEqual(.pending, try s.requestPagerFault(pager_ref, 0, pager_abi.access_read, p1, 41, 1, 1, 1));
+    const event = s.peekPagerEvent(port).?;
+    try std.testing.expect(s.consumePagerEvent(port, event));
+    const other_fd = try s.createAnonymousVmoFdWithPages(p0, 4096, fdRights(.{ .close = true, .map_read = true }), .{}, 16, &free);
+    var prepared = try s.prepareFixedFdMmapIntoProcess(p0, other_fd, p1, va, 4096,
+        .{ .read = true }, .{ .private = true, .fixed = true }, 0, &free);
+    s.commitFixedMmapPrepared(&prepared, &free);
+    const replacement = s.nativeVmaFaultMapping(p1, va, false, false).?.paddr;
+    const supplied = (try s.allocPhysicalPage(&free)).paddr;
+    try std.testing.expect(replacement != supplied);
+    try s.publishPagerPages(pager_ref, 0, &.{supplied}, &free);
+    s.completePagerPublishedRange(port, pager_ref, 9, generation, 0, 1);
+    try std.testing.expectEqual(replacement, s.nativeVmaFaultMapping(p1, va, false, false).?.paddr);
+    try s.munmapRangeWithFreeList(p1, va, 4096, &free);
+    try std.testing.expect(s.nativeVmaFaultMapping(p1, va, false, false) == null);
+    try s.closeFdWithFreeList(p0, other_fd, &free);
+    try s.closeFdWithFreeList(p0, pager_fd, &free);
+    try std.testing.expectEqual(pager_abi.event_vmo_release, s.peekPagerEvent(port).?.kind);
+    try s.closeFdWithFreeList(p0, port_fd, &free);
+    s.releasePrincipalNativeMemory(p1, &free);
+    s.releasePrincipalNativeMemory(p0, &free);
+    try std.testing.expectEqual(@as(usize, 16), free.pageCount());
+}
+
+test "pager control FD inherited by fork prevents child self map" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
+    defer s.deinitPools();
+    var free: FreePageList = .{};
+    const port_fd = try s.createPagerPortFd(p0, .{}, 16);
+    const pager_fd = try s.createPagerVmoFd(p0, 4096,
+        fdRights(.{ .close = true, .map_read = true, .pager_attach = true }), .{}, 16);
+    _ = try s.attachPagerVmo(p0, port_fd, pager_fd, 11);
+    try s.cloneFdTableForFork(p0, p1);
+    try std.testing.expectError(KernelError.InvalidState,
+        s.mmapFd(p1, pager_fd, 0x5400_0000, 4096, .{ .read = true }, .{ .private = true }, 0));
+    try std.testing.expectError(KernelError.InvalidState,
+        s.mmapFdIntoProcess(p0, pager_fd, p1, 0x5400_0000, 4096, .{ .read = true }, .{ .private = true }, 0));
+    try s.closeFdWithFreeList(p1, pager_fd, &free);
+    try s.closeFdWithFreeList(p1, port_fd, &free);
+    try s.closeFdWithFreeList(p0, pager_fd, &free);
+    try s.closeFdWithFreeList(p0, port_fd, &free);
+    s.releasePrincipalNativeMemory(p1, &free);
+    s.releasePrincipalNativeMemory(p0, &free);
+    try std.testing.expectEqual(@as(usize, 0), s.pager_ports.live);
+}
+
+test "pager creator death fails waiters even with inherited control FD" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
+    defer s.deinitPools();
+    var free: FreePageList = .{};
+    const port_fd = try s.createPagerPortFd(p0, .{}, 16);
+    const pager_fd = try s.createPagerVmoFd(p0, 4096,
+        fdRights(.{ .close = true, .map_read = true, .pager_attach = true }), .{}, 16);
+    const ref = s.nativeVmoRefForFd(p0, pager_fd).?;
+    _ = try s.attachPagerVmo(p0, port_fd, pager_fd, 15);
+    _ = try s.mmapFdIntoProcess(p0, pager_fd, p2, 0x5500_0000, 4096, .{ .read = true }, .{ .private = true }, 0);
+    try s.cloneFdTableForFork(p0, p1);
+    try std.testing.expectEqual(.pending, try s.requestPagerFault(ref, 0, pager_abi.access_read, p2, 42, 1, 1, 1));
+    s.releasePrincipalNativeMemory(p0, &free);
+    try std.testing.expect(s.pagerPageFailed(ref, 0));
+    try std.testing.expectEqual(@as(usize, 0), s.pager_waiters.live);
+    const inherited = s.pagerPortRefForFd(p1, port_fd, .{ .pager_fault = true }).?;
+    try std.testing.expect(s.peekPagerEvent(inherited) == null);
+    try std.testing.expectEqual(.failed, try s.requestPagerFault(ref, 0, pager_abi.access_read, p2, 42, 1, 2, 1));
+    s.releasePrincipalNativeMemory(p2, &free);
+    s.releasePrincipalNativeMemory(p1, &free);
+    try std.testing.expectEqual(@as(usize, 0), s.pager_ports.live);
+}
+
+test "pager munmap while pending cannot resurrect a removed VMA" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
+    defer s.deinitPools();
+    var free: FreePageList = .{};
+    const base: u64 = 0x35_0000;
+    try free.installRegions(&.{.{ .id = 0, .start = base, .end = base + 4 * 4096 }});
+    try free.seedContiguousRange(base, 4);
+    const port_fd = try s.createPagerPortFd(p0, .{}, 16);
+    const port = s.pagerPortRefForFd(p0, port_fd, .{ .pager_fault = true }).?;
+    const pager_fd = try s.createPagerVmoFd(p0, 4096,
+        fdRights(.{ .close = true, .map_read = true, .pager_attach = true }), .{}, 16);
+    const ref = s.nativeVmoRefForFd(p0, pager_fd).?;
+    const generation = try s.attachPagerVmo(p0, port_fd, pager_fd, 16);
+    const va: u64 = 0x5600_0000;
+    _ = try s.mmapFdIntoProcess(p0, pager_fd, p1, va, 4096, .{ .read = true }, .{ .private = true }, 0);
+    try std.testing.expectEqual(.pending, try s.requestPagerFault(ref, 0, pager_abi.access_read, p1, 42, 1, 1, 1));
+    const event = s.peekPagerEvent(port).?;
+    try std.testing.expect(s.consumePagerEvent(port, event));
+    try s.munmapRangeWithFreeList(p1, va, 4096, &free);
+    const physical = (try s.allocPhysicalPage(&free)).paddr;
+    try s.publishPagerPages(ref, 0, &.{physical}, &free);
+    s.completePagerPublishedRange(port, ref, 16, generation, 0, 1);
+    try std.testing.expect(s.nativeVmaFaultMapping(p1, va, false, false) == null);
+    try s.closeFdWithFreeList(p0, pager_fd, &free);
+    try std.testing.expectEqual(pager_abi.event_vmo_release, s.peekPagerEvent(port).?.kind);
+    try s.closeFdWithFreeList(p0, port_fd, &free);
+    s.releasePrincipalNativeMemory(p1, &free);
+    s.releasePrincipalNativeMemory(p0, &free);
+    try std.testing.expectEqual(@as(usize, 4), free.pageCount());
 }

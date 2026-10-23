@@ -900,7 +900,9 @@ def fd_storage_boundary(files):
     policy = function_body(production_source(files['kernel/src/syscall/lock_policy.zig']), 'needsKernelStateLock')
     expected_policy = '''if (nr == runtime_abi.syscall_nanosleep) return false;
         if (nr == fd_abi.syscall_vmo_revoke) return true;
-        return process_abi.isProcessSyscall(nr) or capsule_abi.isCapsuleSyscall(nr) or
+        return process_abi.isProcessSyscall(nr) or
+        (nr >= pager_abi.syscall_pager_port_create and nr <= pager_abi.syscall_pager_fail) or
+        capsule_abi.isCapsuleSyscall(nr) or
         fd_abi.isFdSyscall(nr) or ipc_abi.isIpcSyscall(nr) or runtime_abi.isRuntimeSyscall(nr) or
         (nr >= vm_abi.syscall_vm_first and nr <= vm_abi.syscall_vm_last);'''
     if re.sub(r'\s+', '', policy).strip('{}') != re.sub(r'\s+', '', expected_policy):
@@ -1042,7 +1044,12 @@ def pending_data_return_boundary(files):
     errors = []
     vmo = production_source(files['kernel/src/state/vmo.zig'])
     types = production_source(files['kernel/src/state/types.zig'])
-    dispatch = re.sub(r'\s+', '', function_body(production_source(files['kernel/src/syscalls.zig']), 'dispatchCompactSyscall'))
+    syscalls_source = production_source(files['kernel/src/syscalls.zig'])
+    outer = re.sub(r'\s+', '', function_body(syscalls_source, 'dispatchCompactSyscall'))
+    dispatch = re.sub(r'\s+', '', function_body(syscalls_source, 'dispatchCompactSyscallBody'))
+    if ('constresult=dispatchCompactSyscallBody(frame);' not in outer or
+            outer.count('dispatchCompactSyscallBody(frame)') != 1):
+        errors.append('pending drain: syscall wrapper must enter the reviewed K interval once')
     compact = lambda name: re.sub(r'\s+', '', function_body(vmo, name))
     for name in ('nativeVmoSlot', 'nativeVmoSlotConst', 'nativeCowTableSlot'):
         if not re.search(r'(?:slot|value)\.pending_data_return!=null\)returnnull;', compact(name)):

@@ -559,23 +559,42 @@ pub fn cr3WithUserPcid(raw_cr3: u64, pcid: u16) u64 {
     return raw | (@as(u64, pcid) & 0xfff);
 }
 
-/// CR3 operand for returning to a user context without discarding its PCID's
-/// TLB entries. A flushing load on every kernel exit threw away the whole user
-/// TLB per syscall, which dominated small syscalls under nested paging.
-/// No-flush is safe only because every user PTE removal, downgrade, remap,
-/// paging-structure retirement and PCID reuse performs an all-CPU PCID
-/// shootdown (`user_copy.shootdownRequest`): leaf ranges use INVLPG/INVPCID,
-/// while parent retirement, PCID reuse and unsupported CPUs reload the stored
-/// CR3 without bit 63. Stored CR3 values never carry bit 63
-/// (validators reject high bits, and flushing writes must keep flushing); it
-/// is added only here, at the load. Bit 63 is reserved without PCIDE and has
-/// no meaning for the PCID-0 flushing fallback.
-// Operand-only return: callers keep IF clear through the following assembly
-// CR3 load (trap return and scheduler activation). Ordinary callers use writeCr3.
-pub fn userCr3NoFlush(cr3: u64) u64 {
-    if (pcid_enabled == 0 or (cr3 & 0xfff) == 0) return cr3;
-    if (!@import("../../tlb_residency.zig").enter(@import("../../smp.zig").currentCpuSlot(), cr3)) return cr3;
+/// All user-return CR3 operands publish execution, even PCID-0/forced loads.
+/// Leaf invalidations clear remote retention and flush only active users;
+/// dormant CPUs must flush before reuse. Retirement, cache maintenance, PCID
+/// reuse and PCID-0 still rendezvous with every online CPU before reclamation.
+/// Stored CR3s never contain NOFLUSH; add it only at this IF-clear boundary.
+pub fn userReturnCr3(cr3: u64, force_flush: bool) u64 {
+    if (userReturnChecksEnabled()) assertUserReturnInterruptsOff();
+    const retained = @import("../../tlb_residency.zig").enterUser(
+        @import("../../smp.zig").currentCpuSlot(),
+        @import("../../tlb_residency.zig").UserContext.fromCr3(cr3),
+    );
+    if (force_flush or pcid_enabled == 0 or (cr3 & 0xfff) == 0 or !retained) return cr3;
     return cr3 | (@as(u64, 1) << 63);
+}
+
+pub fn userReturnChecksEnabled() bool {
+    if (@import("builtin").mode == .Debug) return true;
+    return @import("kernel_lock_check_options").user_return_checks_enabled;
+}
+
+fn assertUserReturnInterruptsOff() void {
+    var flags: u64 = undefined;
+    asm volatile ("pushfq; popq %[flags]"
+        : [flags] "=r" (flags),
+        :
+        : .{ .memory = true });
+    if (flags & (1 << 9) != 0) asm volatile ("ud2");
+}
+
+/// Called immediately after the actual user CR3 load in checked builds.
+pub export fn assertUserCr3LoadedFromAsm() callconv(.c) void {
+    if (!userReturnChecksEnabled()) return;
+    assertUserReturnInterruptsOff();
+    const residency = @import("../../tlb_residency.zig");
+    if (!residency.isActive(@import("../../smp.zig").currentCpuSlot(), residency.UserContext.fromCr3(readCr3())))
+        asm volatile ("ud2");
 }
 
 pub fn userPcidForProcessIndex(process_index: usize) u16 {
@@ -940,7 +959,7 @@ pub fn writeCr3(value: u64) void {
             : [flags] "=r" (flags),
             :
             : .{ .memory = true });
-        if (!@import("../../tlb_residency.zig").enter(@import("../../smp.zig").currentCpuSlot(), value)) operand &= ~(@as(u64, 1) << 63);
+        if (!@import("../../tlb_residency.zig").enterRetained(@import("../../smp.zig").currentCpuSlot(), value)) operand &= ~(@as(u64, 1) << 63);
         writeCr3ForMaintenance(operand);
         if (flags & (1 << 9) != 0) asm volatile ("sti" ::: .{ .memory = true });
         return;
@@ -949,7 +968,7 @@ pub fn writeCr3(value: u64) void {
 }
 
 // Invalidation-only loads do not walk user mappings. Keeping them outside
-// residency avoids marking every ACK receiver as a user of the address space.
+// residency/active avoids publishing an ACK receiver as a user entrant.
 pub fn writeCr3ForMaintenance(value: u64) void {
     asm volatile ("mov %[value], %%cr3"
         :

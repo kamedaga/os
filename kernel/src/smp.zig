@@ -952,6 +952,7 @@ fn redispatchCurrentAp(timer_expired: bool) noreturn {
 pub fn wakeCpu(cpu_slot: usize) bool {
     if (cpu_slot == currentCpuSlot()) return true;
     if (cpu_slot >= cpuCapacity()) return false;
+    @import("wake_trace.zig").record(.ipi_send, cpu_slot, 0, 0);
     // A runnable publication needs its own APIC edge. Coalescing against an
     // earlier vector loses the later publication when the target consumes the
     // first vector immediately before returning to HLT.

@@ -508,6 +508,12 @@
         "threadContextLocked": 1
       }
     },
+    "setCurrentThreadSignalPendingHint": {
+      "exclusion": "table",
+      "calls": {
+        "threadContextLocked": 1
+      }
+    },
     "claimCurrentSignalForUserReturn": {
       "exclusion": "table",
       "calls": {
@@ -718,7 +724,10 @@
       "currentThreadGeneration": 5
     },
     "kernel/src/syscall/fd.zig": {
-      "currentThreadGeneration": 2
+      "currentThreadGeneration": 3
+    },
+    "kernel/src/traps.zig": {
+      "currentThreadGeneration": 1
     }
   }
 }

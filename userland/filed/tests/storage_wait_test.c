@@ -6,6 +6,14 @@ static struct ph_ipc_packet packets[3];
 static unsigned packet_count, received, closed;
 static long receive_status;
 static int close_error;
+static struct pacha_fd_info shared_info;
+
+int pacha_fd_get_info(pacha_fd_t fd, struct pacha_fd_info *info)
+{
+    assert(fd == 70);
+    *info = shared_info;
+    return 0;
+}
 
 static long protocol_oracle2(uint64_t, uint64_t, uint64_t);
 static long protocol_oracle4(uint64_t nr, uint64_t fd, uint64_t address,
@@ -48,6 +56,17 @@ static void reset(struct filed_storage_owner *owner, struct owner_queue *queue)
     packets[0] = (struct ph_ipc_packet){.operation = PH_FS_QUEUE_NOTIFY,
         .generation = 9, .value = 2};
     packet_count = 1; received = closed = 0; receive_status = close_error = 0;
+    shared_info = (struct pacha_fd_info){.kind = PACHA_FD_KIND_VMO, .size = 8192,
+        .flags = PACHA_FD_FLAG_CLOEXEC,
+        .rights = PACHA_FD_RIGHT_INSPECT | PACHA_FD_RIGHT_DUP | PACHA_FD_RIGHT_TRANSFER |
+            PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_MAP_READ | PACHA_FD_RIGHT_MAP_WRITE};
+}
+
+static struct ph_ipc_packet shared_packet(void)
+{
+    return (struct ph_ipc_packet){.operation = PH_FS_SHARED_ATTACHMENT,
+        .generation = 9, .correlation = 41, .value = 5, .fd_count = 1,
+        .fds = {{.fd = 70, .rights = shared_info.rights, .flags = PACHA_FD_FLAG_CLOEXEC}}};
 }
 
 int main(void)
@@ -99,6 +118,33 @@ int main(void)
     reset(&owner, &queue);
     owner.management.b = 61;
     assert(queue_wait(&queue, 2) == -EPROTO && !received);
+    reset(&owner, &queue);
+    owner.shared_expected = 41;
+    packets[1] = packets[0]; packets[0] = shared_packet(); packet_count = 2;
+    assert(!queue_wait(&queue, 2) && received == 2 && !closed);
+    pacha_fd_t shared_fd = -1;
+    assert(!filed_storage_owner_take_shared(&owner, 5, 41, 8192, &shared_fd));
+    assert(shared_fd == 70 && !owner.shared_expected && !owner.shared_attachment.fd_count);
+    reset(&owner, &queue);
+    owner.shared_expected = 41;
+    packets[1] = shared_packet(); packet_count = 2;
+    assert(!filed_storage_owner_take_shared(&owner, 5, 41, 8192, &shared_fd));
+    assert(shared_fd == 70 && received == 2 && !closed);
+    reset(&owner, &queue);
+    owner.shared_expected = 41; packets[0] = shared_packet();
+    assert(filed_storage_owner_take_shared(&owner, 5, 40, 8192, &shared_fd) == -EPROTO && !received);
+    packets[0].fds[0].rights |= PACHA_FD_RIGHT_REVOKE;
+    assert(filed_storage_owner_take_shared(&owner, 5, 41, 8192, &shared_fd) == -EPROTO);
+    assert(owner.failed && owner.shared_attachment.fd_count == 1 && !closed);
+    assert(!filed_storage_owner_cancel_shared(&owner) && closed == 1 && !owner.shared_expected);
+    reset(&owner, &queue);
+    owner.shared_expected = 41; packets[0] = shared_packet(); shared_info.size = 4096;
+    assert(filed_storage_owner_take_shared(&owner, 5, 41, 8192, &shared_fd) == -EPROTO);
+    assert(!filed_storage_owner_cancel_shared(&owner) && closed == 1);
+    reset(&owner, &queue);
+    owner.shared_expected = 41; packets[0] = shared_packet(); packets[0].correlation = 42;
+    assert(filed_storage_owner_take_shared(&owner, 5, 41, 8192, &shared_fd) == -EPROTO && closed == 1);
+    puts("filed shared attachment: early/late ordering, sequence/rights/size checks, retained failure cleanup PASS");
     puts("filed storage wait: single RECV_WAIT, stale lanes, peer death, generation, ancillary cleanup PASS");
 }
 

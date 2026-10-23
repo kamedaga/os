@@ -34,7 +34,7 @@ for test in relay identity client_retirement lease_retirement register_reply exe
     -Ikobox2/protocol/include -Ikobox2/protocol/generated/include \
     -Iuserland/filed/include -Iuserland/libipc/include -Iuserland/libpacha/include \
     -Iuserland/personality/include -Iuserland/storage/include \
-    "userland/filed/tests/${test}_test.c" "${sources[@]}" \
+    "userland/filed/tests/${test}_test.c" userland/filed/src/snapshot_cache.c userland/filed/tests/pager_stub.c "${sources[@]}" \
     kobox2/protocol/src/filesystem.c kobox2/protocol/src/virtqueue.c \
     kobox2/protocol/src/protocol.c \
     -o ".artifacts/fs-cutover-filed-tests/${test}-test"
@@ -68,3 +68,5 @@ done
 bash userland/filed/tests/run-storage-wait-test.sh
 bash userland/filed/tests/run-storage-client-queue-test.sh
 bash userland/filed/tests/run-session-detach-test.sh
+
+bash userland/filed/tests/run-snapshot-cache-test.sh

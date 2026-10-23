@@ -136,10 +136,11 @@ pub const signal_ctl_return: u64 = 3;
 pub const signal_ctl_deliver_pending_frame: u64 = 4;
 pub const signal_ctl_get_timer: u64 = 5;
 pub const signal_ctl_set_timer: u64 = 6;
-pub const signal_ctl_set_pending_hint: u64 = 7;
+pub const signal_ctl_set_thread_pending_hint: u64 = 7;
+pub const signal_ctl_set_pending_hint: u64 = 8;
 // Current thread only: rsi=entry, rdx=dedicated stack base, r10=stack size.
 // All zero unregisters. Synchronous CPU faults are not maskable signals.
-pub const signal_ctl_register_fault: u64 = 8;
+pub const signal_ctl_register_fault: u64 = 9;
 pub const signal_timer_state_signo_offset: u64 = 0;
 pub const signal_timer_state_remaining_ticks_offset: u64 = 8;
 pub const signal_timer_state_interval_ticks_offset: u64 = 16;
@@ -152,8 +153,14 @@ pub const signal_xstate_size: u64 = 832;
 pub const signal_frame_xstate_offset: u64 = signal_frame_context_offset + 20 * 8;
 pub const signal_frame_size: u64 = signal_frame_xstate_offset + signal_xstate_size;
 // A synchronous fault uses the same context/XState prefix and RETURN, signo=0,
-// followed by raw architecture exception vector, error code and fault address.
+// followed by architecture exception vector, error code and fault address.
+// error_code preserves CPU bits plus the report-only software reason mask.
+// Extract the original CPU code with `error_code & ~fault_error_software_mask`.
 pub const fault_frame_size: u64 = signal_frame_size + 3 * 8;
+// A permitted access hit unavailable borrowed backing. Personality-specific
+// consequences (e.g. SIGBUS for a file mapping) belong to the receiving task.
+pub const fault_error_backing_unavailable: u64 = 1 << 63;
+pub const fault_error_software_mask: u64 = fault_error_backing_unavailable;
 pub const signal_red_zone_size: u64 = 128;
 pub const signal_runtime_stack_size: u64 = 4096;
 

@@ -5,6 +5,7 @@
 
 #include "filed/runtime.h"
 #include "filed/live_bootstrap.h"
+#include "filed/pager.h"
 #include "pacha/ipc.h"
 
 int main(int argc, char **argv)
@@ -26,6 +27,12 @@ int main(int argc, char **argv)
     status = filed_runtime_mount_root(&runtime);
     if (status != 0) {
         printf("[filed] fatal stage=mount-root status=%d\n", status);
+        fflush(stdout);
+        return 1;
+    }
+    status = filed_pager_start(&runtime);
+    if (status != 0) {
+        printf("[filed] fatal stage=pager-start status=%d\n", status);
         fflush(stdout);
         return 1;
     }

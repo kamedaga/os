@@ -3,6 +3,7 @@
 #include "filed/runtime.h"
 #include "filed/storage_owner.h"
 #include <limits.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #ifdef FILED_INTERNAL_MICROBENCH
@@ -24,8 +25,10 @@ int filed_storage_exchange(filed_runtime_t *rt, const uint8_t *request,
 #ifdef FILED_INTERNAL_MICROBENCH
     uint64_t start = filed_bench_collect ? filed_bench_tsc() : 0;
 #endif
+    filed_mutex_lock(&rt->storage_exchange_lock);
     int status = filed_storage_owner_call(rt->storage, request, size, reply,
                                          capacity, used);
+    filed_mutex_unlock(&rt->storage_exchange_lock);
 #ifdef FILED_INTERNAL_MICROBENCH
     if (filed_bench_collect) {
         filed_bench_exchange_cycles += filed_bench_tsc() - start;
@@ -38,7 +41,8 @@ int filed_storage_exchange(filed_runtime_t *rt, const uint8_t *request,
 static int storage_request(filed_runtime_t *rt, kb2_fs_request_t *r,
                           const void *tail, size_t tail_size,
                           kb2_fs_response_t *response,
-                          void *data, size_t capacity,int owner)
+                          void *data, size_t capacity,int owner,
+                          uint64_t pager_client, uint64_t pager_credential)
 {
     if (!rt || !r || !response || (tail_size && !tail) ||
         (capacity && !data) ||
@@ -53,9 +57,10 @@ static int storage_request(filed_runtime_t *rt, kb2_fs_request_t *r,
     if (!request || !reply) { free(request); free(reply); return -12; }
     r->generation = rt->storage_generation;
     if (rt->request_sequence == UINT64_MAX) { free(request); free(reply); return -75; }
-    r->sequence = ++rt->request_sequence;
-    r->client = rt->actor ? rt->actor->id : 1;
-    r->credential_generation = rt->actor ? rt->actor->credential_generation : 1;
+    r->sequence = __atomic_add_fetch(&rt->request_sequence,1,__ATOMIC_RELAXED);
+    r->client = pager_client ? pager_client : (rt->actor ? rt->actor->id : 1);
+    r->credential_generation = pager_client ? pager_credential :
+        (rt->actor ? rt->actor->credential_generation : 1);
     int status = kb2_fs_request_encode(request, KB2_FILESYSTEM_REQUEST_SIZE,
                                       request_size, r);
     if (!status && tail_size) memcpy(request + KB2_FILESYSTEM_REQUEST_SIZE, tail, tail_size);
@@ -70,15 +75,33 @@ static int storage_request(filed_runtime_t *rt, kb2_fs_request_t *r,
         FILED_BENCH_STAGE(filed_bench_storage_cycles,3,bench_stage);
     }
 #endif
-    if (!status) status = owner ? filed_storage_owner_control_call(rt->storage,
-        request,request_size,reply,reply_size,&used) :
-        filed_storage_exchange(rt,request,request_size,reply,reply_size,&used);
+    if (!status) {
+        filed_mutex_lock(&rt->storage_exchange_lock);
+        status = owner ? filed_storage_owner_control_call(rt->storage,
+            request,request_size,reply,reply_size,&used) :
+            filed_storage_owner_call(rt->storage,request,request_size,
+                reply,reply_size,&used);
+        filed_mutex_unlock(&rt->storage_exchange_lock);
+    }
 #ifdef FILED_INTERNAL_MICROBENCH
     if(filed_bench_collect) bench_stage=filed_bench_tsc();
 #endif
-    if (!status && (kb2_fs_response_decode(reply, used, response) != 0 ||
-                    !kb2_fs_response_matches(response, r))) status = -71;
-    if (!status && response->data_length > capacity) status = -71;
+    if (!status) {
+        const int decode=kb2_fs_response_decode(reply,used,response);
+        if (decode || !kb2_fs_response_matches(response,r)) {
+            fprintf(stderr,"[filed] storage response mismatch op=%u seq=%llu decode=%d used=%zu generation=%llu/%llu response_seq=%llu\n",
+                r->opcode,(unsigned long long)r->sequence,decode,used,
+                (unsigned long long)r->generation,
+                (unsigned long long)(decode ? 0 : response->generation),
+                (unsigned long long)(decode ? 0 : response->sequence));
+            status=-71;
+        }
+    }
+    if (!status && response->data_length > capacity) {
+        fprintf(stderr,"[filed] storage response oversize op=%u length=%llu capacity=%zu\n",
+            r->opcode,(unsigned long long)response->data_length,capacity);
+        status=-71;
+    }
     if (!status && response->result < 0) status = (int)response->result;
     if (!status && response->data_length)
         memcpy(data, reply + KB2_FILESYSTEM_RESPONSE_SIZE,
@@ -96,7 +119,7 @@ static int storage_request(filed_runtime_t *rt, kb2_fs_request_t *r,
 int filed_storage_request(filed_runtime_t *rt,kb2_fs_request_t *r,
     const void *tail,size_t tail_size,kb2_fs_response_t *response,void *data,size_t capacity)
 {
-    return storage_request(rt,r,tail,tail_size,response,data,capacity,0);
+    return storage_request(rt,r,tail,tail_size,response,data,capacity,0,0,0);
 }
 
 int filed_storage_open(filed_runtime_t *rt, uint64_t dir, const char *path,
@@ -139,7 +162,7 @@ static int storage_stat(filed_runtime_t *rt,uint64_t handle,
     kb2_fs_request_t r = { .opcode = KB2_FILESYSTEM_OP_STATX,
         .handle = handle, .flags = 0x1000, .mask = 0x7ff };
     kb2_fs_response_t response;
-    int status = storage_request(rt,&r,NULL,0,&response,bytes,sizeof(bytes),owner);
+    int status = storage_request(rt,&r,NULL,0,&response,bytes,sizeof(bytes),owner,0,0);
     if (status) return status;
     if (response.data_length != sizeof(bytes)) return -71;
     *out = (filed_storage_stat_t){
@@ -160,6 +183,38 @@ int filed_storage_stat(filed_runtime_t *rt,uint64_t handle,filed_storage_stat_t 
 {
     return storage_stat(rt,handle,out,0);
 }
+int filed_storage_snapshot_stat(filed_runtime_t *rt,uint64_t handle,filed_storage_stat_t *out)
+{
+    uint8_t bytes[KB2_FILESYSTEM_SNAPSHOT_STAT_SIZE];
+    kb2_fs_request_t request={.opcode=KB2_FILESYSTEM_OP_STATX,.handle=handle,
+        .flags=0x1000,.mode=KB2_FILESYSTEM_SNAPSHOT_QUERY,.mask=0x7ff};
+    kb2_fs_response_t response;
+    int status=storage_request(rt,&request,NULL,0,&response,bytes,sizeof(bytes),0,0,0);
+    if (status) {
+        fprintf(stderr,"[filed] snapshot STATX exchange status=%d handle=%llu\n",
+            status,(unsigned long long)handle);
+        return status;
+    }
+    if (response.data_length!=sizeof(bytes)) {
+        fprintf(stderr,"[filed] snapshot STATX length=%llu expected=%zu handle=%llu\n",
+            (unsigned long long)response.data_length,sizeof(bytes),
+            (unsigned long long)handle);
+        return -71;
+    }
+    const uint8_t *s=bytes+KB2_FILESYSTEM_SNAPSHOT_STAT_STATX_OFFSET;
+    *out=(filed_storage_stat_t){
+        .inode=rd(s+KB2_FILESYSTEM_STATX_INO_OFFSET,8),
+        .filesystem=rd(s+KB2_FILESYSTEM_STATX_DEV_MAJOR_OFFSET,4)<<32 |
+            rd(s+KB2_FILESYSTEM_STATX_DEV_MINOR_OFFSET,4),
+        .size=rd(s+KB2_FILESYSTEM_STATX_SIZE_OFFSET,8),
+        .mode=(uint32_t)rd(s+KB2_FILESYSTEM_STATX_MODE_OFFSET,2),
+        .nlink=(uint32_t)rd(s+KB2_FILESYSTEM_STATX_NLINK_OFFSET,4),
+        .inode_generation=(uint32_t)rd(bytes,4),
+        .snapshot_valid=(rd(bytes+4,4)==KB2_FILESYSTEM_SNAPSHOT_VALID),
+        .change_cookie=rd(bytes+8,8)};
+    return 0;
+}
+
 int filed_storage_device_route(filed_runtime_t *rt,kb2_fs_request_t *request,
     const void *tail,size_t tail_size,filed_storage_stat_t *stat,uint64_t *handle,
     uint8_t statx[KB2_FILESYSTEM_STATX_SIZE])
@@ -167,7 +222,7 @@ int filed_storage_device_route(filed_runtime_t *rt,kb2_fs_request_t *request,
     uint8_t bytes[KB2_FILESYSTEM_STATX_SIZE];
     kb2_fs_response_t response;
     if (!stat || !handle || request->opcode!=KB2_FILESYSTEM_OP_DEVICE_ROUTE) return -22;
-    int status=storage_request(rt,request,tail,tail_size,&response,bytes,sizeof(bytes),1);
+    int status=storage_request(rt,request,tail,tail_size,&response,bytes,sizeof(bytes),1,0,0);
     if (status) return status;
     if (response.data_length!=sizeof(bytes) || !response.handle) return -71;
     *stat=(filed_storage_stat_t){
@@ -179,7 +234,9 @@ int filed_storage_device_route(filed_runtime_t *rt,kb2_fs_request_t *request,
     return 0;
 }
 static int storage_pread(filed_runtime_t *rt,uint64_t handle,uint64_t offset,
-    void *data,size_t length,size_t *got,int owner)
+    void *data,size_t length,size_t *got,int owner,
+    const filed_storage_stat_t *expected,int *valid,
+    uint64_t pager_client,uint64_t pager_credential)
 {
     if (!rt || !rt->storage || !got || (length && !data) || offset > INT64_MAX) return -22;
     /* These readers assemble private exec/FILE_VMO snapshots, not ordinary
@@ -195,11 +252,13 @@ static int storage_pread(filed_runtime_t *rt,uint64_t handle,uint64_t offset,
         length=UINT32_MAX-KB2_FILESYSTEM_RESPONSE_SIZE;
     kb2_fs_request_t r = { .opcode = KB2_FILESYSTEM_OP_PREAD,
         .handle = handle, .offset = (int64_t)offset, .length = length };
+    if(expected) r.mode=KB2_FILESYSTEM_SNAPSHOT_QUERY;
     if(rt->request_sequence==UINT64_MAX) return -75;
     r.generation=rt->storage_generation;
-    r.sequence=++rt->request_sequence;
-    r.client=rt->actor ? rt->actor->id : 1;
-    r.credential_generation=rt->actor ? rt->actor->credential_generation : 1;
+    r.sequence=__atomic_add_fetch(&rt->request_sequence,1,__ATOMIC_RELAXED);
+    r.client=pager_client ? pager_client : (rt->actor ? rt->actor->id : 1);
+    r.credential_generation=pager_client ? pager_credential :
+        (rt->actor ? rt->actor->credential_generation : 1);
     uint8_t request[KB2_FILESYSTEM_REQUEST_SIZE];
     int status=kb2_fs_request_encode(request,sizeof(request),sizeof(request),&r);
     kb2_fs_response_t response;
@@ -210,10 +269,14 @@ static int storage_pread(filed_runtime_t *rt,uint64_t handle,uint64_t offset,
     /* Snapshot readers already own the destination VMO. Copy from the queue
      * directly into it; a fresh header+payload malloc would fault in another
      * full image only to copy and immediately discard it. */
-    if(!status) status=owner ? filed_storage_owner_control_call_split(rt->storage,
-        request,sizeof(request),&response,data,length,&used) :
-        filed_storage_owner_call_split(rt->storage,request,sizeof(request),
-            &response,data,length,&used);
+    if(!status) {
+        filed_mutex_lock(&rt->storage_exchange_lock);
+        status=owner ? filed_storage_owner_control_call_split(rt->storage,
+            request,sizeof(request),&response,data,length,&used) :
+            filed_storage_owner_call_split(rt->storage,request,sizeof(request),
+                &response,data,length,&used);
+        filed_mutex_unlock(&rt->storage_exchange_lock);
+    }
 #ifdef FILED_INTERNAL_MICROBENCH
     if(filed_bench_collect) {
         filed_bench_exchange_cycles+=filed_bench_tsc()-start;
@@ -227,13 +290,15 @@ static int storage_pread(filed_runtime_t *rt,uint64_t handle,uint64_t offset,
     if (!status) {
         if ((uint64_t)response.result != response.data_length) return -71;
         *got = (size_t)response.data_length;
+        if (expected && (response.service!=KB2_FILESYSTEM_SNAPSHOT_VALID ||
+            response.handle!=expected->change_cookie)) *valid=0;
     }
     return status;
 }
 int filed_storage_pread(filed_runtime_t *rt,uint64_t handle,uint64_t offset,
     void *data,size_t length,size_t *got)
 {
-    return storage_pread(rt,handle,offset,data,length,got,0);
+    return storage_pread(rt,handle,offset,data,length,got,0,NULL,NULL,0,0);
 }
 int filed_storage_exec_open(filed_runtime_t *rt,uint64_t directory,
     const char *path,uint64_t *handle)
@@ -243,7 +308,7 @@ int filed_storage_exec_open(filed_runtime_t *rt,uint64_t directory,
     kb2_fs_request_t r={.opcode=KB2_FILESYSTEM_OP_EXEC_OPEN,.handle=directory,
         .path={KB2_FILESYSTEM_REQUEST_SIZE,length}};
     kb2_fs_response_t response;
-    int status=storage_request(rt,&r,path,length,&response,NULL,0,1);
+    int status=storage_request(rt,&r,path,length,&response,NULL,0,1,0,0);
     if(!status) *handle=response.handle;
     return status;
 }
@@ -254,11 +319,45 @@ int filed_storage_exec_stat(filed_runtime_t *rt,uint64_t handle,filed_storage_st
 int filed_storage_exec_pread(filed_runtime_t *rt,uint64_t handle,uint64_t offset,
     void *data,size_t length,size_t *got)
 {
-    return storage_pread(rt,handle,offset,data,length,got,1);
+    return storage_pread(rt,handle,offset,data,length,got,1,NULL,NULL,0,0);
 }
 int filed_storage_exec_close(filed_runtime_t *rt,uint64_t handle)
 {
     kb2_fs_request_t r={.opcode=KB2_FILESYSTEM_OP_CLOSE,.handle=handle};
     kb2_fs_response_t response;
-    return storage_request(rt,&r,NULL,0,&response,NULL,0,1);
+    return storage_request(rt,&r,NULL,0,&response,NULL,0,1,0,0);
+}
+
+int filed_storage_snapshot_pread(filed_runtime_t *rt,uint64_t handle,uint64_t offset,
+    void *data,size_t length,size_t *got,const filed_storage_stat_t *expected,int *valid)
+{
+    if (!expected || !valid) return -22;
+    return storage_pread(rt,handle,offset,data,length,got,0,
+        expected->snapshot_valid ? expected : NULL,valid,0,0);
+}
+
+int filed_storage_pager_request(filed_runtime_t *rt,uint64_t client,
+    uint64_t credential,kb2_fs_request_t *request,kb2_fs_response_t *response,
+    void *data,size_t capacity)
+{
+    if (!client || !credential) return -22;
+    return storage_request(rt,request,NULL,0,response,data,capacity,0,
+        client,credential);
+}
+int filed_storage_pager_request_ex(filed_runtime_t *rt,uint64_t client,
+    uint64_t credential,kb2_fs_request_t *request,const void *tail,
+    size_t tail_size,kb2_fs_response_t *response,void *data,size_t capacity)
+{
+    if (!client || !credential) return -22;
+    return storage_request(rt,request,tail,tail_size,response,data,capacity,
+        0,client,credential);
+}
+
+int filed_storage_pager_pread(filed_runtime_t *rt,uint64_t client,
+    uint64_t credential,uint64_t handle,uint64_t offset,void *data,
+    size_t length,size_t *got)
+{
+    if (!client || !credential) return -22;
+    return storage_pread(rt,handle,offset,data,length,got,0,NULL,NULL,
+        client,credential);
 }

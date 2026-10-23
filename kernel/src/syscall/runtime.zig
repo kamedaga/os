@@ -10,6 +10,7 @@ const scheduler = @import("../scheduler.zig").connection;
 const smp = @import("../smp.zig");
 const sc = @import("numbers.zig");
 const perf = @import("../smp_perf.zig");
+const wake_trace = @import("../wake_trace.zig");
 const user_vm = @import("../memory/user_vm.zig");
 
 const runtime_abi = abi_root.runtime_abi;
@@ -59,6 +60,73 @@ const FutexWaiter = struct {
 var futex_waiters: slot_storage.SlotTable(FutexWaiter) = .{};
 var futex_directory_leaf: slot_storage.Leaf = .{};
 var futex_waiters_lock: FutexSpinLock = .{};
+const FutexThreadCacheEntry = struct {
+    principal: kernel.PrincipalId = @enumFromInt(0),
+    thread_index: usize = std.math.maxInt(usize),
+    thread_generation: u32 = 0,
+    waiter: ?*FutexWaiter = null,
+    retired: bool = false,
+};
+// Advisory, direct-mapped identity hints. F owns both these pointers and the
+// waiter table; an eviction only restores the full directory search.
+var futex_thread_cache: [64]FutexThreadCacheEntry = [_]FutexThreadCacheEntry{.{}} ** 64;
+const FutexKeyHint = struct {
+    principal: kernel.PrincipalId = @enumFromInt(0),
+    user_va: u64 = 0,
+    count: usize = 0,
+    unique: ?*FutexWaiter = null,
+    conflicted: bool = false,
+};
+// F owns these key hints. A collision or multiple waiters restores the full
+// scan; an empty bucket proves that no registered waiter has this key.
+var futex_key_hints: [256]FutexKeyHint = [_]FutexKeyHint{.{}} ** 256;
+
+fn futexKeyHint(proc: kernel.PrincipalId, user_va: u64) *FutexKeyHint {
+    const mixed = (@as(u64, @intFromEnum(proc)) *% 0x9e3779b97f4a7c15) ^
+        (user_va >> 2) ^ (user_va >> 17);
+    return &futex_key_hints[@as(usize, @truncate(mixed)) & (futex_key_hints.len - 1)];
+}
+
+fn addFutexKeyHint(waiter: *FutexWaiter) void {
+    const hint = futexKeyHint(waiter.principal, waiter.user_va);
+    if (hint.count == 0) {
+        hint.* = .{ .principal = waiter.principal, .user_va = waiter.user_va,
+            .count = 1, .unique = waiter };
+        return;
+    }
+    hint.count += 1;
+    if (hint.principal != waiter.principal or hint.user_va != waiter.user_va)
+        hint.conflicted = true;
+    hint.unique = null;
+}
+
+fn removeFutexKeyHint(waiter: *FutexWaiter) void {
+    if (!waiter.active) return;
+    const hint = futexKeyHint(waiter.principal, waiter.user_va);
+    // Some unit fixtures populate SlotTable directly; production publishes
+    // every active waiter through addFutexKeyHint under F.
+    if (hint.count == 0) {
+        std.debug.assert(@import("builtin").is_test);
+        return;
+    }
+    hint.count -= 1;
+    if (hint.count == 0) hint.* = .{} else hint.unique = null;
+}
+
+fn futexKeyKnownEmpty(proc: kernel.PrincipalId, user_va: u64) bool {
+    const hint = futexKeyHint(proc, user_va);
+    return hint.count == 0 or
+        (hint.count == 1 and !hint.conflicted and
+        (hint.principal != proc or hint.user_va != user_va));
+}
+
+fn uniqueFutexKeyWaiter(proc: kernel.PrincipalId, user_va: u64) ?*FutexWaiter {
+    const hint = futexKeyHint(proc, user_va);
+    if (hint.count != 1 or hint.conflicted or hint.principal != proc or hint.user_va != user_va) return null;
+    const waiter = hint.unique orelse return null;
+    if (!waiter.active or waiter.principal != proc or waiter.user_va != user_va) return null;
+    return waiter;
+}
 // The table stays fully available, but short waits must not scan its unused
 // tail under global exclusion. This is the active-record extent, not a count
 // of live scheduler tokens: timeout/signal may leave stale records behind.
@@ -77,6 +145,8 @@ pub fn kernelStaticStorageEndAddr() usize {
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(futex_waiters), &futex_waiters));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(futex_waiters_lock), &futex_waiters_lock));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(futex_directory_leaf), &futex_directory_leaf));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(futex_thread_cache), &futex_thread_cache));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(futex_key_hints), &futex_key_hints));
     end = maxStaticEnd(end, realtime_clock.kernelStaticStorageEndAddr());
     return end;
 }
@@ -85,6 +155,17 @@ fn readUserU32(h: anytype, proc: kernel.PrincipalId, user_va: u64) ?u32 {
     var bytes: [4]u8 = undefined;
     if (!h.copy_user_bytes_from_va(proc, user_va, bytes[0..])) return null;
     return std.mem.readInt(u32, &bytes, .little);
+}
+
+fn readUserU32UnderFutexLock(h: anytype, proc: kernel.PrincipalId, user_va: u64) ?u32 {
+    const HookType = if (@typeInfo(@TypeOf(h)) == .pointer) @typeInfo(@TypeOf(h)).pointer.child else @TypeOf(h);
+    if (comptime @hasField(HookType, "resident_read_user_u32")) {
+        if (h.resident_read_user_u32) |resident| return resident(proc, user_va);
+    }
+    // Small host fixtures supply only a checked-copy mock. Production hooks
+    // always install the resident reader so F -> AS never faults or allocates.
+    if (comptime !@import("builtin").is_test) unreachable;
+    return readUserU32(h, proc, user_va);
 }
 
 fn writeTimespec(h: anytype, proc: kernel.PrincipalId, out_va: u64, sec: u64, nsec: u64) u64 {
@@ -419,7 +500,33 @@ test "yield result preserves the selected frame and saves caller success" {
 }
 
 fn retireFutexWaiterLocked(waiter: *FutexWaiter) void {
+    removeFutexKeyHint(waiter);
+    const cache = &futex_thread_cache[waiter.thread_index % futex_thread_cache.len];
+    if (cache.waiter == waiter and cache.thread_index == waiter.thread_index and
+        cache.thread_generation == waiter.thread_generation and cache.principal == waiter.principal)
+    {
+        // Remove the pointer before SlotTable can release/reuse its body.
+        cache.waiter = null;
+        cache.retired = false;
+    }
     futex_waiters.remove(waiter, &futex_directory_leaf);
+}
+
+fn retainRetiredFutexWaiterLocked(waiter: *FutexWaiter) void {
+    const cache = &futex_thread_cache[waiter.thread_index % futex_thread_cache.len];
+    if (cache.waiter == waiter and cache.thread_index == waiter.thread_index and
+        cache.thread_generation == waiter.thread_generation and cache.principal == waiter.principal)
+    {
+        removeFutexKeyHint(waiter);
+        // A completed wait keeps at most one inactive slot per cache bucket.
+        // The slot body stays published, so the next wait neither scans the
+        // directory nor rebuilds a detached SlotTable body. An evicted active
+        // record is retired normally when its own completion arrives.
+        waiter.active = false;
+        cache.retired = true;
+        return;
+    }
+    retireFutexWaiterLocked(waiter);
 }
 
 fn futexHasPreparedFree() bool {
@@ -486,12 +593,42 @@ fn recordFutexWaiterWithTokenCheckLocked(
     user_va: u64,
     wait_token: u64,
 ) bool {
+    const cache = &futex_thread_cache[thread_index % futex_thread_cache.len];
+    var reusable: ?*FutexWaiter = null;
+    const matches = cache.thread_index == thread_index and
+        cache.thread_generation == thread_generation and cache.principal == proc;
+    if (matches) {
+        if (cache.waiter) |waiter| {
+            if (waiter.principal == proc and
+                waiter.thread_index == thread_index and waiter.thread_generation == thread_generation)
+            {
+                removeFutexKeyHint(waiter);
+                waiter.* = .{ .active = true, .principal = proc,
+                    .thread_index = thread_index, .thread_generation = thread_generation,
+                    .user_va = user_va, .wait_token = wait_token };
+                addFutexKeyHint(waiter);
+                cache.retired = false;
+                return true;
+            }
+            // A stale hint is never authority for skipping the directory.
+            if (cache.retired and !waiter.active) reusable = waiter;
+        }
+    } else if (cache.waiter) |waiter| {
+        // A collision never removes a live waiter. It may leave another
+        // active record for this thread, so search before reusing the cached
+        // inactive slot. Removing a last live body first would detach the
+        // SlotTable and make the following allocation fail under F.
+        if (cache.retired and !waiter.active) reusable = waiter;
+    }
+    cache.* = .{};
     // An earlier hole must not hide this thread's registration at a higher
     // slot. Finish the replacement search before inserting into a free slot.
     var iterator = futex_waiters.iteratorLocked(&futex_directory_leaf);
     while (iterator.next()) |item| {
         const waiter = item.value;
         if (waiter.active and waiter.principal == proc and waiter.thread_index == thread_index) {
+            if (reusable) |old| futex_waiters.remove(old, &futex_directory_leaf);
+            removeFutexKeyHint(waiter);
             waiter.* = .{
                 .active = true,
                 .principal = proc,
@@ -500,12 +637,33 @@ fn recordFutexWaiterWithTokenCheckLocked(
                 .user_va = user_va,
                 .wait_token = wait_token,
             };
+            addFutexKeyHint(waiter);
+            cache.* = .{ .principal = proc, .thread_index = thread_index,
+                .thread_generation = thread_generation, .waiter = waiter };
             return true;
         }
     }
-    if (recordFutexWaiterInFreeSlot(proc, thread_index, thread_generation, user_va, wait_token)) return true;
+    if (reusable) |waiter| {
+        waiter.* = .{ .active = true, .principal = proc,
+            .thread_index = thread_index, .thread_generation = thread_generation,
+            .user_va = user_va, .wait_token = wait_token };
+        addFutexKeyHint(waiter);
+        cache.* = .{ .principal = proc, .thread_index = thread_index,
+            .thread_generation = thread_generation, .waiter = waiter };
+        return true;
+    }
+    if (recordFutexWaiterInFreeSlot(proc, thread_index, thread_generation, user_va, wait_token)) |waiter| {
+        cache.* = .{ .principal = proc, .thread_index = thread_index,
+            .thread_generation = thread_generation, .waiter = waiter };
+        return true;
+    }
     reclaimStaleFutexWaitersLocked(is_current);
-    return recordFutexWaiterInFreeSlot(proc, thread_index, thread_generation, user_va, wait_token);
+    if (recordFutexWaiterInFreeSlot(proc, thread_index, thread_generation, user_va, wait_token)) |waiter| {
+        cache.* = .{ .principal = proc, .thread_index = thread_index,
+            .thread_generation = thread_generation, .waiter = waiter };
+        return true;
+    }
+    return false;
 }
 
 fn recordFutexWaiterInFreeSlot(
@@ -514,11 +672,11 @@ fn recordFutexWaiterInFreeSlot(
     thread_generation: u32,
     user_va: u64,
     wait_token: u64,
-) bool {
+) ?*FutexWaiter {
     const flags = futex_directory_leaf.lock();
     const allocation = futex_waiters.allocatePrepared();
     futex_directory_leaf.unlock(flags);
-    const slot = allocation catch return false;
+    const slot = allocation catch return null;
     slot.value.* = .{
         .active = true,
         .principal = proc,
@@ -527,7 +685,8 @@ fn recordFutexWaiterInFreeSlot(
         .user_va = user_va,
         .wait_token = wait_token,
     };
-    return true;
+    addFutexKeyHint(slot.value);
+    return slot.value;
 }
 
 fn clearFutexWaiter(
@@ -602,6 +761,7 @@ fn futexWait(h: anytype, proc: kernel.PrincipalId, frame: *TrapFrame) u64 {
 
     const thread_index = scheduler.currentThread();
     const thread_generation = scheduler.currentThreadGeneration() orelse return sc.syscall_err_invalid;
+    wake_trace.record(.futex_wait_enter, user_va, 0, thread_index);
 
     // FUTEX_WAIT must compare the userspace word and enqueue the waiter
     // atomically with respect to FUTEX_WAKE.  A wake performs its userspace
@@ -613,14 +773,16 @@ fn futexWait(h: anytype, proc: kernel.PrincipalId, frame: *TrapFrame) u64 {
     var claim_start: u64 = 0;
     while (true) {
         futex_waiters_lock.lock();
+        wake_trace.record(.futex_lock, user_va, 0, thread_index);
         const copy_start = perf.runtimeTimestamp(.futex_wait);
-        const current = readUserU32(h, proc, user_va) orelse {
+        const current = readUserU32UnderFutexLock(h, proc, user_va) orelse {
             perf.runtimeAdd(.futex_wait, .invalid, 1);
             perf.runtimeAdd(.futex_wait, .copy_calls, 1);
             perf.runtimeElapsed(.futex_wait, .copy_cycles, copy_start);
             futex_waiters_lock.unlock();
             return sc.syscall_err_invalid;
         };
+        wake_trace.record(.futex_word, user_va, current, thread_index);
         perf.runtimeAdd(.futex_wait, .copy_calls, 1);
         perf.runtimeElapsed(.futex_wait, .copy_cycles, copy_start);
         if (current != expected) {
@@ -639,17 +801,20 @@ fn futexWait(h: anytype, proc: kernel.PrincipalId, frame: *TrapFrame) u64 {
             futex_waiters_lock.unlock();
             return sc.syscall_err_invalid;
         };
+        wake_trace.record(.futex_token, user_va, wait_token, thread_index);
         if (!recordFutexWaiterLocked(proc, thread_index, thread_generation, user_va, wait_token)) {
             perf.runtimeAdd(.futex_wait, .invalid, 1);
             futex_waiters_lock.unlock();
             scheduler.cancelCurrentWaitToken(thread_generation, wait_token);
             return sc.syscall_err_alloc;
         }
+        wake_trace.record(.futex_record, user_va, wait_token, thread_index);
         futex_waiters_lock.unlock();
         break;
     }
     perf.runtimeAdd(.futex_wait, .claim_calls, 1);
     perf.runtimeElapsed(.futex_wait, .claim_cycles, claim_start);
+    wake_trace.record(.futex_wait_reserved, user_va, wait_token, thread_index);
 
     const timeout_result = if (timeout_ticks == 0)
         sc.syscall_err_not_ready
@@ -665,6 +830,7 @@ fn futexWait(h: anytype, proc: kernel.PrincipalId, frame: *TrapFrame) u64 {
     else
         h.before_current_thread_leave;
     perf.runtimeAdd(.futex_wait, .body_calls, 1);
+    wake_trace.record(.futex_wait_block, user_va, wait_token, thread_index);
     const blocked = h.block_current_thread_for_event(
         frame,
         true,
@@ -680,12 +846,16 @@ fn futexWait(h: anytype, proc: kernel.PrincipalId, frame: *TrapFrame) u64 {
             perf.runtimeAdd(.futex_wait, if (blocked) .claimed else .invalid, 1);
         }
     }
-    if (blocked) return frame.rax;
+    if (blocked) {
+        wake_trace.record(.futex_wait_return, user_va, wait_token, thread_index);
+        return frame.rax;
+    }
     scheduler.cancelCurrentWaitToken(thread_generation, wait_token);
     // FUTEX_REQUEUE may have changed this waiter's key while it slept.  The
     // reserved token uniquely identifies the wait, so cleanup must not depend
     // on the original userspace address.
     clearFutexWaiter(proc, thread_index, thread_generation, wait_token);
+    wake_trace.record(.futex_wait_return, user_va, wait_token, thread_index);
     return sc.syscall_err_not_ready;
 }
 
@@ -711,6 +881,7 @@ const WakeWaitPeerResult = struct {
 };
 
 fn wakeWaitPeerLocked(comptime Ops: type, proc: kernel.PrincipalId, wake_va: u64, frame: *TrapFrame, caller_id: usize, caller_generation: u32, caller_token: u64, registered: bool, timeout_ticks: u64, resume_rax: u64, wait_uninterruptible: bool) WakeWaitPeerResult {
+    if (!@import("builtin").is_test and futexKeyKnownEmpty(proc, wake_va)) return .{};
     var iterator = futex_waiters.iteratorLocked(&futex_directory_leaf);
     while (iterator.next()) |item| {
         const waiter = item.value;
@@ -737,14 +908,14 @@ fn wakeWaitPeerLocked(comptime Ops: type, proc: kernel.PrincipalId, wake_va: u64
             perf.runtimeElapsed(.futex_wake_wait, .body_cycles, transfer_start);
             if (transferred) |installed| {
                 if (comptime perf.enabled) perf.runtimeAdd(.futex_wake_wait, if (installed) .claimed else .reserved, 1);
-                retireFutexWaiterLocked(waiter);
+                retainRetiredFutexWaiterLocked(waiter);
                 return .{ .count = 1, .transfer = installed };
             }
             if (comptime perf.enabled) perf.runtimeAdd(.futex_wake_wait, .no_claim, 1);
         }
         switch (Ops.wake(waiter.thread_index, waiter.thread_generation, proc, waiter.wait_token, sc.syscall_ok)) {
             .woke => {
-                retireFutexWaiterLocked(waiter);
+                retainRetiredFutexWaiterLocked(waiter);
                 return .{ .count = 1 };
             },
             .stale => retireFutexWaiterLocked(waiter),
@@ -794,7 +965,7 @@ fn futexWakeWaitWithOps(comptime Ops: type, h: anytype, proc: kernel.PrincipalId
         futex_waiters_lock.lock();
         if (wait_va != 0 and (wait_va & 3) == 0 and generation != null) {
             const copy_start = perf.runtimeTimestamp(.futex_wake_wait);
-            const user_word = readUserU32(h, proc, wait_va);
+            const user_word = readUserU32UnderFutexLock(h, proc, wait_va);
             perf.runtimeElapsed(.futex_wake_wait, .copy_cycles, copy_start);
             if (user_word) |current| {
                 if (current != expected) {
@@ -858,6 +1029,8 @@ fn futexWakeWait(h: anytype, proc: kernel.PrincipalId, frame: *TrapFrame) u64 {
 
 fn resetFutexTestStorage() void {
     futex_waiters.deinit();
+    @memset(&futex_thread_cache, .{});
+    @memset(&futex_key_hints, .{});
     futex_test_fail_growth = false;
     _ = futex_waiters.prepareFree(slot_storage.hostTestAllocator()) catch unreachable;
 }
@@ -969,11 +1142,13 @@ const WakeWaitProbe = struct {
         return if (publication_failed) .publish_failed else .woke;
     }
     fn copy(_: kernel.PrincipalId, _: u64, bytes: []u8) bool {
-        std.debug.assert(futex_waiters_lock.value == 1 and bytes.len == 4);
+        _ = bytes;
+        @panic("checked user copy under futex lock");
+    }
+    fn resident(_: kernel.PrincipalId, _: u64) ?u32 {
+        std.debug.assert(futex_waiters_lock.value == 1);
         copies += 1;
-        if (!copy_ok) return false;
-        std.mem.writeInt(u32, bytes[0..4], word, .little);
-        return true;
+        return if (copy_ok) word else null;
     }
     fn leave(context: *anyopaque) void {
         const count: *usize = @ptrCast(@alignCast(context));
@@ -1014,7 +1189,12 @@ const WakeWaitProbe = struct {
     }
     fn run(frame: *TrapFrame) u64 {
         const callback: ?scheduler.BeforeCurrentThreadLeaveCallback = .{ .context = &leaves, .run = leave };
-        return futexWakeWaitWithOps(@This(), .{ .copy_user_bytes_from_va = copy, .before_current_thread_leave = callback, .block_current_thread_for_event = block }, owner, frame);
+        return futexWakeWaitWithOps(@This(), .{
+            .copy_user_bytes_from_va = copy,
+            .resident_read_user_u32 = @as(?*const fn (kernel.PrincipalId, u64) ?u32, resident),
+            .before_current_thread_leave = callback,
+            .block_current_thread_for_event = block,
+        }, owner, frame);
     }
 };
 
@@ -1156,6 +1336,8 @@ fn futexWakeCollect(
     if (max_count == 0) return 0;
     futex_waiters_lock.lock();
     defer futex_waiters_lock.unlock();
+    wake_trace.record(.futex_lock, user_va, 0, scheduler.currentThread());
+    if (!@import("builtin").is_test and futexKeyKnownEmpty(proc, user_va)) return 0;
     var woke: u64 = 0;
     var iterator = futex_waiters.iteratorLocked(&futex_directory_leaf);
     while (iterator.next()) |item| {
@@ -1173,7 +1355,8 @@ fn futexWakeCollect(
             sc.syscall_ok,
         )) {
             .woke => {
-                retireFutexWaiterLocked(waiter);
+                wake_trace.record(.futex_wake_claim, user_va, wait_token, thread_index);
+                retainRetiredFutexWaiterLocked(waiter);
                 woke += 1;
                 if (handoff_target) |hint| hint.* = .{
                     .owner = proc,
@@ -1195,17 +1378,41 @@ fn futexWakeOneCollect(comptime wake_and_handoff: anytype, proc: kernel.Principa
     if (user_va == 0 or (user_va & 3) != 0) return .{ .count = sc.syscall_err_invalid };
     futex_waiters_lock.lock();
     defer futex_waiters_lock.unlock();
+    wake_trace.record(.futex_lock, user_va, 0, scheduler.currentThread());
+    if (!@import("builtin").is_test and futexKeyKnownEmpty(proc, user_va)) return .{};
+    if (uniqueFutexKeyWaiter(proc, user_va)) |waiter| {
+        wake_trace.record(.futex_found, user_va, waiter.wait_token, waiter.thread_index);
+        const result = wake_and_handoff(frame, waiter.thread_index, waiter.thread_generation, proc, waiter.wait_token, sc.syscall_ok, 1);
+        switch (result.wake) {
+            .woke => {
+                wake_trace.record(.futex_wake_claim, user_va, waiter.wait_token, waiter.thread_index);
+                const retired_token = waiter.wait_token;
+                retainRetiredFutexWaiterLocked(waiter);
+                wake_trace.record(.futex_retired, user_va, retired_token, scheduler.currentThread());
+                return .{ .count = 1, .handed_off = result.handed_off };
+            },
+            .stale => {
+                retireFutexWaiterLocked(waiter);
+                if (!@import("builtin").is_test) return .{};
+            },
+            .publish_failed => return .{},
+        }
+    }
     var iterator = futex_waiters.iteratorLocked(&futex_directory_leaf);
     while (iterator.next()) |item| {
         const waiter = item.value;
         if (!waiter.active or waiter.principal != proc or waiter.user_va != user_va) continue;
+        wake_trace.record(.futex_found, user_va, waiter.wait_token, waiter.thread_index);
         const result = wake_and_handoff(frame, waiter.thread_index, waiter.thread_generation, proc, waiter.wait_token, sc.syscall_ok, 1);
         switch (result.wake) {
             .woke => {
+                wake_trace.record(.futex_wake_claim, user_va, waiter.wait_token, waiter.thread_index);
                 // Context installation may have replaced the caller's frame,
                 // but the exact waiter remains pinned until this retirement.
                 // Never read a new key/count from that receiver frame.
-                retireFutexWaiterLocked(waiter);
+                const retired_token = waiter.wait_token;
+                retainRetiredFutexWaiterLocked(waiter);
+                wake_trace.record(.futex_retired, user_va, retired_token, scheduler.currentThread());
                 return .{ .count = 1, .handed_off = result.handed_off };
             },
             .stale => retireFutexWaiterLocked(waiter),
@@ -1229,11 +1436,13 @@ fn finishFutexWakeOne(frame: *TrapFrame, result: FutexWakeOneResult, before_leav
 fn futexWakeAndHandoff(h: anytype, proc: kernel.PrincipalId, frame: *TrapFrame) u64 {
     const user_va = frame.rdi;
     const max_count = frame.rsi;
+    wake_trace.record(.futex_wake_enter, user_va, max_count, scheduler.currentThread());
     if (max_count != 1) {
         const start = perf.runtimeTimestamp(.futex_wake);
         const woke = futexWake(proc, user_va, max_count);
         perf.runtimeAdd(.futex_wake, .claim_calls, 1);
         perf.runtimeElapsed(.futex_wake, .claim_cycles, start);
+        wake_trace.record(.futex_wake_return, user_va, woke, scheduler.currentThread());
         return woke;
     }
     // The one-wake collector now includes context installation. Its claim
@@ -1246,8 +1455,10 @@ fn futexWakeAndHandoff(h: anytype, proc: kernel.PrincipalId, frame: *TrapFrame) 
     perf.runtimeAdd(.futex_wake, if (result.count == 1) .claimed else .no_claim, 1);
     const handoff_start = perf.runtimeTimestamp(.futex_wake);
     const returned = finishFutexWakeOne(frame, result, h.before_current_thread_leave);
+    wake_trace.record(.futex_wake_handoff, user_va, @intFromBool(result.handed_off), scheduler.currentThread());
     perf.runtimeAdd(.futex_wake, .body_calls, 1);
     perf.runtimeElapsed(.futex_wake, .body_cycles, handoff_start);
+    wake_trace.record(.futex_wake_return, user_va, result.count, scheduler.currentThread());
     return returned;
 }
 
@@ -1320,6 +1531,62 @@ test "futex grows beyond former limit and replaces above holes" {
     try std.testing.expectEqual(@as(u64, 6000), futex_waiters.get(former_max_futex_waiters).?.wait_token);
 }
 
+test "futex retired thread hint cannot redirect a reused slot or generation" {
+    const Probe = struct {
+        var observed: [4]u64 = .{ 0, 0, 0, 0 };
+        var count: usize = 0;
+        fn current(_: kernel.PrincipalId, _: usize, _: u32, _: u64) bool {
+            return true;
+        }
+        fn wake(_: usize, _: u32, _: kernel.PrincipalId, token: u64, _: u64) scheduler.KeyedWakeResult {
+            observed[count] = token;
+            count += 1;
+            return .woke;
+        }
+    };
+    resetFutexTestStorage();
+    defer resetFutexTestStorage();
+    Probe.observed = .{ 0, 0, 0, 0 };
+    Probe.count = 0;
+    const owner: kernel.PrincipalId = @enumFromInt(7);
+    try std.testing.expect(recordFutexWaiterWithTokenCheckLocked(Probe.current, owner, 5, 3, 0x1000, 11));
+    try std.testing.expectEqual(@as(u64, 1), futexWakeCollect(Probe.wake, owner, 0x1000, 1, null));
+    try std.testing.expect(recordFutexWaiterWithTokenCheckLocked(Probe.current, owner, 5, 3, 0x1000, 12));
+    try std.testing.expectEqual(@as(u64, 1), futexWakeCollect(Probe.wake, owner, 0x1000, 1, null));
+    // Thread 69 evicts thread 5 from the same direct-mapped cache bucket.
+    // Recycling both the table slot and thread index must retain exact keys.
+    try std.testing.expect(recordFutexWaiterWithTokenCheckLocked(Probe.current, owner, 69, 1, 0x2000, 21));
+    try std.testing.expect(recordFutexWaiterWithTokenCheckLocked(Probe.current, owner, 5, 4, 0x3000, 31));
+    try std.testing.expectEqual(@as(u64, 1), futexWakeCollect(Probe.wake, owner, 0x2000, 1, null));
+    try std.testing.expectEqual(@as(u64, 1), futexWakeCollect(Probe.wake, owner, 0x3000, 1, null));
+    try std.testing.expectEqualSlices(u64, &.{ 11, 12, 21, 31 }, &Probe.observed);
+}
+
+test "futex key hint admits one waiter and falls back for shared keys" {
+    const Probe = struct {
+        fn current(_: kernel.PrincipalId, _: usize, _: u32, _: u64) bool {
+            return true;
+        }
+    };
+    resetFutexTestStorage();
+    defer resetFutexTestStorage();
+    const owner: kernel.PrincipalId = @enumFromInt(71);
+    try std.testing.expect(futexKeyKnownEmpty(owner, 0x1000));
+    try std.testing.expect(recordFutexWaiterWithTokenCheckLocked(Probe.current, owner, 4, 2, 0x1000, 11));
+    const first = uniqueFutexKeyWaiter(owner, 0x1000) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(usize, 4), first.thread_index);
+    try std.testing.expect(recordFutexWaiterWithTokenCheckLocked(Probe.current, owner, 5, 2, 0x1000, 12));
+    try std.testing.expect(uniqueFutexKeyWaiter(owner, 0x1000) == null);
+    try std.testing.expect(!futexKeyKnownEmpty(owner, 0x1000));
+    clearFutexWaiter(owner, 4, 2, 11);
+    try std.testing.expect(!futexKeyKnownEmpty(owner, 0x1000));
+    clearFutexWaiter(owner, 5, 2, 12);
+    try std.testing.expect(futexKeyKnownEmpty(owner, 0x1000));
+    if (!futexHasPreparedFree()) try std.testing.expect(growFutexStorage(.{}));
+    try std.testing.expect(recordFutexWaiterWithTokenCheckLocked(Probe.current, owner, 4, 2, 0x1000, 13));
+    try std.testing.expectEqual(@as(u64, 13), uniqueFutexKeyWaiter(owner, 0x1000).?.wait_token);
+}
+
 test "futex active extent requeue and wake all preserve failed publication" {
     const Probe = struct {
         var fail: bool = true;
@@ -1358,7 +1625,13 @@ test "futex active extent requeue and wake all preserve failed publication" {
         try std.testing.expect(recordFutexWaiterWithTokenCheckLocked(Probe.current, owner, thread, 3, 0x1000, thread + 1));
     }
     try std.testing.expectEqual(@as(u64, 8), futexWakeCollect(Probe.wake, owner, 0x1000, runtime_abi.futex_wake_all, null));
-    try std.testing.expectEqual(@as(usize, 0), futex_waiters.live);
+    var active: usize = 0;
+    var remaining = futex_waiters.iteratorLocked(&futex_directory_leaf);
+    while (remaining.next()) |item| {
+        if (item.value.active) active += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 0), active);
+    try std.testing.expect(futex_waiters.live <= futex_thread_cache.len);
 }
 
 test "futex fused collector retires exact waiter before one leave callback" {
@@ -1455,6 +1728,7 @@ fn futexRequeueWithWake(
     // userland cannot reproduce without a lost-wakeup interval.
     futex_waiters_lock.lock();
     defer futex_waiters_lock.unlock();
+    if (!@import("builtin").is_test and futexKeyKnownEmpty(proc, source_va)) return 0;
 
     var woke: u64 = 0;
     var requeued: u64 = 0;
@@ -1473,7 +1747,7 @@ fn futexRequeueWithWake(
                 sc.syscall_ok,
             )) {
                 .woke => {
-                    retireFutexWaiterLocked(waiter);
+                    retainRetiredFutexWaiterLocked(waiter);
                     woke += 1;
                 },
                 .stale => retireFutexWaiterLocked(waiter),
@@ -1482,7 +1756,9 @@ fn futexRequeueWithWake(
             continue;
         }
         if (requeued < max_requeue) {
+            removeFutexKeyHint(waiter);
             waiter.user_va = target_va;
+            addFutexKeyHint(waiter);
             requeued += 1;
         }
         if (woke >= max_wake and requeued >= max_requeue) break;

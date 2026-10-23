@@ -10,6 +10,7 @@ const sc = @import("numbers.zig");
 const smp_perf = @import("../smp_perf.zig");
 
 const fd_abi = abi_root.fd_abi;
+const pager_abi = abi_root.pager_abi;
 const vm_abi = abi_root.vm_abi;
 const TrapFrame = interrupts.TrapFrame;
 const first_dynamic_fd: kernel.Fd = fd_abi.first_dynamic_fd;
@@ -456,6 +457,44 @@ fn fdWriteSerial(h: anytype, proc: kernel.PrincipalId, in_va: u64, len: u64) ?u6
     return total;
 }
 
+fn readIovecWord(h: anytype, proc: kernel.PrincipalId, item_va: u64, field_offset: u64) ?u64 {
+    // The entry probe captured descriptors before taking K. Using the same
+    // snapshot for transfer prevents another thread from swapping a resident
+    // target for an absent one after the probe and before a side effect.
+    const Hook = switch (@typeInfo(@TypeOf(h))) {
+        .pointer => |pointer| pointer.child,
+        else => @TypeOf(h),
+    };
+    if (comptime @hasField(Hook, "iovec_snapshot")) {
+        if (h.iovec_snapshot) |snapshot| {
+            if (item_va >= snapshot.base_va and (item_va - snapshot.base_va) % fd_abi.iovec_size == 0) {
+                const index = (item_va - snapshot.base_va) / fd_abi.iovec_size;
+                if (index < snapshot.count and field_offset <= 8 and field_offset % 8 == 0)
+                    return snapshot.words[@as(usize, @intCast(index * 2 + field_offset / 8))];
+            }
+            return null;
+        }
+    }
+    return h.read_user_u64(proc, item_va + field_offset);
+}
+
+test "iovec snapshot prevents a post-probe pointer swap" {
+    const Mock = struct {
+        fn stale(_: kernel.PrincipalId, _: u64) ?u64 {
+            @panic("iovec descriptor was re-read after preflight");
+        }
+    };
+    const snapshot: struct { base_va: u64, count: u64, words: [fd_abi.max_iovecs * 2]u64 } = .{
+        .base_va = 0x3000,
+        .count = 1,
+        .words = [_]u64{ 0x5000, 8192 } ++ [_]u64{0} ** ((fd_abi.max_iovecs - 1) * 2),
+    };
+    const h = .{ .iovec_snapshot = @as(?*const @TypeOf(snapshot), &snapshot), .read_user_u64 = Mock.stale };
+    const proc: kernel.PrincipalId = @enumFromInt(1);
+    try std_rc.testing.expectEqual(@as(u64, 0x5000), readIovecWord(&h, proc, 0x3000, fd_abi.iovec_base_offset).?);
+    try std_rc.testing.expectEqual(@as(u64, 8192), readIovecWord(&h, proc, 0x3000, fd_abi.iovec_len_offset).?);
+}
+
 fn fdReadv(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, fd: kernel.Fd, iov_va: u64, iov_count: u64) u64 {
     if (iov_va == 0 or iov_count == 0 or iov_count > fd_abi.max_iovecs) return sc.syscall_err_invalid;
     if (state.pipeEndpointForFd(proc, fd)) |endpoint| {
@@ -465,8 +504,8 @@ fn fdReadv(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, fd:
         var i: u64 = 0;
         while (i < iov_count) : (i += 1) {
             const item_va = iov_va + i * fd_abi.iovec_size;
-            const base = h.read_user_u64(proc, item_va + fd_abi.iovec_base_offset) orelse return sc.syscall_err_invalid;
-            const len = h.read_user_u64(proc, item_va + fd_abi.iovec_len_offset) orelse return sc.syscall_err_invalid;
+            const base = readIovecWord(h, proc, item_va, fd_abi.iovec_base_offset) orelse return sc.syscall_err_invalid;
+            const len = readIovecWord(h, proc, item_va, fd_abi.iovec_len_offset) orelse return sc.syscall_err_invalid;
             if (len == 0) continue;
             if (base == 0) return if (total != 0) total else sc.syscall_err_invalid;
             var offset: u64 = 0;
@@ -488,8 +527,8 @@ fn fdReadv(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, fd:
     var i: u64 = 0;
     while (i < iov_count) : (i += 1) {
         const item_va = iov_va + i * fd_abi.iovec_size;
-        const base = h.read_user_u64(proc, item_va + fd_abi.iovec_base_offset) orelse return sc.syscall_err_invalid;
-        const len = h.read_user_u64(proc, item_va + fd_abi.iovec_len_offset) orelse return sc.syscall_err_invalid;
+        const base = readIovecWord(h, proc, item_va, fd_abi.iovec_base_offset) orelse return sc.syscall_err_invalid;
+        const len = readIovecWord(h, proc, item_va, fd_abi.iovec_len_offset) orelse return sc.syscall_err_invalid;
         if (len == 0) continue;
         return fdRead(h, state, proc, fd, base, len);
     }
@@ -504,8 +543,8 @@ fn fdWritev(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, fd
         var i: u64 = 0;
         while (i < iov_count) : (i += 1) {
             const item_va = iov_va + i * fd_abi.iovec_size;
-            _ = h.read_user_u64(proc, item_va + fd_abi.iovec_base_offset) orelse return sc.syscall_err_invalid;
-            const len = h.read_user_u64(proc, item_va + fd_abi.iovec_len_offset) orelse return sc.syscall_err_invalid;
+            _ = readIovecWord(h, proc, item_va, fd_abi.iovec_base_offset) orelse return sc.syscall_err_invalid;
+            const len = readIovecWord(h, proc, item_va, fd_abi.iovec_len_offset) orelse return sc.syscall_err_invalid;
             const next, const overflow = @addWithOverflow(requested, len);
             if (overflow != 0) return sc.syscall_err_invalid;
             requested = next;
@@ -517,8 +556,8 @@ fn fdWritev(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, fd
             i = 0;
             while (i < iov_count) : (i += 1) {
                 const item_va = iov_va + i * fd_abi.iovec_size;
-                const base = h.read_user_u64(proc, item_va + fd_abi.iovec_base_offset) orelse return sc.syscall_err_invalid;
-                const len = h.read_user_u64(proc, item_va + fd_abi.iovec_len_offset) orelse return sc.syscall_err_invalid;
+                const base = readIovecWord(h, proc, item_va, fd_abi.iovec_base_offset) orelse return sc.syscall_err_invalid;
+                const len = readIovecWord(h, proc, item_va, fd_abi.iovec_len_offset) orelse return sc.syscall_err_invalid;
                 if (len == 0) continue;
                 const len_usize: usize = @intCast(len);
                 if (base == 0 or !h.copy_user_bytes_from_va(proc, base, buf[copied .. copied + len_usize])) return sc.syscall_err_invalid;
@@ -532,8 +571,8 @@ fn fdWritev(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, fd
         i = 0;
         while (i < iov_count) : (i += 1) {
             const item_va = iov_va + i * fd_abi.iovec_size;
-            const base = h.read_user_u64(proc, item_va + fd_abi.iovec_base_offset) orelse return if (total != 0) total else sc.syscall_err_invalid;
-            const len = h.read_user_u64(proc, item_va + fd_abi.iovec_len_offset) orelse return if (total != 0) total else sc.syscall_err_invalid;
+            const base = readIovecWord(h, proc, item_va, fd_abi.iovec_base_offset) orelse return if (total != 0) total else sc.syscall_err_invalid;
+            const len = readIovecWord(h, proc, item_va, fd_abi.iovec_len_offset) orelse return if (total != 0) total else sc.syscall_err_invalid;
             if (len == 0) continue;
             if (base == 0) return if (total != 0) total else sc.syscall_err_invalid;
             var offset: u64 = 0;
@@ -559,8 +598,8 @@ fn fdWritev(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, fd
                 var i: u64 = 0;
                 while (i < iov_count) : (i += 1) {
                     const item_va = iov_va + i * fd_abi.iovec_size;
-                    const base = h.read_user_u64(proc, item_va + fd_abi.iovec_base_offset) orelse return sc.syscall_err_invalid;
-                    const len = h.read_user_u64(proc, item_va + fd_abi.iovec_len_offset) orelse return sc.syscall_err_invalid;
+                    const base = readIovecWord(h, proc, item_va, fd_abi.iovec_base_offset) orelse return sc.syscall_err_invalid;
+                    const len = readIovecWord(h, proc, item_va, fd_abi.iovec_len_offset) orelse return sc.syscall_err_invalid;
                     const written = fdWriteSerial(h, proc, base, len) orelse return sc.syscall_err_invalid;
                     total += written;
                 }
@@ -569,8 +608,8 @@ fn fdWritev(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, fd
             else => {},
         }
     }
-    const base = h.read_user_u64(proc, iov_va + fd_abi.iovec_base_offset) orelse return sc.syscall_err_invalid;
-    const len = h.read_user_u64(proc, iov_va + fd_abi.iovec_len_offset) orelse return sc.syscall_err_invalid;
+    const base = readIovecWord(h, proc, iov_va, fd_abi.iovec_base_offset) orelse return sc.syscall_err_invalid;
+    const len = readIovecWord(h, proc, iov_va, fd_abi.iovec_len_offset) orelse return sc.syscall_err_invalid;
     return fdWrite(h, state, proc, fd, base, len);
 }
 
@@ -832,6 +871,8 @@ fn fdWaitMany(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, 
     const count = frame.rsi;
     const timeout_ticks = frame.rdx;
     const flags = frame.r10;
+    const trace = @import("../wake_trace.zig");
+    trace.record(.fd_wait_enter, count, pollfds_va, scheduler.currentThread());
     // INVALID and singleton count both have numeric value 1. A nonzero
     // event register distinguishes success, including error returns before block.
     frame.r10 = 0;
@@ -879,6 +920,7 @@ fn fdWaitMany(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, 
         return statusFromKernelError(err);
     };
     ipc_metric.record(.wait_register, register_start);
+    trace.record(.fd_wait_register, count, wait_token, current_thread);
     const repoll_start = ipc_metric.timestamp();
     const ready_after_register = pollCached(h, state, proc, poll_items, frame) orelse {
         scheduler.cancelCurrentWaitToken(current_generation, wait_token);
@@ -886,6 +928,7 @@ fn fdWaitMany(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, 
         return sc.syscall_err_invalid;
     };
     ipc_metric.record(.wait_repoll, repoll_start);
+    trace.record(.fd_wait_repoll, count, wait_token, current_thread);
     if (ready_after_register != 0) {
         scheduler.cancelCurrentWaitToken(current_generation, wait_token);
         state.cancelFdWaitGroup(group, wait_token);
@@ -893,6 +936,7 @@ fn fdWaitMany(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, 
     }
 
     const block_ticks: u64 = if (timeout_ticks == fd_abi.wait_forever) 0 else timeout_ticks;
+    trace.record(.fd_wait_block, count, wait_token, current_thread);
     if (h.block_current_thread_for_event(
         frame,
         true,
@@ -1034,6 +1078,144 @@ fn defaultVmoRights(rights: kernel.FdRights) kernel.FdRights {
     return out;
 }
 
+fn residentAnonymousUserOutput(state: *kernel.KernelState, proc: kernel.PrincipalId, va: u64, len: u64) bool {
+    const end = std_rc.math.add(u64, va, len) catch return false;
+    if (!user_vm.lockVmTransaction(proc)) return false;
+    defer user_vm.unlockVmTransaction(proc);
+    var page = va & ~@as(u64, 4095);
+    while (page < end) : (page += 4096) {
+        const entry = state.vmaEntryForVaConst(proc, page) orelse return false;
+        const vmo = state.nativeVmoSlotConst(entry.vmo) orelse return false;
+        // WAIT writes before dequeuing. Keep its destination independent of
+        // this pager's progress, including aliases and sparse anonymous VMOs.
+        if (vmo.kind != .anonymous or !entry.prot.write or
+            (state.entryDirtyPagePaddr(entry, page) == null and
+            state.nativeVmoResolvedPagePaddr(entry.vmo, @intCast((entry.vmo_offset + page - entry.start_va) / 4096)) == null)) return false;
+        if (page > std_rc.math.maxInt(u64) - 4096) return false;
+    }
+    return true;
+}
+
+fn pagerWait(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, frame: *TrapFrame) u64 {
+    if (frame.rdi >= kernel.fd_number_capacity or frame.rdx != 0 or
+        !residentAnonymousUserOutput(state, proc, frame.rsi, @sizeOf(pager_abi.Event))) return sc.syscall_err_invalid;
+    const port_ref = state.pagerPortRefForFd(proc, @intCast(frame.rdi), .{ .wait = true, .pager_fault = true }) orelse return sc.syscall_err_invalid;
+    // Copyout is tested before dequeue. K serializes PAGER_WAIT consumers;
+    // fault producers may append but cannot remove the chosen head.
+    const zero = std_rc.mem.zeroes(pager_abi.Event);
+    if (!h.copy_bytes_to_user_va(proc, frame.rsi, std_rc.mem.asBytes(&zero))) return sc.syscall_err_invalid;
+    while (true) {
+        if (state.peekPagerEvent(port_ref)) |event| {
+            if (!h.copy_bytes_to_user_va(proc, frame.rsi, std_rc.mem.asBytes(&event))) return sc.syscall_err_invalid;
+            if (!state.consumePagerEvent(port_ref, event)) return sc.syscall_err_closed;
+            return sc.syscall_ok;
+        }
+        const generation = scheduler.currentThreadGeneration() orelse return sc.syscall_err_invalid;
+        const token = scheduler.reserveCurrentWaitToken(generation) orelse return sc.syscall_err_not_ready;
+        const registered = state.registerPagerPortWait(port_ref, proc, scheduler.currentThread(), generation, token) catch {
+            scheduler.cancelCurrentWaitToken(generation, token);
+            return sc.syscall_err_closed;
+        };
+        if (!registered) {
+            scheduler.cancelCurrentWaitToken(generation, token);
+            continue;
+        }
+        // The wait token latches a wake that arrives between registration and
+        // park. No port, AS, shared-VM or copy-window lock crosses this call.
+        if (h.block_current_thread_for_event(frame, true, false, token, 0, sc.syscall_err_not_ready, h.before_current_thread_leave))
+            return frame.rax;
+        scheduler.cancelCurrentWaitToken(generation, token);
+        state.cancelPagerPortWait(port_ref, token);
+        return sc.syscall_err_not_ready;
+    }
+}
+
+fn pagerSupply(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, frame: *TrapFrame) u64 {
+    if (frame.rdi >= kernel.fd_number_capacity) return sc.syscall_err_invalid;
+    const port_ref = state.pagerPortRefForFd(proc, @intCast(frame.rdi), .{ .pager_fault = true }) orelse return sc.syscall_err_invalid;
+    var desc: pager_abi.Supply = undefined;
+    if (!h.copy_user_bytes_from_va(proc, frame.rsi, std_rc.mem.asBytes(&desc))) return sc.syscall_err_invalid;
+    if (desc.length == 0 or desc.length > pager_abi.max_supply_bytes or
+        (desc.length | desc.source_offset | desc.target_offset) & 4095 != 0 or
+        desc.source_fd >= kernel.fd_number_capacity) return sc.syscall_err_invalid;
+    const count: usize = @intCast(desc.length / 4096);
+    const source_view = state.fdPayloadWithRightsConst(proc, @intCast(desc.source_fd), .{ .map_read = true }) orelse return sc.syscall_err_invalid;
+    const source_ref = switch (source_view.payload.*) { .vmo => |ref| ref, else => return sc.syscall_err_invalid };
+    var source_pages: [128]u64 = undefined;
+    var target_ref: kernel.NativeVmoRef = .{};
+    user_vm.lockSharedVmObjects();
+    const source = state.nativeVmoSlotConst(source_ref) orelse {
+        user_vm.unlockSharedVmObjects();
+        return sc.syscall_err_invalid;
+    };
+    target_ref = state.pagerVmoForKey(port_ref, desc.key, desc.vmo_generation) orelse {
+        user_vm.unlockSharedVmObjects();
+        return sc.syscall_err_invalid;
+    };
+    const target = state.nativeVmoSlotConst(target_ref) orelse {
+        user_vm.unlockSharedVmObjects();
+        return sc.syscall_err_invalid;
+    };
+    const source_end = std_rc.math.add(u64, desc.source_offset, desc.length) catch 0;
+    const target_end = std_rc.math.add(u64, desc.target_offset, desc.length) catch 0;
+    if (source.kind != .anonymous or source_end == 0 or source_end > source.size_bytes or
+        target.kind != .pager or target_end == 0 or target_end > target.size_bytes or
+        !state.pagerRequestCovers(port_ref, target_ref, desc.request_id, @intCast(desc.target_offset / 4096), @intCast(count))) {
+        user_vm.unlockSharedVmObjects();
+        return sc.syscall_err_invalid;
+    }
+    for (0..count) |i| {
+        const source_page: usize = @intCast(desc.source_offset / 4096 + i);
+        source_pages[i] = state.nativeVmoResolvedPagePaddr(source_ref, source_page) orelse {
+            user_vm.unlockSharedVmObjects();
+            return sc.syscall_err_invalid;
+        };
+        const target_page: usize = @intCast(desc.target_offset / 4096 + i);
+        if (state.nativeVmoResolvedPagePaddr(target_ref, target_page) != null or
+            state.pagerPageFailed(target_ref, @intCast(target_page))) {
+            user_vm.unlockSharedVmObjects();
+            return sc.syscall_err_invalid;
+        }
+    }
+    // The source FD may be closed as soon as shared-VM exclusion ends. Its
+    // temporary ownership also prevents partial-unmap reclamation of the
+    // sampled PFNs while the physical copy window reads them.
+    state.retainNativeVmo(source_ref) catch {
+        user_vm.unlockSharedVmObjects();
+        return sc.syscall_err_alloc;
+    };
+    state.retainNativeVmo(target_ref) catch {
+        state.releaseNativeVmoWithFreeList(source_ref, h.free_list);
+        user_vm.unlockSharedVmObjects();
+        return sc.syscall_err_alloc;
+    };
+    user_vm.unlockSharedVmObjects();
+    defer state.releaseNativeVmoWithFreeList(source_ref, h.free_list);
+    defer state.releaseNativeVmoWithFreeList(target_ref, h.free_list);
+    var pages: [128]u64 = undefined;
+    var staged: usize = 0;
+    defer if (staged != 0) for (pages[0..staged]) |paddr| h.free_list.appendPage(paddr) catch |err| switch (err) {
+        error.PageQuarantined => {},
+        else => @panic("pager staging return failed"),
+    };
+    while (staged < count) : (staged += 1) {
+        pages[staged] = (state.allocPhysicalPage(h.free_list) catch return sc.syscall_err_alloc).paddr;
+        if (!kernel.KernelState.copyPhysicalPage(pages[staged], source_pages[staged])) {
+            h.free_list.appendPage(pages[staged]) catch {};
+            return sc.syscall_err_map;
+        }
+    }
+    user_vm.lockSharedVmObjects();
+    defer user_vm.unlockSharedVmObjects();
+    // The page store checks every destination and grows metadata first, then
+    // publishes the whole batch under one lock. Failed copy/validation leaves
+    // every destination absent and returns all staging pages above.
+    state.publishPagerPages(target_ref, @intCast(desc.target_offset / 4096), pages[0..count], h.free_list) catch return sc.syscall_err_map;
+    staged = 0; // canonical VMO owns the pages from this point onward.
+    state.completePagerPublishedRange(port_ref, target_ref, desc.key, desc.vmo_generation, @intCast(desc.target_offset / 4096), @intCast(count));
+    return sc.syscall_ok;
+}
+
 const VmoRevokeUnmapper = struct {
     pub fn unmap(_: VmoRevokeUnmapper, owner: kernel.PrincipalId, start_va: u64, size_bytes: u64) bool {
         if (size_bytes > @import("std").math.maxInt(usize)) return false;
@@ -1082,11 +1264,17 @@ fn createPageViewVmoFd(
     }
 
     const rights = kernel.fdRightsFromBits(rights_bits);
-    const flags = kernel.fdFlagsFromBits(@truncate(flags_bits));
-    if (!rights.close or (!rights.map_read and !rights.map_write)) {
+    const flags = kernel.fdFlagsFromBits(@truncate(flags_bits & fd_abi.known_flags_mask));
+    if (!rights.close or (!rights.map_read and !rights.map_write and !rights.map_exec) or
+        parent_fd >= kernel.fd_number_capacity)
+    {
         reportPageViewRefusal("rights", page_count_u64, null, null, "missing-map-or-close");
         return sc.syscall_err_invalid;
     }
+    // Parent pages, cache policy and every derived alias must remain stable
+    // from input staging until capability publication.
+    user_vm.lockAllVmTransactions();
+    defer user_vm.unlockAllVmTransactions();
     const parent_entry = state.fdEntryConst(proc, parent_fd) orelse {
         reportPageViewRefusal("parent-fd", page_count_u64, null, null, "not-found");
         return sc.syscall_err_invalid;
@@ -1117,36 +1305,13 @@ fn createPageViewVmoFd(
         reportPageViewRefusal("create", page_count_u64, null, null, @errorName(err));
         return statusFromKernelError(err);
     };
-    var page_offset: usize = 0;
-    while (page_offset < page_count) {
-        var pages: [64]u64 = undefined;
-        const chunk_count = @min(pages.len, page_count - page_offset);
-        for (pages[0..chunk_count], 0..) |*paddr, chunk_index| {
-            const list_index = page_offset + chunk_index;
-            const list_va = indices_va +
-                @as(u64, @intCast(list_index)) * fd_abi.vmo_page_view_index_size;
-            const parent_page = h.read_user_u64(proc, list_va) orelse {
-                reportPageViewRefusal("index-read", page_count_u64, list_index, null, "unreadable");
-                state.releaseNativeVmoWithFreeList(view, h.free_list);
-                return sc.syscall_err_invalid;
-            };
-            if (parent_page > @import("std").math.maxInt(usize)) {
-                reportPageViewRefusal("index-range", page_count_u64, list_index, parent_page, "overflow");
-                state.releaseNativeVmoWithFreeList(view, h.free_list);
-                return sc.syscall_err_invalid;
-            }
-            paddr.* = state.nativeVmoResolvedPagePaddr(parent, @intCast(parent_page)) orelse {
-                reportPageViewRefusal("page-resolve", page_count_u64, list_index, parent_page, "absent-or-invalid");
-                state.releaseNativeVmoWithFreeList(view, h.free_list);
-                return sc.syscall_err_invalid;
-            };
-        }
-        state.installNativeVmoPages(view, page_offset, pages[0..chunk_count], h.free_list) catch |err| {
-            reportPageViewRefusal("install", page_count_u64, page_offset, null, @errorName(err));
-            state.releaseNativeVmoWithFreeList(view, h.free_list);
-            return statusFromKernelError(err);
-        };
-        page_offset += chunk_count;
+    const view_slot = state.nativeVmoSlot(view) orelse unreachable;
+    view_slot.page_view_sparse = flags_bits & fd_abi.vmo_page_view_sparse != 0;
+    view_slot.page_view_max_prot = .{ .read = rights.map_read, .write = rights.map_write, .exec = rights.map_exec };
+    const populated = populatePageView(h, state, proc, parent, view, indices_va, page_count);
+    if (populated != sc.syscall_ok) {
+        state.releaseNativeVmoWithFreeList(view, h.free_list);
+        return populated;
     }
 
     const object = state.createKernelObject(.vmo, .{ .vmo = view }) catch |err| {
@@ -1160,6 +1325,76 @@ fn createPageViewVmoFd(
             state.clearKernelObjectSlotWithFreeList(slot, h.free_list);
         return statusFromKernelError(err);
     };
+}
+
+// Input is read once into an unpublished metadata owner. A malformed late
+// index therefore cannot partially modify any already published alias.
+fn populatePageView(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, parent: kernel.NativeVmoRef, view: kernel.NativeVmoRef, indices_va: u64, page_count: usize) u64 {
+    const sparse = (state.nativeVmoSlotConst(view) orelse return sc.syscall_err_invalid).page_view_sparse;
+    var page_offset: usize = 0;
+    while (page_offset < page_count) {
+        var pages: [64]u64 = undefined;
+        const chunk_count = @min(pages.len, page_count - page_offset);
+        for (pages[0..chunk_count], 0..) |*paddr, chunk_index| {
+            const list_index = page_offset + chunk_index;
+            const list_va = indices_va +
+                @as(u64, @intCast(list_index)) * fd_abi.vmo_page_view_index_size;
+            const parent_page = h.read_user_u64(proc, list_va) orelse {
+                reportPageViewRefusal("index-read", page_count, list_index, null, "unreadable");
+                return sc.syscall_err_invalid;
+            };
+            if (sparse and parent_page == fd_abi.vmo_page_view_hole) {
+                paddr.* = 0;
+                continue;
+            }
+            if (parent_page > @import("std").math.maxInt(usize)) {
+                reportPageViewRefusal("index-range", page_count, list_index, parent_page, "overflow");
+                return sc.syscall_err_invalid;
+            }
+            paddr.* = state.nativeVmoResolvedPagePaddr(parent, @intCast(parent_page)) orelse {
+                reportPageViewRefusal("page-resolve", page_count, list_index, parent_page, "absent-or-invalid");
+                return sc.syscall_err_invalid;
+            };
+        }
+        state.installNativeVmoPages(view, page_offset, pages[0..chunk_count], h.free_list) catch |err| {
+            reportPageViewRefusal("install", page_count, page_offset, null, @errorName(err));
+            return statusFromKernelError(err);
+        };
+        page_offset += chunk_count;
+    }
+
+    return sc.syscall_ok;
+}
+
+const PageViewInvalidator = struct {
+    pub fn invalidate(_: @This(), owner: kernel.PrincipalId, start: u64, bytes: u64) bool {
+        if (bytes > @import("std").math.maxInt(usize)) return false;
+        return user_vm.invalidatePresentUserLinearRegionPtes(owner, start, @intCast(bytes));
+    }
+};
+
+fn refreshPageViewVmoFd(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, view_fd: u64, parent_fd: u64, indices_va: u64, count: u64) u64 {
+    if (view_fd >= kernel.fd_number_capacity or parent_fd >= kernel.fd_number_capacity or
+        count == 0 or count > kernel.max_vmo_logical_pages or indices_va == 0 or
+        indices_va > @import("std").math.maxInt(u64) - count * fd_abi.vmo_page_view_index_size)
+        return sc.syscall_err_invalid;
+    user_vm.lockAllVmTransactions();
+    defer user_vm.unlockAllVmTransactions();
+    const view = state.nativePageViewRefreshAuthority(proc, @intCast(view_fd), @intCast(parent_fd)) catch
+        return sc.syscall_err_invalid;
+    const slot = state.nativeVmoSlotConst(view) orelse return sc.syscall_err_invalid;
+    if (count != slot.page_count) return sc.syscall_err_invalid;
+    const staged = state.createNativePageView(slot.backing.parent.ref, @intCast(count)) catch |err|
+        return statusFromKernelError(err);
+    defer state.releaseNativeVmoWithFreeList(staged, h.free_list);
+    const stage_slot = state.nativeVmoSlot(staged) orelse unreachable;
+    stage_slot.page_view_sparse = slot.page_view_sparse;
+    stage_slot.page_view_max_prot = slot.page_view_max_prot;
+    const populated = populatePageView(h, state, proc, slot.backing.parent.ref, staged, indices_va, @intCast(count));
+    if (populated != sc.syscall_ok) return populated;
+    state.refreshNativePageView(view, staged, PageViewInvalidator{}) catch |err|
+        return statusFromKernelError(err);
+    return sc.syscall_ok;
 }
 
 fn mapVmoFd(
@@ -1187,7 +1422,8 @@ fn mapVmoFd(
         const vmo = state.nativeVmoSlotConst(vmo_ref) orelse
             return sc.syscall_err_invalid;
         if (vmo.kind == .page_view and
-            (!flags.shared or flags.private or prot.exec))
+            (!flags.shared or flags.private or
+                !kernel.KernelState.pageViewProtAllowed(prot, vmo.page_view_max_prot)))
             return sc.syscall_err_invalid;
         if (vmo.kind == .kernel_page and
             (!flags.shared or flags.private or prot.write or prot.exec))
@@ -1333,6 +1569,11 @@ fn mapVmoFd(
     // These VMOs explicitly accept fault-time allocation failure. Leave even
     // populated pages to the normal fault path rather than requiring all holes.
     if (state.nativeVmoIsZeroOnDemand(mapped_vmo)) return base_va;
+    // Explicit unavailable backing is a valid VMA, not an eager-map failure.
+    // Fault-time lookup must distinguish its holes from demand-zero pages;
+    // requiring a complete page sequence here would undo sparse admission.
+    // Dense views (including ordinary GPU exports) retain eager validation.
+    if (state.nativeVmoIsSparsePageView(mapped_vmo)) return base_va;
     // Device PTEs must carry the admitted PAT slot; the ordinary eager
     // shared-RAM path below deliberately has no device-cache parameter.
     if (state.nativeVmoDevicePatSlot(mapped_vmo) != null) return base_va;
@@ -1502,7 +1743,7 @@ fn mremapVmaRange(
 
     // musl probes the initial (file-backed) stack with a no-MAYMOVE growth.
     // A mapped but occupied extension is ENOMEM, not an unsupported-source
-    // error. Check before the anonymous-only implementation and before any
+    // error. Check before source admission and before any
     // PTE or VMA mutation; the source's own remaining pages also collide.
     if (!may_move and new_size > old_size) {
         if (@addWithOverflow(old_va, new_size)[1] != 0) return sc.syscall_err_invalid;
@@ -1510,7 +1751,7 @@ fn mremapVmaRange(
             return sc.syscall_err_invalid;
         if (!tail_free) return sc.syscall_err_alloc;
     }
-    if (!source.flags.anonymous) return sc.syscall_err_invalid;
+    if (!state.vmaRemapSourceAllowed(source, old_size, new_size)) return sc.syscall_err_invalid;
 
     const target_va = if (!moves)
         old_va
@@ -1826,9 +2067,24 @@ pub fn dispatch(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId
         sc.syscall_timerfd_gettime => timerfdGettime(h, state, proc, @intCast(frame.rdi), frame.rsi),
         sc.syscall_vmo_create => blk: {
             if ((frame.rdx & ~fd_abi.vmo_create_known_flags_mask) != 0) break :blk sc.syscall_err_invalid;
+            if ((frame.rdx & (fd_abi.vmo_create_zero_on_demand | fd_abi.vmo_create_pager)) ==
+                (fd_abi.vmo_create_zero_on_demand | fd_abi.vmo_create_pager)) break :blk sc.syscall_err_invalid;
             user_vm.lockSharedVmObjects();
             defer user_vm.unlockSharedVmObjects();
             const create_flags = kernel.fdFlagsFromBits(@intCast(frame.rdx & fd_abi.known_flags_mask));
+            if ((frame.rdx & fd_abi.vmo_create_pager) != 0) {
+                var rights = kernel.fdRightsFromBits(frame.rsi);
+                if (frame.rsi == 0) rights = .{
+                    .inspect = true, .dup = true, .transfer = true, .close = true,
+                    .map_read = true, .map_write = true, .pager_attach = true,
+                };
+                // Pager authority belongs to the control port, and a client
+                // must never gain it by receiving the VMO descriptor.
+                if (rights.pager_fault or rights.read or rights.write or rights.resize or
+                    rights.cache_policy or rights.share or !rights.pager_attach)
+                    break :blk sc.syscall_err_invalid;
+                break :blk state.createPagerVmoFd(proc, frame.rdi, rights, create_flags, first_dynamic_fd) catch |err| statusFromKernelError(err);
+            }
             if ((frame.rdx & fd_abi.vmo_create_zero_on_demand) != 0) {
                 break :blk state.createZeroOnDemandVmoFd(
                     proc,
@@ -1846,6 +2102,34 @@ pub fn dispatch(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId
                 first_dynamic_fd,
                 h.free_list,
             ) catch |err| statusFromKernelError(err);
+        },
+        sc.syscall_pager_port_create => blk: {
+            if (frame.rdi & ~@as(u64, fd_abi.known_flags_mask) != 0) break :blk sc.syscall_err_invalid;
+            const flags = kernel.fdFlagsFromBits(@intCast(frame.rdi));
+            break :blk state.createPagerPortFd(proc, flags, first_dynamic_fd) catch |err| statusFromKernelError(err);
+        },
+        sc.syscall_pager_attach => blk: {
+            if (frame.rdi >= kernel.fd_number_capacity or frame.rsi >= kernel.fd_number_capacity or frame.r10 != 0)
+                break :blk sc.syscall_err_invalid;
+            user_vm.lockSharedVmObjects();
+            defer user_vm.unlockSharedVmObjects();
+            const generation = state.attachPagerVmo(proc, @intCast(frame.rdi), @intCast(frame.rsi), frame.rdx) catch |err|
+                break :blk statusFromKernelError(err);
+            frame.rdx = generation;
+            break :blk sc.syscall_ok;
+        },
+        sc.syscall_pager_wait => pagerWait(h, state, proc, frame),
+        sc.syscall_pager_supply => pagerSupply(h, state, proc, frame),
+        sc.syscall_pager_fail => blk: {
+            if (frame.rdi >= kernel.fd_number_capacity or
+                frame.r8 != pager_abi.fail_io and frame.r8 != pager_abi.fail_eof_or_truncate and frame.r8 != pager_abi.fail_pager_dead)
+                break :blk sc.syscall_err_invalid;
+            const port_ref = state.pagerPortRefForFd(proc, @intCast(frame.rdi), .{ .pager_fault = true }) orelse break :blk sc.syscall_err_invalid;
+            user_vm.lockSharedVmObjects();
+            defer user_vm.unlockSharedVmObjects();
+            state.completePagerRequest(port_ref, frame.rsi, frame.rdx, frame.r10, true, @intCast(frame.r8)) catch
+                break :blk sc.syscall_err_invalid;
+            break :blk sc.syscall_ok;
         },
         sc.syscall_vmo_grow => blk: {
             if (frame.rdi > @import("std").math.maxInt(kernel.Fd)) break :blk sc.syscall_err_invalid;
@@ -1893,7 +2177,8 @@ pub fn dispatch(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId
             break :blk sc.syscall_ok;
         },
         sc.syscall_vmo_revoke => revokeVmoFd(state, proc, @intCast(frame.rdi), h.free_list),
-        sc.syscall_vmo_create_page_view => createPageViewVmoFd(
+        sc.syscall_vmo_refresh_page_view => refreshPageViewVmoFd(h, state, proc, frame.rdi, frame.rsi, frame.rdx, frame.r10),
+        sc.syscall_vmo_create_page_view => if (frame.rdi >= kernel.fd_number_capacity) sc.syscall_err_invalid else createPageViewVmoFd(
             h,
             state,
             proc,

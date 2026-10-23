@@ -5,7 +5,40 @@ const std = @import("std");
 const types = @import("types.zig");
 const refs = types.references;
 pub const enabled = if (@import("builtin").is_test) true else if (@hasDecl(@import("root"), "kernel_reference_checks_enabled")) @import("root").kernel_reference_checks_enabled else false;
-pub const Error = error{ Missing, Target, Identity, Range, Allocation, Extra, BrokenLink, Duplicate, Count, Ownership };
+pub const Error = error{ Missing, Target, Identity, Range, Allocation, Extra, BrokenLink, Duplicate, Count, Ownership, VmaMark };
+
+/// Stable-boundary checks also cover anonymous/logical entries without a VMO.
+/// A linked flag alone is insufficient: lookup proves reachability from root.
+pub fn vmaTable(table: *const types.VmaTable) Error!void {
+    if (table.entries.firstMarkedAtOrAfter(0) != null) return error.VmaMark;
+    if (table.address_index.count != table.active_count) return error.Count;
+    var entries = table.entries.iterator();
+    var count: usize = 0;
+    while (entries.next()) |item| {
+        const entry = item.value;
+        if (!entry.active) continue;
+        count += 1;
+        const pair = entry.references orelse return error.Missing;
+        if (!pair.address_node.linked) return error.Missing;
+        if (pair.address_owner != table or pair.entry != entry) return error.Ownership;
+        if (pair.address_node.key.start != entry.start_va or pair.address_node.key.slot != item.ref.index) return error.Identity;
+        if (entry.active_position >= table.active_count) return error.Count;
+        if ((table.active_indices.get(entry.active_position) orelse return error.Missing).* != item.ref.index) return error.Identity;
+        if (table.entryForVa(entry.start_va) != entry) return error.Missing;
+    }
+    if (count != table.active_count) return error.Count;
+}
+
+/// Compare the frozen tree overlap set against the former full slot scan,
+/// before any range/reference mutation can make the two views incomparable.
+pub fn vmaOverlapMarks(table: *const types.VmaTable, start: u64, end: u64) Error!void {
+    var entries = table.entries.iterator();
+    while (entries.next()) |item| {
+        const entry = item.value;
+        const old_overlap = entry.active and start < entry.endVa() and entry.start_va < end;
+        if (old_overlap != table.entries.isMarked(item.ref.index, 1)) return error.VmaMark;
+    }
+}
 
 // Scalar failure evidence only; the caller's K/all-AS exclusion serializes
 // the oracle. UART output happens after the target leaf has been released.
@@ -90,6 +123,7 @@ pub fn check(self: anytype) Error!void {
     for (0..self.process_capacity) |p| {
         const desc = self.processDescriptorSlotConst(p) orelse continue;
         if (self.vmaTableForProcessIndex(p)) |table| {
+            try vmaTable(table);
             for (0..table.active_count) |position| {
                 const index = table.active_indices.get(@intCast(position)).?.*;
                 const entry = table.entries.get(index).?;

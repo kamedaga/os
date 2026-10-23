@@ -65,8 +65,20 @@ struct filed_storage_owner {
     uint64_t next_exchange;
     struct owner_client_queue *clients;
     uint64_t client_bytes, client_count;
+    uint64_t shared_expected;
+    struct ph_ipc_packet shared_attachment;
     int started, failed;
 };
+
+static int receive_shared(struct filed_storage_owner *owner, struct ph_ipc_packet *packet)
+{
+    if (!owner->shared_expected || owner->shared_attachment.fd_count ||
+        packet->correlation != owner->shared_expected || !packet->value || packet->fd_count != 1)
+        return -EPROTO;
+    owner->shared_attachment = *packet;
+    memset(packet, 0, sizeof(*packet));
+    return 0;
+}
 
 static void *allocate(void *context, size_t size)
 { (void)context; return malloc(size); }
@@ -78,7 +90,8 @@ static int make_blob(const void *bytes, size_t size, struct ph_bootstrap_item *i
     if (!bytes || !size || size > SIZE_MAX - 4095) return -EINVAL;
     size_t mapped_size = (size + 4095) & ~(size_t)4095;
     const uint64_t rights = PACHA_FD_RIGHT_INSPECT | PACHA_FD_RIGHT_CLOSE |
-        PACHA_FD_RIGHT_TRANSFER | PACHA_FD_RIGHT_MAP_READ | PACHA_FD_RIGHT_MAP_WRITE;
+        PACHA_FD_RIGHT_TRANSFER | PACHA_FD_RIGHT_DUP | PACHA_FD_RIGHT_READ |
+        PACHA_FD_RIGHT_MAP_READ | PACHA_FD_RIGHT_MAP_WRITE;
     pacha_fd_t fd = pacha_vmo_create(mapped_size, rights, 0);
     if (fd < 16) return fd < 0 ? fd : -ENOMEM;
     void *mapping = pacha_mmap(fd, mapped_size, PACHA_PROT_READ | PACHA_PROT_WRITE,
@@ -88,6 +101,18 @@ static int make_blob(const void *bytes, size_t size, struct ph_bootstrap_item *i
     if (size < mapped_size) memset((unsigned char *)mapping + size, 0, mapped_size - size);
     int error = pacha_munmap(mapping, mapped_size);
     if (error) { (void)pacha_fd_close(fd); return error; }
+    /* The sandbox and its kobox2 adapter boot only from these BOOTFS blobs.
+     * An accidental pager VMO fails FD_READ before it can be handed off. */
+    const pacha_fd_t probe=pacha_fd_fcntl(fd,PACHA_FD_FCNTL_DUP,16,
+        PACHA_FD_RIGHT_READ|PACHA_FD_RIGHT_CLOSE);
+    unsigned char first=0;
+    const int ordinary=probe>=16 && pacha_fd_read(probe,&first,1)==1 &&
+        first==*(const unsigned char *)bytes;
+    if (probe>=16) (void)pacha_fd_close(probe);
+    if (!ordinary) {
+        (void)pacha_fd_close(fd);
+        return -EIO;
+    }
     *item = (struct ph_bootstrap_item){.size = size,
         .capability = {.fd = (uint64_t)fd, .rights = PH_BOOTSTRAP_BLOB_RIGHTS,
             .flags = PACHA_FD_FLAG_CLOEXEC}};
@@ -507,6 +532,10 @@ static int queue_wait(void *context, uint32_t notification)
 #endif
         int known_lane = (packet.operation == PH_FS_QUEUE_NOTIFY ||
             packet.operation == PH_FS_OWNER_NOTIFY) && !packet.correlation;
+        if (!error && packet.operation == PH_FS_SHARED_ATTACHMENT) {
+            error = receive_shared(queue->owner, &packet);
+            if (!error) continue;
+        }
         int temporary_lane = packet.operation == PH_FS_EXCHANGE_NOTIFY &&
             packet.correlation == queue->channel.config.channel_id &&
             queue->notify_operation == PH_FS_EXCHANGE_NOTIFY;
@@ -690,6 +719,10 @@ static int storage_call(struct filed_storage_owner *owner,
         }
     }
     struct ph_fs_channel_wait wait = {.context = queue, .notify = queue_notify, .wait = queue_wait};
+    if (decoded.opcode == KB2_FILESYSTEM_OP_SHARED_FILE_VMO) {
+        if (!control || owner->shared_expected || owner->shared_attachment.fd_count) return -EPROTO;
+        owner->shared_expected = decoded.sequence;
+    }
     int error = decoded_response ? ph_fs_channel_call_split(&queue->channel,
         request,size,decoded_response,data,capacity-KB2_FILESYSTEM_RESPONSE_SIZE,
         used,&wait) : ph_fs_channel_call(&queue->channel, request, size,
@@ -698,6 +731,54 @@ static int storage_call(struct filed_storage_owner *owner,
     if (!error && exchange) error = close_queue(queue);
     if (!error && exchange) { free(queue); owner->temporary = NULL; }
     if (error) owner->failed = 1;
+    return error;
+}
+
+int filed_storage_owner_take_shared(struct filed_storage_owner *owner,
+    uint64_t id, uint64_t sequence, uint64_t length, pacha_fd_t *fd)
+{
+    if (!owner || !fd || !id || owner->shared_expected != sequence ||
+        owner->management.b >= 16) return -EPROTO;
+    while (!owner->shared_attachment.fd_count) {
+        struct ph_ipc_packet packet = {0};
+        // Data admission has closed our copy of the sandbox endpoint. Use
+        // the same peer-death-aware blocking receive as queue_wait, including
+        // when the ring reply raced ahead of the ancillary capability.
+        int error = ph_ipc_receive_wait(&owner->ipc, owner->identity.generation,
+            &packet, PACHA_FD_WAIT_FOREVER);
+        if (!error && packet.operation == PH_FS_SHARED_ATTACHMENT)
+            error = receive_shared(owner, &packet);
+        else if (!error && (packet.fd_count || packet.correlation ||
+            (packet.operation != PH_FS_OWNER_NOTIFY && packet.operation != PH_FS_QUEUE_NOTIFY)))
+            error = -EPROTO;
+        int closed = ph_ipc_packet_release(&packet);
+        if (closed) { owner->ipc.rejected = packet; owner->ipc.admitted = 0; }
+        if (error || closed) { owner->failed = 1; return error ? error : closed; }
+    }
+    struct ph_ipc_packet *packet = &owner->shared_attachment;
+    const uint64_t base = PACHA_FD_RIGHT_INSPECT | PACHA_FD_RIGHT_DUP |
+        PACHA_FD_RIGHT_TRANSFER | PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_MAP_READ;
+    const uint64_t allowed = base | PACHA_FD_RIGHT_MAP_WRITE | PACHA_FD_RIGHT_MAP_EXEC;
+    struct pacha_fd_info info;
+    if (packet->value != id || packet->correlation != sequence ||
+        packet->fds[0].rights & ~allowed || (packet->fds[0].rights & base) != base ||
+        packet->fds[0].flags != PACHA_FD_FLAG_CLOEXEC ||
+        pacha_fd_get_info(packet->fds[0].fd, &info) || info.kind != PACHA_FD_KIND_VMO ||
+        info.size != length || info.rights != packet->fds[0].rights || info.flags != PACHA_FD_FLAG_CLOEXEC) {
+        owner->failed = 1;
+        return -EPROTO;
+    }
+    *fd = packet->fds[0].fd;
+    memset(packet, 0, sizeof(*packet));
+    owner->shared_expected = 0;
+    return 0;
+}
+
+int filed_storage_owner_cancel_shared(struct filed_storage_owner *owner)
+{
+    if (!owner) return -EINVAL;
+    int error = ph_ipc_packet_release(&owner->shared_attachment);
+    if (!error) owner->shared_expected = 0;
     return error;
 }
 
@@ -847,6 +928,8 @@ int filed_storage_owner_destroy(struct filed_storage_owner *owner)
     /* No transparent restart is possible: Linux owns offsets, mounts and the
      * page cache. Keep every backing object pinned until remote retirement. */
     int error = retire_owner(owner);
+    if (error) return error;
+    error = filed_storage_owner_cancel_shared(owner);
     if (error) return error;
     error = close_queue(&owner->data);
     if (!error) error = close_queue(&owner->credentials);

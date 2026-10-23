@@ -148,6 +148,7 @@ pub fn clearNativeVmoSlot(self: anytype, slot: *NativeVmoSlot) void {
     if (slot.has_page_store and slot.page_count != 0) {
         _ = freeVmoBackingPageStore(slot.page_store_start, slot.page_count, slot.page_store_owner);
     }
+    if (slot.kind == .pager) _ = slot.pager_request_store.clear(slot.pager_request_start);
     self.native_vmos.remove(slot, &self.vmo_directory_leaf);
 }
 
@@ -188,6 +189,7 @@ pub fn createNativeVmoWithPageStore(
     slot.page_store_start = page_store_start;
     slot.page_store_owner = page_store_owner;
     slot.has_page_store = allocate_page_store;
+    slot.pager_request_start = if (kind == .pager) slot.pager_request_store.init(page_store_owner) else .{};
     slot.zero_on_demand = false;
     slot.ref_count = 0;
     return .{ .index = allocation.ref.index, .generation = allocation.ref.generation };
@@ -224,6 +226,70 @@ pub fn createNativePageView(
     errdefer self.releaseNativeVmo(parent);
     try self.publishNativeVmoParent(view, parent, 0);
     keep_view = true;
+    return view;
+}
+
+/// PTE-only invalidation preserves each address reservation, VMA and its
+/// protection ceiling. If any invalidation fails, previously removed PTEs
+/// still fault against the OLD backing; no borrowed page may be released.
+/// Caller holds K -> all-AS -> shared VM from staging through retirement.
+pub fn refreshNativePageView(
+    self: anytype,
+    view: NativeVmoRef,
+    staged: NativeVmoRef,
+    invalidator: anytype,
+) KernelError!void {
+    if (nativeVmoRefsEqual(view, staged)) return KernelError.InvalidState;
+    const target = self.nativeVmoSlot(view) orelse return KernelError.InvalidState;
+    const source = self.nativeVmoSlot(staged) orelse return KernelError.InvalidState;
+    if (target.kind != .page_view or source.kind != .page_view or
+        !nativeVmoRefsEqual(target.backing.parent.ref, source.backing.parent.ref) or
+        target.page_count != source.page_count or
+        target.page_view_sparse != source.page_view_sparse or
+        !std.meta.eql(target.page_view_max_prot, source.page_view_max_prot) or
+        source.references.ownership().edges != 0 or source.ref_count != 1 or
+        target.ram_cache_state != .wb or source.ram_cache_state != .wb or
+        !target.has_page_store or !source.has_page_store)
+        return KernelError.InvalidState;
+    if (self.nativeVmoMappingsOverlapPinnedUserObjects(view)) return KernelError.InvalidState;
+    try @import("vma.zig").validateRamAdmission(self, staged, 0, source.size_bytes, target.page_view_max_prot, .{ .shared = true });
+    var cursor = types.references.Cursor.init(&target.references);
+    while (cursor.next()) |edge| {
+        if (edge.identity.kind != .vma) continue;
+        const entry = resolveVmaEdge(self, view, edge.identity) orelse return KernelError.InvalidState;
+        if (!invalidator.invalidate(@TypeOf(self.*).processPrincipal(edge.identity.owner), entry.start_va, entry.size_bytes)) return KernelError.InvalidState;
+    }
+
+    // All old aliases have acknowledged their TLB invalidation. Transfer only
+    // radix contents, never lock/owner/Ref: nodes retain their issuing allocator
+    // and the unpublished stage now owns retirement of the old metadata.
+    // Outer lifetime exclusion prevents readers between these two leaf loans.
+    target.page_store.lock.lock();
+    const old_root = target.page_store.root;
+    const old_used = target.page_store.used;
+    target.page_store.root = source.page_store.root;
+    target.page_store.used = source.page_store.used;
+    target.page_store.lock.unlock();
+    source.page_store.lock.lock();
+    source.page_store.root = old_root;
+    source.page_store.used = old_used;
+    source.page_store.lock.unlock();
+}
+
+/// REVOKE alone is not authority to redirect a delegated view into arbitrary
+/// parent RAM. Require the actual same-generation parent capability and its
+/// full immutable MAP ceiling, not just the updater's attenuated view rights.
+pub fn nativePageViewRefreshAuthority(self: anytype, owner: PrincipalId, view_fd: Fd, parent_fd: Fd) KernelError!NativeVmoRef {
+    const view = try self.nativeVmoRefForRevokeFd(owner, view_fd);
+    const slot = self.nativeVmoSlotConst(view) orelse return KernelError.InvalidState;
+    if (slot.kind != .page_view) return KernelError.InvalidState;
+    const parent = self.nativeVmoRefForFd(owner, parent_fd) orelse return KernelError.InvalidState;
+    const entry = self.fdEntryConst(owner, parent_fd) orelse return KernelError.InvalidState;
+    const max = slot.page_view_max_prot;
+    if (!nativeVmoRefsEqual(parent, slot.backing.parent.ref) or !entry.rights.share or
+        (max.read and !entry.rights.map_read) or
+        (max.write and !entry.rights.map_write) or
+        (max.exec and !entry.rights.map_exec)) return KernelError.InvalidState;
     return view;
 }
 
@@ -523,6 +589,7 @@ pub fn releaseNativeVmo(self: anytype, vmo_ref: NativeVmoRef) void {
     slot.ref_count -= 1;
     if (slot.ref_count == 0) {
         if (retireDeviceMemory(self, slot) or retireRamCache(self, slot)) return;
+        self.pagerVmoReleased(slot);
         const parent: NativeVmoRef = if (vmoKindHasParentArm(slot.kind)) slot.backing.parent.ref else .{};
         self.clearNativeVmoSlot(slot);
         if (!parent.isNull()) self.releaseNativeVmo(parent);
@@ -536,6 +603,7 @@ pub fn releaseNativeVmoWithFreeList(self: anytype, vmo_ref: NativeVmoRef, free_l
     slot.ref_count -= 1;
     if (slot.ref_count == 0) {
         if (retireDeviceMemory(self, slot) or retireRamCache(self, slot)) return;
+        self.pagerVmoReleased(slot);
         const parent: NativeVmoRef = if (vmoKindHasParentArm(slot.kind)) slot.backing.parent.ref else .{};
         smp_perf.vmoAdd(.final_drop_calls, 1);
         smp_perf.vmoAdd(.final_drop_logical_pages, slot.page_count);
@@ -686,6 +754,15 @@ pub fn nativeVmoPagePaddrOrHole(self: anytype, vmo_ref: NativeVmoRef, page_index
     return vmoBackingPageStorePaddr(slot.page_store_start, slot.page_count, page_index);
 }
 
+pub fn nativeVmoSparsePageViewHole(self: anytype, ref: NativeVmoRef, page: usize) bool {
+    const slot = self.nativeVmoSlotConst(ref) orelse return false;
+    if (slot.kind != .page_view or !slot.page_view_sparse or !slot.has_page_store or
+        page >= slot.page_count) return false;
+    const owner = vmoBackingStoreOwner(.native_vmo, ref.index, ref.generation);
+    if (!types.vmoBackingPageStoreOwnerMatches(slot.page_store_start, slot.page_count, slot.page_store_owner, owner)) return false;
+    return vmoBackingPageStorePaddr(slot.page_store_start, slot.page_count, page) == @as(?u64, 0);
+}
+
 pub fn nativeVmoOwnPagePaddr(self: anytype, vmo_ref: NativeVmoRef, page_index: usize) ?u64 {
     const paddr = self.nativeVmoPagePaddrOrHole(vmo_ref, page_index) orelse return null;
     if (paddr == 0) return null;
@@ -756,6 +833,11 @@ pub fn resolveOrInstallNativeVmoPage(self: anytype, ref: NativeVmoRef, index: u3
 pub fn nativeVmoIsZeroOnDemand(self: anytype, vmo_ref: NativeVmoRef) bool {
     const slot = self.nativeVmoSlotConst(vmo_ref) orelse return false;
     return slot.kind == .anonymous and slot.backing.parent.ref.isNull() and slot.zero_on_demand;
+}
+
+pub fn nativeVmoIsSparsePageView(self: anytype, vmo_ref: NativeVmoRef) bool {
+    const slot = self.nativeVmoSlotConst(vmo_ref) orelse return false;
+    return slot.kind == .page_view and slot.page_view_sparse;
 }
 
 /// Resolve canonical, already populated RAM without faulting pages in or
@@ -1359,7 +1441,7 @@ pub fn installNativeVmoPages(
 ) KernelError!void {
     if (paddrs.len == 0) return KernelError.InvalidState;
     const slot = self.nativeVmoSlot(vmo_ref) orelse return KernelError.InvalidState;
-    if (slot.kind == .device_memory or slot.kind == .kernel_page or slot.ram_cache_state != .wb) return KernelError.InvalidState;
+    if (slot.kind == .device_memory or slot.kind == .kernel_page or slot.kind == .pager or slot.ram_cache_state != .wb) return KernelError.InvalidState;
     if (page_offset > slot.page_count or paddrs.len > @as(usize, slot.page_count) - page_offset) {
         return KernelError.InvalidState;
     }
@@ -1373,6 +1455,18 @@ pub fn installNativeVmoPages(
         paddrs,
         free_list,
     );
+}
+
+/// The pager syscall has already checked port authority and copied every
+/// source page into fresh canonical pages. The backing store verifies every
+/// slot and allocates metadata before one locked, all-or-nothing publish.
+pub fn publishPagerPages(self: anytype, ref: NativeVmoRef, first: usize, pages: []const u64, free_list: *FreePageList) KernelError!void {
+    const slot = self.nativeVmoSlot(ref) orelse return KernelError.InvalidState;
+    if (slot.kind != .pager or slot.pager_port.isNull() or pages.len == 0 or
+        first > slot.page_count or pages.len > slot.page_count - first or slot.ram_cache_state != .wb)
+        return KernelError.InvalidState;
+    for (pages) |paddr| if (paddr == 0 or paddr & 4095 != 0) return KernelError.InvalidState;
+    try setVmoBackingPageStorePaddrs(slot.page_store_start, slot.page_count, first, slot.page_store_owner, pages, free_list);
 }
 
 pub fn nativeVmoRefForFd(self: anytype, owner: PrincipalId, fd: Fd) ?NativeVmoRef {

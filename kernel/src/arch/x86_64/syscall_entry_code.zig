@@ -85,22 +85,60 @@ test "generated syscall entry preserves every live GPR before borrowing scratch"
     try std.testing.expect(offset + 14 <= stride);
 }
 
+const ipc_abi = @import("kernel_abi_root").ipc_abi;
+
+pub const DirectIpc = enum { call, reply_recv, notify, notify_wait };
+
+/// The only syscall-number -> direct-path mapping. Entry routing, prepare and
+/// commit all derive from it. Numbers come from ipc_abi, never literals: when
+/// the ABI was renumbered, hand-written bytes silently dropped CALL,
+/// REPLY_RECV and NOTIFY_WAIT from the fast path while routing unrelated
+/// RECV/REPLY/RECV_WAIT into prepare (a wasted round trip that also counted
+/// them as reply attempts in ipc_metric).
+pub const direct_ipc_syscalls = [_]struct { nr: u64, kind: DirectIpc }{
+    .{ .nr = ipc_abi.syscall_ipc_call, .kind = .call },
+    .{ .nr = ipc_abi.syscall_ipc_reply_recv, .kind = .reply_recv },
+    .{ .nr = ipc_abi.syscall_ipc_notify, .kind = .notify },
+    .{ .nr = ipc_abi.syscall_ipc_notify_wait, .kind = .notify_wait },
+};
+const direct_slow_offset = 64;
+const direct_route_bytes = 10;
+comptime {
+    for (direct_ipc_syscalls, 0..) |entry, i| {
+        // `cmp rax, imm8` sign-extends; 128..255 would compare as negative.
+        if (entry.nr > 127) @compileError("direct IPC syscall number does not fit cmp imm8");
+        for (direct_ipc_syscalls[0..i]) |earlier| {
+            if (earlier.nr == entry.nr) @compileError("duplicate direct IPC syscall number");
+        }
+    }
+    // Routing compares plus the final JMP must end before the slow entry.
+    if (direct_ipc_syscalls.len * direct_route_bytes + 5 > direct_slow_offset)
+        @compileError("direct IPC routing overflows into the slow entry");
+}
+
+pub fn directIpcKind(nr: u64) ?DirectIpc {
+    inline for (direct_ipc_syscalls) |entry| {
+        if (nr == entry.nr) return entry.kind;
+    }
+    return null;
+}
+
 /// Opcode routing precedes all frame stores. The direct entry saves only ABI
 /// inputs and volatile state; RBX holds the deferred FD destination and must be saved before preflight.
 /// Win64 preflight preserves RBP/R13/R14 until
 /// assembly saves them after admission (or before falling back).
 pub fn generateDirect(out: []u8, frame: u64, slot: usize, slow: u64, direct: u64) void {
     @memset(out, 0xcc);
-    const slow_offset = 64;
+    const slow_offset = direct_slow_offset;
     const direct_offset = 320;
     generate(out[slow_offset..direct_offset], frame, slot, slow);
     var n: usize = 0;
-    for ([_]u8{ 74, 76, 79, 80 }) |nr| {
-        @memcpy(out[n..][0..4], &[_]u8{ 0x48, 0x83, 0xf8, nr });
+    inline for (direct_ipc_syscalls) |entry| {
+        @memcpy(out[n..][0..4], &[_]u8{ 0x48, 0x83, 0xf8, @as(u8, entry.nr) });
         out[n + 4] = 0x0f;
         out[n + 5] = 0x84;
         std.mem.writeInt(u32, out[n + 6 ..][0..4], @intCast(direct_offset - (n + 10)), .little);
-        n += 10;
+        n += direct_route_bytes;
     }
     out[n] = 0xe9;
     std.mem.writeInt(u32, out[n + 1 ..][0..4], @intCast(slow_offset - (n + 5)), .little);
@@ -155,7 +193,7 @@ test "direct syscall entry routes CALL REPLY_RECV NOTIFY and NOTIFY_WAIT before 
                 pc += 5 + delta;
             }
         }
-        try std.testing.expectEqual(@as(usize, if (nr == 74 or nr == 76 or nr == 79 or nr == 80) 320 else 64), pc);
+        try std.testing.expectEqual(@as(usize, if (directIpcKind(nr) != null) 320 else 64), pc);
     }
     var offset: usize = 340;
     var seen: [16]bool = @splat(false);
@@ -166,4 +204,23 @@ test "direct syscall entry routes CALL REPLY_RECV NOTIFY and NOTIFY_WAIT before 
         seen[reg] = true;
     }
     for (seen, 0..) |saved, reg| try std.testing.expectEqual(reg != 5 and reg != 13 and reg != 14, saved);
+}
+
+// Prepare/commit branch on directIpcKind. Bind each kind to its named ABI
+// syscall independently of the table, and require every other IPC syscall to
+// stay on the slow path, so a table edit cannot pair a number with the wrong
+// prepare branch or admit an operation prepare would only bounce.
+test "direct IPC kinds are exactly the named ABI syscalls prepare admits" {
+    try std.testing.expectEqual(@as(?DirectIpc, .call), directIpcKind(ipc_abi.syscall_ipc_call));
+    try std.testing.expectEqual(@as(?DirectIpc, .reply_recv), directIpcKind(ipc_abi.syscall_ipc_reply_recv));
+    try std.testing.expectEqual(@as(?DirectIpc, .notify), directIpcKind(ipc_abi.syscall_ipc_notify));
+    try std.testing.expectEqual(@as(?DirectIpc, .notify_wait), directIpcKind(ipc_abi.syscall_ipc_notify_wait));
+    var admitted: usize = 0;
+    for (0..256) |nr| {
+        if (directIpcKind(nr) != null) {
+            try std.testing.expect(nr >= ipc_abi.syscall_ipc_first and nr <= ipc_abi.syscall_ipc_last);
+            admitted += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 4), admitted);
 }

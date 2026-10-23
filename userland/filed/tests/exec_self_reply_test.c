@@ -215,3 +215,9 @@ int main(void)
     assert(!source_rights[94] && !source_rights[95] && !source_rights[96]);
     puts("filed actual EXEC_SELF reply: explicit native DUP / exact source and recipient rights / negative errors / no partial replacement / failed cleanup / failed-send unwind PASS");
 }
+
+int filed_storage_snapshot_stat(filed_runtime_t *rt,uint64_t handle,filed_storage_stat_t *out)
+{ return filed_storage_stat(rt,handle,out); }
+int filed_storage_snapshot_pread(filed_runtime_t *rt,uint64_t handle,uint64_t offset,
+    void *data,size_t length,size_t *got,const filed_storage_stat_t *expected,int *valid)
+{ (void)expected;*valid=0;return filed_storage_pread(rt,handle,offset,data,length,got); }

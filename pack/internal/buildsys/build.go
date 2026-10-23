@@ -409,7 +409,17 @@ func fileSourceDependencies(workspace *config.Workspace, source config.FileSourc
 		deps = append(deps, path)
 	}
 	for _, arg := range source.Rebuild {
-		add(arg)
+		// Recipe arguments include output files and CMake build directories.
+		// Hashing them makes a successful build invalidate its own cache.
+		// Generated inputs must instead be declared explicitly in Input.
+		argPath := arg
+		if !filepath.IsAbs(argPath) {
+			argPath = workspace.Path(argPath)
+		}
+		rel, err := filepath.Rel(workspace.Path(workspace.Artifacts), argPath)
+		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			add(arg)
+		}
 		if strings.HasSuffix(arg, ".sh") {
 			for _, dep := range inferScriptDependencies(workspace, arg) {
 				add(dep)
@@ -418,6 +428,27 @@ func fileSourceDependencies(workspace *config.Workspace, source config.FileSourc
 	}
 	for _, input := range source.Input {
 		add(input)
+		if filepath.Clean(input) == filepath.Join("userland", "cmake") {
+			// These native producers embed the same musl translation and
+			// codecs. Keep the outer cache aligned with CMake's real inputs.
+			for _, dep := range nativeCMakeDependencies(workspace) {
+				add(dep)
+			}
+		}
+	}
+	return deps
+}
+
+func nativeCMakeDependencies(workspace *config.Workspace) []string {
+	path := workspace.Path("userland", "cmake", "pachaos_native_dependencies.cmake")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	deps := []string{path}
+	pattern := regexp.MustCompile(`"\$\{_pachaos_native_root\}/([^"\n]+)"`)
+	for _, match := range pattern.FindAllStringSubmatch(string(data), -1) {
+		deps = append(deps, match[1])
 	}
 	return deps
 }

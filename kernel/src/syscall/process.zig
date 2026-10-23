@@ -84,7 +84,7 @@ fn ProcessExitPublishContext(comptime Handler: type) type {
     };
 }
 
-const ProcessCloneUserFrame = extern struct {
+pub const ProcessCloneUserFrame = extern struct {
     r15: u64,
     r14: u64,
     r13: u64,
@@ -780,8 +780,18 @@ fn deliverPendingSignalToUserFrame(
     }
     var user_frame: ProcessCloneUserFrame = undefined;
     const copy_start = perf.runtimeTimestamp(.pending_frame);
-    const valid = h.copy_user_bytes_from_va(proc, user_frame_va, std.mem.asBytes(&user_frame)) and
-        isUserEntryVa(user_frame.rip) and isUserEntryVa(user_frame.rsp);
+    const Hook = switch (@typeInfo(@TypeOf(h))) {
+        .pointer => |pointer| pointer.child,
+        else => @TypeOf(h),
+    };
+    const staged = if (comptime @hasField(Hook, "pending_signal_frame_snapshot")) h.pending_signal_frame_snapshot else null;
+    const copied = if (staged) |snapshot| blk: {
+        // The entry probe checked the destination derived from this exact
+        // frame. A second userspace read could swap RSP after that probe.
+        user_frame = snapshot.*;
+        break :blk true;
+    } else h.copy_user_bytes_from_va(proc, user_frame_va, std.mem.asBytes(&user_frame));
+    const valid = copied and isUserEntryVa(user_frame.rip) and isUserEntryVa(user_frame.rsp);
     perf.runtimeAdd(.pending_frame, .copy_calls, 1);
     perf.runtimeElapsed(.pending_frame, .copy_cycles, copy_start);
     if (!valid) {
@@ -946,6 +956,13 @@ fn signalControl(h: anytype, proc: kernel.PrincipalId, frame: *TrapFrame) u64 {
         process_abi.signal_ctl_set_pending_hint => {
             if (frame.rsi != 0 and !isUserEntryVa(frame.rsi)) return sc.syscall_err_invalid;
             return if (scheduler.setCurrentSignalPendingHint(frame.rsi))
+                sc.syscall_ok
+            else
+                sc.syscall_err_not_ready;
+        },
+        process_abi.signal_ctl_set_thread_pending_hint => {
+            if (frame.rsi != 0 and !isUserEntryVa(frame.rsi)) return sc.syscall_err_invalid;
+            return if (scheduler.setCurrentThreadSignalPendingHint(frame.rsi))
                 sc.syscall_ok
             else
                 sc.syscall_err_not_ready;

@@ -1,5 +1,10 @@
 /* SPDX-License-Identifier: MIT */
 #include "../src/relay.c"
+int filed_storage_owner_take_shared(struct filed_storage_owner *owner,
+    uint64_t id, uint64_t sequence, uint64_t length, pacha_fd_t *fd)
+{ (void)owner; (void)id; (void)sequence; (void)length; (void)fd; abort(); }
+int filed_storage_owner_cancel_shared(struct filed_storage_owner *owner)
+{ (void)owner; abort(); }
 #include <assert.h>
 #include <stdio.h>
 #include <fcntl.h>
@@ -249,3 +254,9 @@ int main(void)
     puts("filed direct session control: no payload mapping/relay, registered binding, sandbox ACK before local close, source retention/lost reply PASS");
     return 0;
 }
+
+int filed_storage_snapshot_stat(filed_runtime_t *rt,uint64_t handle,filed_storage_stat_t *out)
+{ return filed_storage_stat(rt,handle,out); }
+int filed_storage_snapshot_pread(filed_runtime_t *rt,uint64_t handle,uint64_t offset,
+    void *data,size_t length,size_t *got,const filed_storage_stat_t *expected,int *valid)
+{ (void)expected;*valid=0;return filed_storage_pread(rt,handle,offset,data,length,got); }

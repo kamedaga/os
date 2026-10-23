@@ -49,8 +49,14 @@ lpr_trap_entry:
 .hidden lpr_async_signal_entry
 .type lpr_async_signal_entry, @function
 lpr_async_signal_entry:
+    # Interrupted Linux RBP is arbitrary, not an owned LPR frame chain.
+    # Its original value is already retained in the native signal frame.
+    xor %ebp, %ebp
     and $-16, %rsp
     call lpr_linux_async_signal_prepare
+.globl lpr_signal_enter_handler
+.hidden lpr_signal_enter_handler
+lpr_signal_enter_handler:
     mov 16(%rax), %r11
     mov 8(%rax), %rdi
     lea 1056(%rax), %rsi
@@ -59,10 +65,23 @@ lpr_async_signal_entry:
     jmp *%r11
 .size lpr_async_signal_entry, .-lpr_async_signal_entry
 
+.globl lpr_fault_entry
+.hidden lpr_fault_entry
+.type lpr_fault_entry, @function
+lpr_fault_entry:
+    # Fault handlers run on a dedicated stack. Never follow interrupted
+    # Linux frame pointers into the unavailable page that caused the fault.
+    xor %ebp, %ebp
+    and $-16, %rsp
+    call lpr_linux_fault_prepare
+    ud2
+.size lpr_fault_entry, .-lpr_fault_entry
+
 .globl lpr_async_signal_restorer
 .hidden lpr_async_signal_restorer
 .type lpr_async_signal_restorer, @function
 lpr_async_signal_restorer:
+    xor %ebp, %ebp
     mov %rsp, %rdi
     and $-16, %rsp
     call lpr_linux_rt_sigreturn_body

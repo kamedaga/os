@@ -26,8 +26,9 @@ const (
 	OutputDir    = ".artifacts/live-bootfs"
 	ManifestName = "bootfs.generated.txt"
 	ImageName    = "BOOTFS.IMG"
-	// Only seed0boot and a page-address list use fixed kernel scratch. Bootfs
-	// contents are staged in allocated physical pages before the CR3 switch.
+	// Conservative packaging budget for seed0boot and staging metadata. The
+	// kernel scratch arena grows on demand; this is not a fixed allocation.
+	// Bootfs contents are staged in physical pages outside this budget.
 	bootScratchBytes = 32 * 1024 * 1024
 	maxBootfsBytes   = 192 * 1024 * 1024
 	maxLiveRootBytes = 192 * 1024 * 1024

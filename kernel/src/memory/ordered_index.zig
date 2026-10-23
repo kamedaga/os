@@ -37,6 +37,34 @@ pub fn Index(comptime A: type) type {
             }
             return n;
         }
+        /// The owner must keep the tree stable until the returned handle is used.
+        pub fn lastAtOrBefore(self: *Self, key: Key) ?H {
+            var cursor = self.root;
+            var result: ?H = null;
+            while (cursor) |n| {
+                if (testing) self.tree_steps += 1;
+                if (!self.less(key, node(n).key)) {
+                    result = n;
+                    cursor = node(n).child[1];
+                } else cursor = node(n).child[0];
+            }
+            return result;
+        }
+        /// Parent links avoid another root search for each item in a stable walk.
+        /// No cursor may survive an insertion, removal or key change.
+        pub fn successor(self: *Self, n: H) ?H {
+            std.debug.assert(node(n).linked);
+            if (node(n).child[1]) |right| return self.minimum(right);
+            var child = n;
+            var parent = node(child).parent;
+            while (parent) |p| {
+                if (testing) self.tree_steps += 1;
+                if (node(p).child[0] == child) return p;
+                child = p;
+                parent = node(p).parent;
+            }
+            return null;
+        }
         fn side(n: H) usize {
             return @intFromBool(node(node(n).parent.?).child[1] == n);
         }
@@ -230,4 +258,56 @@ pub fn Index(comptime A: type) type {
             return heights[0] + @intFromBool(!node(n).red);
         }
     };
+}
+
+const TestAdapter = struct {
+    pub const Key = usize;
+    pub const Node = struct {
+        key: usize = 0,
+        parent: ?*@This() = null,
+        child: [2]?*@This() = .{ null, null },
+        red: bool = false,
+        linked: bool = false,
+    };
+    pub const Handle = *Node;
+    pub const augmented = false;
+    pub fn resolve(h: Handle) *Node {
+        return h;
+    }
+    pub fn less(a: Key, b: Key) bool {
+        return a < b;
+    }
+    pub fn update(_: Handle) void {}
+    pub fn validate(_: Handle) !void {}
+};
+
+test "ordered index floor and successor after random rotations and deletion fixups" {
+    var index: Index(TestAdapter) = .{};
+    var nodes: [257]TestAdapter.Node = @splat(.{});
+    var rng = std.Random.DefaultPrng.init(0x766d615f696478);
+    for (0..6000) |_| {
+        const slot = rng.random().uintLessThan(usize, nodes.len);
+        if (nodes[slot].linked) index.remove(&nodes[slot]) else index.insert(&nodes[slot], slot * 2 + 1);
+        try index.validate();
+        var cursor = index.first;
+        var previous: ?*TestAdapter.Node = null;
+        for (&nodes, 0..) |*n, i| {
+            const steps = index.tree_steps;
+            try std.testing.expectEqual(previous, index.lastAtOrBefore(i * 2));
+            try std.testing.expect(index.tree_steps - steps <= 2 * (std.math.log2_int(usize, index.count + 1) + 1));
+            if (n.linked) {
+                try std.testing.expectEqual(n, cursor.?);
+                cursor = index.successor(cursor.?);
+                previous = n;
+            }
+            try std.testing.expectEqual(previous, index.lastAtOrBefore(i * 2 + 1));
+        }
+        try std.testing.expect(cursor == null);
+        try std.testing.expectEqual(previous, index.lastAtOrBefore(std.math.maxInt(usize)));
+    }
+    for (&nodes) |*n| if (n.linked) {
+        index.remove(n);
+    };
+    try index.validate();
+    try std.testing.expect(index.lastAtOrBefore(0) == null);
 }

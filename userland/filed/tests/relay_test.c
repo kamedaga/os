@@ -11,7 +11,8 @@ static uint64_t lease_target,closed_handle;
 static struct pacha_ipc_msg lease_reply;
 static uint8_t *vmo_memory;
 static size_t vmo_size;
-static int executable_status;
+static int executable_status,create_error,map_error,read_error,unmap_error;
+static unsigned vmo_closes;
 int filed_storage_executable_mapping(filed_runtime_t *rt,uint64_t handle)
 {
     assert(rt && handle==90);return executable_status;
@@ -53,6 +54,7 @@ int filed_storage_pread(filed_runtime_t *rt,uint64_t handle,uint64_t offset,
     void *data,size_t length,size_t *got)
 {
     assert(rt && handle==90 && offset<=10000);
+    if (read_error) return read_error;
     if(length>10000-offset) length=(size_t)(10000-offset);
     if(length>1024) length=1024;
     for(size_t i=0;i<length;++i) ((uint8_t *)data)[i]=(uint8_t)(offset+i);
@@ -61,6 +63,7 @@ int filed_storage_pread(filed_runtime_t *rt,uint64_t handle,uint64_t offset,
 pacha_fd_t pacha_vmo_create(uint64_t size,uint64_t rights,uint32_t flags)
 {
     assert((rights&PACHA_FD_RIGHT_MAP_READ) && !flags);
+    if (create_error) return create_error;
     assert(!vmo_memory);vmo_size=(size_t)size;vmo_memory=malloc(vmo_size);assert(vmo_memory);
     /* Match the native eager VMO_CREATE zero-fill contract, including EOF. */
     memset(vmo_memory,0,vmo_size);return 80;
@@ -69,11 +72,11 @@ void *pacha_mmap(pacha_fd_t fd,uint64_t size,uint64_t protection,uint64_t flags,
 {
     assert(fd==80 && size==vmo_size && !offset);
     assert(protection==(PACHA_PROT_READ|PACHA_PROT_WRITE) && flags==PACHA_MMAP_SHARED);
-    return vmo_memory;
+    return map_error ? NULL : vmo_memory;
 }
 int pacha_munmap(void *memory,uint64_t size)
 {
-    assert(memory==vmo_memory && size==vmo_size);return 0;
+    assert(memory==vmo_memory && size==vmo_size);return unmap_error;
 }
 int pacha_ipc_recv(pacha_fd_t fd,struct pacha_ipc_msg *message)
 {
@@ -91,6 +94,7 @@ int pacha_ipc_reply(pacha_fd_t fd,const struct pacha_ipc_msg *message)
 }
 int pacha_fd_close(pacha_fd_t fd)
 {
+    if (fd==80) { assert(vmo_memory);free(vmo_memory);vmo_memory=NULL;++vmo_closes;return 0; }
     assert(fd==70);++closed_count;return 0;
 }
 int main(void)
@@ -165,8 +169,27 @@ int main(void)
     free(vmo_memory);vmo_memory=NULL;
     request.flags=FILED_FILE_VMO_EXEC;executable_status=-EACCES;
     assert(make_file_vmo(&runtime,&request,&response,&vmo)==-EACCES && !vmo_memory);
-    request.flags=0;
+    request.flags=0;runtime.storage_generation=31;
+    create_error=-ENOMEM;assert(make_file_vmo(&runtime,&request,&response,&vmo)==-ENOMEM && !vmo_memory);
+    create_error=1;assert(make_file_vmo(&runtime,&request,&response,&vmo)==-EIO && !vmo_memory);
+    create_error=0;map_error=1;
+    assert(make_file_vmo(&runtime,&request,&response,&vmo)==-ENOMEM && !vmo_memory);
+    map_error=0;read_error=-EIO;
+    assert(make_file_vmo(&runtime,&request,&response,&vmo)==-EIO && !vmo_memory);
+    read_error=0;unmap_error=-EIO;
+    assert(make_file_vmo(&runtime,&request,&response,&vmo)==-EIO && !vmo_memory && !runtime.storage_generation);
+    unmap_error=0;assert(vmo_closes==3);
+    puts("filed snapshot fill failures: CREATE/map/PREAD/munmap cleanup, no invalid positive FD, failed unmap retires owner: PASS");
     request.length=UINT64_MAX;assert(make_file_vmo(&runtime,&request,&response,&vmo)==-EINVAL);
     request.length=1;request.offset=-1;assert(make_file_vmo(&runtime,&request,&response,&vmo)==-EINVAL);
     puts("filed relay authentication / immutable request / lease adoption: PASS");
 }
+
+int filed_storage_snapshot_stat(filed_runtime_t *rt,uint64_t handle,filed_storage_stat_t *out)
+{ return filed_storage_stat(rt,handle,out); }
+int filed_storage_snapshot_pread(filed_runtime_t *rt,uint64_t handle,uint64_t offset,
+    void *data,size_t length,size_t *got,const filed_storage_stat_t *expected,int *valid)
+{ (void)expected;*valid=0;return filed_storage_pread(rt,handle,offset,data,length,got); }
+
+long pacha_fd_fcntl(pacha_fd_t a,uint64_t b,uint64_t c,uint64_t d)
+{ (void)a;(void)b;(void)c;(void)d;abort(); }

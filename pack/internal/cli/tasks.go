@@ -916,7 +916,7 @@ func syncRootfsCommand(ctx *context) *cobra.Command {
 	var noBuild bool
 	cmd := &cobra.Command{
 		Use:   "rootfs",
-		Short: "Sync generated rootfs manifest into the FAT32 rootfs partition",
+		Short: "Write generated rootfs manifest to its partition (ext4: full rewrite, discards unmanaged files)",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			var userland buildsys.UserlandResult
 			if !noBuild {

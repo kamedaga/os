@@ -10,6 +10,7 @@ const interrupts = @import("interrupts.zig");
 const scheduler = @import("scheduler.zig").connection;
 const boot_static = @import("boot/main_static.zig");
 const sc = @import("syscall/numbers.zig");
+const direct_ipc_entry = @import("arch/x86_64/syscall_entry_code.zig");
 const kernel_log = @import("kernel_log.zig");
 const kernel_log_abi = @import("kernel_abi_root").kernel_log_abi;
 const syscall_lock_policy = @import("syscall/lock_policy.zig");
@@ -21,6 +22,13 @@ const process_syscalls = @import("syscall/process.zig");
 const runtime_syscalls = @import("syscall/runtime.zig");
 
 const TrapFrame = interrupts.TrapFrame;
+const preflight_fd_abi = @import("kernel_abi_root").fd_abi;
+
+pub const IovecSnapshot = struct {
+    base_va: u64 = 0,
+    count: u64 = 0,
+    words: [preflight_fd_abi.max_iovecs * 2]u64 = [_]u64{0} ** (preflight_fd_abi.max_iovecs * 2),
+};
 
 pub const Hooks = struct {
     state: *kernel.KernelState,
@@ -36,6 +44,10 @@ pub const Hooks = struct {
     write_user_u64: *const fn (kernel.PrincipalId, u64, u64) bool,
     copy_user_bytes_from_va: *const fn (kernel.PrincipalId, u64, []u8) bool,
     copy_bytes_to_user_va: *const fn (kernel.PrincipalId, u64, []const u8) bool,
+    probe_user_range: ?*const fn (kernel.PrincipalId, u64, usize, bool) user_copy.ProbeResult = null,
+    resident_read_user_u32: ?*const fn (kernel.PrincipalId, u64) ?u32 = null,
+    iovec_snapshot: ?*const IovecSnapshot = null,
+    pending_signal_frame_snapshot: ?*const process_syscalls.ProcessCloneUserFrame = null,
     wake_waiting_thread_for_principal: *const fn (kernel.PrincipalId) void,
     thread_wake_target_is_live: *const fn (usize, u32, kernel.PrincipalId) bool,
     wake_waiting_thread_generation: *const fn (usize, u32) bool,
@@ -387,6 +399,220 @@ fn lifecycleAdmissionRejectedResult(nr: u64) u64 {
     };
 }
 
+fn copyFaultResult(nr: u64) u64 {
+    return switch (nr) {
+        sc.syscall_fd_read, sc.syscall_fd_write, sc.syscall_fd_readv,
+        sc.syscall_fd_writev, sc.syscall_getrandom => 0 -% sc.syscall_err_map,
+        else => sc.syscall_err_map,
+    };
+}
+
+fn probeBuffer(h: anytype, proc: kernel.PrincipalId, frame: *TrapFrame, va: u64, len: u64, write: bool) ?u64 {
+    if (len == 0) return null;
+    if (va == 0 or len > std.math.maxInt(usize)) return copyFaultResult(frame.rax);
+    const probe = h.probe_user_range orelse return null;
+    switch (probe(proc, va, @intCast(len), write)) {
+        .resident => return null,
+        .invalid_address => return copyFaultResult(frame.rax),
+        .backing_absent => |missing_va| {
+            frame.rdx = missing_va;
+            return sc.syscall_err_pager_absent;
+        },
+    }
+}
+
+fn preflightUserBuffers(h: anytype, proc: kernel.PrincipalId, frame: *TrapFrame, iovecs: *IovecSnapshot, signal_frame: *process_syscalls.ProcessCloneUserFrame) ?u64 {
+    const abi = @import("kernel_abi_root");
+    const nr = frame.rax;
+    // These ranges are examined before K and before any descriptor, pipe,
+    // timer or IPC state changes. Pager pages stay resident after supply;
+    // a later failed copy can therefore only follow a concurrent VMA change.
+    switch (nr) {
+        sc.syscall_log => return probeBuffer(h, proc, frame, frame.rdi, @min(frame.rsi, sc.user_log_max_bytes), false),
+        sc.syscall_kernel_log_read => return probeBuffer(h, proc, frame, frame.rdi, @sizeOf(kernel_log_abi.Read), true),
+        sc.syscall_system_info => return probeBuffer(h, proc, frame, frame.rdi, abi.runtime_abi.system_info_size, true),
+        sc.syscall_clock_gettime, sc.syscall_clock_getres => return probeBuffer(h, proc, frame, frame.rsi, abi.runtime_abi.timespec_size, true),
+        sc.syscall_nanosleep => return probeBuffer(h, proc, frame, frame.rdi, abi.runtime_abi.timespec_size, false),
+        sc.syscall_futex_wait => return probeBuffer(h, proc, frame, frame.rdi, 4, false),
+        sc.syscall_futex_wake_wait => return probeBuffer(h, proc, frame, frame.rsi, 4, false),
+        sc.syscall_getrandom => return probeBuffer(h, proc, frame, frame.rdi, frame.rsi, true),
+        sc.syscall_fd_table => return probeBuffer(h, proc, frame, frame.rsi, preflight_fd_abi.fd_table_info_size, true),
+        sc.syscall_fd_get_info => return probeBuffer(h, proc, frame, frame.rsi, preflight_fd_abi.fd_info_size, true),
+        sc.syscall_fd_stat => return probeBuffer(h, proc, frame, frame.rsi, preflight_fd_abi.stat_size, true),
+        sc.syscall_fd_read => return probeBuffer(h, proc, frame, frame.rsi, frame.rdx, true),
+        sc.syscall_fd_write => return probeBuffer(h, proc, frame, frame.rsi, frame.rdx, false),
+        sc.syscall_fd_readv, sc.syscall_fd_writev => {
+            if (frame.rdx == 0 or frame.rdx > preflight_fd_abi.max_iovecs) return sc.syscall_err_invalid;
+            if (probeBuffer(h, proc, frame, frame.rsi, frame.rdx * preflight_fd_abi.iovec_size, false)) |status| return status;
+            const count: usize = @intCast(frame.rdx);
+            var bytes: [preflight_fd_abi.max_iovecs * preflight_fd_abi.iovec_size]u8 = undefined;
+            if (!h.copy_user_bytes_from_va(proc, frame.rsi, bytes[0 .. count * preflight_fd_abi.iovec_size])) return sc.syscall_err_invalid;
+            iovecs.base_va = frame.rsi;
+            iovecs.count = frame.rdx;
+            for (0..count) |i| {
+                const offset = i * preflight_fd_abi.iovec_size;
+                const base = std.mem.readInt(u64, bytes[offset..][0..8], .little);
+                const len = std.mem.readInt(u64, bytes[offset + 8 ..][0..8], .little);
+                iovecs.words[2 * i] = base;
+                iovecs.words[2 * i + 1] = len;
+                if (probeBuffer(h, proc, frame, base, len, nr == sc.syscall_fd_readv)) |status| return status;
+            }
+            return null;
+        },
+        sc.syscall_fd_poll, sc.syscall_fd_wait_many => {
+            if (frame.rsi > preflight_fd_abi.max_pollfds) return sc.syscall_err_invalid;
+            return probeBuffer(h, proc, frame, frame.rdi, frame.rsi * preflight_fd_abi.pollfd_size, true);
+        },
+        sc.syscall_fd_ioctl => {
+            if (frame.rsi == preflight_fd_abi.ioctl_tiocgwinsz)
+                return probeBuffer(h, proc, frame, frame.rdx, preflight_fd_abi.winsize_size, true);
+            return null;
+        },
+        sc.syscall_pipe_create => return probeBuffer(h, proc, frame, frame.rdi, preflight_fd_abi.pipe_pair_size, true),
+        sc.syscall_timerfd_settime => {
+            if (probeBuffer(h, proc, frame, frame.rdx, preflight_fd_abi.timerfd_spec_size, false)) |status| return status;
+            if (frame.r10 != 0) return probeBuffer(h, proc, frame, frame.r10, preflight_fd_abi.timerfd_spec_size, true);
+            return null;
+        },
+        sc.syscall_timerfd_gettime => return probeBuffer(h, proc, frame, frame.rsi, preflight_fd_abi.timerfd_spec_size, true),
+        sc.syscall_process_create => {
+            if (frame.r8 > abi.process_abi.process_create_max_grants) return sc.syscall_err_invalid;
+            return probeBuffer(h, proc, frame, frame.r10, frame.r8 * @sizeOf(abi.process_abi.ProcessFdGrant), false);
+        },
+        sc.syscall_process_clone => {
+            if ((frame.rsi & abi.process_abi.process_clone_flag_user_frame) == 0) return null;
+            return probeBuffer(h, proc, frame, frame.rdx, abi.process_abi.process_clone_user_frame_size, false);
+        },
+        sc.syscall_process_wait, sc.syscall_thread_wait => return probeBuffer(h, proc, frame, frame.rsi, abi.process_abi.status_size, true),
+        sc.syscall_thread_context => return probeBuffer(h, proc, frame, frame.rdx, abi.process_abi.thread_user_context_size, frame.rsi == abi.process_abi.thread_context_get),
+        sc.syscall_process_map_batch => {
+            if (frame.rdx > abi.process_abi.process_map_batch_max_entries) return sc.syscall_err_invalid;
+            return probeBuffer(h, proc, frame, frame.rsi, frame.rdx * abi.process_abi.process_map_batch_entry_size, false);
+        },
+        sc.syscall_process_signal_ctl => {
+            return switch (frame.rdi) {
+                abi.process_abi.signal_ctl_return =>
+                    probeBuffer(h, proc, frame, frame.rsi, abi.process_abi.signal_frame_size, false),
+                abi.process_abi.signal_ctl_deliver_pending_frame => blk: {
+                    if (probeBuffer(h, proc, frame, frame.rsi, abi.process_abi.process_clone_user_frame_size, false)) |status| break :blk status;
+                    if (!h.copy_user_bytes_from_va(proc, frame.rsi, std.mem.asBytes(signal_frame))) break :blk copyFaultResult(nr);
+                    const stack_cost = abi.process_abi.signal_red_zone_size + abi.process_abi.signal_frame_size + abi.process_abi.signal_runtime_stack_size;
+                    if (signal_frame.rsp <= stack_cost) break :blk sc.syscall_err_invalid;
+                    const target = (signal_frame.rsp - abi.process_abi.signal_red_zone_size - abi.process_abi.signal_frame_size) & ~@as(u64, 63);
+                    break :blk probeBuffer(h, proc, frame, target, abi.process_abi.signal_frame_size, true);
+                },
+                abi.process_abi.signal_ctl_get_timer =>
+                    probeBuffer(h, proc, frame, frame.rsi, abi.process_abi.signal_timer_state_size, true),
+                abi.process_abi.signal_ctl_set_timer => if (frame.r8 == 0) null else
+                    probeBuffer(h, proc, frame, frame.r8, abi.process_abi.signal_timer_state_size, true),
+                else => null,
+            };
+        },
+        sc.syscall_vmo_create_page_view, sc.syscall_vmo_refresh_page_view => {
+            // The index list is read into unpublished metadata before any
+            // VMO becomes visible. Keep every page of it resident first.
+            const count = if (nr == sc.syscall_vmo_create_page_view) frame.rdx else frame.r10;
+            if (count > kernel.max_vmo_logical_pages) return sc.syscall_err_invalid;
+            const indices_va = if (nr == sc.syscall_vmo_create_page_view) frame.rsi else frame.rdx;
+            return probeBuffer(h, proc, frame, indices_va, count * preflight_fd_abi.vmo_page_view_index_size, false);
+        },
+        sc.syscall_pager_supply => return probeBuffer(h, proc, frame, frame.rsi, @sizeOf(abi.pager_abi.Supply), false),
+        sc.syscall_ipc_channel_create => return probeBuffer(h, proc, frame, frame.rdi, 16, true),
+        sc.syscall_ipc_send, sc.syscall_ipc_recv, sc.syscall_ipc_call,
+        sc.syscall_ipc_reply, sc.syscall_ipc_reply_recv, sc.syscall_ipc_recv_wait => {
+            const send_count = abi.ipc_abi.sendCount(frame);
+            const recv_count = abi.ipc_abi.receiveCapacity(frame);
+            if (send_count > abi.ipc_abi.max_transfer_fds or recv_count > abi.ipc_abi.max_transfer_fds)
+                return sc.syscall_err_invalid;
+            if (probeBuffer(h, proc, frame, frame.r13, send_count * abi.ipc_abi.fd_item_size, false)) |status| return status;
+            return probeBuffer(h, proc, frame, frame.rbx, recv_count * abi.ipc_abi.fd_item_size, true);
+        },
+        sc.syscall_capsule_query => return probeBuffer(h, proc, frame, frame.rsi, abi.capsule_abi.snapshot_word_count * 8, true),
+        sc.syscall_capsule_irq_route => return probeBuffer(h, proc, frame, frame.rsi, abi.capsule_abi.irq_route_word_count * 8, true),
+        sc.syscall_capsule_irq_poll => return probeBuffer(h, proc, frame, frame.rdx, 8, true),
+        sc.syscall_capsule_pci_enumerate => return probeBuffer(h, proc, frame, frame.rsi,
+            if (frame.rdi == std.math.maxInt(u64)) 8 else abi.capsule_abi.pci_function_word_count * 8, true),
+        sc.syscall_capsule_pci_config_read, sc.syscall_capsule_pci_config_write =>
+            return probeBuffer(h, proc, frame, frame.rdx, @min(frame.r10, 4), nr == sc.syscall_capsule_pci_config_read),
+        sc.syscall_capsule_pci_bar_info => return probeBuffer(h, proc, frame, frame.rdx, abi.capsule_abi.bar_info_word_count * 8, true),
+        sc.syscall_capsule_derive_dma_mapping_pages => {
+            const layout = abi.capsule_abi.dmaMappingPagesLayout(frame.rsi, frame.rdx) orelse return sc.syscall_err_invalid;
+            return probeBuffer(h, proc, frame, frame.r8, layout.output_size_bytes, true);
+        },
+        sc.syscall_capsule_derive_mmio => {
+            if ((frame.r8 & abi.capsule_abi.mmio_map_flag_export_vmo) == 0) return null;
+            if (frame.r10 / 4096 > kernel.max_vmo_logical_pages) return sc.syscall_err_invalid;
+            return probeBuffer(h, proc, frame, frame.rdx, (frame.r10 / 4096) * 8, false);
+        },
+        else => return null,
+    }
+}
+
+test "pager preflight reports absent VA before a side effect" {
+    try std.testing.expectEqual(0 -% sc.syscall_err_map, copyFaultResult(sc.syscall_fd_read));
+    try std.testing.expectEqual(sc.syscall_err_map, copyFaultResult(sc.syscall_fd_stat));
+    const Mock = struct {
+        var probes: usize = 0;
+        var copies: usize = 0;
+        fn probe(_: kernel.PrincipalId, va: u64, len: usize, write: bool) user_copy.ProbeResult {
+            probes += 1;
+            std.debug.assert(write and len == 8192 and va == 0x1000);
+            return .{ .backing_absent = 0x2000 };
+        }
+        fn copy(_: kernel.PrincipalId, _: u64, _: []u8) bool {
+            copies += 1;
+            return true;
+        }
+    };
+    Mock.probes = 0;
+    Mock.copies = 0;
+    const h = .{
+        .probe_user_range = @as(?*const fn (kernel.PrincipalId, u64, usize, bool) user_copy.ProbeResult, Mock.probe),
+        .copy_user_bytes_from_va = Mock.copy,
+    };
+    var frame = std.mem.zeroes(TrapFrame);
+    frame.rax = sc.syscall_fd_read;
+    frame.rsi = 0x1000;
+    frame.rdx = 8192;
+    var iovecs = IovecSnapshot{};
+    var signal_frame: process_syscalls.ProcessCloneUserFrame = undefined;
+    try std.testing.expectEqual(sc.syscall_err_pager_absent, preflightUserBuffers(&h, @enumFromInt(1), &frame, &iovecs, &signal_frame).?);
+    try std.testing.expectEqual(@as(u64, 0x2000), frame.rdx);
+    try std.testing.expectEqual(@as(usize, 1), Mock.probes);
+    try std.testing.expectEqual(@as(usize, 0), Mock.copies);
+}
+
+test "iovec preflight captures one immutable descriptor before transfer" {
+    const Mock = struct {
+        var copies: usize = 0;
+        fn probe(_: kernel.PrincipalId, _: u64, _: usize, _: bool) user_copy.ProbeResult {
+            return .resident;
+        }
+        fn copy(_: kernel.PrincipalId, va: u64, dest: []u8) bool {
+            std.debug.assert(va == 0x3000 and dest.len == 16);
+            copies += 1;
+            std.mem.writeInt(u64, dest[0..8], 0x5000, .little);
+            std.mem.writeInt(u64, dest[8..16], 8192, .little);
+            return true;
+        }
+    };
+    Mock.copies = 0;
+    const h = .{
+        .probe_user_range = @as(?*const fn (kernel.PrincipalId, u64, usize, bool) user_copy.ProbeResult, Mock.probe),
+        .copy_user_bytes_from_va = Mock.copy,
+    };
+    var frame = std.mem.zeroes(TrapFrame);
+    frame.rax = sc.syscall_fd_writev;
+    frame.rsi = 0x3000;
+    frame.rdx = 1;
+    var iovecs = IovecSnapshot{};
+    var signal_frame: process_syscalls.ProcessCloneUserFrame = undefined;
+    try std.testing.expect(preflightUserBuffers(&h, @enumFromInt(1), &frame, &iovecs, &signal_frame) == null);
+    try std.testing.expectEqual(@as(usize, 1), Mock.copies);
+    try std.testing.expectEqual(@as(u64, 0x5000), iovecs.words[0]);
+    try std.testing.expectEqual(@as(u64, 8192), iovecs.words[1]);
+}
+
 test "lifecycle admission does not report byte progress for a rejected syscall" {
     const not_ready: u64 = 0 -% sc.syscall_err_not_ready;
     for ([_]u64{ sc.syscall_fd_read, sc.syscall_fd_write, sc.syscall_fd_readv, sc.syscall_fd_writev, sc.syscall_getrandom }) |nr| {
@@ -401,6 +627,34 @@ var reference_audit_calls: if (@import("state/reference_check.zig").enabled) u64
 var reference_audit_count: if (@import("state/reference_check.zig").enabled) u64 else void = if (@import("state/reference_check.zig").enabled) 0 else {};
 
 fn dispatchCompactSyscall(frame: *TrapFrame) u64 {
+    const nr = frame.rax;
+    // Only wake-relevant syscall entry/exit markers enter the diagnostic
+    // ring. General call markers would bury a request in GUI background IO.
+    const trace_call = @import("wake_trace.zig").enabled and (nr == sc.syscall_futex_wait or nr == sc.syscall_futex_wake or
+        nr == sc.syscall_futex_wake_wait or nr == sc.syscall_ipc_call or
+        nr == sc.syscall_ipc_reply or nr == sc.syscall_ipc_notify or
+        nr == sc.syscall_ipc_notify_wait or nr == sc.syscall_ipc_recv_wait or
+        nr == sc.syscall_process_signal_ctl or nr == sc.syscall_gettid or
+        nr == sc.syscall_fd_read or nr == sc.syscall_fd_write or
+        nr == sc.syscall_fd_wait_many or nr == sc.syscall_fd_poll);
+    const trace_thread = if (trace_call) scheduler.currentThread() else 0;
+    const trace_arg = if (trace_call) frame.rdi else 0;
+    if (trace_call) @import("wake_trace.zig").record(.syscall_enter, nr, trace_arg, trace_thread);
+    defer if (trace_call) @import("wake_trace.zig").record(.syscall_exit, nr, trace_arg, trace_thread);
+    user_copy.beginSyscallCopyTracking(scheduler.currentPrincipal());
+    const result = dispatchCompactSyscallBody(frame);
+    if (user_copy.takeSyscallCopyAbsent()) |absent| {
+        // A covered VA became absent only after another thread replaced the
+        // mapping. Retrying the syscall could duplicate an earlier effect.
+        if (absent.was_probed) return copyFaultResult(nr);
+        if (std.debug.runtime_safety) @panic("syscall copied a pager page without a preflight probe");
+        frame.rdx = absent.va;
+        return sc.syscall_err_pager_absent;
+    }
+    return result;
+}
+
+fn dispatchCompactSyscallBody(frame: *TrapFrame) u64 {
     const generic_admission = b3.now();
     const runtime_path = perf.runtimePath(frame.rax, frame.rdi);
     const profile_kind = if (lock_profile.enabled) lock_profile.classify(frame.rax) else {};
@@ -431,6 +685,9 @@ fn dispatchCompactSyscall(frame: *TrapFrame) u64 {
     }
     const state = base_hooks.state;
     const proc = scheduler.currentPrincipal();
+    var iovec_snapshot = IovecSnapshot{};
+    var pending_signal_frame_snapshot: process_syscalls.ProcessCloneUserFrame = undefined;
+    if (preflightUserBuffers(base_hooks, proc, frame, &iovec_snapshot, &pending_signal_frame_snapshot)) |status| return status;
     @import("ipc_metric.zig").recordSyscall(state, frame.rax, proc);
     @import("notify_metric.zig").begin(frame.rax, @intFromEnum(proc), scheduler.currentThread(), scheduler.currentThreadGeneration() orelse 0);
     defer @import("notify_metric.zig").finish();
@@ -446,6 +703,10 @@ fn dispatchCompactSyscall(frame: *TrapFrame) u64 {
         if (!hold_kernel_state_lock) lock_profile.event(profile_kind, 0);
     }
     var hooks = base_hooks.*;
+    hooks.iovec_snapshot = if (iovec_snapshot.count != 0) &iovec_snapshot else null;
+    hooks.pending_signal_frame_snapshot = if (frame.rax == sc.syscall_process_signal_ctl and
+        frame.rdi == @import("kernel_abi_root").process_abi.signal_ctl_deliver_pending_frame)
+        &pending_signal_frame_snapshot else null;
     hooks.before_current_thread_leave = if (hold_kernel_state_lock)
         scheduler.BeforeCurrentThreadLeaveCallback{
             .context = &lock_drop_context,
@@ -617,14 +878,21 @@ pub fn initDirectIpcStorage(count: usize) !void {
 
 // Called before saving callee-saved user GPRs. Win64 preserves those registers;
 // all code reachable here is covered by the live-XState scalar ELF gate.
+// Branches on the same table that generated the entry routing, so a renumbered
+// ABI cannot route a syscall here that prepare would misclassify.
 pub export fn syscallDirectIpcPrepare(frame: *const TrapFrame) callconv(.winapi) u64 {
     if (@import("builtin").is_test) return 0;
-    if (frame.rax == sc.syscall_ipc_notify or frame.rax == sc.syscall_ipc_notify_wait) return prepareDirectNotifyEntry(frame);
+    const kind = direct_ipc_entry.directIpcKind(frame.rax) orelse return 0;
+    // A receive FD array needs an AS probe before K can publish the wait.
+    // The compact path owns that probe and can return PAGER_ABSENT + VA.
+    if ((kind == .call or kind == .reply_recv) and
+        @import("kernel_abi_root").ipc_abi.receiveCapacity(frame) != 0) return 0;
+    if (kind == .notify or kind == .notify_wait) return prepareDirectNotifyEntry(frame);
     const metric = @import("ipc_metric.zig");
     metric.entryBegin();
     var census_success = false;
     defer metric.entryEnd(census_success);
-    metric.recordElapsed(if (frame.rax == sc.syscall_ipc_call) .entry_call_attempt else .entry_reply_attempt, 0);
+    metric.recordElapsed(if (kind == .call) .entry_call_attempt else .entry_reply_attempt, 0);
     if ((frame.r15 & 0xffff_ffff) != 0 or frame.rdi > std.math.maxInt(u32) or frame.rdx != std.math.maxInt(u64) or
         frame.rsi & ~@as(u64, @import("kernel_abi_root").ipc_abi.wait_uninterruptible) != 0 or !syscall_hooks_ready)
     {
@@ -637,8 +905,7 @@ pub export fn syscallDirectIpcPrepare(frame: *const TrapFrame) callconv(.winapi)
         metric.entryReason(.receive_capacity);
         return 0;
     }
-    const call = frame.rax == sc.syscall_ipc_call;
-    if (!call and frame.rax != sc.syscall_ipc_reply_recv) return 0;
+    const call = kind == .call;
     if (!syscall_hooks_storage.kernel_state_ready.*) return 0;
     const probe_key = (frame.rax << 32) | frame.rdi;
     if (!scheduler.directIpcProbeDue(probe_key)) return 0;
@@ -675,7 +942,11 @@ pub export fn syscallDirectIpcPrepare(frame: *const TrapFrame) callconv(.winapi)
 
 pub export fn syscallDirectIpcCommit(frame: *TrapFrame) callconv(.winapi) u64 {
     if (@import("builtin").is_test) return 0;
-    if (frame.rax == sc.syscall_ipc_notify or frame.rax == sc.syscall_ipc_notify_wait) return commitDirectNotifyEntry(frame);
+    // Reached only after prepare admitted this frame, so the kind exists.
+    switch (direct_ipc_entry.directIpcKind(frame.rax).?) {
+        .notify, .notify_wait => return commitDirectNotifyEntry(frame),
+        .call, .reply_recv => {},
+    }
     const plan = &direct_entry_plans[scheduler.currentCpu()];
     @import("xstate_runtime.zig").beginIpcLive();
     scheduler.commitDirectHandoff(&plan.handoff, frame);

@@ -4,7 +4,7 @@ from pathlib import Path
 import re, subprocess
 ROOT=Path(__file__).resolve().parents[1]
 OPS=r'(?:SEND|RECV|CALL|REPLY|REPLY_RECV|RECV_WAIT)\b'
-OLD=re.compile(r'\b(?:pacha_syscall[0-6](?:_committed)?|lpr_pacha_syscall[0-6](?:_committed)?|__pachaos_raw[0-6])\s*\(\s*(?:PACHA_IPC_SYSCALL_'+OPS+r'|PACHAOS_SYSCALL_IPC_'+OPS+r'|(?:72|73|74|75|76|78)\s*,)')
+OLD=re.compile(r'\b(?:pacha_syscall[0-6](?:_committed)?|lpr_pacha_syscall[0-6](?:_committed)?|__pachaos_raw[0-6])\s*\(\s*(?:PACHA_IPC_SYSCALL_'+OPS+r'|PACHAOS_SYSCALL_IPC_'+OPS+r'|(?:78|79|80|81|82|84)\s*,)')
 def main():
     violations=[]
     for directory in ['userland','musl/pachaos','tests']:
@@ -14,7 +14,7 @@ def main():
     assert not violations, violations
     abi=(ROOT/'kernel/abi/ipc_abi.zig').read_text()
     assert not re.search(r'\bmsg_(?:size|word\d_offset|fd_\w+_offset|flags_offset)\b',abi)
-    for name,nr in [('send',72),('recv',73),('call',74),('reply',75),('reply_recv',76),('recv_wait',78)]:
+    for name,nr in [('send',78),('recv',79),('call',80),('reply',81),('reply_recv',82),('recv_wait',84)]:
         assert f'syscall_ipc_{name}: u64 = {nr};' in abi
     # Negative controls: all six operations and both native symbol families.
     for op in ['SEND','RECV','CALL','REPLY','REPLY_RECV','RECV_WAIT']:
@@ -31,5 +31,5 @@ def main():
         assert re.search(r'push\s+%'+reg,asm) and re.search(r'pop\s+%'+reg,asm), reg
     for reg in ['r10','r8','r9','r12','r13','rbx','r15']:
         assert '%'+reg in asm
-    print('IPC register ABI: old callsites/header absent; numbers unchanged; 12 negative controls; RBX/R12/R13/R15 preservation PASS')
+    print('IPC register ABI: old callsites/header absent; current numbers; 12 negative controls; RBX/R12/R13/R15 preservation PASS')
 if __name__=='__main__': main()

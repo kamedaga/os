@@ -1564,7 +1564,7 @@ static int netd_read_file_alloc(const char *path, unsigned char **out_data, size
     }
 
     uint64_t map_size = (NETD_CA_BUNDLE_MAX_BYTES + 4095u) & ~4095ull;
-    const unsigned char *mapped = pacha_mmap(vmo_fd, map_size, PACHA_PROT_READ, PACHA_MMAP_SHARED, 0);
+    const unsigned char *mapped = pacha_mmap(vmo_fd, map_size, PACHA_PROT_READ, PACHA_MMAP_PRIVATE, 0);
     if (mapped == NULL) {
         (void)pacha_fd_close(vmo_fd);
         (void)netd_filed_close_handle(handle);

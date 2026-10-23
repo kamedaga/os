@@ -4,26 +4,35 @@
 #include "../support/mmap_profile.h"
 
 static int64_t lpr_linux_file_vmo_call(uint32_t op, uint64_t flags,
-    uint64_t fd, uint64_t file_offset, uint64_t length, uint64_t *out_loaded)
+    uint64_t fd, uint64_t file_offset, uint64_t length, uint32_t prot, uint64_t *out_loaded, uint64_t *out_vmo_offset, int *out_pager)
 {
     if (out_loaded) *out_loaded = 0;
+    if (out_vmo_offset) *out_vmo_offset = 0;
+    if (out_pager) *out_pager = 0;
     const int64_t binding_status = lpr_filed_fd_binding(fd);
     if (binding_status) return binding_status;
     const lpr_filed_backend_t *file = lpr_filed_backend(fd);
     if (!file) return -LPR_LINUX_EBADF;
     kb2_fs_request_t request = {.opcode = op, .handle = file->handle,
-        .offset = (int64_t)file_offset, .length = length, .flags = flags};
+        .offset = (int64_t)file_offset, .length = length, .flags = flags, .mask = prot};
     kb2_fs_response_t response;
     pacha_fd_t returned = -1;
     const int64_t status = lpr_fs_call(&request, 0, 0, 0, 0, 0, 0,
         &response, -1, &returned);
     if (status < 0) return status;
     if (returned < 16) return -LPR_LINUX_EIO;
+    if (op==KB2_FILESYSTEM_OP_FILE_VMO &&
+        ((response.handle&4095) || (uint64_t)response.result>length)) {
+        (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE,(uint64_t)returned);
+        return -LPR_LINUX_EIO;
+    }
+    if (out_vmo_offset) *out_vmo_offset = response.handle;
     if (out_loaded) *out_loaded = (uint64_t)response.result;
+    if (out_pager) *out_pager = response.service==FILED_FILE_VMO_PAGER;
     return returned;
 }
 
-int64_t lpr_linux_file_vmo(uint64_t fd, uint64_t file_offset, uint64_t length, int executable, uint64_t *out_loaded)
+int64_t lpr_linux_file_vmo(uint64_t fd, uint64_t file_offset, uint64_t length, int executable, uint64_t *out_loaded, uint64_t *out_vmo_offset, int *out_pager)
 {
     return lpr_linux_file_vmo_call(
         KB2_FILESYSTEM_OP_FILE_VMO,
@@ -31,7 +40,8 @@ int64_t lpr_linux_file_vmo(uint64_t fd, uint64_t file_offset, uint64_t length, i
         fd,
         file_offset,
         length,
-        out_loaded);
+        0,
+        out_loaded, out_vmo_offset, out_pager);
 }
 
 int64_t lpr_linux_shared_file_vmo(
@@ -40,6 +50,7 @@ int64_t lpr_linux_shared_file_vmo(
     uint64_t length,
     int writable,
     int executable,
+    uint32_t initial_prot,
     uint64_t *out_file_size)
 {
     return lpr_linux_file_vmo_call(
@@ -49,7 +60,8 @@ int64_t lpr_linux_shared_file_vmo(
         fd,
         file_offset,
         length,
-        out_file_size);
+        initial_prot,
+        out_file_size, 0, 0);
 }
 
 int64_t lpr_backend_write(uint64_t fd, uint64_t buf, uint64_t count, unsigned *wait_not_ready __attribute__((unused)))
@@ -696,6 +708,10 @@ void lpr_write_linux_stat(void *statbuf, const uint8_t *wire)
 static int64_t fs_stat(uint64_t handle, const char *path, uint64_t flags,
     uint64_t mask, uint8_t *wire)
 {
+    /* Linux's CHANGE_COOKIE is kernel-only. Clear it at the common wire
+     * boundary for path, descriptor, pinned-stat and statx callers alike;
+     * the protocol snapshot selector lives separately in request.mode. */
+    mask &= ~UINT64_C(0x40000000);
     kb2_fs_request_t request = {.opcode = KB2_FILESYSTEM_OP_STATX, .handle = handle,
         .flags = flags, .mask = (uint32_t)mask};
     kb2_fs_response_t response;
@@ -966,6 +982,10 @@ int64_t lpr_linux_statx(
         return -LPR_LINUX_EINVAL;
     }
 
+    /* Linux keeps CHANGE_COOKIE kernel-only and ignores this user mask bit.
+     * The filed internal snapshot envelope must never replace a Linux statx
+     * record returned to an application. */
+    mask &= ~UINT64_C(0x40000000);
     const char *path = (const char *)(uintptr_t)path_raw;
     if (!path) return -LPR_LINUX_EFAULT;
     const int virtual_path = (lpr_strncmp(path, "/proc", 5) == 0 &&

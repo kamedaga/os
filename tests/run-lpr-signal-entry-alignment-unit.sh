@@ -17,6 +17,10 @@ check_call_site() {
     }
     !in_function { next }
     /^[[:space:]]*(#.*)?$/ { next }
+    /^[[:space:]]*xor[lq]?[[:space:]]+%[er]bp,[[:space:]]*%[er]bp([[:space:]]*(#.*)?)?$/ {
+      saw_chain_boundary = 1
+      next
+    }
     /^[[:space:]]*and[q]?[[:space:]]+\$-16,[[:space:]]*%rsp([[:space:]]*(#.*)?)?$/ {
       if (saw_alignment || saw_call) bad = 1
       saw_alignment = 1
@@ -26,6 +30,7 @@ check_call_site() {
     expect_call {
       if ($0 ~ "^[[:space:]]*call[q]?[[:space:]]+" target "([[:space:]]*(#.*)?)?$") {
         saw_call = 1
+        if (!saw_chain_boundary) bad = 1
       } else {
         bad = 1
       }
@@ -36,12 +41,13 @@ check_call_site() {
       bad = 1
     }
     END {
-      if (!saw_alignment || !saw_call || bad) exit 1
+      if (!saw_alignment || !saw_call || !saw_chain_boundary || bad) exit 1
     }
   ' "$source_file"
 }
 
 check_call_site lpr_async_signal_entry lpr_linux_async_signal_prepare
 check_call_site lpr_async_signal_restorer lpr_linux_rt_sigreturn_body
+check_call_site lpr_fault_entry lpr_linux_fault_prepare
 
-echo "LPR_SIGNAL_ENTRY_ALIGNMENT=OK entry_call_rsp_mod16=0 restorer_call_rsp_mod16=0"
+echo "LPR_SIGNAL_ENTRY_ALIGNMENT=OK entry_call_rsp_mod16=0 restorer_call_rsp_mod16=0 Linux_RBP_chain_detached"

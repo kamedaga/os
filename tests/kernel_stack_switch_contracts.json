@@ -39,7 +39,22 @@
         "initial_bytes": 0,
         "reason": "per-CPU saved IRET frame: no pushes/calls before IRET, consumes no new stack"
       }
-    }
+    },
+    "variants": [
+      {
+        "sha256": "b9e3a8d417b7c0de5090f6f6ba80b95ecc6e2b7103b35a2d6a84911b75eb3ad7",
+        "switches": {
+          "25": {
+            "initial_bytes": 0,
+            "reason": "TLB checked return: select BSP kernel stack before scalar CR3 assertion; saved IRET stack is selected only after assertion"
+          },
+          "53": {
+            "initial_bytes": 0,
+            "reason": "TLB checked return: select BSP kernel stack before scalar CR3 assertion; saved IRET stack is selected only after assertion"
+          }
+        }
+      }
+    ]
   },
   "deviceInterruptHandlerStub": {
     "sha256": "46d58603030ec3c1eabb938914381baca80953fb1360b1f09d4a17d0fad15513",
@@ -48,7 +63,18 @@
         "initial_bytes": 0,
         "reason": "validated CPU index into kernel_syscall_stack_tops: new kernel stack segment"
       }
-    }
+    },
+    "variants": [
+      {
+        "sha256": "60a2f16f895be6a1d75edbe0dcdea57434464bdd448409a7a96a1cefc056afec",
+        "switches": {
+          "65": {
+            "initial_bytes": 0,
+            "reason": "TLB lazy entry/checked return: existing validated CPU kernel stack or saved user/IRET frame; scalar helper calls precede final frame switch"
+          }
+        }
+      }
+    ]
   },
   "timerInterruptHandlerStub": {
     "sha256": "c2cbf130f1b9685414b5e50e6a74c6b3c90a9541ce4f0191493426104528216c",
@@ -57,7 +83,18 @@
         "initial_bytes": 0,
         "reason": "validated CPU index into kernel_syscall_stack_tops: new kernel stack segment"
       }
-    }
+    },
+    "variants": [
+      {
+        "sha256": "19daffe985950968cfa22086ff8ac6d1328de95155b87717e1b5345ff79a0224",
+        "switches": {
+          "65": {
+            "initial_bytes": 0,
+            "reason": "TLB lazy entry/checked return: existing validated CPU kernel stack or saved user/IRET frame; scalar helper calls precede final frame switch"
+          }
+        }
+      }
+    ]
   },
   "schedulerWakeIpiHandlerStub": {
     "sha256": "acbf9d696253039a1baf4b59080ccad3fc301f0ca919d693a193e25490dd7d65",
@@ -66,7 +103,18 @@
         "initial_bytes": 0,
         "reason": "validated CPU index into kernel_syscall_stack_tops: new kernel stack segment"
       }
-    }
+    },
+    "variants": [
+      {
+        "sha256": "21bb59b816c5272e234ad83754b73e6e4192ad3554a92cb861c79fed69fa3921",
+        "switches": {
+          "65": {
+            "initial_bytes": 0,
+            "reason": "TLB lazy entry/checked return: existing validated CPU kernel stack or saved user/IRET frame; scalar helper calls precede final frame switch"
+          }
+        }
+      }
+    ]
   },
   "syscallEntryCommon": {
     "sha256": "01e8511489d2ee71fa7d8bdcbe9840e08c0156c08c3d0925d5211f16e9ab55c7",
@@ -142,7 +190,18 @@
         "initial_bytes": 0,
         "reason": "per-CPU saved IRET frame: no pushes/calls before IRET, consumes no new stack"
       }
-    }
+    },
+    "variants": [
+      {
+        "sha256": "0693d62902a3bb6d8f3039dbf98b7a1819fea4ef272b87823f475c599ac95c78",
+        "switches": {
+          "63": {
+            "initial_bytes": 0,
+            "reason": "TLB lazy entry/checked return: existing validated CPU kernel stack or saved user/IRET frame; scalar helper calls precede final frame switch"
+          }
+        }
+      }
+    ]
   },
   "syscallDirectIpcEntry": {
     "sha256": "6a7445d3609b26ce4c9f097373ea666a525cce32bca8a1b32f27301566a647e4",
@@ -182,6 +241,19 @@
             "reason": "Validated native user RSP; only GPR restores precede SYSRET. Miss jumps to the shared entry under the already installed kernel CR3."
           }
         }
+      },
+      {
+        "sha256": "d1d7716070434630848c38e0c0931ef8f7de381cd3192b618e432f0f74d9ac5a",
+        "switches": {
+          "4": {
+            "initial_bytes": 0,
+            "reason": "TLB lazy entry/checked return: existing validated CPU kernel stack or saved user/IRET frame; scalar helper calls precede final frame switch"
+          },
+          "87": {
+            "initial_bytes": 0,
+            "reason": "TLB lazy entry/checked return: existing validated CPU kernel stack or saved user/IRET frame; scalar helper calls precede final frame switch"
+          }
+        }
       }
     ]
   },
@@ -192,7 +264,18 @@
         "initial_bytes": 0,
         "reason": "B7 notify: validated saved user frame; only GPR loads before SYSRET/IRET, no further stack allocation"
       }
-    }
+    },
+    "variants": [
+      {
+        "sha256": "a2abed63c02e177497678bb252f1e52bd32eddd589b4dac400a9a01ff8c3b43a",
+        "switches": {
+          "48": {
+            "initial_bytes": 0,
+            "reason": "TLB lazy entry/checked return: existing validated CPU kernel stack or saved user/IRET frame; scalar helper calls precede final frame switch"
+          }
+        }
+      }
+    ]
   },
   "syscallEntryCommonFromKernel": {
     "sha256": "37ca61ff8392fba4ce8795ac04b1e4fb6953fcddb33b5acee2db3f936cf65477",
@@ -205,6 +288,17 @@
         "initial_bytes": 0,
         "reason": "Both reviewed preambles form R14=validated CPU slot*8 and R12=supervisor work frame with kernel CR3 installed; select the boot-owned kernel stack before any call."
       }
-    }
+    },
+    "variants": [
+      {
+        "sha256": "8b35892a06d1da63651670e3ea0be8535df3dac31faf49b3937afdb89c9f162d",
+        "switches": {
+          "1": {
+            "initial_bytes": 0,
+            "reason": "TLB lazy entry/checked return: existing validated CPU kernel stack or saved user/IRET frame; scalar helper calls precede final frame switch"
+          }
+        }
+      }
+    ]
   }
 }

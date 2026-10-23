@@ -198,7 +198,8 @@ int pacha_thread_signal(pacha_fd_t thread_fd, unsigned int notification);
 int pacha_thread_register_fault(uint64_t entry_rip, uint64_t stack_base, uint64_t stack_size);
 /* Trampolines receive this frame in RDI on a 16-byte aligned runtime stack.
  * Register order follows the native x86-64 trap frame, not Linux pt_regs.
- * Fault frames use signo=0 and append raw vector/error/address metadata;
+ * Fault frames use signo=0 and append vector/error/address metadata. error_code
+ * includes PACHA_FAULT_ERROR_SOFTWARE_MASK; mask it off for the raw CPU code;
  * return both kinds through PROCESS_SIGNAL_CTL_RETURN. */
 struct pacha_native_signal_frame {
     uint64_t magic, size, signo, xstate_features;

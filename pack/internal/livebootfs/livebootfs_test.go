@@ -155,20 +155,28 @@ func TestAMDGPUProbeOverlayContainsOnlyOptionalPackages(t *testing.T) {
 	}
 }
 
-func TestBootScratchLimitMatchesKernel(t *testing.T) {
-	if bootScratchBytes != 32*1024*1024 {
-		t.Fatal("pack boot scratch limit changed without updating kernel agreement test")
-	}
-	root, err := config.FindRoot(".")
-	if err != nil {
-		t.Fatal(err)
-	}
-	source, err := os.ReadFile(filepath.Join(root, "kernel/src/boot/boot_scratch.zig"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Contains(source, []byte("pub const default_bytes: usize = 32 * 1024 * 1024;")) {
-		t.Fatal("pack boot scratch limit no longer matches the kernel")
+func TestBootScratchPackagingBudget(t *testing.T) {
+	// The kernel arena grows dynamically. Exercise pack's conservative policy
+	// at its actual aligned boundaries instead of matching an obsolete constant
+	// in the kernel source.
+	metadata := int64((maxBootfsBytes+4095)/4096) * 8
+	for _, test := range []struct {
+		name                string
+		init, load, archive int64
+		want                bool
+	}{
+		{"load fits", 1, bootScratchBytes - 8, 0, true},
+		{"load alignment overflows", 1, bootScratchBytes - 7, 0, false},
+		{"image fits", bootScratchBytes - 8, 1, 0, true},
+		{"image alignment overflows", bootScratchBytes - 7, 1, 0, false},
+		{"metadata fits", bootScratchBytes - metadata, 1, maxBootfsBytes, true},
+		{"metadata alignment overflows", bootScratchBytes - metadata + 1, 1, maxBootfsBytes, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := fitsBootScratch(test.init, test.load, test.archive); got != test.want {
+				t.Fatalf("fitsBootScratch(%d, %d, %d) = %v, want %v", test.init, test.load, test.archive, got, test.want)
+			}
+		})
 	}
 }
 

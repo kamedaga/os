@@ -30,23 +30,23 @@ nix develop
 
 ## Build
 
-userland をビルドして rootfs に同期:
-
-```bash
-./pacgo build userland
-```
-
-rootfs 同期はせず artifact だけ確認したい場合:
+userland の生成物を更新（既存 rootfs は変更しない）:
 
 ```bash
 ./pacgo build userland --no-rootfs
 ```
 
+rootfs の再生成も行う場合（下記「Sync」の注意を確認）:
+
+```bash
+./pacgo build userland
+```
+
 特定 app だけ:
 
 ```bash
-./pacgo build userland exec
-./pacgo build userland fastfetch
+./pacgo build userland exec --no-rootfs
+./pacgo build userland fastfetch --no-rootfs
 ```
 
 kernel をビルド:
@@ -55,7 +55,7 @@ kernel をビルド:
 ./pacgo build kernel
 ```
 
-出力: `kernel/zig-out/bin/EFI/BOOT/BOOTX64.EFI`
+通常の Limine 起動用出力: `kernel/zig-out/bin/limine/pacha-kernel.elf`
 
 ## Manifests
 
@@ -71,7 +71,12 @@ kernel をビルド:
 
 ## Sync
 
-rootfs を差分同期:
+rootfs を再生成して反映:
+
+注意: 現在の ext4 実装は差分同期ではない。新しく生成した ext4 を
+rootfs パーティション全体へ書き込むため、manifest にないゲスト内の変更や
+ファイルは保持されない。必要なデータを退避してから実行する。
+`build userland`（`--no-rootfs` なし）と `qemu --prepare` にも同じ注意が必要。
 
 ```bash
 ./pacgo sync rootfs
@@ -103,7 +108,27 @@ console を別 terminal に分ける:
 ./pacgo qemu --new-terminal
 ```
 
-ログ: `.artifacts/qemu.log`
+通常の Limine 起動ログ: `.artifacts/qemu-limine.log`
+
+### Xfce / D3D12 (WSLg)
+
+配備済みの通常 boot profile は `/sbin/pacha-boot-session` から
+`startx /root/.xinitrc` → `dbus-run-session -- startxfce4` を実行する。
+`/etc/pacha_boot_profile` が `console-shell` の場合は自動起動しない。
+
+```bash
+PACGO_NIX_DEVELOP=1 CAPOS_QEMU=/usr/bin/qemu-system-x86_64 \
+GALLIUM_DRIVER=d3d12 GDK_BACKEND=x11 MESA_D3D12_DEFAULT_ADAPTER_NAME=Intel \
+./pacgo qemu --memory 8G --cpus 4 --graphics virgl --display gtk,gl=on \
+  --input-profile keyboard-tablet \
+  --qemu-arg=-device --qemu-arg=ramfb --qemu-arg=-vga --qemu-arg=none
+```
+
+このコマンドは既存ディスクを再生成しない。2026-10-21 の更新後の構成では
+4G で `OutOfFreePages` が発生したため、確認には 8G を使用した。
+GPU acceleration の判定は Xorg log の
+`glamor X acceleration enabled on virgl (D3D12 (` を確認し、
+`LLVMPIPE` を成功として扱わない。
 
 ## Tests
 

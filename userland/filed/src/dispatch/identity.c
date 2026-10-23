@@ -19,12 +19,16 @@ int filed_owner_control(filed_runtime_t *rt, kb2_fs_request_t *r,
     else memset(copy,0,size);
     r->generation=rt->storage_generation;
     if (rt->request_sequence==UINT64_MAX) { free(copy); return -75; }
-    r->sequence=++rt->request_sequence;
+    r->sequence=__atomic_add_fetch(&rt->request_sequence,1,__ATOMIC_RELAXED);
     int status=kb2_fs_request_encode(copy,KB2_FILESYSTEM_REQUEST_SIZE,size,r);
     uint8_t reply[KB2_FILESYSTEM_RESPONSE_SIZE];
     size_t used=0;
-    if (!status) status=filed_storage_owner_control_call(rt->storage,
-        copy,size,reply,sizeof(reply),&used);
+    if (!status) {
+        filed_mutex_lock(&rt->storage_exchange_lock);
+        status=filed_storage_owner_control_call(rt->storage,
+            copy,size,reply,sizeof(reply),&used);
+        filed_mutex_unlock(&rt->storage_exchange_lock);
+    }
     if (!status && (kb2_fs_response_decode(reply,used,response) ||
                     !kb2_fs_response_matches(response,r))) status=-71;
     free(copy);
