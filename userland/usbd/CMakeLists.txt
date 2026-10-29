@@ -12,6 +12,7 @@ set(PROTOCOL "${REPO_ROOT}/kobox2/protocol")
 # The controller/process/lifecycle helpers have no GPU dependency; the USB
 # binary deliberately omits gpud's DRM, queue, and GPU-session sources.
 set(USBD_SOURCES
+  "${CMAKE_CURRENT_SOURCE_DIR}/diagnostic.c"
   "${REPO_ROOT}/userland/kobox2_owner/boot.c"
   "${CMAKE_CURRENT_SOURCE_DIR}/package.c"
   "${CMAKE_CURRENT_SOURCE_DIR}/input_bridge.c"

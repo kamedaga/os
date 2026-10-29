@@ -6,7 +6,9 @@
 #include "../userland/kobox2_adapter/device_pci.c"
 
 #define BASE UINT64_C(0x200000000)
+#ifndef BAR_BASE
 #define BAR_BASE UINT64_C(0x120000000)
+#endif
 #define DEVICE_FD 224
 
 static struct pacha_capsule_bar_info native_bars[6];

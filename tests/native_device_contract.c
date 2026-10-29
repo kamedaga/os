@@ -10,7 +10,8 @@
 #define PAGE 4096u
 #define DMA_SIZE (4u * PAGE)
 /* Inside the native VT-d allocator's existing 0x80000000..0x90000000 aperture. */
-#define TEST_IOVA UINT64_C(0x83000000)
+static uint64_t test_iova = UINT64_C(0x83000000);
+#define TEST_IOVA test_iova
 #define MAP_BASE UINT64_C(0x200000000)
 #define STR1(x) #x
 #define STR(x) STR1(x)

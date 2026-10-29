@@ -17,6 +17,7 @@ enum pacha_log_source {
     PACHA_LOG_SOURCE_KOBOX2_NET = 2,
     PACHA_LOG_SOURCE_GPUD = 3,
     PACHA_LOG_SOURCE_KOBOX2_GPU = 4,
+    PACHA_LOG_SOURCE_KOBOX2_USB = 5,
 };
 
 /* SEND-only endpoint granted by the service launcher. No filesystem or

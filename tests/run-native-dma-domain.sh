@@ -5,12 +5,24 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 out="$repo_root/.artifacts/tests/native-dma-domain"
 mkdir -p "$out"
+extra_flags=()
+firmware=()
+memory=2G
+if [[ "${NATIVE_DMA_HIGH_MMIO:-0}" == 1 ]]; then
+  # Reserve a high memory hotplug range without allocating hundreds of GiB.
+  # Firmware must place 64-bit PCI apertures beyond it, like the NEC xHCI BAR.
+  memory=2G,slots=1,maxmem=416G
+  extra_flags=(-DNATIVE_DMA_REQUIRE_HIGH_MMIO=1)
+  cp /usr/share/OVMF/OVMF_VARS_4M.fd "$out/vars.fd"
+  firmware=(-drive if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.fd
+    -drive "if=pflash,format=raw,file=$out/vars.fd")
+fi
 "${CAPOS_FREESTANDING_CC:-clang}" -target x86_64-linux-gnu -fuse-ld=lld \
   -nostdlib -static -ffreestanding -fno-builtin -fno-stack-protector -mno-red-zone \
   -O2 -g -Wall -Wextra -Werror \
   -I "$repo_root/userland/libpacha/include" -I "$repo_root/userland/libipc/include" \
   -I "$repo_root/userland/libcapsule/include" -I "$repo_root/kobox2/linux-sandbox/kobox" \
-  "$repo_root/tests/native_dma_domain.c" \
+  "${extra_flags[@]}" "$repo_root/tests/native_dma_domain.c" \
   "$repo_root/userland/kobox2_adapter/device_dma.c" \
   "$repo_root/userland/libpacha/src/syscall.c" \
   -Wl,-e,_start,--image-base=0x400000,-z,noexecstack -o "$out/native_dma_domain.elf"
@@ -37,7 +49,8 @@ sha256sum "$repo_root/tests/native_dma_domain.c" "$repo_root/tests/native_device
   "$repo_root/userland/kobox2_adapter/device_dma.c" \
   "$repo_root/userland/kobox2_adapter/device_dma.h" >"$out/sources.sha256"
 : >"$out/serial.log"
-qemu-system-x86_64 -machine q35 -cpu host -enable-kvm -m 2G -smp 2 \
+qemu-system-x86_64 -machine q35 -cpu host -enable-kvm -m "$memory" -smp 2 \
+  "${firmware[@]}" \
   -trace 'enable=virtio_rng_*' -trace enable=vtd_dmar_fault \
   -trace enable=vtd_dmar_translate \
   -device intel-iommu,intremap=off,aw-bits="$aw_bits" \

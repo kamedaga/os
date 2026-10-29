@@ -1009,12 +1009,14 @@ fn changeInterruptSourceMask(io: anytype, loc: Location, kind: InterruptKind, en
         const control: u16 = @truncate(header >> 16);
         if (id == 0x05 and (kind == .msi or kind == .auto)) {
             found = true;
-            // A one-message MSI can be stopped through its function-wide
-            // Enable bit. With no pending register, its route must never be
-            // reassigned in this boot after the first owner has used it.
+            // MME, not MMC, selects the number of active messages: a device
+            // capable of eight messages may still use one. Function-wide
+            // Enable is a valid mask only for that single-message setting.
+            // With no pending register, its route must never be reassigned
+            // in this boot after the first owner has used it.
             if ((control & 0x100) == 0) {
                 if (kind != .msi or entry != 0 or
-                    ((control >> 1) & 7) != 0 or ((control >> 4) & 7) != 0)
+                    ((control >> 1) & 7) > 5 or ((control >> 4) & 7) != 0)
                     return error.Unsupported;
                 const next_control = if (masked) control & ~@as(u16, 1) else control | 1;
                 if (!io.setConfig(loc, cap + 2, 2, next_control)) return error.Unsupported;
@@ -1429,6 +1431,53 @@ test "IRQ release masks source and pending MSI-X blocks same-vector reuse until 
     try std.testing.expectError(error.NotReady, prepareInterruptLease(&fixture, device, .msi, 0));
     try std.testing.expectError(error.NotReady, prepareInterruptLease(&fixture, device, .msix, 0));
 
+    // Maximum capability is not active ownership. Cover both 32/64-bit
+    // layouts and every valid MMC, including Tiger Lake's eight-message
+    // capability, while MME selects only entry zero. Other control bits must
+    // survive masking, and the no-pending tombstone still forbids reuse.
+    for ([_]u16{ 0, 0x80 }) |address_mode| {
+        for (0..6) |mmc| {
+            clearInterruptRoutes();
+            try std.testing.expect(registerInterruptRoute(device, 0));
+            fixture = Fixture{ .drain_first = 0x50 };
+            fixture.registers[0x04 / 4] = 0x00100002;
+            fixture.registers[0x34 / 4] = 0x40;
+            const control: u16 = address_mode | (@as(u16, @intCast(mmc)) << 1) | 1;
+            const header = (@as(u32, control) << 16) | 0x0005;
+            fixture.registers[0x40 / 4] = header;
+            const cap_was_unmasked = try prepareInterruptLease(&fixture, device, .msi, 0);
+            try std.testing.expect(cap_was_unmasked);
+            try std.testing.expectEqual(header & ~@as(u32, 0x10000), fixture.registers[0x40 / 4]);
+            try std.testing.expect(restoreInterruptLeaseMask(&fixture, device, .msi, 0, cap_was_unmasked));
+            try std.testing.expectEqual(header, fixture.registers[0x40 / 4]);
+            try quiesceInterruptLease(&fixture, device, .msi, 0);
+            try std.testing.expectEqual(header & ~@as(u32, 0x10000), fixture.registers[0x40 / 4]);
+            commitInterruptRouteRetirement(device, @intFromEnum(InterruptKind.msi), 0);
+            try std.testing.expectError(error.NotReady, prepareInterruptLease(&fixture, device, .msi, 0));
+            try std.testing.expectError(error.NotReady, prepareInterruptLease(&fixture, device, .msix, 0));
+        }
+    }
+    // Reserved capabilities, active multi-message settings and nonzero
+    // entries must fail before changing the function-wide Enable bit.
+    for ([_]struct { control: u16, entry: u32 }{
+        .{ .control = 0x008d, .entry = 0 }, // reserved MMC=6
+        .{ .control = 0x008f, .entry = 0 }, // reserved MMC=7
+        .{ .control = 0x0097, .entry = 0 }, // MMC=3, MME=1
+        .{ .control = 0x00b7, .entry = 0 }, // MMC=3, MME=3
+        .{ .control = 0x0087, .entry = 1 }, // one active message, wrong entry
+    }) |rejected| {
+        clearInterruptRoutes();
+        try std.testing.expect(registerInterruptRoute(device, 0));
+        fixture = Fixture{ .drain_first = 0x50 };
+        fixture.registers[0x04 / 4] = 0x00100002;
+        fixture.registers[0x34 / 4] = 0x40;
+        const header = (@as(u32, rejected.control) << 16) | 0x0005;
+        fixture.registers[0x40 / 4] = header;
+        try std.testing.expectError(error.Unsupported, prepareInterruptLease(&fixture, device, .msi, rejected.entry));
+        try std.testing.expectEqual(header, fixture.registers[0x40 / 4]);
+        try std.testing.expectEqual(@as(usize, 0), fixture.drains);
+    }
+
     // An implicit FD close after a partially completed native launch must
     // preserve the same tombstone as explicit retirement.
     clearInterruptRoutes();
@@ -1459,14 +1508,14 @@ test "IRQ release masks source and pending MSI-X blocks same-vector reuse until 
     try std.testing.expect(!releaseInterruptLease(&fixture, device, .msi, 0));
     try std.testing.expectError(error.NotReady, prepareInterruptLease(&fixture, device, .msi, 0));
 
-    // Reject multi-message capability and a failed function-wide readback
+    // Reject active multi-message operation and failed mask readback
     // before publishing any lease; the CPU barrier must also succeed.
     clearInterruptRoutes();
     try std.testing.expect(registerInterruptRoute(device, 0));
     fixture = Fixture{ .drain_first = 0x50 };
     fixture.registers[0x04 / 4] = 0x00100002;
     fixture.registers[0x34 / 4] = 0x40;
-    fixture.registers[0x40 / 4] = 0x00850005; // four-message capable
+    fixture.registers[0x40 / 4] = 0x00970005; // eight capable, two enabled
     try std.testing.expectError(error.Unsupported, prepareInterruptLease(&fixture, device, .msi, 0));
     try std.testing.expectEqual(@as(u32, 0x00010000), fixture.registers[0x40 / 4] & 0x00010000);
     fixture.registers[0x40 / 4] = 0x00810005;

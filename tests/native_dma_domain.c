@@ -132,6 +132,16 @@ int main(void) {
     stage = "dma-domain-bootstrap";
     acquire_device();
     discover();
+    log_text("NATIVE_DMA_MMIO_BAR_START=");
+    log_number(bar_info(common_cap.bar).start);
+#if NATIVE_DMA_REQUIRE_HIGH_MMIO
+    CHECK(bar_info(common_cap.bar).start >= (UINT64_C(1) << 38));
+    /* UEFI's hotplug reservation also changes the reservation-free DMA
+     * aperture. Test the granted namespace instead of a BIOS-only address. */
+    const struct pacha_capsule_info aperture = query(DEVICE_FD);
+    test_iova = aperture.iova ? aperture.iova : PAGE;
+    CHECK(aperture.size >= (UINT64_C(4224) + 1) * PAGE);
+#endif
     reset_device();
     struct ph_dma port = {0};
     struct ph_dma_mapping mappings[4];

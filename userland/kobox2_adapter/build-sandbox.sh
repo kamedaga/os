@@ -125,6 +125,7 @@ if [[ "$device" == 1 ]]; then
   sources+=("$adapter/device_grant.c" "$adapter/device.c" "$adapter/device_pci.c"
     "$adapter/device_dma.c" "$adapter/device_irq.c" "$adapter/device_irq_queue.c")
   if [[ "$usb_hid" == 1 ]]; then
+    sources+=("$repo_root/userland/libpacha/src/log.c")
     sources+=("$adapter/usb_input_service.c")
     if [[ "$block" == 1 ]]; then
       sources+=("$adapter/usb_storage_service.c")

@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: MIT */
 #include <usbd/boot_config.h>
 #include "package.h"
+#include "diagnostic.h"
 #include "input_bridge.h"
 #include "source_client.h"
 #include "media_probe.h"
@@ -27,6 +28,7 @@
 enum { USBD_RESOURCE_SET_ID = 1, USBD_SANDBOX_ID = 1 };
 
 static const struct gpud_lifecycle *status_lifecycle;
+static struct usbd_diagnostic diagnostic = {.endpoint = -1};
 
 /* Keep controller startup evidence readable from the local shell. Native
  * stdout goes to serial, which is usually unavailable on a laptop. */
@@ -99,11 +101,17 @@ static void controller_deallocate(void *context, void *pointer, size_t size) {
 }
 
 static int wait_readable(pacha_fd_t fd, pacha_fd_t process_fd) {
-    struct pacha_pollfd events[2] = {
+    struct pacha_pollfd events[3] = {
         {.fd = fd, .events = PACHA_FD_EVENT_READABLE | PACHA_FD_EVENT_HANGUP},
         {.fd = process_fd, .events = PACHA_FD_EVENT_READABLE | PACHA_FD_EVENT_HANGUP},
     };
-    long result = pacha_fd_wait_many(events, 2, PACHA_FD_WAIT_FOREVER);
+    size_t count = 2;
+    if (diagnostic.endpoint >= 16) events[count++] = (struct pacha_pollfd){
+        .fd = diagnostic.endpoint, .events = PACHA_FD_EVENT_READABLE};
+    long result = pacha_fd_wait_many(events, count, PACHA_FD_WAIT_FOREVER);
+    usbd_diagnostic_drain(&diagnostic);
+    if (events[0].revents & PACHA_FD_EVENT_READABLE) return 0;
+    if (count == 3 && events[2].revents) return 0;
     if (events[1].revents)
         return -EPIPE;
     return result > 0 && events[0].revents == PACHA_FD_EVENT_READABLE ? 0 : -EIO;
@@ -123,7 +131,7 @@ static int wait_process_or_tick(pacha_fd_t process_fd, pacha_fd_t timer_fd,
     /* This loop runs on the service thread. The helper replaces the set when
      * optional endpoints arrive or disappear. */
     static struct pacha_fd_wait_retained wait_set;
-    struct pacha_pollfd events[4] = {
+    struct pacha_pollfd events[5] = {
         {.fd = process_fd, .events = PACHA_FD_EVENT_READABLE | PACHA_FD_EVENT_HANGUP},
         {.fd = timer_fd, .events = PACHA_FD_EVENT_READABLE},
         {.fd = installer_fd, .events = PACHA_FD_EVENT_READABLE | PACHA_FD_EVENT_HANGUP},
@@ -134,6 +142,9 @@ static int wait_process_or_tick(pacha_fd_t process_fd, pacha_fd_t timer_fd,
     if (installer_fd >= 16) events[count++] = events[2];
     const size_t input_index = count;
     if (input_fd >= 16) events[count++] = events[3];
+    const size_t log_index = count;
+    if (diagnostic.endpoint >= 16) events[count++] = (struct pacha_pollfd){
+        .fd = diagnostic.endpoint, .events = PACHA_FD_EVENT_READABLE};
     long result = pacha_fd_wait_many_retained(&wait_set, events, count,
         PACHA_FD_WAIT_FOREVER);
     if (result <= 0) return -EIO;
@@ -146,6 +157,7 @@ static int wait_process_or_tick(pacha_fd_t process_fd, pacha_fd_t timer_fd,
         return pacha_fd_read(input_fd, &notifications, sizeof(notifications)) ==
             (long)sizeof(notifications) ? 3 : -EIO;
     }
+    if (!events[1].revents && log_index < count && events[log_index].revents) return 4;
     if (events[1].revents != PACHA_FD_EVENT_READABLE) return -EIO;
     uint64_t expirations = 0;
     return pacha_fd_read(timer_fd, &expirations, sizeof(expirations)) ==
@@ -195,10 +207,15 @@ static int start_generation(kb2_controller_t *controller, struct usbd_package *p
     if (error)
         return error;
 
+    if (config->kind == USBD_KIND_USB_XHCI) {
+        error = usbd_diagnostic_open(&diagnostic, generation);
+        if (error) return error;
+    }
     struct ph_sandbox_config sandbox_config = {.size = sizeof(struct ph_sandbox_config),
         .identity = package->identity,
         .artifact_count = package->artifact_count, .resource_count = 1,
-        .device = package->device, .platform = package->platform};
+        .device = package->device, .platform = package->platform,
+        .log_endpoint_fd = diagnostic.endpoint >= 16 ? PH_SANDBOX_LOG_FD : 0};
     const struct ph_block_write_policy block_policy = {
         .magic = PH_BLOCK_POLICY_MAGIC,
         .generation = generation,
@@ -222,7 +239,7 @@ static int start_generation(kb2_controller_t *controller, struct usbd_package *p
         .extra_blobs = config->kind == USBD_KIND_PS2 ? NULL : blobs,
         .extra_blob_count = config->kind == USBD_KIND_PS2 ? 0 : 1,
         .items = package->items, .artifact_count = package->artifact_count,
-        .resource_count = 1, .log_endpoint_fd = -1};
+        .resource_count = 1, .log_endpoint_fd = diagnostic.endpoint};
     struct ph_owner_boot boot = {0};
     status_lifecycle = &current->lifecycle;
     status_note(config, "sandbox-launch", 0);
@@ -236,6 +253,7 @@ static int start_generation(kb2_controller_t *controller, struct usbd_package *p
     status_note(config, "module-probe", 0);
     unsigned observed_progress = 0;
     for (;;) {
+        usbd_diagnostic_drain(&diagnostic);
         kb2_status_t status = gpud_lifecycle_ready(&current->lifecycle);
         if (status == KB2_STATUS_OK) {
             status_note(config, "input-bridge", 0);
@@ -260,6 +278,8 @@ static int start_generation(kb2_controller_t *controller, struct usbd_package *p
             if (!connected && config->kind != USBD_KIND_PS2)
                 connected = ph_block_client_open(&current->block,
                     &current->ipc, current->launch.process.fd, generation);
+            usbd_diagnostic_drain(&diagnostic);
+            (void)usbd_diagnostic_publish(&diagnostic, config);
             status_note(config, connected ? "bridge-failed" : "ready", connected);
             return connected;
         }
@@ -270,15 +290,19 @@ static int start_generation(kb2_controller_t *controller, struct usbd_package *p
             status_note(config, "module-probe", 0);
         }
         if (status != KB2_STATUS_ACTION_PENDING ||
-            wait_readable(current->ipc.fd, current->launch.process.fd))
+            wait_readable(current->ipc.fd, current->launch.process.fd)) {
+            usbd_diagnostic_drain(&diagnostic);
+            (void)usbd_diagnostic_publish(&diagnostic, config);
             return -EIO;
+        }
     }
 }
 
 static int restart_generation(kb2_controller_t *controller,
-    struct usbd_package *package, struct usbd_generation *current) {
+    struct usbd_package *package, struct usbd_generation *current, int reload) {
     const uint64_t generation = current->id;
-    kb2_status_t observed = gpud_process_observe(&current->watch, generation);
+    kb2_status_t observed = kb2_controller_state(controller) == KB2_STATE_FAULTED ?
+        KB2_STATUS_OK : gpud_process_observe(&current->watch, generation);
     if (observed == KB2_STATUS_ACTION_PENDING) {
         kb2_status_t fault = kb2_controller_report_fault(controller, generation,
             KB2_FAULT_PROTOCOL, EPIPE);
@@ -287,12 +311,12 @@ static int restart_generation(kb2_controller_t *controller,
     } else if (observed != KB2_STATUS_OK) {
         return -EIO;
     }
-    if (kb2_controller_restart(controller) != KB2_STATUS_OK)
+    if ((reload ? kb2_controller_stop(controller) : kb2_controller_restart(controller)) != KB2_STATUS_OK)
         return -EIO;
     for (;;) {
         const kb2_action_t *action = kb2_controller_pending_action(controller);
         if (!action)
-            return -EIO;
+            return reload && kb2_controller_state(controller) == KB2_STATE_IDLE ? 0 : -EIO;
         const kb2_action_type_t type = kb2_action_type(action);
         if (type == KB2_ACTION_ALLOCATE_RESOURCES)
             return kb2_controller_generation(controller) == generation + 1 ? 0 : -EIO;
@@ -319,6 +343,7 @@ static int restart_generation(kb2_controller_t *controller,
                     error = ph_block_client_close(&current->block);
                 if (!error)
                     error = ph_ipc_destroy(&current->ipc, generation);
+                if (!error) error = usbd_diagnostic_close(&diagnostic);
                 if (error)
                     return error;
             }
@@ -343,6 +368,17 @@ static int restart_generation(kb2_controller_t *controller,
         }
         return -EOPNOTSUPP;
     }
+}
+
+static int reload_package(kb2_controller_t *controller, struct usbd_package *package,
+    const struct usbd_boot_config *config) {
+    if (kb2_controller_state(controller) != KB2_STATE_IDLE) return -EBUSY;
+    int error = usbd_package_close(package);
+    if (!error) error = usbd_package_open(package, config->filed_endpoint_fd,
+        config->device_fd, config->kind);
+    if (!error) error = usbd_package_configure_controller(package, controller);
+    if (!error && kb2_controller_start(controller) != KB2_STATUS_OK) error = -EIO;
+    return error;
 }
 
 static int run(const struct usbd_boot_config *config) {
@@ -371,7 +407,36 @@ static int run(const struct usbd_boot_config *config) {
             write_disk.diskseq ? &write_disk : NULL);
         if (error) {
             printf("[usbd] stage=sandbox-ready status=%d\n", error);
-            return error;
+            if (config->kind != USBD_KIND_USB_XHCI || !current.watch.controller)
+                return error;
+            usbd_diagnostic_drain(&diagnostic);
+            (void)usbd_diagnostic_publish(&diagnostic, config);
+            /* Startup failure is reported once, while this owner keeps its
+             * capsule for an explicit, generation-scoped recovery request. */
+            if (current.id == 1) (void)send_ready(config, error);
+            int cleanup = restart_generation(controller, &package, &current, 1);
+            if (cleanup) return cleanup;
+            status_note(config, "failed-wait-reload", error);
+            const uint64_t rights = PACHA_FD_RIGHT_READ | PACHA_FD_RIGHT_WAIT |
+                PACHA_FD_RIGHT_POLL | PACHA_FD_RIGHT_CLOSE;
+            pacha_fd_t timer = pacha_timerfd_create(UINT64_C(1000000000),
+                UINT64_C(1000000000), rights, 0);
+            if (timer < 16) return -EIO;
+            for (;;) {
+                int requested = usbd_reload_requested(config, current.id);
+                if (requested < 0) { (void)pacha_fd_close(timer); return requested; }
+                if (requested) break;
+                struct pacha_pollfd event = {.fd = timer, .events = PACHA_FD_EVENT_READABLE};
+                uint64_t count = 0;
+                if (pacha_fd_wait_many(&event, 1, PACHA_FD_WAIT_FOREVER) <= 0 ||
+                    pacha_fd_read(timer, &count, sizeof(count)) != (long)sizeof(count)) {
+                    (void)pacha_fd_close(timer); return -EIO;
+                }
+            }
+            if (pacha_fd_close(timer)) return -EIO;
+            error = reload_package(controller, &package, config);
+            if (error) return error;
+            continue;
         }
         if (current.id == 1 && (error = send_ready(config, 0)))
             return error;
@@ -389,6 +454,7 @@ static int run(const struct usbd_boot_config *config) {
             printf("[usbd] input transport=event-driven frames=preserved\n");
             fflush(stdout);
         }
+        int reload_requested = 0;
         for (;;) {
             int wake = wait_process_or_tick(current.launch.process.fd,
                 timer_fd, install_port.fd, current.input.event_fd);
@@ -400,6 +466,8 @@ static int run(const struct usbd_boot_config *config) {
                 error = 0;
                 break;
             }
+            usbd_diagnostic_drain(&diagnostic);
+            if (wake == 4) continue;
             if (wake < 0) { error = wake; break; }
             if (wake == 0) break;
             if (wake == 2) {
@@ -417,6 +485,12 @@ static int run(const struct usbd_boot_config *config) {
                 continue;
             }
             if (wake == 1) {
+                (void)usbd_diagnostic_publish(&diagnostic, config);
+                if (config->kind == USBD_KIND_USB_XHCI) {
+                    int requested = usbd_reload_requested(config, current.id);
+                    if (requested < 0) { error = requested; break; }
+                    if (requested) { reload_requested = 1; break; }
+                }
                 if (config->kind == USBD_KIND_PS2) continue;
                 size_t count = 0;
                 uint64_t next = 0;
@@ -449,7 +523,11 @@ static int run(const struct usbd_boot_config *config) {
         }
         (void)pacha_fd_close(timer_fd);
         if (error) return error;
-        error = restart_generation(controller, &package, &current);
+        error = restart_generation(controller, &package, &current, reload_requested);
+        if (!error && reload_requested) {
+            write_disk = (kb2_block_disk_t){0};
+            error = reload_package(controller, &package, config);
+        }
         if (error)
             return error;
     }

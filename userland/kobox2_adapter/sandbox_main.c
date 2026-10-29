@@ -586,10 +586,14 @@ void ph_main(void) {
               config->artifact_count == (PH_SANDBOX_DEVICE ? 13u : 2u)) &&
              config->resource_count == (PH_SANDBOX_FS ? config->storage_device_count :
                 (PH_SANDBOX_DEVICE || PH_SANDBOX_PS2) ? 1u : 0u));
-#if PH_SANDBOX_AMDGPU || PH_SANDBOX_WIFI
+#if PH_SANDBOX_AMDGPU || PH_SANDBOX_WIFI || PH_SANDBOX_USB_HID
     PH_CHECK(config->log_endpoint_fd == 0 ||
              config->log_endpoint_fd == PH_SANDBOX_LOG_FD);
     ph_boot_set_log_fd((pacha_fd_t)config->log_endpoint_fd);
+#else
+    PH_CHECK(!config->log_endpoint_fd);
+#endif
+#if PH_SANDBOX_AMDGPU || PH_SANDBOX_WIFI
     PH_CHECK(config->firmware_address == PH_SANDBOX_FIRMWARE_ADDRESS &&
              config->firmware_size >= sizeof(struct ph_firmware_bundle) &&
              config->firmware_size <=
@@ -600,8 +604,7 @@ void ph_main(void) {
     ph_number("verified firmware files", firmware_count);
 #else
     static const uint8_t absent_sha256[32];
-    PH_CHECK(!config->log_endpoint_fd &&
-             !config->firmware_address && !config->firmware_size &&
+    PH_CHECK(!config->firmware_address && !config->firmware_size &&
              !memcmp(config->firmware_sha256, absent_sha256, 32));
 #endif
     PH_OK(ph_ipc_init(&bootstrap_ipc, PH_SANDBOX_CHANNEL_FD, config->identity.generation));
