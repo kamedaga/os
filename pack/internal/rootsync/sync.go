@@ -777,3 +777,37 @@ func writeLayoutCacheFile(workspace *config.Workspace, partitionName string, cac
 func layoutCachePath(workspace *config.Workspace, partitionName string) string {
 	return workspace.Path(workspace.State, partitionName+".layout.json")
 }
+
+// PartitionUpToDate reports whether the partition already holds manifestPath,
+// using the same fingerprints that let SyncRootfs/SyncBootfs skip. It never
+// writes the disk.
+func PartitionUpToDate(workspace *config.Workspace, partitionName string, manifestPath string) (bool, error) {
+	partition, ok := workspace.Disk.Partitions[partitionName]
+	if !ok {
+		return false, fmt.Errorf("missing disk.partitions.%s", partitionName)
+	}
+	if _, err := os.Stat(workspace.Path(workspace.Disk.Image)); err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	layoutFingerprint, err := ManifestContentFingerprint(manifestPath)
+	if err != nil {
+		return false, err
+	}
+	manifest, err := LoadManifestWithOptionsProgress(manifestPath, LoadOptions{CheckSymlinks: true}, nil)
+	if err != nil {
+		return false, err
+	}
+	contentFingerprint, err := Fingerprint(manifest)
+	if err != nil {
+		return false, err
+	}
+	cacheFilesystem := cacheFilesystemKey(normalizeFilesystem(partition.Format))
+	cachePath := workspace.Path(workspace.State, partitionName+".sync.sha256")
+	if !fingerprintMatches(cachePath, syncCacheFingerprint(contentFingerprint, cacheFilesystem)) {
+		return false, nil
+	}
+	return layoutCacheMatches(workspace, partitionName, layoutFingerprint, cacheFilesystem), nil
+}

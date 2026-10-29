@@ -130,6 +130,22 @@ pub const state_continued: u64 = 5;
 
 pub const signal_max: u32 = 64;
 pub const signal_kill: u32 = 9;
+// REGISTER: rsi points to this fixed descriptor, copied before publication.
+// A (0,0) scratch explicitly uses the caller stack; it is not unregister.
+// Nonzero scratch is thread-owned and must remain mapped until exit/replace.
+// The trampoline must copy its frame and leave scratch before leaving its
+// inhibit ranges, because another signal may then reuse the scratch.
+pub const SignalRegistration = extern struct {
+    entry: u64,
+    inhibit_start: u64,
+    inhibit_end: u64,
+    inhibit_secondary_start: u64,
+    inhibit_secondary_end: u64,
+    scratch_base: u64,
+    scratch_size: u64,
+    flags: u64,
+};
+pub const signal_registration_process_owner: u64 = 1;
 pub const signal_ctl_register: u64 = 1;
 pub const signal_ctl_set_mask: u64 = 2;
 pub const signal_ctl_return: u64 = 3;

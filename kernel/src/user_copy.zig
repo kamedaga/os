@@ -11,6 +11,7 @@ const scheduler = @import("scheduler_connection.zig");
 const smp = @import("smp.zig");
 const user_vm = @import("memory/user_vm.zig");
 const ram_cache = @import("memory/ram_cache_policy.zig");
+const runtime_abi = @import("kernel_abi_root").runtime_abi;
 const window_ways = @import("arch/x86_64/platform.zig").phys_copy_window_ways;
 
 const CpuSet = @import("cpu_set.zig").CpuSet;
@@ -527,9 +528,10 @@ fn logCowResolutionFailure(
     page_va: u64,
     stage: []const u8,
     plan: kernel.NativeVmaFaultPlan,
+    shared_lock_held: bool,
 ) void {
-    user_vm.lockSharedVmObjects();
-    defer user_vm.unlockSharedVmObjects();
+    if (!shared_lock_held) user_vm.lockSharedVmObjects();
+    defer if (!shared_lock_held) user_vm.unlockSharedVmObjects();
     const store = kernel.vmObjectBackingStoreStats();
     if (state.vmaEntryForVaConst(principal, page_va)) |entry| {
         const cow_refs: u32 = if (entry.cow_table.isNull())
@@ -624,7 +626,7 @@ pub fn resolveNativeVmaCowMappingWithAddressSpaceLocked(
         switch (plan.kind) {
             .denied => {
                 if (isCowFaultCandidate(state, principal, page_va)) {
-                    logCowResolutionFailure(state, free_list, principal, page_va, "prepare", plan);
+                    logCowResolutionFailure(state, free_list, principal, page_va, "prepare", plan, false);
                 }
                 return null;
             },
@@ -659,7 +661,11 @@ pub fn resolveNativeVmaCowMappingWithAddressSpaceLocked(
                     free_list,
                 );
                 if (mapping == null) {
-                    logCowResolutionFailure(state, free_list, principal, page_va, "locked_slow", plan);
+                    // A private pager page must be supplied before COW can copy
+                    // it. Check the actual pager state while both locks still
+                    // protect the VMA; other null results remain failures.
+                    if (state.pendingPagerFaultPage(principal, page_va, write_access, instruction_fetch) == null)
+                        logCowResolutionFailure(state, free_list, principal, page_va, "locked_slow", plan, true);
                 } else if (invalidated) {
                     // Callers need not repeat the completed shootdown.
                     mapping.?.invalidate_start_va = 0;
@@ -670,7 +676,7 @@ pub fn resolveNativeVmaCowMappingWithAddressSpaceLocked(
             .allocate_zero, .allocate_copy => {},
         }
         const candidate = allocatePreparedFaultPage(state, free_list, plan) orelse {
-            logCowResolutionFailure(state, free_list, principal, page_va, "page_alloc", plan);
+            logCowResolutionFailure(state, free_list, principal, page_va, "page_alloc", plan, false);
             return null;
         };
         const mapping = blk: {
@@ -694,7 +700,7 @@ pub fn resolveNativeVmaCowMappingWithAddressSpaceLocked(
             else => @panic("invalid PMM return"),
         };
     }
-    logCowResolutionFailure(state, free_list, principal, page_va, "commit_retry", last_plan);
+    logCowResolutionFailure(state, free_list, principal, page_va, "commit_retry", last_plan, false);
     return null;
 }
 
@@ -717,7 +723,9 @@ pub fn resolveNativeVmaFaultMappingWithAddressSpaceLocked(
         };
         switch (plan.kind) {
             .denied => {
-                kernel_log.writeFmt("vm: fault prepare denied principal={} va=0x{x} write={} exec={}\n", .{ @intFromEnum(principal), page_va, write_access, instruction_fetch });
+                // Native VMA lookup is only one resolver. A managed address
+                // may be handled by the registered user fault handler next;
+                // traps reports the full fault if that delegation also fails.
                 return null;
             },
             .ready => return plan.mapping,
@@ -1231,11 +1239,55 @@ pub fn readUserU32Resident(principal: kernel.PrincipalId, user_va: u64) ?u32 {
     if ((user_va & 3) != 0) return null;
     if (!user_vm.lockAddressSpace(principal)) return null;
     defer user_vm.unlockAddressSpace(principal);
+    return readUserU32ResidentWithAddressSpaceLocked(principal, user_va);
+}
+
+/// F owns the compare/order with WAKE; the caller keeps A from this read
+/// through waiter publication so a concurrent VM replacement cannot move
+/// the checked word to a different page before registration.
+pub fn readUserU32ResidentWithAddressSpaceLocked(principal: kernel.PrincipalId, user_va: u64) ?u32 {
+    if ((user_va & 3) != 0) return null;
     const page = address_types.UserVirtualAddress.fromInt(user_va & ~@as(u64, 4095));
     const paddr = user_vm.lookupUserPhysicalPageWithAddressSpaceLocked(principal, page, false, false) orelse return null;
     const address, const overflow = @addWithOverflow(paddr.toInt(), user_va & 4095);
     if (overflow != 0) return null;
     return readPhysU32(address);
+}
+
+/// F orders the update with wait registration and both wake selections. AS
+/// retains the VMA/PTE while the pinned CPU copy window supplies a stable RAM
+/// alias. In particular, a writable device PTE is not authority for atomic
+/// operations on a BAR, nor is the absence of a special RAM cache policy.
+/// Preflight resolves absent/COW pages before F; this path never faults.
+pub fn atomicUserU32ResidentWithAddressSpaceLocked(
+    principal: kernel.PrincipalId,
+    user_va: u64,
+    operation: runtime_abi.FutexAtomicOperation,
+    operand: u32,
+) ?u32 {
+    if (user_va == 0 or (user_va & 3) != 0) return null;
+    const vma = getHooks().state.vmaEntryForVaConst(principal, user_va) orelse return null;
+    if (vma.device_backing or !vma.prot.write) return null;
+    const page = address_types.UserVirtualAddress.fromInt(user_va & ~@as(u64, 4095));
+    const paddr = user_vm.lookupUserPhysicalPageWithAddressSpaceLocked(principal, page, true, false) orelse return null;
+    if (ramCachePolicyForLockedPage(paddr.toInt()) != .ordinary) return null;
+    const address, const overflow = @addWithOverflow(paddr.toInt(), user_va & 4095);
+    if (overflow != 0) return null;
+    const previous = blk: {
+        const window = PhysCopyWindowGuard.lock();
+        defer window.unlock();
+        const alias = physWindowAddr(address, @sizeOf(u32), window.cpu_slot) orelse return null;
+        const word: *u32 = @ptrCast(@alignCast(alias));
+        break :blk switch (operation) {
+            .set => @atomicRmw(u32, word, .Xchg, operand, .seq_cst),
+            .add => @atomicRmw(u32, word, .Add, operand, .seq_cst),
+            .bit_or => @atomicRmw(u32, word, .Or, operand, .seq_cst),
+            .and_not => @atomicRmw(u32, word, .And, ~operand, .seq_cst),
+            .bit_xor => @atomicRmw(u32, word, .Xor, operand, .seq_cst),
+        };
+    };
+    kernel.page_view_dirty.markSoftwareWrite(getHooks().state, principal, user_va);
+    return previous;
 }
 
 pub fn copyFromUser(principal: kernel.PrincipalId, source: address_types.UserVirtualAddress, dest: []u8) bool {
@@ -1378,6 +1430,7 @@ pub fn copyToUser(principal: kernel.PrincipalId, destination: address_types.User
             @memcpy(dst[0..chunk_len], src[copied .. copied + chunk_len]);
             copy_profile.copyEnd(.memcpy, memcpy_start);
         }
+        kernel.page_view_dirty.markSoftwareWrite(h.state, principal, current.toInt());
         copied += chunk_len;
     }
     return true;

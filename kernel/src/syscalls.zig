@@ -8,6 +8,7 @@ const lock_profile = @import("lock_profile.zig");
 const kernel = @import("kernel.zig");
 const interrupts = @import("interrupts.zig");
 const scheduler = @import("scheduler.zig").connection;
+const smp = @import("smp.zig");
 const boot_static = @import("boot/main_static.zig");
 const sc = @import("syscall/numbers.zig");
 const direct_ipc_entry = @import("arch/x86_64/syscall_entry_code.zig");
@@ -20,6 +21,7 @@ const fd_syscalls = @import("syscall/fd.zig");
 const native_ipc_syscalls = @import("syscall/native_ipc.zig");
 const process_syscalls = @import("syscall/process.zig");
 const runtime_syscalls = @import("syscall/runtime.zig");
+const runtime_nr_profile = @import("runtime_nr_profile.zig");
 
 const TrapFrame = interrupts.TrapFrame;
 const preflight_fd_abi = @import("kernel_abi_root").fd_abi;
@@ -46,6 +48,10 @@ pub const Hooks = struct {
     copy_bytes_to_user_va: *const fn (kernel.PrincipalId, u64, []const u8) bool,
     probe_user_range: ?*const fn (kernel.PrincipalId, u64, usize, bool) user_copy.ProbeResult = null,
     resident_read_user_u32: ?*const fn (kernel.PrincipalId, u64) ?u32 = null,
+    futex_lock_address_space: ?*const fn (kernel.PrincipalId) bool = null,
+    futex_unlock_address_space: ?*const fn (kernel.PrincipalId) void = null,
+    resident_read_user_u32_with_address_space_locked: ?*const fn (kernel.PrincipalId, u64) ?u32 = null,
+    resident_atomic_user_u32_with_address_space_locked: ?*const fn (kernel.PrincipalId, u64, @import("kernel_abi_root").runtime_abi.FutexAtomicOperation, u32) ?u32 = null,
     iovec_snapshot: ?*const IovecSnapshot = null,
     pending_signal_frame_snapshot: ?*const process_syscalls.ProcessCloneUserFrame = null,
     wake_waiting_thread_for_principal: *const fn (kernel.PrincipalId) void,
@@ -90,6 +96,9 @@ const KernelStateSpinLock = struct {
             lock_diagnostics.beforeAcquire(&self.diagnostic_record, .{ .class = .kernel_state });
             if (@cmpxchgWeak(u8, &self.value, 0, 1, .acquire, .monotonic) == null) {
                 lock_diagnostics.acquired(&self.diagnostic_record, .{ .class = .kernel_state });
+                // Before IF can return: wakes from here to unlock leave after
+                // the release instead of extending K by a VM exit each.
+                smp.beginKernelStateWakeDeferral();
                 lock_diagnostics.restoreInterrupts(diagnostic_if);
                 if (perf.enabled) {
                     self.profile_start = perf.timestamp();
@@ -116,6 +125,7 @@ const KernelStateSpinLock = struct {
             return false;
         }
         lock_diagnostics.acquiredTry(&self.diagnostic_record, .{ .class = .kernel_state });
+        smp.beginKernelStateWakeDeferral();
         if (perf.enabled) {
             self.profile_start = perf.timestamp();
             lock_profile.acquired(.irq, lock_profile.begin(), true);
@@ -151,6 +161,9 @@ const KernelStateSpinLock = struct {
         if (comptime lock_profile.enabled) lock_profile.release();
         lock_diagnostics.releasing(&self.diagnostic_record);
         @atomicStore(u8, &self.value, 0, .release);
+        // Every publication of this section precedes the release store, so
+        // each recorded edge follows the last one it must announce.
+        smp.endKernelStateWakeDeferral();
         if (changed) clockevent.notifyChanged();
     }
 };
@@ -198,6 +211,7 @@ pub fn endExternalPrincipalTeardown() void {
     capsule_syscalls.drainDeviceMemoryRetirements(getHooks().state);
     ram_cache_syscalls.drain(getHooks().state, getHooks().free_list);
     getHooks().state.reclaimFdCapabilities();
+    fd_syscalls.completePersistentWaiters(getHooks(), getHooks().state);
     scheduler.endPrincipalLifecycle();
     kernel_state_lock.unlock();
 }
@@ -214,9 +228,33 @@ fn dropKernelStateLockBeforeCurrentThreadLeave(ctx_ptr: *anyopaque) void {
     if (!ctx.lock_held.*) return;
     const cleanup_start = b3.now();
     defer b3.end(511, cleanup_start);
-    native_ipc_syscalls.drainCancellations(getHooks(), getHooks().state);
-    capsule_syscalls.drainDeviceMemoryRetirements(getHooks().state);
-    ram_cache_syscalls.drain(getHooks().state, getHooks().free_list);
+    lock_profile.parkEnd();
+    {
+        const cleanup_sample = if (comptime lock_profile.enabled) lock_profile.stageBegin() else {};
+        defer if (comptime lock_profile.enabled) lock_profile.stageEnd(.leave_cleanup, cleanup_sample);
+        // Nested samples preserve the outer K cleanup total and attribute its
+        // work without adding diagnostics to the normal kernel.
+        {
+            const sample = if (comptime lock_profile.enabled) lock_profile.stageBegin() else {};
+            native_ipc_syscalls.drainCancellations(getHooks(), getHooks().state);
+            if (comptime lock_profile.enabled) lock_profile.stageEnd(.leave_cancellations, sample);
+        }
+        {
+            const sample = if (comptime lock_profile.enabled) lock_profile.stageBegin() else {};
+            fd_syscalls.completePersistentWaiters(getHooks(), getHooks().state);
+            if (comptime lock_profile.enabled) lock_profile.stageEnd(.leave_persistent_waiters, sample);
+        }
+        {
+            const sample = if (comptime lock_profile.enabled) lock_profile.stageBegin() else {};
+            capsule_syscalls.drainDeviceMemoryRetirements(getHooks().state);
+            if (comptime lock_profile.enabled) lock_profile.stageEnd(.leave_device_memory, sample);
+        }
+        {
+            const sample = if (comptime lock_profile.enabled) lock_profile.stageBegin() else {};
+            ram_cache_syscalls.drain(getHooks().state, getHooks().free_list);
+            if (comptime lock_profile.enabled) lock_profile.stageEnd(.leave_ram_cache, sample);
+        }
+    }
     kernel_state_lock.unlock();
     ctx.lock_held.* = false;
     @import("notify_metric.zig").finish();
@@ -243,7 +281,9 @@ pub fn kernelStaticStorageEndAddr() usize {
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(syscall_hooks_storage), &syscall_hooks_storage));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(syscall_hooks_ready), &syscall_hooks_ready));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(kernel_state_lock), &kernel_state_lock));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(irq_fd_completion_pending), &irq_fd_completion_pending));
     end = maxStaticEnd(end, runtime_syscalls.kernelStaticStorageEndAddr());
+    end = maxStaticEnd(end, runtime_nr_profile.staticEnd());
     end = maxStaticEnd(end, ram_cache_syscalls.kernelStaticStorageEndAddr());
     end = maxStaticEnd(end, @import("ipc_metric.zig").staticEnd());
     end = maxStaticEnd(end, b3.staticEnd());
@@ -280,14 +320,43 @@ fn getHooks() *const Hooks {
 // even without another device edge; the next eligible tick retries delivery
 // (subject to the existing K/shootdown contention checks). Clockevent's retry
 // delay retains the periodic tick, so deferral does not disarm that opportunity.
+// For IRQ FDs that tick is only the fallback: a deferred device IRQ leaves
+// irq_fd_completion_pending set, and the next generic syscall K release
+// completes it (see handOffIrqFdWaitersAfterRelease).
 fn interruptCanCompleteUserWait(from_user: bool) bool {
     return from_user or scheduler.currentCpuInLockFreeIdleWait();
 }
 
+/// Set by a device IRQ after its event counts are published and before it
+/// probes K; cleared under K by the completion scan that then observes those
+/// counts. It records that IRQ FD waiters may be ready but nobody has scanned
+/// for them yet. The scan reads every waiter's published count, so one flag
+/// covers all devices; a spurious set only costs one scan.
+///
+/// Why the K owner, not only the BSP tick: under load the tick's tryLock loses
+/// to the same busy K it lost to at the IRQ, so a device completion waited a
+/// whole number of 1 ms ticks per lost race (measured: about 20% of NVMe IRQs
+/// and most multi-millisecond block I/O stalls while every CPU was idle). The
+/// owner that made tryLock fail is the one place guaranteed to leave K soon.
+var irq_fd_completion_pending: bool = false;
+
+/// Device-IRQ entry. The seq_cst store is a locked XCHG on x86, so the flag is
+/// globally visible before tryLock reads K. handOffIrqFdWaitersAfterRelease
+/// fences between its release store and its flag load, which makes the pair a
+/// Dekker handshake: either this tryLock observes K free and completes the
+/// waiters itself, or the releasing owner observes the flag. A deferral for an
+/// ineligible (kernel-mode) interruption keeps the flag for that same owner.
+pub fn completeDeviceIrqFdWaitersFromInterrupt(from_user: bool) void {
+    @atomicStore(bool, &irq_fd_completion_pending, true, .seq_cst);
+    completePendingIrqFdWaitersFromInterrupt(from_user);
+}
+
 /// IRQ publication itself is lock-free, but completing an FD wait mutates its
 /// generational wait group and must use the same KernelState lock as syscalls.
-/// Interrupt context must never spin on a lock held by the interrupted CPU;
-/// the BSP timer retries any publication that loses this try-lock race.
+/// Interrupt context must never spin on a lock held by the interrupted CPU.
+/// A device IRQ that loses this try-lock race is completed by the K owner at
+/// its release; the BSP timer retries it only as the fallback for owners that
+/// release K without that handoff.
 pub fn completePendingIrqFdWaitersFromInterrupt(from_user: bool) void {
     if (!interruptCanCompleteUserWait(from_user)) return;
     if (!syscall_hooks_ready) return;
@@ -297,22 +366,63 @@ pub fn completePendingIrqFdWaitersFromInterrupt(from_user: bool) void {
     const h = getHooks();
     if (!h.kernel_state_ready.*) return;
     if (!kernel_state_lock.tryLock()) return;
-    defer kernel_state_lock.unlock();
 
     native_ipc_syscalls.drainCancellations(h, h.state);
     completePendingIrqFdWaitersLocked(h);
+    kernel_state_lock.unlock();
+    // This context passed the copyout checks above, so it can also take over
+    // a device IRQ that lost tryLock to this hold.
+    handOffIrqFdWaitersAfterRelease();
+}
+
+/// Under K at a generic syscall release: complete IRQ FD waiters whose device
+/// IRQ lost tryLock to this hold, before the release instead of after it.
+/// Called after the handler's defers dropped inner AS/shared-VM transactions,
+/// where foreign copyout is already used by persistent and data-return drains.
+fn completeDeferredIrqFdWaitersLocked(h: *const Hooks) void {
+    if (@atomicLoad(bool, &irq_fd_completion_pending, .monotonic))
+        completePendingIrqFdWaitersLocked(h);
+}
+
+/// After a K release in a context where the K-holding completion is legal
+/// (generic syscall release, or an IRQ that passed the copyout checks): pick
+/// up a device IRQ that lost tryLock during the hold just released. If K was
+/// taken again meanwhile, that owner inherits the work at its own release.
+/// Releases that skip this check fall back to the next checked release or the
+/// BSP tick: the scalar IPC fast paths (their callees are scalar-gated) and
+/// the blocking-leave release, which can run inside a handler that still holds
+/// its VM transaction and therefore must not start a foreign copyout.
+fn handOffIrqFdWaitersAfterRelease() void {
+    if (!syscall_hooks_ready or !getHooks().kernel_state_ready.*) return;
+    while (true) {
+        // x86 may reorder the plain release store of K with this later load;
+        // without the fence both sides could miss each other (see above).
+        asm volatile ("mfence" ::: .{ .memory = true });
+        if (!@atomicLoad(bool, &irq_fd_completion_pending, .monotonic)) return;
+        if (user_copy.tlbShootdownActiveOnCurrentCpu()) return;
+        if (!kernel_state_lock.tryLock()) return;
+        const h = getHooks();
+        native_ipc_syscalls.drainCancellations(h, h.state);
+        completePendingIrqFdWaitersLocked(h);
+        kernel_state_lock.unlock();
+    }
 }
 
 // Keep the seed batch out of the admission frame: rejected/nested IRQs
 // must not reserve it. The caller retains K through collection and publication,
 // so persistent group links preserve the whole ready set across copy batches.
 noinline fn completePendingIrqFdWaitersLocked(h: *const Hooks) void {
+    // Clear before scanning. Acquire on a set flag synchronizes with the IRQ
+    // that published its counts before setting it, so this scan sees them; an
+    // IRQ ordered after this exchange leaves the flag set for a later pass.
+    _ = @atomicRmw(bool, &irq_fd_completion_pending, .Xchg, false, .acquire);
     var targets: [32]kernel.ThreadWakeTarget = undefined;
     while (true) {
         const count = h.state.takeReadyIrqWaiters(targets[0..]);
         if (count == 0) break;
         _ = fd_syscalls.wakeThreadTargets(h, h.state, targets[0..count]);
     }
+    fd_syscalls.completePersistentWaiters(h, h.state);
 }
 
 pub fn completePendingTimerFdWaitersFromInterrupt(now_ns: u64, from_user: bool) void {
@@ -343,6 +453,7 @@ noinline fn completePendingTimerFdWaitersLocked(h: *const Hooks, now_ns: u64) vo
         if (count == 0) break;
         _ = fd_syscalls.wakeThreadTargets(h, h.state, targets[0..count]);
     }
+    fd_syscalls.completePersistentWaiters(h, h.state);
 }
 
 // Traps cannot hold the private KernelState lock. Keep expiry consumption,
@@ -394,15 +505,14 @@ fn lifecycleAdmissionRejectedResult(nr: u64) u64 {
     // performed no I/O, so +NOT_READY would falsely report two bytes written
     // (or read) while a remote STOP owns the process lifecycle gate.
     return switch (nr) {
-        sc.syscall_fd_read, sc.syscall_fd_write, sc.syscall_fd_readv, sc.syscall_fd_writev, sc.syscall_getrandom => 0 -% sc.syscall_err_not_ready,
+        sc.syscall_fd_read, sc.syscall_fd_write, sc.syscall_fd_readv, sc.syscall_fd_writev, sc.syscall_getrandom, sc.syscall_futex_wake_op => 0 -% sc.syscall_err_not_ready,
         else => sc.syscall_err_not_ready,
     };
 }
 
 fn copyFaultResult(nr: u64) u64 {
     return switch (nr) {
-        sc.syscall_fd_read, sc.syscall_fd_write, sc.syscall_fd_readv,
-        sc.syscall_fd_writev, sc.syscall_getrandom => 0 -% sc.syscall_err_map,
+        sc.syscall_fd_read, sc.syscall_fd_write, sc.syscall_fd_readv, sc.syscall_fd_writev, sc.syscall_getrandom, sc.syscall_futex_wake_op => 0 -% sc.syscall_err_map,
         else => sc.syscall_err_map,
     };
 }
@@ -428,6 +538,22 @@ fn preflightUserBuffers(h: anytype, proc: kernel.PrincipalId, frame: *TrapFrame,
     // timer or IPC state changes. Pager pages stay resident after supply;
     // a later failed copy can therefore only follow a concurrent VMA change.
     switch (nr) {
+        sc.syscall_madvise => {
+            const vm = abi.vm_abi;
+            if (frame.rdx != vm.madvise_populate_read and frame.rdx != vm.madvise_populate_write) return null;
+            if ((frame.rdi & 4095) != 0 or frame.rsi > std.math.maxInt(u64) - 4095)
+                return sc.syscall_err_invalid;
+            const length = (frame.rsi + 4095) & ~@as(u64, 4095);
+            if (frame.rdi > std.math.maxInt(u64) - length) return sc.syscall_err_invalid;
+            if (length == 0) return null;
+            // Populating is a guarantee, not an optional hint. Resolve before
+            // K/VM transactions, using the same pager-absent retry as copyin.
+            // A supplied VMO/COW page remains resident through its live refs,
+            // including PROT_NONE. A future evictor must preserve this contract
+            // or provide residency ownership before reclaiming these pages.
+            if (h.probe_user_range == null) return sc.syscall_err_not_ready;
+            return probeBuffer(h, proc, frame, frame.rdi, length, frame.rdx == vm.madvise_populate_write);
+        },
         sc.syscall_log => return probeBuffer(h, proc, frame, frame.rdi, @min(frame.rsi, sc.user_log_max_bytes), false),
         sc.syscall_kernel_log_read => return probeBuffer(h, proc, frame, frame.rdi, @sizeOf(kernel_log_abi.Read), true),
         sc.syscall_system_info => return probeBuffer(h, proc, frame, frame.rdi, abi.runtime_abi.system_info_size, true),
@@ -435,6 +561,12 @@ fn preflightUserBuffers(h: anytype, proc: kernel.PrincipalId, frame: *TrapFrame,
         sc.syscall_nanosleep => return probeBuffer(h, proc, frame, frame.rdi, abi.runtime_abi.timespec_size, false),
         sc.syscall_futex_wait => return probeBuffer(h, proc, frame, frame.rdi, 4, false),
         sc.syscall_futex_wake_wait => return probeBuffer(h, proc, frame, frame.rsi, 4, false),
+        sc.syscall_futex_wake_op => {
+            if (frame.rdi == 0 or (frame.rdi & 3) != 0 or frame.rsi == 0 or (frame.rsi & 3) != 0)
+                return 0 -% sc.syscall_err_invalid;
+            if (probeBuffer(h, proc, frame, frame.r8, @sizeOf(abi.runtime_abi.FutexWakeOp), false)) |status| return status;
+            return probeBuffer(h, proc, frame, frame.rsi, 4, true);
+        },
         sc.syscall_getrandom => return probeBuffer(h, proc, frame, frame.rdi, frame.rsi, true),
         sc.syscall_fd_table => return probeBuffer(h, proc, frame, frame.rsi, preflight_fd_abi.fd_table_info_size, true),
         sc.syscall_fd_get_info => return probeBuffer(h, proc, frame, frame.rsi, preflight_fd_abi.fd_info_size, true),
@@ -491,22 +623,25 @@ fn preflightUserBuffers(h: anytype, proc: kernel.PrincipalId, frame: *TrapFrame,
         },
         sc.syscall_process_signal_ctl => {
             return switch (frame.rdi) {
-                abi.process_abi.signal_ctl_return =>
-                    probeBuffer(h, proc, frame, frame.rsi, abi.process_abi.signal_frame_size, false),
+                abi.process_abi.signal_ctl_register => probeBuffer(h, proc, frame, frame.rsi, @sizeOf(abi.process_abi.SignalRegistration), false),
+                abi.process_abi.signal_ctl_return => probeBuffer(h, proc, frame, frame.rsi, abi.process_abi.signal_frame_size, false),
                 abi.process_abi.signal_ctl_deliver_pending_frame => blk: {
                     if (probeBuffer(h, proc, frame, frame.rsi, abi.process_abi.process_clone_user_frame_size, false)) |status| break :blk status;
                     if (!h.copy_user_bytes_from_va(proc, frame.rsi, std.mem.asBytes(signal_frame))) break :blk copyFaultResult(nr);
-                    const stack_cost = abi.process_abi.signal_red_zone_size + abi.process_abi.signal_frame_size + abi.process_abi.signal_runtime_stack_size;
-                    if (signal_frame.rsp <= stack_cost) break :blk sc.syscall_err_invalid;
-                    const target = (signal_frame.rsp - abi.process_abi.signal_red_zone_size - abi.process_abi.signal_frame_size) & ~@as(u64, 63);
-                    break :blk probeBuffer(h, proc, frame, target, abi.process_abi.signal_frame_size, true);
+                    const stack = scheduler.currentSignalStack() orelse break :blk null;
+                    if (@import("signal_stack.zig").contains(stack.base, stack.size, frame.rsp))
+                        break :blk sc.syscall_err_invalid;
+                    const destination = @import("signal_stack.zig").layout(stack.base, stack.size, signal_frame.rsp) orelse break :blk sc.syscall_err_invalid;
+                    break :blk probeBuffer(h, proc, frame, destination.frame_va, abi.process_abi.signal_frame_size, true);
                 },
-                abi.process_abi.signal_ctl_get_timer =>
-                    probeBuffer(h, proc, frame, frame.rsi, abi.process_abi.signal_timer_state_size, true),
-                abi.process_abi.signal_ctl_set_timer => if (frame.r8 == 0) null else
-                    probeBuffer(h, proc, frame, frame.r8, abi.process_abi.signal_timer_state_size, true),
+                abi.process_abi.signal_ctl_get_timer => probeBuffer(h, proc, frame, frame.rsi, abi.process_abi.signal_timer_state_size, true),
+                abi.process_abi.signal_ctl_set_timer => if (frame.r8 == 0) null else probeBuffer(h, proc, frame, frame.r8, abi.process_abi.signal_timer_state_size, true),
                 else => null,
             };
+        },
+        sc.syscall_vmo_collect_dirty => {
+            if (frame.rdx > (kernel.max_vmo_logical_pages + 63) / 64) return sc.syscall_err_invalid;
+            return probeBuffer(h, proc, frame, frame.rsi, frame.rdx * 8, true);
         },
         sc.syscall_vmo_create_page_view, sc.syscall_vmo_refresh_page_view => {
             // The index list is read into unpublished metadata before any
@@ -518,8 +653,7 @@ fn preflightUserBuffers(h: anytype, proc: kernel.PrincipalId, frame: *TrapFrame,
         },
         sc.syscall_pager_supply => return probeBuffer(h, proc, frame, frame.rsi, @sizeOf(abi.pager_abi.Supply), false),
         sc.syscall_ipc_channel_create => return probeBuffer(h, proc, frame, frame.rdi, 16, true),
-        sc.syscall_ipc_send, sc.syscall_ipc_recv, sc.syscall_ipc_call,
-        sc.syscall_ipc_reply, sc.syscall_ipc_reply_recv, sc.syscall_ipc_recv_wait => {
+        sc.syscall_ipc_send, sc.syscall_ipc_recv, sc.syscall_ipc_call, sc.syscall_ipc_reply, sc.syscall_ipc_reply_recv, sc.syscall_ipc_recv_wait => {
             const send_count = abi.ipc_abi.sendCount(frame);
             const recv_count = abi.ipc_abi.receiveCapacity(frame);
             if (send_count > abi.ipc_abi.max_transfer_fds or recv_count > abi.ipc_abi.max_transfer_fds)
@@ -530,10 +664,8 @@ fn preflightUserBuffers(h: anytype, proc: kernel.PrincipalId, frame: *TrapFrame,
         sc.syscall_capsule_query => return probeBuffer(h, proc, frame, frame.rsi, abi.capsule_abi.snapshot_word_count * 8, true),
         sc.syscall_capsule_irq_route => return probeBuffer(h, proc, frame, frame.rsi, abi.capsule_abi.irq_route_word_count * 8, true),
         sc.syscall_capsule_irq_poll => return probeBuffer(h, proc, frame, frame.rdx, 8, true),
-        sc.syscall_capsule_pci_enumerate => return probeBuffer(h, proc, frame, frame.rsi,
-            if (frame.rdi == std.math.maxInt(u64)) 8 else abi.capsule_abi.pci_function_word_count * 8, true),
-        sc.syscall_capsule_pci_config_read, sc.syscall_capsule_pci_config_write =>
-            return probeBuffer(h, proc, frame, frame.rdx, @min(frame.r10, 4), nr == sc.syscall_capsule_pci_config_read),
+        sc.syscall_capsule_pci_enumerate => return probeBuffer(h, proc, frame, frame.rsi, if (frame.rdi == std.math.maxInt(u64)) 8 else abi.capsule_abi.pci_function_word_count * 8, true),
+        sc.syscall_capsule_pci_config_read, sc.syscall_capsule_pci_config_write => return probeBuffer(h, proc, frame, frame.rdx, @min(frame.r10, 4), nr == sc.syscall_capsule_pci_config_read),
         sc.syscall_capsule_pci_bar_info => return probeBuffer(h, proc, frame, frame.rdx, abi.capsule_abi.bar_info_word_count * 8, true),
         sc.syscall_capsule_derive_dma_mapping_pages => {
             const layout = abi.capsule_abi.dmaMappingPagesLayout(frame.rsi, frame.rdx) orelse return sc.syscall_err_invalid;
@@ -613,9 +745,58 @@ test "iovec preflight captures one immutable descriptor before transfer" {
     try std.testing.expectEqual(@as(u64, 8192), iovecs.words[1]);
 }
 
+test "pager preflight populate validates access and preserves retry address" {
+    const Mock = struct {
+        var writes: bool = false;
+        var calls: usize = 0;
+        var outcome: user_copy.ProbeResult = .resident;
+        fn probe(_: kernel.PrincipalId, va: u64, len: usize, write: bool) user_copy.ProbeResult {
+            std.debug.assert(va == 0x1000 and len == 8192);
+            calls += 1;
+            writes = write;
+            return outcome;
+        }
+        fn copy(_: kernel.PrincipalId, _: u64, _: []u8) bool {
+            unreachable;
+        }
+    };
+    const Probe = *const fn (kernel.PrincipalId, u64, usize, bool) user_copy.ProbeResult;
+    const h = .{ .probe_user_range = @as(?Probe, Mock.probe), .copy_user_bytes_from_va = Mock.copy };
+    const missing = .{ .probe_user_range = @as(?Probe, null), .copy_user_bytes_from_va = Mock.copy };
+    var iovecs = IovecSnapshot{};
+    var signal_frame: process_syscalls.ProcessCloneUserFrame = undefined;
+    var frame = std.mem.zeroes(TrapFrame);
+    frame.rax = sc.syscall_madvise;
+    frame.rdi = 0x1000;
+    frame.rsi = 4097;
+    const vm = @import("kernel_abi_root").vm_abi;
+    Mock.calls = 0;
+    Mock.outcome = .resident;
+    for ([_]u64{ vm.madvise_populate_read, vm.madvise_populate_write }) |advice| {
+        frame.rdx = advice;
+        try std.testing.expect(preflightUserBuffers(&h, @enumFromInt(1), &frame, &iovecs, &signal_frame) == null);
+        try std.testing.expectEqual(advice == vm.madvise_populate_write, Mock.writes);
+    }
+    Mock.outcome = .{ .backing_absent = 0x2000 };
+    try std.testing.expectEqual(sc.syscall_err_pager_absent, preflightUserBuffers(&h, @enumFromInt(1), &frame, &iovecs, &signal_frame).?);
+    try std.testing.expectEqual(@as(u64, 0x2000), frame.rdx);
+    frame.rdx = vm.madvise_populate_write;
+    try std.testing.expectEqual(sc.syscall_err_not_ready, preflightUserBuffers(&missing, @enumFromInt(1), &frame, &iovecs, &signal_frame).?);
+    const calls = Mock.calls;
+    frame.rdi += 1;
+    try std.testing.expectEqual(sc.syscall_err_invalid, preflightUserBuffers(&h, @enumFromInt(1), &frame, &iovecs, &signal_frame).?);
+    frame.rdi = 0x1000;
+    frame.rsi = std.math.maxInt(u64);
+    try std.testing.expectEqual(sc.syscall_err_invalid, preflightUserBuffers(&h, @enumFromInt(1), &frame, &iovecs, &signal_frame).?);
+    frame.rdi = std.math.maxInt(u64) & ~@as(u64, 4095);
+    frame.rsi = 8192;
+    try std.testing.expectEqual(sc.syscall_err_invalid, preflightUserBuffers(&h, @enumFromInt(1), &frame, &iovecs, &signal_frame).?);
+    try std.testing.expectEqual(calls, Mock.calls);
+}
+
 test "lifecycle admission does not report byte progress for a rejected syscall" {
     const not_ready: u64 = 0 -% sc.syscall_err_not_ready;
-    for ([_]u64{ sc.syscall_fd_read, sc.syscall_fd_write, sc.syscall_fd_readv, sc.syscall_fd_writev, sc.syscall_getrandom }) |nr| {
+    for ([_]u64{ sc.syscall_fd_read, sc.syscall_fd_write, sc.syscall_fd_readv, sc.syscall_fd_writev, sc.syscall_getrandom, sc.syscall_futex_wake_op }) |nr| {
         try std.testing.expectEqual(not_ready, lifecycleAdmissionRejectedResult(nr));
     }
     for ([_]u64{ sc.syscall_process_signal_ctl, sc.syscall_fd_close, sc.syscall_ipc_notify, sc.syscall_futex_wait }) |nr| {
@@ -664,6 +845,7 @@ fn dispatchCompactSyscallBody(frame: *TrapFrame) u64 {
     if (frame.rax == sc.syscall_futex_wake_wait) frame.rdx = std.math.maxInt(u64);
     const base_hooks = getHooks();
     if (!base_hooks.kernel_state_ready.*) return sc.syscall_err_not_ready;
+    if (comptime lock_profile.enabled) runtime_nr_profile.record(frame.rax);
     if (frame.rax == sc.syscall_clock_read) {
         // Scalar time reads touch no capability, user mapping or KernelState
         // object. Keep the live CPU reference and ordinary signal/user return;
@@ -695,7 +877,15 @@ fn dispatchCompactSyscallBody(frame: *TrapFrame) u64 {
     // syscall number in and the result out, so by the time a thread is placed
     // again the number is gone.  rdi is kept alongside because it is the fd or
     // futex address the spin is going around.
-    const hold_kernel_state_lock = syscall_lock_policy.needsKernelStateLock(frame.rax);
+    // A published clock source cannot be withdrawn during this syscall.
+    // Clock copyout uses the address-space/shared-VM transaction used by
+    // preflight and by the existing K-free nanosleep copy; neither path adds
+    // K-only retirement work. An unready source retains K for CMOS/tick use.
+    const hold_kernel_state_lock = syscall_lock_policy.needsKernelStateLock(frame.rax) and
+        !(frame.rax == sc.syscall_clock_gettime and runtime_syscalls.clockGettimeMaySkipK(frame.rdi));
+    if (comptime lock_profile.enabled) {
+        if (hold_kernel_state_lock) runtime_nr_profile.recordLocked(frame.rax);
+    }
     var lock_held = false;
     var lock_drop_context = KernelStateLockDropContext{ .lock_held = &lock_held };
     if (lock_profile.enabled) lock_drop_context.kind = profile_kind;
@@ -706,7 +896,9 @@ fn dispatchCompactSyscallBody(frame: *TrapFrame) u64 {
     hooks.iovec_snapshot = if (iovec_snapshot.count != 0) &iovec_snapshot else null;
     hooks.pending_signal_frame_snapshot = if (frame.rax == sc.syscall_process_signal_ctl and
         frame.rdi == @import("kernel_abi_root").process_abi.signal_ctl_deliver_pending_frame)
-        &pending_signal_frame_snapshot else null;
+        &pending_signal_frame_snapshot
+    else
+        null;
     hooks.before_current_thread_leave = if (hold_kernel_state_lock)
         scheduler.BeforeCurrentThreadLeaveCallback{
             .context = &lock_drop_context,
@@ -746,20 +938,59 @@ fn dispatchCompactSyscallBody(frame: *TrapFrame) u64 {
         defer b3.end(508, trace_retire);
         if (lock_held) {
             const retire_sample = if (comptime lock_profile.enabled) lock_profile.stageBegin() else {};
-            @import("memory/user_vm.zig").retryRetiredAddressSpaces();
-            state.retryInvocationStorage();
-            state.retryReferenceStorage();
-            native_ipc_syscalls.drainCancellations(h, state);
-            capsule_syscalls.drainDeviceMemoryRetirements(state);
-            ram_cache_syscalls.drain(state, h.free_list);
-            if (state.hasPendingDataReturns()) {
-                // Never acquire all-AS while a syscall's inner AS/shared
-                // transaction is held. Handler defers have run before this
-                // outer drain, and KernelState still excludes VMO finalizers.
-                @import("memory/user_vm.zig").lockAllVmTransactions();
-                state.drainPendingDataReturns();
-                @import("memory/user_vm.zig").unlockAllVmTransactions();
+            {
+                const sample = if (comptime lock_profile.enabled) lock_profile.stageBegin() else {};
+                @import("memory/user_vm.zig").retryRetiredAddressSpaces();
+                if (comptime lock_profile.enabled) lock_profile.stageEnd(.retire_address_spaces, sample);
             }
+            {
+                const sample = if (comptime lock_profile.enabled) lock_profile.stageBegin() else {};
+                state.retryInvocationStorage();
+                if (comptime lock_profile.enabled) lock_profile.stageEnd(.retire_invocation_storage, sample);
+            }
+            {
+                const sample = if (comptime lock_profile.enabled) lock_profile.stageBegin() else {};
+                state.retryReferenceStorage();
+                if (comptime lock_profile.enabled) lock_profile.stageEnd(.retire_reference_storage, sample);
+            }
+            {
+                const sample = if (comptime lock_profile.enabled) lock_profile.stageBegin() else {};
+                native_ipc_syscalls.drainCancellations(h, state);
+                if (comptime lock_profile.enabled) lock_profile.stageEnd(.retire_cancellations, sample);
+            }
+            {
+                const sample = if (comptime lock_profile.enabled) lock_profile.stageBegin() else {};
+                capsule_syscalls.drainDeviceMemoryRetirements(state);
+                if (comptime lock_profile.enabled) lock_profile.stageEnd(.retire_device_memory, sample);
+            }
+            {
+                const sample = if (comptime lock_profile.enabled) lock_profile.stageBegin() else {};
+                ram_cache_syscalls.drain(state, h.free_list);
+                if (comptime lock_profile.enabled) lock_profile.stageEnd(.retire_ram_cache, sample);
+            }
+            // A device IRQ that lost tryLock to this hold completes here,
+            // ahead of the persistent drain that delivers retained sets.
+            completeDeferredIrqFdWaitersLocked(h);
+            // E guards have ended. Complete retained native subscriptions
+            // under K before publishing any user return or releasing storage.
+            {
+                const sample = if (comptime lock_profile.enabled) lock_profile.stageBegin() else {};
+                fd_syscalls.completePersistentWaiters(h, state);
+                if (comptime lock_profile.enabled) lock_profile.stageEnd(.retire_persistent_waiters, sample);
+            }
+            {
+                const sample = if (comptime lock_profile.enabled) lock_profile.stageBegin() else {};
+                if (state.hasPendingDataReturns()) {
+                    // Never acquire all-AS while a syscall's inner AS/shared
+                    // transaction is held. Handler defers have run before this
+                    // outer drain, and KernelState still excludes VMO finalizers.
+                    @import("memory/user_vm.zig").lockAllVmTransactions();
+                    state.drainPendingDataReturns();
+                    @import("memory/user_vm.zig").unlockAllVmTransactions();
+                }
+                if (comptime lock_profile.enabled) lock_profile.stageEnd(.retire_pending_returns, sample);
+            }
+            const audit_sample = if (comptime lock_profile.enabled) lock_profile.stageBegin() else {};
             if (comptime @import("state/reference_check.zig").enabled) {
                 reference_audit_calls +%= 1;
                 if (reference_audit_calls % 1024 == 0 or frame.rax == sc.syscall_vmo_revoke) {
@@ -774,8 +1005,10 @@ fn dispatchCompactSyscallBody(frame: *TrapFrame) u64 {
                     if (std.math.isPowerOfTwo(reference_audit_count)) @import("kernel_log.zig").writeFmt("reference-check comparisons={} mismatches=0\n", .{reference_audit_count});
                 }
             }
+            if (comptime lock_profile.enabled) lock_profile.stageEnd(.retire_reference_audit, audit_sample);
             if (comptime lock_profile.enabled) lock_profile.stageEnd(.retire, retire_sample);
             kernel_state_lock.unlock();
+            handOffIrqFdWaitersAfterRelease();
         }
         perf.runtimeElapsed(runtime_path, .unlock_cycles, runtime_unlock_start);
     }
@@ -1225,7 +1458,12 @@ const InterruptWaiterTest = struct {
         if (timer) completePendingTimerFdWaitersFromInterrupt(100, from_user) else completePendingIrqFdWaitersFromInterrupt(from_user);
     }
 
-    fn run(timer: bool, kernel_interruption: bool, resume_idle: bool) !void {
+    /// Who completes the waiter once the deferral checks have run: an eligible
+    /// interrupt, or (IRQ FDs only) the K owner whose hold made a device IRQ
+    /// lose tryLock, either before its release or right after it.
+    const Completion = enum { interrupt, owner_drain, release_handoff };
+
+    fn run(timer: bool, kernel_interruption: bool, resume_idle: bool, completion: Completion) !void {
         comptime std.debug.assert(@import("builtin").is_test);
         scheduler.initializeStaticStorage();
         defer scheduler.initializeStaticStorage();
@@ -1258,7 +1496,7 @@ const InterruptWaiterTest = struct {
         syscall_hooks_storage.write_user_u64 = copy;
         syscall_hooks_ready = true;
         const rights = kernel.FdRights{ .poll = true, .read = true, .irq_wait = true, .close = true };
-        const fd = if (timer) try state.createTimerFd(owner, 100, 0, .{}, rights, 16) else try state.createIrqFd(owner, .{ .device = 0x1001, .kind = .msix, .vector = 1 }, rights, .{}, 16);
+        const fd = if (timer) try state.createTimerFd(owner, 100, 0, .{}, rights, 16) else try state.createIrqFd(owner, .{ .source = .{ .pci = 0x1001 }, .kind = .msix, .vector = 1 }, rights, .{}, 16);
         const group = try state.beginFdWaitGroup(owner, tid, generation, token);
         state.fd_wait_groups.get(group.index).?.pollfds_va = poll_address;
         try std.testing.expect(try state.registerTaskReadableWaiterForFd(owner, fd, fd_abi.event_readable, poll_address, tid, generation, token, group));
@@ -1297,7 +1535,28 @@ const InterruptWaiterTest = struct {
         try std.testing.expectEqual(@as(usize, 0), copies);
         scheduler.testSetCurrentCpuLockFreeIdleWait(resume_idle);
         defer scheduler.testSetCurrentCpuLockFreeIdleWait(false);
-        complete(timer, !resume_idle);
+        switch (completion) {
+            .interrupt => complete(timer, !resume_idle),
+            .owner_drain, .release_handoff => {
+                std.debug.assert(!timer);
+                // An eligible device IRQ that loses tryLock to a K owner.
+                try std.testing.expect(kernel_state_lock.tryLock());
+                completeDeviceIrqFdWaitersFromInterrupt(true);
+                try std.testing.expectEqual(@as(usize, 1), registered(state));
+                if (completion == .owner_drain) {
+                    completeDeferredIrqFdWaitersLocked(getHooks());
+                    try std.testing.expectEqual(@as(usize, 0), registered(state));
+                    kernel_state_lock.unlock();
+                } else {
+                    // A release without the handoff (a fast path) leaves it
+                    // pending; only the checked release completes it.
+                    kernel_state_lock.unlock();
+                    try std.testing.expectEqual(@as(usize, 1), registered(state));
+                    handOffIrqFdWaitersAfterRelease();
+                }
+                try std.testing.expect(!irq_fd_completion_pending);
+            },
+        }
         try std.testing.expectEqual(@as(usize, 0), registered(state));
         try std.testing.expectEqual(@as(usize, 0), copies);
         try std.testing.expectEqual(@as(u64, 0), ctx.frame.r10);
@@ -1314,11 +1573,11 @@ const InterruptWaiterTest = struct {
 };
 
 test "shootdown interrupt guard preserves timer waiters until one completion" {
-    try InterruptWaiterTest.run(true, false, false);
+    try InterruptWaiterTest.run(true, false, false, .interrupt);
 }
 
 test "shootdown interrupt guard preserves IRQ waiters until one completion" {
-    try InterruptWaiterTest.run(false, false, false);
+    try InterruptWaiterTest.run(false, false, false, .interrupt);
 }
 
 test "shootdown interrupt guard process timer generation and contention" {
@@ -1404,19 +1663,27 @@ test "shootdown interrupt guard process timer generation and contention" {
 }
 
 test "shootdown interrupt guard kernel IRQ defers timer FD until user tick" {
-    try InterruptWaiterTest.run(true, true, false);
+    try InterruptWaiterTest.run(true, true, false, .interrupt);
 }
 
 test "shootdown interrupt guard kernel IRQ defers IRQ FD until user tick" {
-    try InterruptWaiterTest.run(false, true, false);
+    try InterruptWaiterTest.run(false, true, false, .interrupt);
 }
 
 test "shootdown interrupt guard kernel IRQ defers timer FD until idle tick" {
-    try InterruptWaiterTest.run(true, true, true);
+    try InterruptWaiterTest.run(true, true, true, .interrupt);
 }
 
 test "shootdown interrupt guard kernel IRQ defers IRQ FD until idle tick" {
-    try InterruptWaiterTest.run(false, true, true);
+    try InterruptWaiterTest.run(false, true, true, .interrupt);
+}
+
+test "device IRQ losing K is completed by that owner before its release" {
+    try InterruptWaiterTest.run(false, false, false, .owner_drain);
+}
+
+test "device IRQ losing K is completed by the owner's checked release" {
+    try InterruptWaiterTest.run(false, true, false, .release_handoff);
 }
 
 test "lock ordering K actual blocking and IRQ try failure success" {
@@ -1518,7 +1785,7 @@ const InterruptSnapshotTest = struct {
         seen = @splat(false);
         expected_events = fd_abi.event_readable;
         const rights = kernel.FdRights{ .poll = true, .read = true, .irq_wait = true, .close = true };
-        const fd = if (timer) try state.createTimerFd(F.owner, 100, 0, .{}, rights, 16) else try state.createIrqFd(F.owner, .{ .device = 0x1001, .kind = .msix, .vector = 1 }, rights, .{}, 16);
+        const fd = if (timer) try state.createTimerFd(F.owner, 100, 0, .{}, rights, 16) else try state.createIrqFd(F.owner, .{ .source = .{ .pci = 0x1001 }, .kind = .msix, .vector = 1 }, rights, .{}, 16);
         const group = try state.beginFdWaitGroup(F.owner, F.tid, F.generation, F.token);
         for (0..kernel.fd_table_entries) |index| {
             try std.testing.expect(try state.registerTaskReadableWaiterForFd(F.owner, fd, fd_abi.event_readable, F.poll_address + index * fd_abi.pollfd_size, F.tid, F.generation, F.token, group));

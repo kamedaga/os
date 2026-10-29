@@ -19,17 +19,75 @@ _Static_assert(INPUTD_INPUT_CAP_RELATIVE == NETD_INPUT_CAP_RELATIVE,
 _Static_assert(INPUTD_INPUT_CAP_ABSOLUTE == NETD_INPUT_CAP_ABSOLUTE,
     "input absolute capability ABI");
 
+struct inputd_uevent {
+    struct inputd_uevent *next;
+    uint64_t device;
+};
+
+int inputd_service_uevents_pending(const inputd_service_t *service)
+{
+    return service && service->uevent_head && !service->uevent_error;
+}
+
+void inputd_service_uevent_hangup(inputd_service_t *service)
+{
+    /* Keep unsent events, but do not poll a permanently failed endpoint in
+     * a level-triggered loop. Local namespace and input RPCs remain usable. */
+    if (service && !service->uevent_error) {
+        service->uevent_error = PACHA_ERR_CLOSED;
+        fprintf(stderr, "[inputd] netd notification endpoint closed; retaining queued events\n");
+    }
+}
+
+int inputd_service_flush_uevents(inputd_service_t *service)
+{
+    if (!service || !service->cfg) return -22;
+    if (service->uevent_error) return 0;
+    /* Bound work per service turn so hotplug traffic cannot starve evdev. */
+    for (unsigned budget = 0; budget < 32 && service->uevent_head; ++budget) {
+        struct inputd_uevent *event = service->uevent_head;
+        const struct pacha_ipc_msg request = {
+            .word0 = PACHA_SERVICE_REQUEST_MAGIC,
+            .word1 = NETD_OP_UEVENT_PUBLISH,
+            .word2 = event->device,
+            /* This existing operation is a notification when word3 is zero. */
+            .word3 = 0,
+        };
+        int status = pacha_ipc_send((pacha_fd_t)service->cfg->netd_endpoint_fd, &request);
+        if (status == PACHA_ERR_NOT_READY) return 0;
+        if (status) {
+            service->uevent_error = status;
+            fprintf(stderr, "[inputd] netd notification send failed status=%d; retaining queued events\n",
+                status);
+            return status;
+        }
+        service->uevent_head = event->next;
+        if (!service->uevent_head) service->uevent_tail = NULL;
+        free(event);
+    }
+    return 0;
+}
+
 static int publish_device(
     inputd_service_t *service,
     const struct inputd_public_device *input_device, uint8_t action)
 {
-    static uint64_t request_id;
     if (service == NULL || service->cfg == NULL || input_device == NULL ||
         input_device->event_index > UINT16_MAX ||
         input_device->capabilities > UINT8_MAX ||
         input_device->pci_segment > UINT16_MAX || input_device->pci_bus > UINT8_MAX ||
         input_device->pci_device > 31 || input_device->pci_function > 7)
         return -22;
+    if (service->cfg->netd_endpoint_fd != 0 && service->cfg->netd_endpoint_fd < 16)
+        return -22;
+    /* Reserve the notification before changing the namespace. Allocation
+     * failure is reported to the source, never acknowledged with a lost event.
+     * Do not coalesce: ADD/REMOVE order matters when event indices are reused. */
+    struct inputd_uevent *event = NULL;
+    if (service->cfg->netd_endpoint_fd) {
+        event = malloc(sizeof(*event));
+        if (!event) return -12;
+    }
     /* Publish the namespace before its uevent: Xorg may enumerate immediately
      * on ADD, including on a live system without netd or a fixture rootfs. */
     int status;
@@ -42,6 +100,7 @@ static int publish_device(
             input_device, &snapshot);
     }
     if (status) {
+        free(event);
         fprintf(stderr, "[inputd] event%u namespace action=%u failed status=%d\n",
             input_device->event_index, action, status);
         return status;
@@ -49,7 +108,6 @@ static int publish_device(
     /* A RAM-only live session has no network service. Input publication to
      * clients still works; only netlink uevents are intentionally absent. */
     if (service->cfg->netd_endpoint_fd == 0) return 0;
-    if (service->cfg->netd_endpoint_fd < 16) return -22;
     const uint64_t device = netd_input_uevent_encode((netd_input_uevent_descriptor_t){
         .segment = (uint16_t)input_device->pci_segment,
         .bus = (uint8_t)input_device->pci_bus,
@@ -58,18 +116,13 @@ static int publish_device(
         .capabilities = (uint8_t)input_device->capabilities,
         .event_index = (uint16_t)input_device->event_index,
         .action = action,
+        .platform = input_device->source_kind == INPUTD_SOURCE_PLATFORM,
     });
-    const struct pacha_ipc_msg request = {
-        .word0 = PACHA_SERVICE_REQUEST_MAGIC,
-        .word1 = NETD_OP_UEVENT_PUBLISH,
-        .word2 = device,
-        .word3 = ++request_id,
-    };
-    struct pacha_ipc_msg reply = {0};
-    const int recv_status = pacha_ipc_call((pacha_fd_t)service->cfg->netd_endpoint_fd, &request, &reply, PACHA_FD_WAIT_FOREVER, NULL);
-    if (recv_status != 0) return recv_status;
-    if (reply.word0 != PACHA_SERVICE_REPLY_MAGIC || reply.word3 != request.word3) return -5;
-    return (int)(int64_t)reply.word1;
+    *event = (struct inputd_uevent){.device = device};
+    if (service->uevent_tail) service->uevent_tail->next = event;
+    else service->uevent_head = event;
+    service->uevent_tail = event;
+    return 0;
 }
 
 int inputd_service_publish_startup_devices(inputd_service_t *service)
@@ -88,6 +141,8 @@ int inputd_service_publish_startup_devices(inputd_service_t *service)
 
 struct source_state {
     uint64_t id, generation, next_sequence;
+    uint64_t platform_id;
+    uint32_t source_kind;
     int syncing;
 };
 
@@ -111,6 +166,11 @@ static int dispatch_source_page(inputd_service_t *service,
         page->magic != INPUTD_SOURCE_MAGIC || !page->source_id ||
         !page->generation || page->pci_device > 31 || page->pci_function > 7)
         return -22;
+    if ((page->source_kind != INPUTD_SOURCE_PCI && page->source_kind != INPUTD_SOURCE_PLATFORM) ||
+        (page->source_kind == INPUTD_SOURCE_PCI && page->platform_id) ||
+        (page->source_kind == INPUTD_SOURCE_PLATFORM && (!page->platform_id ||
+            page->pci_segment || page->pci_bus || page->pci_device || page->pci_function)))
+        return -22;
     struct source_state *state = find_source(service, page->source_id);
     if (page->kind == INPUTD_SOURCE_SYNC_BEGIN) {
         /* A repeated begin retries an interrupted sync; a newer generation
@@ -130,18 +190,22 @@ static int dispatch_source_page(inputd_service_t *service,
             page->source_id, page->generation, page->overwritten != 0);
         if (result) return result;
         state->generation = page->generation;
+        state->source_kind = page->source_kind;
+        state->platform_id = page->platform_id;
         state->next_sequence = page->sequence;
         state->syncing = 1;
         return 0;
     }
-    if (!state || page->generation != state->generation) return -116;
+    if (!state || page->generation != state->generation ||
+        page->source_kind != state->source_kind || page->platform_id != state->platform_id)
+        return -116;
     if (page->kind == INPUTD_SOURCE_DEVICE) {
         if (!state->syncing || page->count != 1) return -22;
         const struct kobox_linux_input_device_info *info =
             (const void *)page->payload;
         struct inputd_public_device published;
         int result = inputd_input_source_device(service->input,
-            page->source_id, page->generation, page->pci_segment,
+            page->source_id, page->generation, page->source_kind, page->platform_id, page->pci_segment,
             page->pci_bus, page->pci_device, page->pci_function, info,
             &published);
         if (result > 0)

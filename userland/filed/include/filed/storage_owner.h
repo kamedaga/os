@@ -17,6 +17,11 @@ int filed_storage_owner_cancel_shared(struct filed_storage_owner *);
 
 int filed_storage_owner_create(pacha_fd_t bootfs_fd, uint64_t bootfs_size,
     const storage_filed_bootstrap_t *bootstrap, struct filed_storage_owner **out);
+/* RAM owners seal the same filesystem service without any PCI resource.
+ * Archive bytes are immutable and borrowed until owner destruction. */
+struct ph_bootfs;
+int filed_storage_owner_create_ram(pacha_fd_t, uint64_t, uint64_t, struct filed_storage_owner **);
+const struct ph_bootfs *filed_storage_owner_archive(const struct filed_storage_owner *);
 int filed_storage_owner_start(struct filed_storage_owner *owner);
 /* Serialized control-plane calls. IDs are fresh even after detach; caller
  * retains transferred backing/endpoint inventory until a matching release

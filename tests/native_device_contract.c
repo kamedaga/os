@@ -406,8 +406,16 @@ int main(void)
         query(source).rights, 0, 0, 0) == DEVICE_FD);
     close_fd(source);
     CHECK(call(PACHA_PROCESS_SYSCALL_SIGNAL_CTL, PACHA_PROCESS_SIGNAL_CTL_REGISTER,
-        (uintptr_t)fault_entry, (uintptr_t)__start_native_handlers,
-        (uintptr_t)__stop_native_handlers, 0, 0) == 0);
+        (uintptr_t)&(struct pacha_signal_registration){
+            .entry = (uintptr_t)fault_entry,
+            .inhibit_start = (uintptr_t)__start_native_handlers,
+            .inhibit_end = (uintptr_t)__stop_native_handlers,
+            .inhibit_secondary_start = 0,
+            .inhibit_secondary_end = 0,
+            .scratch_base = 0,
+            .scratch_size = 0,
+            .flags = PACHA_SIGNAL_REGISTRATION_PROCESS_OWNER,
+        }, 0, 0, 0, 0) == 0);
     CHECK(call(PACHA_PROCESS_SYSCALL_SIGNAL_CTL, PACHA_PROCESS_SIGNAL_CTL_REGISTER_FAULT,
         (uintptr_t)fault_entry, (uintptr_t)fault_stack, sizeof(fault_stack), 0, 0) == 0);
     discover();

@@ -2,6 +2,7 @@
 #include "pacha/launch.h"
 #include "pacha/service_abi.h"
 #include "pacha/syscall.h"
+#include "pacha/log.h"
 #include "filed/payload.h"
 #include "filed/ipc_protocol.h"
 #include "filed_client/client.h"
@@ -20,8 +21,10 @@
 #include "termd/boot_config.h"
 #include "termd/ipc_protocol.h"
 #include "gpud/boot_config.h"
+#include "../../audiod/include/audiod/boot_config.h"
 #include "inputd/boot_config.h"
 #include "usbd/boot_config.h"
+#include "../../kobox2_adapter/platform_authority.h"
 #include "unixd/ipc_protocol.h"
 #include "../../installer/bootstrap.h"
 
@@ -29,6 +32,7 @@
 #define SEED0ROOT_DEFAULT_BOOT_PROFILE 0u
 #endif
 
+#include <fcntl.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -717,6 +721,33 @@ static int seed0root_read_filed_text(pacha_fd_t endpoint, const char *path,
     return error ? error : closed;
 }
 
+/* Boot failures must remain inspectable when no installer TTY was opened.
+ * Native stderr is serial-only; a RAM record also survives recovery to ash. */
+static int seed0root_write_filed_text(pacha_fd_t endpoint, const char *path,
+    const char *text)
+{
+    kb2_fs_request_t request = {.opcode=KB2_FILESYSTEM_OP_OPENAT2,
+        .flags=O_WRONLY|O_CREAT|O_TRUNC|O_CLOEXEC, .mode=0600};
+    kb2_fs_response_t response;
+    int status=filedfs_call(endpoint,&request,path,NULL,NULL,0,NULL,0,
+        &response,NULL,0,NULL,NULL);
+    if (!status && response.result<0) status=(int)response.result;
+    if (status) return status;
+    const uint64_t handle=response.handle;
+    const size_t length=strlen(text);
+    request=(kb2_fs_request_t){.opcode=KB2_FILESYSTEM_OP_PWRITE,
+        .handle=handle,.length=length};
+    status=filedfs_call(endpoint,&request,NULL,NULL,text,length,NULL,0,
+        &response,NULL,0,NULL,NULL);
+    if (!status && response.result!=(int64_t)length)
+        status=response.result<0 ? (int)response.result : -5;
+    request=(kb2_fs_request_t){.opcode=KB2_FILESYSTEM_OP_CLOSE,.handle=handle};
+    int closed=filedfs_call(endpoint,&request,NULL,NULL,NULL,0,NULL,0,
+        &response,NULL,0,NULL,NULL);
+    if (!closed && response.result<0) closed=(int)response.result;
+    return status ? status : closed;
+}
+
 static int seed0root_filed_sync_all(pacha_fd_t endpoint)
 {
     kb2_fs_request_t request = {.opcode = KB2_FILESYSTEM_OP_OPENAT2, .flags = 00200000};
@@ -814,8 +845,12 @@ static unsigned seed0root_boot_profile_flags(pacha_fd_t filed_endpoint_fd)
     return flags;
 }
 
+struct seed0root_live_ssh;
+static void seed0root_poll_live_ssh(void *context);
+
 static int seed0root_wait_process_with_console(pacha_fd_t process_fd, const char *label,
-    struct seed0root_wait_result *out_result, struct live_console *console)
+    struct seed0root_wait_result *out_result, struct live_console *console,
+    struct seed0root_live_ssh *live_ssh)
 {
     if (process_fd < 16) {
         return -1;
@@ -831,6 +866,7 @@ static int seed0root_wait_process_with_console(pacha_fd_t process_fd, const char
         /* The live console owns PTY draining and GOP presentation. A child
          * that writes progress cannot update the screen while this owner is
          * asleep waiting for its exit, even though termd accepts the bytes. */
+        if (live_ssh != NULL) seed0root_poll_live_ssh(live_ssh);
         if (console != NULL) {
             const int console_status = live_console_step(console);
             if (console_status != 0) return console_status;
@@ -893,7 +929,7 @@ static int seed0root_wait_process(pacha_fd_t process_fd, const char *label,
     struct seed0root_wait_result *out_result)
 {
     return seed0root_wait_process_with_console(process_fd, label,
-        out_result, NULL);
+        out_result, NULL, NULL);
 }
 
 static int seed0root_create_wire_page(uint64_t size, pacha_fd_t *out_fd, void **out_mapped)
@@ -2342,6 +2378,43 @@ struct seed0root_live_usb_ready {
     uint64_t net_fault_ip, net_fault_address;
 };
 
+static void seed0root_record_installer_boot(pacha_fd_t filed_fd,
+    const char *stage, int marker_status, int enabled, int status, uint64_t result,
+    const struct seed0root_live_usb_ready *devices)
+{
+    size_t pending=0, failed=0;
+    for (size_t i=0; i<devices->count; ++i) {
+        pending+=devices->fds[i]>=16;
+        failed+=devices->fds[i]==-2;
+    }
+    char text[512];
+    (void)snprintf(text,sizeof(text),
+        "stage=%s\nmarker_read_status=%d\ninstaller_enabled=%d\nstatus=%d\n"
+        "ui_result=%llu\nusb_controllers=%zu\nsource_count=%zu\n"
+        "pending=%zu\nfailed=%zu\n",
+        stage,marker_status,enabled,status,(unsigned long long)result,
+        devices->usb_count,devices->installer_count,pending,failed);
+    int logged=seed0root_write_filed_text(filed_fd,
+        "/run/pacha/installer-boot-status",text);
+    if (logged) fprintf(stderr,"[seed0root] installer boot status write failed=%d\n",logged);
+}
+
+static int seed0root_prepare_usb_ready(struct seed0root_live_usb_ready *ready,
+    size_t device_count)
+{
+    ready->net_fd = -1;
+    if (!device_count) return 0;
+    ready->fds = calloc(device_count, sizeof(*ready->fds));
+    ready->installer_sources = calloc(device_count, sizeof(*ready->installer_sources));
+    if (!ready->fds || !ready->installer_sources) {
+        free(ready->fds); free(ready->installer_sources);
+        ready->fds = NULL; ready->installer_sources = NULL;
+        return -12;
+    }
+    ready->capacity = device_count;
+    return 0;
+}
+
 static void seed0root_close_live_usb_ready(struct seed0root_live_usb_ready *ready)
 {
     if (ready == NULL) return;
@@ -2519,11 +2592,29 @@ static int seed0root_receive_root_handoff(
             const pacha_fd_t fd = (pacha_fd_t)fds[1 + record->transfer_index].fd;
             memset(&info, 0, sizeof(info));
             if (fd < 16 || pacha_fd_get_info(fd, &info) != 0 ||
-                info.kind != SEED0ROOT_FD_KIND_DEVICE ||
+                info.kind != (record->resource_kind == PACHA_ROOT_DEVICE_PLATFORM ?
+                    PACHA_FD_KIND_PLATFORM_DEVICE : SEED0ROOT_FD_KIND_DEVICE) ||
                 (info.rights & (PACHA_FD_RIGHT_INSPECT | PACHA_FD_RIGHT_CLOSE)) !=
                     (PACHA_FD_RIGHT_INSPECT | PACHA_FD_RIGHT_CLOSE)) {
                 status = -13;
                 goto fail_batch;
+            }
+        }
+        for (uint64_t i = 0; i < batch.device_count; i++) {
+            const struct pacha_root_device_record *record = &batch.devices[i];
+            const pacha_fd_t fd = (pacha_fd_t)fds[1 + record->transfer_index].fd;
+            struct pacha_capsule_info capsule;
+            if ((record->resource_kind != PACHA_ROOT_DEVICE_PCI &&
+                    record->resource_kind != PACHA_ROOT_DEVICE_PLATFORM) ||
+                pacha_capsule_query(fd, &capsule) || capsule.device != record->resource_id ||
+                (record->resource_kind == PACHA_ROOT_DEVICE_PLATFORM &&
+                    (capsule.kind != PACHA_CAPSULE_KIND_PLATFORM_DEVICE ||
+                     capsule.index != record->platform_kind || record->vendor_id ||
+                     record->device_id || record->subsystem_id || record->class_code ||
+                     record->pci_segment || record->pci_bus || record->pci_device || record->pci_function)) ||
+                (record->resource_kind == PACHA_ROOT_DEVICE_PCI &&
+                    (capsule.kind != PACHA_CAPSULE_KIND_DEVICE || record->platform_kind))) {
+                status = -13; goto fail_batch;
             }
         }
         if (batch.device_count > (SIZE_MAX / sizeof(*out->fds)) -
@@ -2592,12 +2683,20 @@ static int seed0root_find_root_device(
     return -1;
 }
 
-static int seed0root_find_root_ethernet(const struct seed0root_root_devices *devices)
+static int seed0root_find_root_network(const struct seed0root_root_devices *devices)
 {
     if (devices == NULL) return -1;
     for (uint64_t i = 0; i < devices->metadata.device_count; ++i)
         if ((devices->metadata.devices[i].class_code >> 8) == 0x0200)
             return (int)i;
+    /* The Wi-Fi closure is deliberately scoped to the validated AX210 PCI
+     * identity. Do not claim unrelated wireless devices at boot merely
+     * because their class is network-other. The driver remains userland. */
+    for (uint64_t i = 0; i < devices->metadata.device_count; ++i) {
+        const struct pacha_root_device_record *record = &devices->metadata.devices[i];
+        if (record->class_code == 0x028000 && record->vendor_id == 0x8086 &&
+            record->device_id == 0x2725) return (int)i;
+    }
     return -1;
 }
 
@@ -3060,6 +3159,40 @@ fail:
     return status;
 }
 
+/* Optional hardware: absence must not change ordinary desktop boot. Each
+ * audio sandbox receives only its enumerated PCI capability, not discovery
+ * rights or authority over another device. */
+static int seed0root_launch_audio(pacha_fd_t filed, struct seed0root_root_devices *devices)
+{
+    const int index = seed0root_find_root_device(devices, 0x1af4, 0x1059, 0x1059);
+    if (index < 0) return 0;
+    struct pacha_ipc_channel_pair ready = {.a = -1, .b = -1};
+    pacha_fd_t endpoint = pacha_ipc_endpoint_create(seed0root_channel_rights, 0);
+    if (endpoint < 16) return -12;
+    int status = pacha_ipc_channel_create(&ready, seed0root_channel_rights, 0);
+    if (status) { (void)pacha_fd_close(endpoint); return status; }
+    const struct audiod_boot_config config = {.magic = AUDIOD_BOOT_MAGIC,
+        .size = sizeof(config), .device_fd = SEED0ROOT_SERVICE_DEVICE_FD,
+        .filed_fd = 240, .endpoint_fd = SEED0ROOT_SERVICE_ENDPOINT_FD,
+        .ready_fd = SEED0ROOT_SERVICE_READY_FD};
+    const struct pacha_process_fd_grant grants[] = {
+        PACHA_LAUNCH_GRANT(devices->fds[index], SEED0ROOT_SERVICE_DEVICE_FD,
+            PACHA_LAUNCH_DEVICE_DRIVER | PACHA_FD_RIGHT_TRANSFER),
+        PACHA_LAUNCH_GRANT(endpoint, SEED0ROOT_SERVICE_ENDPOINT_FD, PACHA_LAUNCH_SERVER),
+        PACHA_LAUNCH_GRANT(ready.b, SEED0ROOT_SERVICE_READY_FD, PACHA_LAUNCH_SIGNAL),
+        PACHA_LAUNCH_GRANT(filed, 240, PACHA_LAUNCH_CLIENT),
+    };
+    status = seed0root_exec_native_service(filed, "/srv/audiod.elf",
+        &config, sizeof(config), grants, 4, 0x5eed2014u);
+    (void)pacha_fd_close(ready.b);
+    if (!status) status = seed0root_wait_service_ready(ready.a, AUDIOD_READY_MAGIC, "audiod");
+    else (void)pacha_fd_close(ready.a);
+    if (!status) status = seed0root_register_service_endpoint(filed,
+        FILED_SERVICE_AUDIOD_PCM, endpoint, 0x5eed2015u);
+    (void)pacha_fd_close(endpoint);
+    return status;
+}
+
 static int seed0root_launch_root_services(
     pacha_fd_t filed_endpoint_fd,
     struct seed0root_root_devices *devices,
@@ -3133,7 +3266,7 @@ static int seed0root_launch_root_services(
         *out_linux_clients |= FILED_EXEC_SERVICE_TERMD;
 
     {
-        const int net = seed0root_find_root_ethernet(devices);
+        const int net = seed0root_find_root_network(devices);
         if (net >= 0) {
         struct pacha_ipc_channel_pair net_ready = {.a = -1, .b = -1};
         if (live_mode) {
@@ -3274,7 +3407,7 @@ static int seed0root_launch_root_services(
         ready.b, SEED0ROOT_SERVICE_READY_FD, PACHA_LAUNCH_SIGNAL);
     if (netd_endpoint >= 16)
         input_grants[input_grant_count++] = (struct pacha_process_fd_grant)PACHA_LAUNCH_GRANT(
-            netd_endpoint, SEED0ROOT_SERVICE_NETD_FD, PACHA_LAUNCH_CLIENT);
+            netd_endpoint, SEED0ROOT_SERVICE_NETD_FD, PACHA_LAUNCH_SIGNAL);
     input_grants[input_grant_count++] = (struct pacha_process_fd_grant)PACHA_LAUNCH_GRANT(
         filed_endpoint_fd, 240, PACHA_LAUNCH_CLIENT);
     input_grants[input_grant_count++] = (struct pacha_process_fd_grant)PACHA_LAUNCH_GRANT(
@@ -3290,10 +3423,45 @@ static int seed0root_launch_root_services(
     { const pacha_fd_t ready_fd = ready.a; ready.a = -1;
       status = seed0root_wait_service_ready(ready_fd, INPUTD_BOOT_READY_MAGIC, "inputd"); }
     if (status != 0) goto out;
+    status = seed0root_launch_audio(filed_endpoint_fd, devices);
+    if (status != 0) goto out;
     if (out_linux_clients != NULL)
         *out_linux_clients |= FILED_EXEC_SERVICE_INPUTD;
     /* Inputd owns the evdev names before a USB controller can publish input.
      * Neither its startup nor USB enumeration depends on DRM readiness. */
+    for (uint64_t slot = 0; slot < devices->metadata.device_count; slot++) {
+        const struct pacha_root_device_record *record = &devices->metadata.devices[slot];
+        if (record->resource_kind != PACHA_ROOT_DEVICE_PLATFORM ||
+            record->platform_kind != PACHA_PLATFORM_DEVICE_I8042) continue;
+        if (pacha_ipc_channel_create(&ready, seed0root_channel_rights, 0)) {
+            status = -5; goto out;
+        }
+        const struct usbd_boot_config ps2_config = {
+            .magic = USBD_BOOT_CONFIG_MAGIC, .size = sizeof(ps2_config),
+            .device_fd = SEED0ROOT_SERVICE_DEVICE_FD, .filed_endpoint_fd = 240,
+            .ready_channel_fd = SEED0ROOT_SERVICE_READY_FD,
+            .input_source_endpoint_fd = SEED0ROOT_SERVICE_INPUT_SOURCE_FD,
+            .resource_id = record->resource_id, .kind = USBD_KIND_PS2,
+        };
+        const struct pacha_process_fd_grant grants[] = {
+            PACHA_LAUNCH_GRANT(devices->fds[slot], SEED0ROOT_SERVICE_DEVICE_FD,
+                PH_PLATFORM_CONTROLLER_RIGHTS | PACHA_FD_RIGHT_TRANSFER),
+            PACHA_LAUNCH_GRANT(ready.b, SEED0ROOT_SERVICE_READY_FD, PACHA_LAUNCH_SIGNAL),
+            PACHA_LAUNCH_GRANT(filed_endpoint_fd, 240, PACHA_LAUNCH_CLIENT),
+            PACHA_LAUNCH_GRANT(input_source_endpoint, SEED0ROOT_SERVICE_INPUT_SOURCE_FD,
+                PACHA_LAUNCH_CLIENT),
+        };
+        status = seed0root_exec_native_service(filed_endpoint_fd, "/srv/usbd.elf",
+            &ps2_config, sizeof(ps2_config), grants, sizeof(grants)/sizeof(grants[0]),
+            0x5eed6000u + slot);
+        (void)pacha_fd_close(ready.b); ready.b = -1;
+        if (status) goto out;
+        const pacha_fd_t ready_fd = ready.a; ready.a = -1;
+        status = seed0root_wait_service_ready(ready_fd, USBD_BOOT_READY_MAGIC, "ps2d");
+        if (status) goto out;
+        printf("[seed0root] PS/2 keyboard controller ready platform=%llu\n",
+            (unsigned long long)record->resource_id);
+    }
     for (uint64_t xhci = 0; xhci < devices->metadata.device_count; xhci++) {
         if (devices->metadata.devices[xhci].class_code != 0x0c0330)
             continue;
@@ -4125,10 +4293,12 @@ static int seed0root_spawn_lpr_services(pacha_fd_t filed_endpoint_fd,
             /* A base installation is valid without Ethernet.  Request only
              * endpoints that root-service startup actually registered;
              * filed deliberately rejects a missing capability with
-             * ENOTCONN instead of inventing a dummy network service. */
+             * ENOTCONN instead of inventing a dummy network service.
+             * Include an available DRM client for the local shell too;
+             * granting it only to SSH makes local Xorg unable to open card0. */
             selected.clients = available_clients &
                 (FILED_EXEC_SERVICE_NETD | FILED_EXEC_SERVICE_TERMD |
-                 FILED_EXEC_SERVICE_INPUTD);
+                 FILED_EXEC_SERVICE_INPUTD | FILED_EXEC_SERVICE_GPUD_DRM);
         }
         if (console_ctty != NULL && console_ctty[0] != '\0')
             selected.ctty = console_ctty;
@@ -4195,7 +4365,7 @@ static void seed0root_poll_live_ssh(void *context)
 static int seed0root_launch_installer_runner(
     pacha_fd_t filed_fd, pacha_fd_t supervisor_fd, const char *ctty,
     const struct pacha_installer_runner_plan *plan,
-    const struct pacha_ipc_fd ports[3], struct live_console *console)
+    const struct pacha_ipc_fd ports[3], struct live_console *console, struct seed0root_live_ssh *live_ssh)
 {
     if (!plan || plan->magic != PACHA_INSTALLER_MSG_PLAN ||
         plan->size != sizeof(*plan) || !ports ||
@@ -4268,15 +4438,17 @@ static int seed0root_launch_installer_runner(
     else if (state.token) seed0root_cancel_lpr_exec(supervisor_fd, state.token);
     if (bootstrap_fd >= 16) (void)pacha_fd_close(bootstrap_fd);
     if (!status) status = seed0root_wait_process_with_console(process_fd,
-        "installer filesystem runner", NULL, console);
+        "installer filesystem runner", NULL, console, live_ssh);
     if (process_fd >= 16) (void)pacha_fd_close(process_fd);
     return status;
 }
 
 static int seed0root_run_live_installer(pacha_fd_t filed_fd, pacha_fd_t supervisor_fd,
     pacha_fd_t termd_fd, const char *ctty, struct seed0root_live_usb_ready *devices,
-    struct live_console *console)
+    struct live_console *console, struct seed0root_live_ssh *live_ssh,
+    uint64_t *out_result)
 {
+    if (out_result) *out_result=0;
     if (filed_fd < 16 || supervisor_fd < 16 || termd_fd < 16 || !ctty ||
         !devices || !console || !devices->installer_count ||
         devices->installer_count > PACHA_INSTALLER_MAX_SOURCES)
@@ -4336,6 +4508,7 @@ static int seed0root_run_live_installer(pacha_fd_t filed_fd, pacha_fd_t supervis
     if (status) goto out;
 
     for (;;) {
+        if (live_ssh != NULL) seed0root_poll_live_ssh(live_ssh);
         status = live_console_step(console);
         if (status) break;
         struct pacha_pollfd events[2] = {
@@ -4355,7 +4528,10 @@ static int seed0root_run_live_installer(pacha_fd_t filed_fd, pacha_fd_t supervis
             if (!(events[0].revents & PACHA_FD_EVENT_READABLE) ||
                 pacha_ipc_recv(ready.a, &done) || done.fd_count ||
                 done.word0 != PACHA_INSTALLER_MSG_COMPLETE) status = -5;
-            else status = (int)(int64_t)done.word2;
+            else {
+                status = (int)(int64_t)done.word2;
+                if (out_result) *out_result=done.word1;
+            }
             break;
         }
         if (events[1].revents) {
@@ -4382,7 +4558,7 @@ static int seed0root_run_live_installer(pacha_fd_t filed_fd, pacha_fd_t supervis
                 if (!runner_status) memcpy(&plan, mapped, sizeof(plan));
             }
             if (!runner_status) runner_status = seed0root_launch_installer_runner(
-                filed_fd, supervisor_fd, ctty, &plan, &received[1], console);
+                filed_fd, supervisor_fd, ctty, &plan, &received[1], console, live_ssh);
             if (mapped) (void)pacha_munmap(mapped, 4096);
             for (uint32_t i = 0; i < request.fd_count; ++i)
                 if (received[i].fd >= 16)
@@ -4645,15 +4821,38 @@ static int launch_filed_with_path(const storage_seed0root_bootstrap_t *bootstrap
         seed0root_profile_has_token(installed_profile, "installed-base");
     printf("[seed0root] installed profile=%s\n",
         installed_base_mode ? "base" : "desktop");
+    const int physical_desktop_mode = installed_base_mode &&
+        seed0root_profile_has_token(installed_profile, "physical-desktop");
+    struct seed0root_live_usb_ready installed_ready = {.net_fd = -1};
+    pacha_fd_t installed_log_fd = -1;
+    pacha_fd_t installed_gpu_control = -1, installed_gpu_ready = -1;
+    if (physical_desktop_mode) {
+        status = seed0root_prepare_usb_ready(&installed_ready,
+            (size_t)root_devices.metadata.device_count);
+        if (status) { seed0root_close_root_devices(&root_devices); return status; }
+        const int logged = seed0root_start_logd(filed_client_fd, &installed_log_fd);
+        printf("[seed0root] installed desktop log status=%d\n", logged);
+    }
     const int installed_console_mode = installed_base_mode &&
         bootstrap->framebuffer_paddr != 0 && bootstrap->framebuffer_size != 0 &&
         bootstrap->framebuffer_width != 0 && bootstrap->framebuffer_height != 0 &&
         bootstrap->framebuffer_pitch >= bootstrap->framebuffer_width;
     uint64_t installed_linux_clients = 0;
     status = seed0root_launch_root_services(
-        filed_client_fd, &root_devices, &gpud_control_fd, 0, 0,
-        installed_base_mode, installed_console_mode, 0,
-        &termd_fd, &inputd_fd, NULL, &installed_linux_clients);
+        filed_client_fd, &root_devices, &gpud_control_fd, physical_desktop_mode, 0,
+        installed_base_mode, installed_console_mode, installed_log_fd,
+        &termd_fd, &inputd_fd, physical_desktop_mode ? &installed_ready : NULL,
+        &installed_linux_clients);
+    if (!status && physical_desktop_mode) {
+        const int gpu_status = seed0root_start_optional_gpu_probe(filed_client_fd,
+            &root_devices, installed_log_fd,
+            (installed_linux_clients & FILED_EXEC_SERVICE_NETD) != 0,
+            &installed_gpu_control, &installed_gpu_ready);
+        if (gpu_status)
+            printf("[seed0root] installed GPU inspection unavailable status=%d; console continues\n", gpu_status);
+        else if (installed_gpu_ready >= 16)
+            installed_linux_clients |= FILED_EXEC_SERVICE_GPUD_DRM;
+    }
     if (status == 0 && installed_console_mode) {
         const pacha_live_root_bootstrap_t console_boot = {
             .magic = PACHA_LIVE_ROOT_BOOTSTRAP_MAGIC,
@@ -4792,8 +4991,10 @@ static int launch_filed_with_path(const storage_seed0root_bootstrap_t *bootstrap
         fflush(stdout);
     }
 #endif
-    (void)pacha_fd_close(lpr_supervisor_endpoint_fd);
-    (void)pacha_fd_close(filed_client_fd);
+    if (!physical_desktop_mode || status != 0) {
+        (void)pacha_fd_close(lpr_supervisor_endpoint_fd);
+        (void)pacha_fd_close(filed_client_fd);
+    }
     if (status != 0) {
         live_console_destroy(console);
         if (termd_fd >= 16) (void)pacha_fd_close(termd_fd);
@@ -4808,7 +5009,41 @@ static int launch_filed_with_path(const storage_seed0root_bootstrap_t *bootstrap
             live_console_ctty(console));
         fflush(stdout);
         live_console_finish_boot(console);
-        status = live_console_run(console, NULL, NULL);
+        char authorized_key[256];
+        const int key_status = physical_desktop_mode ?
+            seed0root_read_filed_text(filed_client_fd, "/root/.ssh/authorized_keys",
+                authorized_key, sizeof(authorized_key)) : -1;
+        struct seed0root_live_ssh ssh = {
+            .devices = &installed_ready, .filed_fd = filed_client_fd,
+            .supervisor_fd = lpr_supervisor_endpoint_fd,
+            .gpu_client = installed_gpu_ready >= 16,
+            .input_client = inputd_fd >= 16,
+            .enabled = key_status == 0 &&
+                strncmp(authorized_key, "ssh-ed25519 ", 12) == 0,
+        };
+        struct seed0root_live_runtime runtime = {
+            .ssh = &ssh, .console = console,
+            .gpu_control_fd = installed_gpu_control,
+        };
+        status = live_console_run(console,
+            physical_desktop_mode ? seed0root_poll_live_runtime : NULL,
+            physical_desktop_mode ? &runtime : NULL);
+        if (physical_desktop_mode && installed_log_fd >= 16) {
+            char detail[96];
+            const int length = snprintf(detail, sizeof(detail),
+                "GPU owner console loop exited status=%d", status);
+            if (length > 0 && (size_t)length < sizeof(detail))
+                (void)pacha_log_emit(installed_log_fd, PACHA_LOG_SOURCE_GPUD,
+                    detail, (size_t)length);
+        }
+    }
+    if (physical_desktop_mode) {
+        seed0root_close_live_usb_ready(&installed_ready);
+        if (installed_gpu_control >= 16) (void)pacha_fd_close(installed_gpu_control);
+        if (installed_gpu_ready >= 16) (void)pacha_fd_close(installed_gpu_ready);
+        if (installed_log_fd >= 16) (void)pacha_fd_close(installed_log_fd);
+        (void)pacha_fd_close(lpr_supervisor_endpoint_fd);
+        (void)pacha_fd_close(filed_client_fd);
     }
     live_console_destroy(console);
     if (termd_fd >= 16) (void)pacha_fd_close(termd_fd);
@@ -4889,19 +5124,14 @@ static int launch_live(const pacha_live_root_bootstrap_t *bootstrap)
         fflush(stdout);
     }
     if (status == 0) {
-        usb_ready.capacity = (size_t)devices.metadata.device_count;
-        if (usb_ready.capacity != 0) {
-            usb_ready.fds = calloc(usb_ready.capacity, sizeof(*usb_ready.fds));
-            usb_ready.installer_sources = calloc(usb_ready.capacity,
-                sizeof(*usb_ready.installer_sources));
-            if (usb_ready.fds == NULL || usb_ready.installer_sources == NULL)
-                status = -12;
-        }
+        status = seed0root_prepare_usb_ready(&usb_ready,
+            (size_t)devices.metadata.device_count);
     }
     char installer_marker[32];
-    const int installer_mode = status == 0 &&
+    const int installer_marker_status = status == 0 ?
         seed0root_read_filed_text(filed_fd, "/etc/pacha/installer-mode",
-            installer_marker, sizeof(installer_marker)) == 0 &&
+            installer_marker, sizeof(installer_marker)) : status;
+    const int installer_mode = installer_marker_status == 0 &&
         strcmp(installer_marker, "installer-v1\n") == 0;
     if (status == 0) status = seed0root_launch_root_services(
         filed_fd, &devices, &unused_gpud_fd, 1, installer_mode, 0, 1,
@@ -4928,16 +5158,49 @@ static int launch_live(const pacha_live_root_bootstrap_t *bootstrap)
     seed0root_close_root_devices(&devices);
     if (status == 0) status = seed0root_register_termd_signal_supervisor(
         termd_fd, supervisor_fd);
+    /* Diagnostics must remain reachable while the installer owns the console
+     * and while its formatter children are running. No disk ports are granted
+     * to SSH; it retains the same namespace/network authority as the live shell. */
+    struct seed0root_live_ssh ssh = {0};
+    if (status == 0) {
+        char authorized_key[256];
+        const int key_status = seed0root_read_filed_text(filed_fd,
+            "/root/.ssh/authorized_keys", authorized_key,
+            sizeof(authorized_key));
+        ssh = (struct seed0root_live_ssh){
+            .devices = &usb_ready,
+            .filed_fd = filed_fd,
+            .supervisor_fd = supervisor_fd,
+            .gpu_client = gpu_probe_ready_fd >= 16,
+            .input_client = inputd_fd >= 16,
+            .enabled = key_status == 0 &&
+                strncmp(authorized_key, "ssh-ed25519 ", 12) == 0,
+        };
+    }
+    int installer_start_status=0;
+    uint64_t installer_result=0;
+    if (status == 0)
+        seed0root_record_installer_boot(filed_fd,"mode-decision",
+            installer_marker_status,installer_mode,0,0,&usb_ready);
     if (status == 0 && installer_mode) {
-        int installer_status = seed0root_wait_installer_sources(&usb_ready);
-        if (!installer_status)
-            installer_status = seed0root_run_live_installer(filed_fd,
+        seed0root_record_installer_boot(filed_fd,"waiting-sources",
+            installer_marker_status,1,0,0,&usb_ready);
+        installer_start_status = seed0root_wait_installer_sources(&usb_ready);
+        seed0root_record_installer_boot(filed_fd,"sources-ready",
+            installer_marker_status,1,installer_start_status,0,&usb_ready);
+        if (!installer_start_status) {
+            seed0root_record_installer_boot(filed_fd,"launching-ui",
+                installer_marker_status,1,0,0,&usb_ready);
+            installer_start_status = seed0root_run_live_installer(filed_fd,
                 supervisor_fd, termd_fd, live_console_ctty(console),
-                &usb_ready, console);
-        if (installer_status)
+                &usb_ready, console, &ssh, &installer_result);
+            seed0root_record_installer_boot(filed_fd,"ui-returned",
+                installer_marker_status,1,installer_start_status,installer_result,&usb_ready);
+        }
+        if (installer_start_status)
             fprintf(stderr,
                 "[seed0root] installer unavailable status=%d; starting recovery shell\n",
-                installer_status);
+                installer_start_status);
         /* An installer failure must leave a recovery shell available. The
          * native installer itself fails closed before or after DISARM. */
     }
@@ -4965,19 +5228,6 @@ static int launch_live(const pacha_live_root_bootstrap_t *bootstrap)
         if (shell_bootstrap_fd >= 16) (void)pacha_fd_close(shell_bootstrap_fd);
     }
     if (status == 0) {
-        char authorized_key[256];
-        const int key_status = seed0root_read_filed_text(filed_fd,
-            "/root/.ssh/authorized_keys", authorized_key,
-            sizeof(authorized_key));
-        struct seed0root_live_ssh ssh = {
-            .devices = &usb_ready,
-            .filed_fd = filed_fd,
-            .supervisor_fd = supervisor_fd,
-            .gpu_client = gpu_probe_ready_fd >= 16,
-            .input_client = inputd_fd >= 16,
-            .enabled = key_status == 0 &&
-                strncmp(authorized_key, "ssh-ed25519 ", 12) == 0,
-        };
         printf("[seed0root] live SSH %s\n",
             ssh.enabled ? "public key configured; waiting for netd" :
                 "disabled (no Ed25519 authorized key)");
@@ -5015,6 +5265,8 @@ static int launch_live(const pacha_live_root_bootstrap_t *bootstrap)
             live_console_ctty(console));
         fflush(stdout);
         live_console_finish_boot(console);
+        if (installer_start_status)
+            live_console_report_installer_error(console,installer_start_status);
         struct seed0root_live_runtime runtime = {
             .ssh = &ssh,
             .console = console,

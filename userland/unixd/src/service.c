@@ -1142,6 +1142,7 @@ int unix_service_run(const struct unix_boot_config *config)
     (void)pacha_fd_close((int)config->ready_channel);
     puts("[unixd] ready");
     fflush(stdout);
+    static struct pacha_fd_wait_retained retained_wait;
     for (;;) {
         struct pacha_service_wait_set set;
         int status = pacha_service_wait_init(&set, service.admin);
@@ -1158,7 +1159,7 @@ int unix_service_run(const struct unix_boot_config *config)
             fprintf(stderr, "[unixd] wait capacity exhausted count=%llu\n", (unsigned long long)set.count);
             return 5;
         }
-        const long wait_status = pacha_service_wait(&set, PACHA_FD_WAIT_FOREVER);
+        const long wait_status = pacha_service_wait_retained(&set, &retained_wait, PACHA_FD_WAIT_FOREVER);
         if (wait_status < 0) {
             fprintf(stderr, "[unixd] wait failed status=%ld count=%llu\n",
                 wait_status, (unsigned long long)set.count);

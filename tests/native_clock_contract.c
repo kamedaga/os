@@ -83,9 +83,16 @@ static int clock_register_contract(void)
     long self = pacha_syscall4(PACHA_FD_SYSCALL_DUP, PACHA_THREAD_SELF_FD, 16, rights, 0);
     CHECK(self >= 16);
     CHECK(pacha_syscall6(PACHA_PROCESS_SYSCALL_SIGNAL_CTL, PACHA_PROCESS_SIGNAL_CTL_REGISTER,
-        (uintptr_t)clock_signal_entry, (uintptr_t)__start_clock_handlers,
-        (uintptr_t)__stop_clock_handlers, (uintptr_t)clock_signal_begin,
-        (uintptr_t)clock_signal_resume) == 0);
+        (uintptr_t)&(struct pacha_signal_registration){
+            .entry = (uintptr_t)clock_signal_entry,
+            .inhibit_start = (uintptr_t)__start_clock_handlers,
+            .inhibit_end = (uintptr_t)__stop_clock_handlers,
+            .inhibit_secondary_start = (uintptr_t)clock_signal_begin,
+            .inhibit_secondary_end = (uintptr_t)clock_signal_resume,
+            .scratch_base = 0,
+            .scratch_size = 0,
+            .flags = PACHA_SIGNAL_REGISTRATION_PROCESS_OWNER,
+        }, 0, 0, 0, 0) == 0);
     CHECK(pacha_syscall2(PACHA_PROCESS_SYSCALL_SIGNAL_CTL, PACHA_PROCESS_SIGNAL_CTL_SET_MASK, 0) == 0);
     const uint64_t before = clock_now();
     CHECK(clock_pending_value((int)self, &value) == 0);
@@ -95,8 +102,16 @@ static int clock_register_contract(void)
     // REGISTER requires a valid entry; restore the existing fixture's blocked
     // handler rather than inventing an unsupported unregister operation.
     CHECK(pacha_syscall6(PACHA_PROCESS_SYSCALL_SIGNAL_CTL, PACHA_PROCESS_SIGNAL_CTL_REGISTER,
-        (uintptr_t)notification_entry, (uintptr_t)__start_native_handlers,
-        (uintptr_t)__stop_native_handlers, 0, 0) == 0);
+        (uintptr_t)&(struct pacha_signal_registration){
+            .entry = (uintptr_t)notification_entry,
+            .inhibit_start = (uintptr_t)__start_native_handlers,
+            .inhibit_end = (uintptr_t)__stop_native_handlers,
+            .inhibit_secondary_start = 0,
+            .inhibit_secondary_end = 0,
+            .scratch_base = 0,
+            .scratch_size = 0,
+            .flags = PACHA_SIGNAL_REGISTRATION_PROCESS_OWNER,
+        }, 0, 0, 0, 0) == 0);
     CHECK(pacha_syscall2(PACHA_PROCESS_SYSCALL_SIGNAL_CTL,
         PACHA_PROCESS_SIGNAL_CTL_SET_MASK, 1ull << 11) == 0);
     CHECK(pacha_syscall1(PACHA_FD_SYSCALL_CLOSE, self) == 0);

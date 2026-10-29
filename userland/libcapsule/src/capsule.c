@@ -47,6 +47,50 @@ int pacha_capsule_close(pacha_fd_t fd) {
     return pacha_status_to_int(pacha_syscall1(PACHA_FD_SYSCALL_CLOSE, (uint64_t)fd));
 }
 
+long pacha_capsule_platform_function_count(void) {
+    uint64_t count = 0;
+    const long ret = pacha_syscall2(PACHA_CAPSULE_SYSCALL_PLATFORM_ENUMERATE,
+        UINT64_MAX, (uint64_t)(uintptr_t)&count);
+    return ret == 0 ? (long)count : -(long)ret;
+}
+
+int pacha_capsule_platform_function_at(uint64_t index, struct pacha_capsule_platform_function *out) {
+    if (!out || index == UINT64_MAX) return -1;
+    uint64_t words[8] = {0};
+    const long ret = pacha_syscall3(PACHA_CAPSULE_SYSCALL_PLATFORM_ENUMERATE,
+        index, (uint64_t)(uintptr_t)words, 8);
+    if (ret != 8) return ret == 0 ? -1 : pacha_status_to_int(ret);
+    *out = (struct pacha_capsule_platform_function){
+        words[0], words[1], words[2], words[3],
+        words[4], words[5], words[6], words[7],
+    };
+    return 0;
+}
+
+pacha_fd_t pacha_capsule_platform_claim(uint64_t index) {
+    return pacha_fd_result(pacha_syscall1(PACHA_CAPSULE_SYSCALL_PLATFORM_CLAIM, index));
+}
+
+int pacha_capsule_io_read(pacha_fd_t fd, uint16_t port, unsigned width, uint32_t *out) {
+    if (!out || width != 1) return -1;
+    const long ret = pacha_syscall3(PACHA_CAPSULE_SYSCALL_IO_READ, (uint64_t)fd, port, width);
+    if (ret < 0) return (int)ret;
+    *out = (uint32_t)ret;
+    return 0;
+}
+
+int pacha_capsule_io_write(pacha_fd_t fd, uint16_t port, unsigned width, uint32_t value) {
+    if (width != 1 || value > UINT8_MAX) return -1;
+    return pacha_status_to_int(pacha_syscall4(PACHA_CAPSULE_SYSCALL_IO_WRITE,
+        (uint64_t)fd, port, width, value));
+}
+
+int pacha_capsule_irq_set_mask(pacha_fd_t fd, unsigned masked) {
+    if (masked > 1) return -1;
+    return pacha_status_to_int(pacha_syscall2(PACHA_CAPSULE_SYSCALL_IRQ_SET_MASK,
+        (uint64_t)fd, masked));
+}
+
 long pacha_capsule_pci_function_count(void) {
     uint64_t count = 0;
     const long ret = pacha_syscall2(PACHA_CAPSULE_SYSCALL_PCI_ENUMERATE,

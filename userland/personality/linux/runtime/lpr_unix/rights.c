@@ -1,5 +1,6 @@
 #include "rights.h"
 #include "diagnostic.h"
+#include <unixd/profile.h>
 #include "../lpr_filed_internal.h"
 #include <errno.h>
 
@@ -88,6 +89,7 @@ int lpr_unix_rights_prepare(struct lpr_unix_context *context, uint64_t socket,
     struct lpr_unix_ancillary *state)
 {
     if (!state || (!state->count && !state->credentials.generation && !state->automatic_credentials)) return 0;
+    UP_BEGIN(prepare_total, UP_CONTROL, UNIX_OP_RIGHTS_PREPARE, UP_TOTAL);
     if (state->credentials.generation) {
         /* Obtain the current authenticated generation, not a process-local
          * fork/exec snapshot. PREPARE validates the claimed Linux ucred. */
@@ -116,6 +118,7 @@ int lpr_unix_rights_prepare(struct lpr_unix_context *context, uint64_t socket,
         unsigned cap_count = 0;
         lpr_fd_pin_t pins[4];
         unsigned pinned = 0;
+        UP_BEGIN(export_time, UP_CONTROL, UNIX_OP_RIGHTS_PREPARE, UP_SERIALIZE);
         /* Four descriptors fit even when each provider needs four caps,
          * leaving room for the control page and native reply capability. */
         while (request.rights.count < 4 && offset + request.rights.count < state->count) {
@@ -140,6 +143,7 @@ int lpr_unix_rights_prepare(struct lpr_unix_context *context, uint64_t socket,
             if (!lpr_native_fd_info((uint32_t)fds[i], &info)) { status = -EBADF; break; }
             caps[i] = (struct pacha_ipc_fd){ .fd = (uint32_t)fds[i], .rights = info.rights };
         }
+        UP_END(export_time);
         unsigned received;
         if (!status) status = lpr_unix_context_call(context, &request, caps, cap_count, NULL, 0, &received);
         close_caps(fds, cap_count);
@@ -238,6 +242,7 @@ int lpr_unix_rights_receive(struct lpr_unix_context *context, uint64_t socket,
     const struct unix_read *read, struct lpr_unix_ancillary *state,
     uint64_t flags, uint32_t *message_flags)
 {
+    UP_BEGIN(receive_total, UP_CONTROL, UNIX_OP_RIGHTS_CLAIM, UP_TOTAL);
     const uint64_t credential_space = state && state->passcred ?
         (state->capacity < 32 ? state->capacity : 32) : 0;
     uint64_t available = state && state->capacity - credential_space >= sizeof(struct linux_cmsg) ?
@@ -281,8 +286,10 @@ int lpr_unix_rights_receive(struct lpr_unix_context *context, uint64_t socket,
             break;
         }
         int descriptors[UNIX_TRANSFER_BATCH];
+        UP_BEGIN(import_time, UP_CONTROL, UNIX_OP_RIGHTS_CLAIM, UP_SERIALIZE);
         status = lpr_fd_transfer_stage_batch(request.rights.items, request.rights.count,
             native, received, flags & UINT64_C(0x40000000) ? LPR_LINUX_O_CLOEXEC : 0, descriptors);
+        UP_END(import_time);
         if (status) {
             lpr_unix_diag('E', socket, status, 102, request.rights.items[0].provider);
             close_caps(native, received);

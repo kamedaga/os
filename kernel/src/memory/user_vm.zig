@@ -14,6 +14,9 @@ pub const UserAddressSpaceTable = address_space.UserAddressSpaceTable;
 pub const Hooks = struct {
     pt_allocator: ?pt_storage.Allocator = null,
     retire_user_tlb_for_principal: ?*const fn (kernel.PrincipalId) void = null,
+    // AS protects VMA identity until the retirement TLB ACK. The callback
+    // may only retain dirty evidence: no allocation or K/shared-VM acquisition.
+    before_pte_retirement: ?*const fn (kernel.PrincipalId, u64, u64) void = null,
     user_spaces: *UserAddressSpaceTable,
     four_gib: u64,
     physical_map_limit: u64,
@@ -40,6 +43,14 @@ pub const Hooks = struct {
 };
 
 var hooks: ?Hooks = null;
+
+fn notePteRetirement(h: Hooks, principal: kernel.PrincipalId, start: u64, bytes: u64) void {
+    if (h.before_pte_retirement) |notify| notify(principal, start, bytes);
+}
+
+pub fn pageViewDirtyTrackingAvailable() bool {
+    return if (hooks) |h| h.before_pte_retirement != null else false;
+}
 
 // PTE/CR3 encoding is the raw-integer boundary, not the pointer conversion
 // boundary. Only an actual kernel page-table pointer enters this translation.
@@ -370,6 +381,7 @@ fn detachAndReleaseUserPtStorage(h: Hooks, space: *UserAddressSpace, principal: 
     // Exec clears the staged AS before moving its VMAs; later cleanup sees zero
     // and must not issue a second shootdown for the already retired context.
     if (space.cr3 != 0) {
+        notePteRetirement(h, principal, 0, h.canonical_user_limit_exclusive);
         // Keep the kernel half present: the shootdown implementation briefly
         // loads this CR3 while handling an IPI in kernel mode.
         @memset(space.pml4[0..256], 0);
@@ -1471,6 +1483,7 @@ pub fn unmapUserMmioOverlay(principal: kernel.PrincipalId, va_start: u64, paddr_
         if (pte & (h.page_present | h.page_user) != (h.page_present | h.page_user)) continue;
         if (ptePaddr(pte) != paddr_start + offset) return false;
     }
+    notePteRetirement(h, principal, va_start, @intCast(size_bytes));
     offset = 0;
     while (offset < size_bytes) : (offset += 4096) {
         const index = userPageIndexForVa(h, va_start + offset).?;
@@ -1791,6 +1804,7 @@ pub fn remapTrustedUserPaddrsWithProt(
         const index = userPageIndexForVa(h, va_start + @as(u64, @intCast(i)) * 4096).?;
         _ = ensureUserPtSlotForPd(space, index.pml4, index.pdp, index.pd) orelse return false;
     }
+    notePteRetirement(h, principal, va_start, size_u64);
     page_index = 0;
     while (page_index < paddrs.len) : (page_index += 1) {
         const va = va_start + @as(u64, @intCast(page_index)) * 4096;
@@ -1865,6 +1879,7 @@ pub fn mapOrRemapTrustedUserPaddrsWithProt(
         }
     }
 
+    notePteRetirement(h, principal, va_start, size_u64);
     page_index = 0;
     while (page_index < paddrs.len) : (page_index += 1) {
         const va = va_start + @as(u64, @intCast(page_index)) * 4096;
@@ -2007,6 +2022,7 @@ pub fn unmapUserLinearRegion(
         if ((old_entry & h.page_user) == 0) return false;
     }
 
+    notePteRetirement(h, principal, va_start, size_u64);
     offset = 0;
     while (offset < size_u64) : (offset += 4096) {
         const va = va_start + offset;
@@ -2129,6 +2145,7 @@ pub fn unmapPresentRemoteUserRegion(
     if (!prepareReservationSlots(space, reservationSplitSlotsRequired(space, va_start, @intCast(size_bytes)))) return false;
     const end = va_start + size_bytes;
 
+    notePteRetirement(h, principal, va_start, @intCast(size_bytes));
     var pt_it = space.pt_store.iterator();
     while (pt_it.next()) |slot| {
         const pml4 = space.ptPml4Index(slot).*;
@@ -2198,6 +2215,7 @@ fn unmapPresentCommon(
 
     if (!prepareReservationSlots(space, reservationSplitSlotsRequired(space, va_start, @intCast(size_bytes)))) return false;
     if (!userLeavesOnly(h, space, va_start, va_start + size_u64)) return false;
+    notePteRetirement(h, principal, va_start, size_u64);
     var leaf_changed = false;
     var pt_it = space.pt_store.iterator();
     while (pt_it.next()) |slot| {
@@ -2241,6 +2259,7 @@ pub fn invalidatePresentUserLinearRegionPtes(
     _ = userRangeEndVa(h, va_start, size_u64) orelse return false;
 
     if (!userLeavesOnly(h, space, va_start, va_start + size_u64)) return false;
+    notePteRetirement(h, principal, va_start, size_u64);
     var pt_it = space.pt_store.iterator();
     while (pt_it.next()) |slot| {
         const span = ptSlotIntersection(space, slot, va_start, va_start + size_u64) orelse continue;
@@ -2287,6 +2306,7 @@ pub fn invalidatePresentUserPaddrsIfCurrent(
             return false;
         }
     }
+    notePteRetirement(h, principal, va_start, size_u64);
     for (expected_paddrs, 0..) |_, page_index| {
         const va = va_start + @as(u64, @intCast(page_index)) * 4096;
         const index = userPageIndexForVa(h, va) orelse unreachable;
@@ -2369,10 +2389,13 @@ pub fn collectUserLinearRegionPaddrs(
 }
 
 pub fn unmapUserMappedPaddr(principal: kernel.PrincipalId, paddr: u64) usize {
+    if (!lockAddressSpace(principal)) return 0;
+    defer unlockAddressSpace(principal);
     const h = hooks orelse return 0;
     const space = getUserSpace(principal) orelse return 0;
     if ((paddr & 0xFFF) != 0) return 0;
 
+    notePteRetirement(h, principal, 0, h.canonical_user_limit_exclusive);
     var removed: usize = 0;
     var first: u64 = std.math.maxInt(u64);
     var end: u64 = 0;
@@ -3212,4 +3235,37 @@ test "lock ordering AS shared actual recursion keeps first link and last unlink"
         try std.testing.expect(!state.diagnostic_record.linked);
         lock_diagnostics.assertRootEmpty();
     }
+}
+
+/// Caller holds all VM transactions through bitmap delivery/acknowledgement.
+/// A clear-before-shootdown collects writes through cached dirty translations;
+/// late hardware D updates are reported AND left armed for the next collection.
+/// The visitor accepts only the page-view's original PFN (not private COW).
+pub fn collectUserPteDirty(principal: kernel.PrincipalId, start: u64, bytes: u64, first_page: u64, visitor: anytype) bool {
+    if (!lockAddressSpace(principal)) return false;
+    defer unlockAddressSpace(principal);
+    const h = hooks orelse return false;
+    const space = getUserSpace(principal) orelse return false;
+    if (bytes == 0 or (start | bytes) & 4095 != 0 or bytes > std.math.maxInt(usize)) return false;
+    _ = userRangeEndVa(h, start, bytes) orelse return false;
+    if (!userLeavesOnly(h, space, start, start + bytes)) return false;
+    var present = false;
+    for (0..2) |pass| {
+        var it = space.pt_store.iterator();
+        while (it.next()) |slot| {
+            const span = ptSlotIntersection(space, slot, start, start + bytes) orelse continue;
+            const base = (@as(u64, space.ptPml4Index(slot).*) << 39) |
+                (@as(u64, space.ptPdpIndex(slot).*) << 30) |
+                (@as(u64, space.ptPdIndex(slot).*) << 21);
+            for (span.first..span.last) |i| {
+                const entry = &space.ptPage(slot)[i];
+                const old = if (pass == 0) @atomicRmw(u64, entry, .And, ~@as(u64, 1 << 6), .acq_rel) else @atomicLoad(u64, entry, .acquire);
+                if (old & (h.page_present | h.page_user) != (h.page_present | h.page_user)) continue;
+                present = true;
+                if (old & (1 << 6) != 0) visitor.record(first_page + (base + i * 4096 - start) / 4096, old & h.page_addr_mask);
+            }
+        }
+        if (pass == 0 and present) h.flush_user_tlb_for_principal_range(principal, start, @intCast(bytes));
+    }
+    return true;
 }

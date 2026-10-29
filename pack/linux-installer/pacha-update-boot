@@ -1,0 +1,59 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# Update only an existing PachaOS ESP; never format or mount the root filesystem.
+set -Eeuo pipefail
+payload=${PACHA_UPDATE_PAYLOAD:-/run/archiso/bootmnt/pacha}
+esp_mount=/run/pacha-boot-update/esp
+fail() { echo "Boot update refused: $*" >&2; exit 1; }
+[[ $EUID == 0 ]] || fail 'Run as root from the Linux maintenance USB.'
+[[ $# == 1 && $1 == --apply ]] || fail 'Usage: pacha-update-boot --apply'
+root_uuid=$(cat "$payload/root-uuid.txt")
+expected=$(cat "$payload/kernel.sha256")
+previous=$(cat "$payload/previous-kernel.sha256")
+[[ $root_uuid =~ ^[0-9a-f-]{36}$ && $expected =~ ^[0-9a-f]{64}$ && $previous =~ ^[0-9a-f]{64}$ ]] || fail 'Invalid payload metadata.'
+[[ $(sha256sum "$payload/KERNEL.ELF" | cut -d ' ' -f 1) == "$expected" ]] || fail 'Payload kernel checksum mismatch.'
+mapfile -t roots < <(blkid -t "UUID=$root_uuid" -o device)
+[[ ${#roots[@]} == 1 ]] || fail 'Expected exactly one installed PachaOS root UUID.'
+root=$(readlink -f "${roots[0]}")
+parent=$(lsblk -dn -o PKNAME "$root" | xargs)
+disk=/dev/$parent
+[[ $disk =~ ^/dev/nvme[0-9]+n[0-9]+$ && $root == "${disk}p2" ]] || fail 'Root is not partition 2 on an NVMe disk.'
+esp=${disk}p1
+[[ -b $esp && $(blkid -s TYPE -o value "$root") == ext4 && $(blkid -s TYPE -o value "$esp") == vfat && $(blkid -s LABEL -o value "$esp") == PACHAESP ]] || fail 'Existing PachaOS filesystem identities do not match.'
+[[ $(lsblk -dn -o PARTTYPE "$esp" | tr '[:upper:]' '[:lower:]' | xargs) == c12a7328-f81f-11d2-ba4b-00a0c93ec93b ]] || fail 'Partition 1 is not an EFI system partition.'
+if findmnt -rn -S "$esp" >/dev/null; then fail 'ESP is already mounted.'; fi
+mkdir -p "$esp_mount"
+mounted=0
+cleanup() { if ((mounted)); then umount "$esp_mount"; fi; }
+trap cleanup EXIT
+mount -t vfat -o ro "$esp" "$esp_mount"
+mounted=1
+[[ -f $esp_mount/KERNEL.ELF && -f $esp_mount/BOOTFS.IMG && -f $esp_mount/INITAPP.ELF && -f $esp_mount/EFI/PachaOS/LIMINE.EFI ]] || fail 'Existing PachaOS boot files are missing.'
+grep -Eq '^[[:space:]]*path: boot\(\):/KERNEL\.ELF[[:space:]]*$' "$esp_mount/limine.conf" || fail 'Unexpected boot configuration.'
+actual=$(sha256sum "$esp_mount/KERNEL.ELF" | cut -d ' ' -f 1)
+if [[ $actual == "$expected" ]]; then
+    echo 'BOOT_UPDATE_COMPLETE: installed kernel already matches the fixed kernel.'
+    exit 0
+fi
+[[ $actual == "$previous" ]] || fail 'Installed kernel differs from the known previous kernel.'
+echo "Updating only $esp/KERNEL.ELF; root UUID=$root_uuid"
+lsblk -dn -o NAME,MODEL,SERIAL,SIZE "$disk"
+mount -o remount,rw "$esp_mount"
+# Preserve the known old kernel before publishing its replacement. Flush and
+# verify the staged bytes first so an interrupted copy cannot become bootable.
+backup=$esp_mount/KERNEL.ELF.before-pager-fix
+if [[ -e $backup ]]; then
+    [[ $(sha256sum "$backup" | cut -d ' ' -f 1) == "$previous" ]] || fail 'Existing backup does not match the previous kernel.'
+else
+    cp "$esp_mount/KERNEL.ELF" "$backup"
+fi
+cp "$payload/KERNEL.ELF" "$esp_mount/KERNEL.ELF.new"
+sync -f "$esp_mount"
+[[ $(sha256sum "$backup" | cut -d ' ' -f 1) == "$previous" && $(sha256sum "$esp_mount/KERNEL.ELF.new" | cut -d ' ' -f 1) == "$expected" ]] || fail 'Staged files failed verification.'
+mv -f "$esp_mount/KERNEL.ELF.new" "$esp_mount/KERNEL.ELF"
+sync -f "$esp_mount"
+mount -o remount,ro "$esp_mount"
+[[ $(sha256sum "$esp_mount/KERNEL.ELF" | cut -d ' ' -f 1) == "$expected" ]] || fail 'Installed kernel readback mismatch.'
+umount "$esp_mount"
+mounted=0
+echo "BOOT_UPDATE_COMPLETE: kernel SHA256=$expected; root filesystem unchanged."

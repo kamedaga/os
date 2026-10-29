@@ -22,6 +22,9 @@ var armed: bool = false;
 var active: bool = false;
 var drawing: u8 = 0;
 var drawing_record: lock_diagnostics.Record = .{};
+// The drawing admission guard owns this scratch space. Fatal paths cannot
+// allocate or spend an extra page of the interrupted thread's stack on logs.
+var halt_log_buffer: if (enabled) [4096]u8 else void = if (enabled) undefined else {};
 var next_row: usize = 0;
 var snapshot: mtrr.CacheSnapshot = .{};
 var trace_lock: u8 = 0;
@@ -111,6 +114,10 @@ fn pixel(x: usize, y: usize, color: u32) void {
 
 fn writeLine(row: usize, message: []const u8, color: u32) void {
     const scale: usize = if (fb.width >= 800 and fb.height >= 480) 2 else 1;
+    writeLineScaled(row, message, color, scale);
+}
+
+fn writeLineScaled(row: usize, message: []const u8, color: u32, scale: usize) void {
     const y0 = 64 + row * 16 * scale;
     if (y0 + 16 * scale > fb.height) return;
     const max_columns = @min(message.len, (fb.width -| 16) / (8 * scale));
@@ -237,25 +244,71 @@ pub fn showHalt() void {
     if (comptime !enabled) return;
     if (!begin()) return;
     defer finish();
-    writeLine(next_row + 1, "HALT - LAST KERNEL LOG LINES:", 0x00ffffff);
-    var row = next_row + 2;
-    const log = kernel_log.boot_log_buffer[0..@min(kernel_log.boot_log_len, kernel_log.boot_log_buffer.len)];
-    var start = log.len;
-    var lines: usize = 0;
-    while (start > 0 and lines < 9) {
-        start -= 1;
-        if (log[start] == '\n') lines += 1;
+    // A full boot snapshot stops recording just when a later fault matters.
+    // Take one bounded try at recent kernel bytes, then draw without its lock.
+    const recent = if (comptime kernel_log.ring_enabled)
+        kernel_log.tryReadDebugTail(&halt_log_buffer)
+    else
+        null;
+    const log = if (comptime kernel_log.ring_enabled)
+        if (recent) |count| halt_log_buffer[0..count] else ""
+    else
+        kernel_log.boot_log_buffer[0..@min(kernel_log.boot_log_len, kernel_log.boot_log_buffer.len)];
+    // HALT owns the whole text area. Smaller type keeps the exception header
+    // and RIP visible together instead of showing only the last few registers.
+    for (@min(@as(usize, 64), fb.height)..fb.height) |y| {
+        for (0..fb.width) |x| pixel(x, y, 0);
     }
-    if (start != 0) start += 1;
+    const rows = (fb.height -| 64) / 16;
+    const title = if (!kernel_log.ring_enabled) "HALT - BOOT SNAPSHOT (RECENT LOG DISABLED)" else if (recent == null) "HALT - RECENT LOG BUSY/UNAVAILABLE" else "HALT - RECENT KERNEL LOG (BOUNDED TAIL)";
+    writeLineScaled(0, title, 0x00ffffff, 1);
+    var row: usize = 1;
+    const start = recentLinesStart(log, rows -| 1);
     var cursor = start;
-    while (cursor < log.len and row < 27) {
+    while (cursor < log.len and row < rows) {
         const end = if (std.mem.indexOfScalarPos(u8, log, cursor, '\n')) |i| i else log.len;
         if (end > cursor) {
-            writeLine(row, log[cursor..end], 0x0000ffff);
+            writeLineScaled(row, log[cursor..end], 0x0000ffff, 1);
             row += 1;
         }
         cursor = end + 1;
     }
+}
+
+pub fn logFramebufferSnapshot() void {
+    if (comptime !enabled) return;
+    if (!armed) {
+        kernel_log.write("GOP armed=0; framebuffer metadata unavailable\n");
+        return;
+    }
+    kernel_log.writeFmt("GOP armed={} active={} pa=0x{x} bytes=0x{x} {}x{} pitch={}\n", .{
+        @intFromBool(armed), @intFromBool(active), fb.paddr, fb.size_bytes,
+        fb.width, fb.height, fb.pixels_per_scan_line,
+    });
+}
+
+fn recentLinesStart(log: []const u8, max_lines: usize) usize {
+    if (max_lines == 0) return log.len;
+    var cursor = log.len;
+    var lines: usize = 0;
+    while (cursor > 0) {
+        var end = cursor;
+        while (end > 0 and log[end - 1] == '\n') end -= 1;
+        if (end == 0) return 0;
+        const start = if (std.mem.lastIndexOfScalar(u8, log[0..end], '\n')) |index| index + 1 else 0;
+        lines += 1;
+        if (lines == max_lines) return start;
+        cursor = start;
+    }
+    return 0;
+}
+
+test "halt tail selection fits complete nonempty lines in available rows" {
+    const log = "old\n\nFAULT\n  RIP=0x1234\n  CPU=2\n";
+    try std.testing.expectEqualStrings("FAULT\n  RIP=0x1234\n  CPU=2\n", log[recentLinesStart(log, 3)..]);
+    try std.testing.expectEqualStrings("", log[recentLinesStart(log, 0)..]);
+    try std.testing.expectEqual(@as(usize, 0), recentLinesStart("", 4));
+    try std.testing.expectEqual(@as(usize, 0), recentLinesStart("one", 4));
 }
 
 pub fn showPanic(message: []const u8) void {

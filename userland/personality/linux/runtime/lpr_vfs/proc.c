@@ -141,6 +141,7 @@ static int64_t lpr_proc_snapshot_create(const char *name, uint64_t flags)
     const uint64_t known_flags =
         LPR_LINUX_O_ACCMODE |
         LPR_LINUX_O_NONBLOCK |
+        LPR_LINUX_O_NOCTTY |
         LPR_LINUX_O_LARGEFILE |
         LPR_LINUX_O_CLOEXEC |
         LPR_LINUX_O_NOFOLLOW;
@@ -567,9 +568,37 @@ static lpr_proc_pid_kind_t lpr_proc_pid_kind(const char *leaf)
     return LPR_PROC_PID_NONE;
 }
 
+int lpr_linux_proc_pid_directory(const char *path, uint64_t *out_pid,
+    int64_t *out_status)
+{
+    uint64_t pid = 0;
+    const char *leaf = 0;
+    if (!path || !lpr_proc_pid_from_path(path, &pid, &leaf) || *leaf)
+        return 0;
+    lprs_process_query_t info;
+    lpr_memset(&info, 0, sizeof(info));
+    const int status = lpr_supervisor_query_process(pid, &info);
+    *out_pid = pid;
+    *out_status = status == -LPR_LINUX_ESRCH ? -LPR_LINUX_ENOENT : status;
+    return 1;
+}
+
 int lpr_linux_proc_readlink(
     const char *path, char *target, uint64_t capacity, int64_t *out_status)
 {
+    if (path && lpr_strcmp(path, "/proc/self") == 0) {
+        const int64_t pid = lpr_linux_getpid();
+        if (pid <= 0) {
+            *out_status = -LPR_LINUX_ENOENT;
+            return 1;
+        }
+        char name[24];
+        uint64_t length = lpr_proc_format_u64(name, (uint64_t)pid);
+        if (length > capacity) length = capacity;
+        lpr_memcpy(target, name, length);
+        *out_status = (int64_t)length;
+        return 1;
+    }
     uint64_t pid = 0;
     const char *leaf = 0;
     if (path == 0 || !lpr_proc_pid_from_path(path, &pid, &leaf) ||
@@ -896,45 +925,56 @@ int64_t lpr_linux_proc_getdents64(uint64_t fd, uint64_t buf, uint64_t count)
     return (int64_t)written;
 }
 
+enum lpr_proc_global_kind {
+    LPR_PROC_NONE = 0,
+    LPR_PROC_CPUINFO,
+    LPR_PROC_MEMINFO,
+    LPR_PROC_STAT,
+    LPR_PROC_MOUNTS,
+    LPR_PROC_VERSION,
+};
+
+static enum lpr_proc_global_kind lpr_proc_global_kind(const char *path)
+{
+    if (!path) return LPR_PROC_NONE;
+    if (!lpr_strcmp(path, "/proc/cpuinfo")) return LPR_PROC_CPUINFO;
+    if (!lpr_strcmp(path, "/proc/meminfo")) return LPR_PROC_MEMINFO;
+    if (!lpr_strcmp(path, "/proc/stat")) return LPR_PROC_STAT;
+    if (!lpr_strcmp(path, "/proc/mounts")) return LPR_PROC_MOUNTS;
+    if (!lpr_strcmp(path, "/proc/version")) return LPR_PROC_VERSION;
+    return LPR_PROC_NONE;
+}
+
+/* These synthesized files have no inode in the filesystem service. Keep
+ * access() consistent with their read-only open() route, without making a
+ * snapshot just to check permissions. Unknown paths still use FileD. */
+int lpr_linux_proc_snapshot_access(const char *path, uint64_t mode,
+    uint64_t flags, int64_t *status)
+{
+    if (lpr_proc_global_kind(path) == LPR_PROC_NONE) return 0;
+    if ((mode & ~7u) || (flags & ~(0x100u | 0x200u | 0x1000u)))
+        *status = -LPR_LINUX_EINVAL;
+    else
+        *status = (mode & 3u) ? -LPR_LINUX_EACCES : 0;
+    return 1;
+}
+
 int64_t lpr_linux_proc_snapshot_open(const char *path, uint64_t flags, unsigned *wait_not_ready __attribute__((unused)))
 {
-    enum {
-        LPR_PROC_NONE = 0,
-        LPR_PROC_CPUINFO,
-        LPR_PROC_MEMINFO,
-        LPR_PROC_STAT,
-        LPR_PROC_MOUNTS,
-        LPR_PROC_VERSION,
-    } kind = LPR_PROC_NONE;
-    const char *name = 0;
-    if (path == 0) return -LPR_LINUX_EFAULT;
-    if (lpr_strcmp(path, "/proc/cpuinfo") == 0) {
-        kind = LPR_PROC_CPUINFO;
-        name = "proc-cpuinfo";
-    } else if (lpr_strcmp(path, "/proc/meminfo") == 0) {
-        kind = LPR_PROC_MEMINFO;
-        name = "proc-meminfo";
-    } else if (lpr_strcmp(path, "/proc/stat") == 0) {
-        kind = LPR_PROC_STAT;
-        name = "proc-stat";
-    } else if (lpr_strcmp(path, "/proc/mounts") == 0) {
-        kind = LPR_PROC_MOUNTS;
-        name = "proc-mounts";
-    } else if (lpr_strcmp(path, "/proc/version") == 0) {
-        kind = LPR_PROC_VERSION;
-        name = "proc-version";
-    } else {
+    static const char *const names[] = {
+        0, "proc-cpuinfo", "proc-meminfo", "proc-stat", "proc-mounts", "proc-version",
+    };
+    if (!path) return -LPR_LINUX_EFAULT;
+    const enum lpr_proc_global_kind kind = lpr_proc_global_kind(path);
+    const char *name = names[kind];
+    if (kind == LPR_PROC_NONE) {
         uint64_t pid = 0;
         const char *leaf = 0;
-        if (!lpr_proc_pid_from_path(path, &pid, &leaf)) {
-            return -LPR_LINUX_ENOENT;
-        }
+        if (!lpr_proc_pid_from_path(path, &pid, &leaf)) return -LPR_LINUX_ENOENT;
         const lpr_proc_pid_kind_t pid_kind = lpr_proc_pid_kind(leaf);
-        /* An unknown leaf must fall through: /proc/self/fd/<n> is served by a
-         * separate handler that runs after this one. */
-        if (pid_kind == LPR_PROC_PID_NONE || pid_kind == LPR_PROC_PID_DIR) {
+        /* /proc/self/fd/<n> is served by the next open handler. */
+        if (pid_kind == LPR_PROC_PID_NONE || pid_kind == LPR_PROC_PID_DIR)
             return -LPR_LINUX_ENOENT;
-        }
         return lpr_proc_pid_snapshot_open(path, pid, pid_kind, flags, wait_not_ready);
     }
 

@@ -13,6 +13,7 @@ int main(void)
     assert(lpr_sys_futex(1, 12, 0, 0, 0, 0, 0) == -95);
     assert(lpr_sys_futex(1, 13, 0, 0, 0, 0, 0) == -95);
     assert(lpr_sys_futex(1, 127, 0, 0, 0, 0, 0) == -38);
+    assert(lpr_sys_futex(1, 5, 0, 0, 0, 0, 0) == -38);
     assert(lpr_sys_futex(1, 6 | 512, 0, 0, 0, 0, 0) == -38);
     puts("futex protocol unit PASS");
     return 0;

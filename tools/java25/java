@@ -1,0 +1,24 @@
+#!/bin/sh
+# Keep glibc's loader search local to this Java process and its children.
+. /etc/profile.d/lwjgl.sh
+JAVA_HOME=/opt/java25-openj9
+export JAVA_HOME
+LD_LIBRARY_PATH="$JAVA_HOME/glibc:$JAVA_HOME/lib:$LWJGL_HOME/system${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export LD_LIBRARY_PATH
+if [ -d "$LWJGL_HOME/system/dri" ] && [ -z "${LIBGL_DRIVERS_PATH:-}" ]; then
+    LIBGL_DRIVERS_PATH="$LWJGL_HOME/system/dri"
+    export LIBGL_DRIVERS_PATH
+fi
+if [ -z "${ALSOFT_CONF:-}" ] && [ -f "$LWJGL_HOME/alsoft.conf" ]; then
+    ALSOFT_CONF="$LWJGL_HOME/alsoft.conf"
+    export ALSOFT_CONF
+fi
+# zpoline retains address zero: request OpenJ9's explicit null checks.
+if [ "${LWJGL_NATIVE_PATH+x}" != x ]; then
+    LWJGL_NATIVE_PATH=$LWJGL_HOME/natives
+fi
+if [ -n "$LWJGL_NATIVE_PATH" ]; then
+    set -- "-Dorg.lwjgl.librarypath=$LWJGL_NATIVE_PATH" "$@"
+fi
+exec "$JAVA_HOME/bin/java" -Xjit:disableTraps --enable-native-access=ALL-UNNAMED \
+    "$@"

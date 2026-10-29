@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: MIT */
 #include "../src/relay.c"
+#include "no_audio_control.h"
 #define FILED_TEST_SHARED_CONTROL
 #include "no_session_control.h"
 #include "filed/client_rights.h"
@@ -232,6 +233,12 @@ long pacha_fd_wait_many_batched(struct pacha_pollfd *fds,uint64_t count,uint64_t
 {
     assert(idle_test && count==1 && fds[0].fd==60);
     ++idle_waits;assert(timeout==PACHA_FD_WAIT_FOREVER && !expired_refs);return -EINTR;
+}
+long pacha_fd_wait_many_retained(struct pacha_fd_wait_retained *retained,
+    struct pacha_pollfd *fds,uint64_t count,uint64_t timeout)
+{
+    assert(retained != NULL);
+    return pacha_fd_wait_many_batched(fds,count,timeout);
 }
 int filed_unix_path_receive(filed_runtime_t *rt) { (void)rt;abort(); }
 

@@ -5,6 +5,7 @@
 #include "network_config.h"
 #include "status_file.h"
 #include "upper.h"
+#include "libuinet_backend.h"
 
 #include "pacha/ipc.h"
 #include <errno.h>
@@ -215,6 +216,18 @@ void netd_packet_io_dhcp_disable(void)
         netd_dhcp_disable(&g_packet_io.dhcp);
 }
 
+int netd_packet_io_dhcp_restart(struct netd_runtime *runtime)
+{
+    g_packet_io.dhcp_started = 0;
+    return netd_packet_io_dhcp_start(runtime);
+}
+
+void netd_packet_io_discard_rx(void)
+{
+    g_packet_io.rx_drops += g_packet_io.rx_count;
+    g_packet_io.rx_head = g_packet_io.rx_tail = g_packet_io.rx_count = 0;
+}
+
 const struct netd_dhcp_client *netd_packet_io_dhcp_status(void)
 {
     return g_packet_io.dhcp_started ? &g_packet_io.dhcp : NULL;
@@ -235,6 +248,12 @@ void netd_packet_io_pump_once(void)
         const struct netd_link_info *link = netd_link_current();
         netd_dhcp_poll(&g_packet_io.dhcp, monotonic_ms(),
             link != NULL && link->carrier);
+        if (netd_network_config_get() &&
+            g_packet_io.dhcp.state != NETD_DHCP_DISABLED &&
+            g_packet_io.dhcp.state != NETD_DHCP_BOUND &&
+            g_packet_io.dhcp.state != NETD_DHCP_RENEWING &&
+            g_packet_io.dhcp.state != NETD_DHCP_REBINDING)
+            netd_libuinet_ipv4_suspend();
     }
     netd_packet_io_drain_rx();
     netd_upper_poll();

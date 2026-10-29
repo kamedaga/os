@@ -1,24 +1,31 @@
 const std = @import("std");
 
-pub const syscall_capsule_first: u64 = 87;
-pub const syscall_capsule_query: u64 = 87;
-pub const syscall_capsule_derive_mmio: u64 = 88;
-pub const syscall_capsule_derive_dma_buffer: u64 = 89;
-pub const syscall_capsule_derive_dma_mapping: u64 = 90;
-pub const syscall_capsule_derive_dma_mapping_pages: u64 = 91;
-pub const syscall_capsule_derive_dma_mapping_from_buffer: u64 = 92;
-pub const syscall_capsule_dma_set_enabled: u64 = 93;
-pub const syscall_capsule_derive_irq: u64 = 94;
-pub const syscall_capsule_irq_route: u64 = 95;
-pub const syscall_capsule_irq_poll: u64 = 96;
-pub const syscall_capsule_irq_quiesce: u64 = 97;
-pub const syscall_capsule_irq_retire: u64 = 98;
-pub const syscall_capsule_pci_enumerate: u64 = 99;
-pub const syscall_capsule_pci_claim: u64 = 100;
-pub const syscall_capsule_pci_config_read: u64 = 101;
-pub const syscall_capsule_pci_config_write: u64 = 102;
-pub const syscall_capsule_pci_bar_info: u64 = 103;
-pub const syscall_capsule_dma_pool_create: u64 = 104;
+pub const syscall_capsule_first: u64 = 89;
+pub const syscall_capsule_query: u64 = 89;
+pub const syscall_capsule_platform_enumerate: u64 = 90;
+pub const syscall_capsule_platform_claim: u64 = 91;
+// IO_READ returns an unsigned byte or a NEGATIVE status, so a destructive
+// port read never precedes a potentially failing user-memory copyout.
+pub const syscall_capsule_io_read: u64 = 92;
+pub const syscall_capsule_io_write: u64 = 93;
+pub const syscall_capsule_derive_mmio: u64 = 94;
+pub const syscall_capsule_derive_dma_buffer: u64 = 95;
+pub const syscall_capsule_derive_dma_mapping: u64 = 96;
+pub const syscall_capsule_derive_dma_mapping_pages: u64 = 97;
+pub const syscall_capsule_derive_dma_mapping_from_buffer: u64 = 98;
+pub const syscall_capsule_dma_set_enabled: u64 = 99;
+pub const syscall_capsule_derive_irq: u64 = 100;
+pub const syscall_capsule_irq_route: u64 = 101;
+pub const syscall_capsule_irq_set_mask: u64 = 102;
+pub const syscall_capsule_irq_poll: u64 = 103;
+pub const syscall_capsule_irq_quiesce: u64 = 104;
+pub const syscall_capsule_irq_retire: u64 = 105;
+pub const syscall_capsule_pci_enumerate: u64 = 106;
+pub const syscall_capsule_pci_claim: u64 = 107;
+pub const syscall_capsule_pci_config_read: u64 = 108;
+pub const syscall_capsule_pci_config_write: u64 = 109;
+pub const syscall_capsule_pci_bar_info: u64 = 110;
+pub const syscall_capsule_dma_pool_create: u64 = 111;
 pub const syscall_capsule_last: u64 = syscall_capsule_dma_pool_create;
 pub const syscall_capsule_count: usize = @intCast(syscall_capsule_last - syscall_capsule_first + 1);
 
@@ -28,10 +35,11 @@ pub fn isCapsuleSyscall(nr: u64) bool {
 
 pub const CapsuleKind = enum(u8) {
     device = 2,
-    mmio = 3,
-    dma_buffer = 4,
-    dma_mapping = 5,
-    irq = 6,
+    platform_device = 3,
+    mmio = 4,
+    dma_buffer = 5,
+    dma_mapping = 6,
+    irq = 7,
 };
 
 pub const Rights = packed struct(u64) {
@@ -95,6 +103,13 @@ pub const snapshot_flag_dma_quarantined: u64 = @as(u64, 1) << 32;
 /// This device has a live isolated translation domain; absent in legacy mode.
 pub const snapshot_flag_dma_translated: u64 = @as(u64, 1) << 33;
 pub const snapshot_flag_irq_retired: u64 = @as(u64, 1) << 34;
+pub const snapshot_flag_platform_source: u64 = @as(u64, 1) << 35;
+pub const platform_function_word_count: usize = 8;
+pub const platform_device_i8042: u64 = 1;
+pub const platform_flag_fadt_8042: u64 = 1;
+pub const platform_flag_controller_write: u64 = 2;
+pub const platform_irq_active_low: u64 = 1;
+pub const platform_irq_level: u64 = 2;
 pub const irq_route_word_count: usize = 3;
 
 pub const bar_info_word_count: usize = 4;
@@ -198,23 +213,28 @@ pub const irq_poll_count_index: usize = 0;
 
 comptime {
     std.debug.assert(syscall_capsule_query == syscall_capsule_first + 0);
-    std.debug.assert(syscall_capsule_derive_mmio == syscall_capsule_first + 1);
-    std.debug.assert(syscall_capsule_derive_dma_buffer == syscall_capsule_first + 2);
-    std.debug.assert(syscall_capsule_derive_dma_mapping == syscall_capsule_first + 3);
-    std.debug.assert(syscall_capsule_derive_dma_mapping_pages == syscall_capsule_first + 4);
-    std.debug.assert(syscall_capsule_derive_dma_mapping_from_buffer == syscall_capsule_first + 5);
-    std.debug.assert(syscall_capsule_dma_set_enabled == syscall_capsule_first + 6);
-    std.debug.assert(syscall_capsule_derive_irq == syscall_capsule_first + 7);
-    std.debug.assert(syscall_capsule_irq_route == syscall_capsule_first + 8);
-    std.debug.assert(syscall_capsule_irq_poll == syscall_capsule_first + 9);
-    std.debug.assert(syscall_capsule_irq_quiesce == syscall_capsule_first + 10);
-    std.debug.assert(syscall_capsule_irq_retire == syscall_capsule_first + 11);
-    std.debug.assert(syscall_capsule_pci_enumerate == syscall_capsule_first + 12);
-    std.debug.assert(syscall_capsule_pci_claim == syscall_capsule_first + 13);
-    std.debug.assert(syscall_capsule_pci_config_read == syscall_capsule_first + 14);
-    std.debug.assert(syscall_capsule_pci_config_write == syscall_capsule_first + 15);
-    std.debug.assert(syscall_capsule_pci_bar_info == syscall_capsule_first + 16);
-    std.debug.assert(syscall_capsule_dma_pool_create == syscall_capsule_first + 17);
+    std.debug.assert(syscall_capsule_platform_enumerate == syscall_capsule_first + 1);
+    std.debug.assert(syscall_capsule_platform_claim == syscall_capsule_first + 2);
+    std.debug.assert(syscall_capsule_io_read == syscall_capsule_first + 3);
+    std.debug.assert(syscall_capsule_io_write == syscall_capsule_first + 4);
+    std.debug.assert(syscall_capsule_derive_mmio == syscall_capsule_first + 5);
+    std.debug.assert(syscall_capsule_derive_dma_buffer == syscall_capsule_first + 6);
+    std.debug.assert(syscall_capsule_derive_dma_mapping == syscall_capsule_first + 7);
+    std.debug.assert(syscall_capsule_derive_dma_mapping_pages == syscall_capsule_first + 8);
+    std.debug.assert(syscall_capsule_derive_dma_mapping_from_buffer == syscall_capsule_first + 9);
+    std.debug.assert(syscall_capsule_dma_set_enabled == syscall_capsule_first + 10);
+    std.debug.assert(syscall_capsule_derive_irq == syscall_capsule_first + 11);
+    std.debug.assert(syscall_capsule_irq_route == syscall_capsule_first + 12);
+    std.debug.assert(syscall_capsule_irq_set_mask == syscall_capsule_first + 13);
+    std.debug.assert(syscall_capsule_irq_poll == syscall_capsule_first + 14);
+    std.debug.assert(syscall_capsule_irq_quiesce == syscall_capsule_first + 15);
+    std.debug.assert(syscall_capsule_irq_retire == syscall_capsule_first + 16);
+    std.debug.assert(syscall_capsule_pci_enumerate == syscall_capsule_first + 17);
+    std.debug.assert(syscall_capsule_pci_claim == syscall_capsule_first + 18);
+    std.debug.assert(syscall_capsule_pci_config_read == syscall_capsule_first + 19);
+    std.debug.assert(syscall_capsule_pci_config_write == syscall_capsule_first + 20);
+    std.debug.assert(syscall_capsule_pci_bar_info == syscall_capsule_first + 21);
+    std.debug.assert(syscall_capsule_dma_pool_create == syscall_capsule_first + 22);
 }
 
 test "capsule rights mask strips reserved bits" {
@@ -227,7 +247,7 @@ test "capsule syscall range is stable and contiguous" {
     try std.testing.expect(isCapsuleSyscall(syscall_capsule_dma_pool_create));
     try std.testing.expect(!isCapsuleSyscall(syscall_capsule_first - 1));
     try std.testing.expect(!isCapsuleSyscall(syscall_capsule_last + 1));
-    try std.testing.expectEqual(@as(usize, 16), syscall_capsule_count);
+    try std.testing.expectEqual(@as(usize, 23), syscall_capsule_count);
 }
 
 test "DMA mapping page layout checks boundaries and overflow" {

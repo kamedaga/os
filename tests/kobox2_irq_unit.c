@@ -183,7 +183,8 @@ long pacha_syscall4(uint64_t nr, uint64_t a, uint64_t b, uint64_t c, uint64_t d)
         return ROUTE_FD + (long)c;
     }
     assert(!locked && nr == PACHA_FD_SYSCALL_WAIT_MANY && b == 2 &&
-        c == PACHA_FD_WAIT_FOREVER && !d);
+        c == PACHA_FD_WAIT_FOREVER &&
+        (d == PACHA_FD_WAIT_SET_REPLACE || d == PACHA_FD_WAIT_SET_REUSE));
     struct pacha_pollfd *fds = (void *)(uintptr_t)a;
     assert(fds[0].fd == CONTROL_FD && fds[1].fd == ROUTE_FD);
     if (wait_case == 3) return PACHA_SYSCALL_ERR_INVALID; /* Unchanged epoch: fatal. */

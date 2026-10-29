@@ -9,6 +9,7 @@ mkdir -p "$out"
   -I "$repo_root/userland/libpacha/include" -I "$repo_root/userland/libipc/include" \
   -I "$repo_root/userland/libcapsule/include" -I "$repo_root/kobox2/linux-sandbox/kobox" \
   "$repo_root/tests/kobox2_irq_unit.c" \
+  "$repo_root/userland/kobox2_adapter/wait_retained.c" \
   "$repo_root/userland/kobox2_adapter/device_irq_queue.c" -o "$out/irq-unit"
 "$out/irq-unit" | tee "$out/result.log"
 sha256sum "$repo_root/userland/kobox2_adapter/device_irq.c" \

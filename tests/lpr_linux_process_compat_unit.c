@@ -36,7 +36,7 @@ int main(void)
     };
     expect(lpr_linux_capget((uint64_t)(uintptr_t)&cap_header,
                             (uint64_t)(uintptr_t)caps,
-                            42) == 0,
+                            42, 7) == 0,
            "capget accepts the v3 ABI used by bubblewrap");
     expect(caps[0].effective == 0 && caps[0].permitted == 0 &&
                caps[0].inheritable == 0 && caps[1].effective == 0 &&
@@ -44,15 +44,30 @@ int main(void)
            "CapabilityOS reports an empty Linux capability set");
     expect(lpr_linux_capset((uint64_t)(uintptr_t)&cap_header,
                             (uint64_t)(uintptr_t)caps,
-                            42) == 0,
+                            42, 7) == 0,
            "capset accepts retaining an empty capability set");
+    cap_header.pid = 7;
+    expect(lpr_linux_capget((uint64_t)(uintptr_t)&cap_header,
+                            (uint64_t)(uintptr_t)caps, 42, 7) == 0,
+           "libcap-ng can query its own native TID");
+    expect(lpr_linux_capset((uint64_t)(uintptr_t)&cap_header,
+                            (uint64_t)(uintptr_t)caps, 42, 7) == 0,
+           "current TID may retain an empty capability set");
+    cap_header.pid = 99;
+    expect(lpr_linux_capget((uint64_t)(uintptr_t)&cap_header,
+                            (uint64_t)(uintptr_t)caps, 42, 7) == -LPR_LINUX_ESRCH,
+           "unrelated task is not mistaken for the caller");
+    expect(lpr_linux_capset((uint64_t)(uintptr_t)&cap_header,
+                            (uint64_t)(uintptr_t)caps, 42, 7) == -LPR_LINUX_EPERM,
+           "unrelated task capability change is rejected");
+    cap_header.pid = 7;
     caps[0].effective = 1;
     expect(lpr_linux_capset((uint64_t)(uintptr_t)&cap_header,
                             (uint64_t)(uintptr_t)caps,
-                            42) == -LPR_LINUX_EPERM,
+                            42, 7) == -LPR_LINUX_EPERM,
            "capset cannot manufacture Linux capabilities");
     cap_header.version = 0;
-    expect(lpr_linux_capget((uint64_t)(uintptr_t)&cap_header, 0, 42) ==
+    expect(lpr_linux_capget((uint64_t)(uintptr_t)&cap_header, 0, 42, 7) ==
                -LPR_LINUX_EINVAL &&
                cap_header.version == LPR_LINUX_CAPABILITY_VERSION_3,
            "capget negotiates an unsupported ABI version like Linux");

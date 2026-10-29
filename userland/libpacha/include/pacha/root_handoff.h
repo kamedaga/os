@@ -9,6 +9,8 @@ enum {
      * batch size, not a total device count. */
     PACHA_ROOT_HANDOFF_BATCH_DEVICES = 18,
     PACHA_ROOT_HANDOFF_FLAG_LAST = 1,
+    PACHA_ROOT_DEVICE_PCI = 1,
+    PACHA_ROOT_DEVICE_PLATFORM = 2,
 };
 
 struct pacha_root_device_record {
@@ -18,6 +20,8 @@ struct pacha_root_device_record {
     uint64_t device_id;
     uint64_t subsystem_id;
     uint64_t class_code;
+    uint32_t resource_kind;
+    uint32_t platform_kind;
     uint32_t pci_segment;
     uint32_t pci_bus;
     uint32_t pci_device;
@@ -32,7 +36,7 @@ struct pacha_root_handoff {
     struct pacha_root_device_record devices[PACHA_ROOT_HANDOFF_BATCH_DEVICES];
 };
 
-_Static_assert(sizeof(struct pacha_root_device_record) == 64,
+_Static_assert(sizeof(struct pacha_root_device_record) == 72,
     "root handoff device record ABI");
-_Static_assert(sizeof(struct pacha_root_handoff) == 1184,
+_Static_assert(sizeof(struct pacha_root_handoff) == 1328,
     "root handoff metadata ABI");

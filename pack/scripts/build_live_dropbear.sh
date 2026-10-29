@@ -2,6 +2,7 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "$0")/../.." && pwd)"
+source "$repo_root/pack/scripts/lib/jobs.sh"
 version=2026.94
 expected_sha=e098034a843699200c8c977a991fff73159735bf795d5f72ef672c41a6b1ae81
 source_root="$repo_root/.artifacts/third_party/dropbear"
@@ -35,7 +36,7 @@ if [[ ! -f "$build/Makefile" ]]; then
       --disable-wtmp --disable-wtmpx --disable-lastlog
   )
 fi
-make -s -C "$build" -j 4 PROGRAMS='dropbear dropbearkey'
+pacgo_make "${PACGO_BUILD_JOBS:-4}" -s -C "$build" PROGRAMS='dropbear dropbearkey'
 install -m 0755 "$build/dropbear" "$output/dropbear"
 install -m 0755 "$build/dropbearkey" "$output/dropbearkey"
 for binary in "$output/dropbear" "$output/dropbearkey"; do

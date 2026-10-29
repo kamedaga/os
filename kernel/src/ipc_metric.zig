@@ -86,7 +86,103 @@ pub const Op = enum(usize) {
     entry_fail_other,
     entry_fail_receive_capacity,
     entry_route_overflow,
+    poll_block_idle_unqueued,
+    poll_block_idle_queued,
+    poll_block_active,
+    poll_block_transient,
+    poll_block_receive_memory,
+    poll_block_inactive,
+    poll_block_direct,
+    poll_block_scalar,
+    poll_block_notify,
+    poll_block_token_current,
+    poll_block_token_stale,
 };
+
+pub const PollRoute = enum { direct, scalar, notify };
+/// K/E retain the node and its subscription. Classify only a rejected attempt,
+/// without touching readiness or the scheduler; one syscall may try two routes.
+pub fn pollBlocker(node: *const types.IpcWaiter, path: PollRoute) void {
+    if (comptime !enabled) return;
+    recordElapsed(switch (path) {
+        .direct => .poll_block_direct,
+        .scalar => .poll_block_scalar,
+        .notify => .poll_block_notify,
+    }, 0);
+    const reason: Op = if (!node.active) .poll_block_inactive
+        else if (node.recv_memory.active) .poll_block_receive_memory
+        else if (node.binding.persistent) |item|
+            (if (item.set.invocation != null) .poll_block_active
+            else if (item.queued) .poll_block_idle_queued else .poll_block_idle_unqueued)
+        else .poll_block_transient;
+    recordElapsed(reason, 0);
+    if (reason == .poll_block_active) {
+        const set = node.binding.persistent.?.set;
+        const invocation = set.invocation.?;
+        // K/E retain the subscription; the existing T-owned query validates
+        // its incarnation without cleaning or changing admission. A matching
+        // token does not assert that the target is currently asleep.
+        const current = @import("scheduler_connection.zig").waitTokenIsCurrent(
+            set.owner, set.thread, set.thread_generation, invocation.token);
+        recordElapsed(if (current) .poll_block_token_current else .poll_block_token_stale, 0);
+    }
+}
+
+test "principal syscall counts poll blocker classification is exclusive" {
+    @import("scheduler_connection.zig").initializeStaticStorage();
+    defer @import("scheduler_connection.zig").initializeStaticStorage();
+    counters = &counters_boot;
+    @memset(&counters_boot[0], 0);
+    var set: @import("state/persistent_wait_types.zig").Set = .{};
+    var item: @import("state/persistent_wait_types.zig").Item = .{ .set = &set };
+    const expected = [_]Op{ .poll_block_inactive, .poll_block_transient,
+        .poll_block_receive_memory, .poll_block_idle_unqueued,
+        .poll_block_idle_queued, .poll_block_active };
+    for (expected, 0..) |reason, i| {
+        var node: types.IpcWaiter = .{ .active = i != 0 };
+        if (i == 2) node.recv_memory.active = true;
+        if (i >= 3) node.binding.persistent = &item;
+        item.queued = i == 4;
+        set.invocation = if (i == 5) .{ .token = 1 } else null;
+        pollBlocker(&node, .scalar);
+        try std.testing.expectEqual(@as(u64, 1), counters[0][2 * @intFromEnum(reason)]);
+    }
+    try std.testing.expectEqual(@as(u64, expected.len), counters[0][2 * @intFromEnum(Op.poll_block_scalar)]);
+    var total: u64 = 0;
+    for (expected) |reason| total += counters[0][2 * @intFromEnum(reason)];
+    try std.testing.expectEqual(@as(u64, expected.len), total);
+}
+
+test "principal syscall counts retained token current expired generation and owner" {
+    const scheduler = @import("scheduler_connection.zig");
+    scheduler.initializeStaticStorage();
+    defer scheduler.initializeStaticStorage();
+    const ctx = scheduler.threadContextMutable(7).?;
+    const saved = ctx.*;
+    defer ctx.* = saved;
+    counters = &counters_boot;
+    @memset(&counters_boot[0], 0);
+    const owner = types.processPrincipalFromIndex(0).?;
+    var set: @import("state/persistent_wait_types.zig").Set = .{
+        .owner = owner, .thread = 7, .thread_generation = 11, .invocation = .{ .token = 41 },
+    };
+    var item: @import("state/persistent_wait_types.zig").Item = .{ .set = &set };
+    const node: types.IpcWaiter = .{ .active = true, .binding = .{ .persistent = &item } };
+    for (0..4) |scenario| {
+        ctx.* = .{ .id = 7, .allocated = true, .generation = 11,
+            .owner_process = owner, .active_wait_token = 41 };
+        switch (scenario) {
+            1 => ctx.active_wait_token = 0,
+            2 => ctx.generation += 1,
+            3 => ctx.owner_process = types.processPrincipalFromIndex(1).?,
+            else => {},
+        }
+        pollBlocker(&node, .scalar);
+        try std.testing.expectEqual(@as(u64, 1), counters[0][2 * @intFromEnum(Op.poll_block_token_current)]);
+        try std.testing.expectEqual(@as(u64, @intCast(scenario)), counters[0][2 * @intFromEnum(Op.poll_block_token_stale)]);
+        try std.testing.expectEqual(@as(u64, @intCast(scenario + 1)), counters[0][2 * @intFromEnum(Op.poll_block_active)]);
+    }
+}
 pub const Direction = enum { request, reply };
 pub const Phase = enum { build, claim, install, copy, complete, register, block, select, @"switch", pmm_alloc, pmm_free };
 // Scoped only across synchronous kernel work; never retained across block or

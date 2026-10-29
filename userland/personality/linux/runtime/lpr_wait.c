@@ -163,6 +163,9 @@ int64_t lpr_wait_graph_add_fd(
         return lpr_wait_graph_add_native(graph, lpr_drm_native_wait_fd(fd),
             PACHA_FD_EVENT_READABLE | PACHA_FD_EVENT_HANGUP);
     }
+    if (lpr_audio_backend(fd))
+        return lpr_wait_graph_add_native(graph, lpr_audio_backend(fd)->native.raw,
+            PACHA_FD_EVENT_READABLE | PACHA_FD_EVENT_HANGUP);
     if (lpr_linux_input_fd_active(fd))
         return lpr_wait_graph_add_leaf(
             graph, lpr_input_native_wait_fd(fd), PACHA_FD_EVENT_READABLE,
@@ -310,6 +313,72 @@ static int64_t lpr_wait_sleep(uint64_t wait_ns)
     return lpr_pacha_nanosleep(&delay);
 }
 
+struct lpr_native_wait_cache {
+    uint64_t process_token;
+    uint32_t count, valid;
+    struct { uint64_t fd, events, minimum; } items[LPR_WAIT_GRAPH_MAX_LEAVES];
+};
+#define LPR_NATIVE_WAIT_CACHE_BYTES ((sizeof(struct lpr_native_wait_cache) + 4095u) & ~4095ull)
+
+void lpr_wait_thread_release(lpr_thread_record_t *record)
+{
+    if (!record || !record->native_wait_set) return;
+    (void)lpr_pacha_syscall4(PACHA_FD_SYSCALL_WAIT_MANY, 0, 0, 0, PACHA_FD_WAIT_SET_CLEAR);
+    (void)lpr_pacha_syscall2(PACHAOS_SYSCALL_MUNMAP,
+        (uint64_t)(uintptr_t)record->native_wait_set, LPR_NATIVE_WAIT_CACHE_BYTES);
+    record->native_wait_set = NULL;
+}
+
+int64_t lpr_wait_native_retained_fds(struct pacha_pollfd *leaves,
+    uint32_t count, uint64_t timeout, uint64_t native_flags)
+{
+    lpr_thread_record_t *record = NULL;
+    const int found = lpr_thread_current_record(&record);
+    if (found != 0 || record == NULL)
+        return lpr_pacha_syscall4(PACHA_FD_SYSCALL_WAIT_MANY,
+            (uint64_t)(uintptr_t)leaves, count, timeout, native_flags);
+    struct lpr_native_wait_cache *cache = record->native_wait_set;
+    if (!cache) {
+        /* Do not enlarge clone's stack-resident thread record. A bounded
+         * private mapping is created only for a thread that actually waits. */
+        const int64_t mapped = lpr_pacha_syscall6(PACHAOS_SYSCALL_MMAP, 0, 0,
+            LPR_NATIVE_WAIT_CACHE_BYTES, PACHAOS_PROT_READ | PACHAOS_PROT_WRITE,
+            PACHAOS_MMAP_PRIVATE | PACHAOS_MMAP_ANONYMOUS, 0);
+        if (mapped < 4096) return -LPR_LINUX_ENOMEM;
+        cache = record->native_wait_set = (void *)(uintptr_t)mapped;
+        lpr_memset(cache, 0, sizeof(*cache));
+    }
+    unsigned same = cache->valid && cache->process_token == lpr_supervisor_token &&
+        cache->count == count;
+    for (uint32_t i = 0; same && i < count; ++i)
+        same = cache->items[i].fd == leaves[i].fd &&
+            cache->items[i].events == leaves[i].events &&
+            cache->items[i].minimum == leaves[i].min_write_bytes;
+    uint64_t flags = native_flags | (same ? PACHA_FD_WAIT_SET_REUSE : PACHA_FD_WAIT_SET_REPLACE);
+    int64_t result = lpr_pacha_syscall4(PACHA_FD_SYSCALL_WAIT_MANY,
+        (uint64_t)(uintptr_t)leaves, count, timeout, flags);
+    if (result == PACHA_FD_WAIT_SET_INVALIDATED && same) {
+        same = 0;
+        result = lpr_pacha_syscall4(PACHA_FD_SYSCALL_WAIT_MANY,
+            (uint64_t)(uintptr_t)leaves, count, timeout,
+            native_flags | PACHA_FD_WAIT_SET_REPLACE);
+    }
+    if (!same) {
+        uint32_t ready = 0;
+        for (uint32_t i = 0; i < count; ++i) ready += leaves[i].revents != 0;
+        cache->valid = (result > 0 && result == ready) ||
+            (result == PACHA_SYSCALL_ERR_NOT_READY && ready == 0);
+        cache->process_token = lpr_supervisor_token;
+        cache->count = count;
+        for (uint32_t i = 0; i < count; ++i) {
+            cache->items[i].fd = leaves[i].fd;
+            cache->items[i].events = leaves[i].events;
+            cache->items[i].minimum = leaves[i].min_write_bytes;
+        }
+    }
+    return result;
+}
+
 static int64_t lpr_wait_graph_block_native(
     lpr_wait_graph_t *graph,
     const lpr_wait_deadline_t *deadline)
@@ -404,12 +473,8 @@ static int64_t lpr_wait_graph_block_native(
         const int gui = lpr_gui_profile_current_thread();
         const uint64_t gui_start = gui ? pacha_trace_read_tsc() : 0;
 #endif
-        status = lpr_pacha_syscall4(
-            PACHA_FD_SYSCALL_WAIT_MANY,
-            (uint64_t)(uintptr_t)graph->leaves,
-            graph->leaf_count,
-            timeout_ticks,
-            0);
+        status = lpr_wait_native_retained_fds(graph->leaves, graph->leaf_count,
+            timeout_ticks, 0);
 #if defined(LPR_GUI_PROFILE) && LPR_GUI_PROFILE
         if (gui) {
             const uint64_t end = pacha_trace_read_tsc();

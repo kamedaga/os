@@ -39,7 +39,7 @@ void filed_runtime_init(filed_runtime_t *rt)
     rt->bootstrap_fd=rt->client_endpoint_fd=rt->unix_path_fd=-1;
     rt->live_bootfs_fd=rt->live_ready_fd=-1;
     rt->netd_socket_endpoint_fd=rt->termd_tty_endpoint_fd=-1;
-    rt->gpud_drm_endpoint_fd=rt->inputd_input_endpoint_fd=-1;
+    rt->gpud_drm_endpoint_fd=rt->inputd_input_endpoint_fd=rt->audiod_pcm_endpoint_fd=-1;
     rt->storage_generation=1;
     rt->client_sequence=1;
 }
@@ -50,30 +50,56 @@ int filed_runtime_bootstrap(filed_runtime_t *rt,char **argv)
     if (fd<16) return fd;
     rt->bootstrap_fd=fd;
     struct pacha_fd_info info;
+    uint64_t magic = 0;
     if (pacha_fd_get_info(fd,&info) || info.kind!=PACHA_FD_KIND_VMO ||
-        info.size<sizeof(storage_filed_bootstrap_t)) return -EINVAL;
-    storage_filed_bootstrap_t bootstrap={0};
-    long got=pacha_fd_read(fd,&bootstrap,sizeof(bootstrap));
-    if (got!=(long)sizeof(bootstrap) ||
-        bootstrap.magic!=STORAGE_FILED_BOOTSTRAP_MAGIC ||
+        info.size<sizeof(magic) || pacha_fd_read(fd,&magic,sizeof(magic))!=(long)sizeof(magic))
+        return -EINVAL;
+    pacha_system_info_t memory={0};
+    if (pacha_syscall1(PACHA_RUNTIME_SYSCALL_SYSTEM_INFO,(uintptr_t)&memory)) return -EIO;
+    rt->snapshots.limit=memory.total_usable_memory_bytes/8;
+    if (rt->snapshots.limit>UINT64_C(768)*1024*1024)
+        rt->snapshots.limit=UINT64_C(768)*1024*1024;
+    if (magic==FILED_LIVE_BOOTSTRAP_MAGIC) {
+        filed_live_bootstrap_t live={.magic=magic};
+        if (info.size<sizeof(live) ||
+            pacha_fd_read(fd,(uint8_t *)&live+sizeof(magic),sizeof(live)-sizeof(magic))!=(long)(sizeof(live)-sizeof(magic)) ||
+            live.bootfs_fd<16 || live.bootfs_fd>=PACHA_THREAD_SELF_FD ||
+            live.public_endpoint_fd<16 || live.public_endpoint_fd>=PACHA_THREAD_SELF_FD ||
+            live.ready_channel_fd<16 || live.ready_channel_fd>=PACHA_THREAD_SELF_FD ||
+            live.unix_path_fd<16 || live.unix_path_fd>=PACHA_THREAD_SELF_FD ||
+            live.bootfs_size<104 || live.bootfs_size>FILED_LIVE_BOOTFS_MAX_BYTES)
+            return -EINVAL;
+        /* A bounded resource budget for the existing filesystem core. RAM
+         * root imports and installer staging share Linux tmpfs accounting;
+         * there is no disk discovery or device capability in this owner. */
+        uint64_t ram=memory.total_usable_memory_bytes/2;
+        if (ram>(UINT64_C(4)<<30)) ram=UINT64_C(4)<<30;
+        ram &= ~UINT64_C(4095);
+        if (ram<(UINT64_C(256)<<20)) return -ENOMEM;
+        rt->live_root=1;
+        rt->live_bootfs_fd=(pacha_fd_t)live.bootfs_fd;
+        rt->live_bootfs_size=live.bootfs_size;
+        rt->live_ready_fd=(pacha_fd_t)live.ready_channel_fd;
+        rt->client_endpoint_fd=(pacha_fd_t)live.public_endpoint_fd;
+        rt->unix_path_fd=(pacha_fd_t)live.unix_path_fd;
+        rt->bootstrap.queue_arena_bytes=16u<<20;
+        return filed_storage_owner_create_ram(rt->live_bootfs_fd,
+            live.bootfs_size,ram,&rt->storage);
+    }
+    storage_filed_bootstrap_t bootstrap={.magic=magic};
+    if (magic!=STORAGE_FILED_BOOTSTRAP_MAGIC || info.size<sizeof(bootstrap) ||
+        pacha_fd_read(fd,(uint8_t *)&bootstrap+sizeof(magic),sizeof(bootstrap)-sizeof(magic))!=(long)(sizeof(bootstrap)-sizeof(magic)) ||
         bootstrap.control_fd<16 || bootstrap.control_fd>=PACHA_THREAD_SELF_FD ||
         bootstrap.unix_path_fd<16 || bootstrap.unix_path_fd>=PACHA_THREAD_SELF_FD ||
         bootstrap.bootfs_fd<16 || bootstrap.bootfs_fd>=PACHA_THREAD_SELF_FD ||
         !bootstrap.bootfs_size) return -EINVAL;
-    /* At 8 GiB this covers the measured 519 MiB boot distinct set while
-     * retaining at most 768 MiB. Smaller machines retain at most RAM/8. */
-    pacha_system_info_t memory={0};
-    if (!pacha_syscall1(PACHA_RUNTIME_SYSCALL_SYSTEM_INFO,(uintptr_t)&memory)) {
-        rt->snapshots.limit=memory.total_usable_memory_bytes/8;
-        if (rt->snapshots.limit>UINT64_C(768)*1024*1024)
-            rt->snapshots.limit=UINT64_C(768)*1024*1024;
-    }
     rt->bootstrap=bootstrap;
     rt->client_endpoint_fd=(pacha_fd_t)bootstrap.control_fd;
     rt->unix_path_fd=(pacha_fd_t)bootstrap.unix_path_fd;
     return filed_storage_owner_create((pacha_fd_t)bootstrap.bootfs_fd,
         bootstrap.bootfs_size,&bootstrap,&rt->storage);
 }
+
 int filed_runtime_mount_root(filed_runtime_t *rt)
 {
     if (!rt || !rt->storage) return -EINVAL;
@@ -96,5 +122,6 @@ int filed_runtime_mount_root(filed_runtime_t *rt)
         .capabilities=KB2_FILESYSTEM_RIGHTS_VALID_MASK,
         .data={KB2_FILESYSTEM_REQUEST_SIZE,KB2_FILESYSTEM_CREDENTIALS_SIZE}};
     if (!status) status=filed_owner_control(rt,&register_owner,bytes,sizeof(bytes),&response);
+    if (!status && rt->live_root) status=filed_live_root_import(rt);
     return status;
 }

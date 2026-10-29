@@ -386,15 +386,34 @@ pub fn fastDispatchAfterRegisterAdmission(h: anytype, state: *kernel.KernelState
     const resolved = .{ .queue = borrowed.queue, .list = borrowed.list, .hint = borrowed.hint.* };
     const queue = resolved.queue;
     const list = resolved.list;
+    // Persistent observers queue native readiness rather than completing an
+    // old transient group. Their copyout runs in ordinary XSAVE dispatch after
+    // E ends, never in this scalar live-XState entry. Reject before enqueue.
+    var observer = list.dataPollAfter(null);
+    while (observer) |node| : (observer = list.dataPollAfter(node))
+        if (node.binding.persistent != null) {
+            ipc_metric.pollBlocker(node, .scalar);
+            return fastMissFor(frame, .fast_generic_waiter);
+        };
+    if (borrowed.opposite) |opposite| {
+        observer = opposite.dataPollAfter(null);
+        while (observer) |node| : (observer = opposite.dataPollAfter(node))
+            if (node.binding.persistent != null) {
+                ipc_metric.pollBlocker(node, .scalar);
+                return fastMissFor(frame, .fast_generic_waiter);
+            };
+    }
     if (comptime ipc_metric.enabled) ipc_metric.route(2, frame.rax, proc, (tid << 32) | generation, frame.r15 >> 32, list, resolved.hint);
     if (!queue.isEmpty()) return fastMissFor(frame, .fast_queued);
-    const poll_ready = if (list.poll_head) |waiter|
-        (is_call or is_send) and list.receive_head == null and waiter.next == null and
+    const data_waiter = list.dataPollAfter(null);
+    const poll_ready = if (data_waiter) |waiter|
+        (is_call or is_send) and list.receive_head == null and list.dataPollAfter(waiter) == null and
             !waiter.recv_memory.active and (waiter.events & fd_abi.event_readable) != 0
     else
         false;
-    if (list.poll_head) |waiter| {
+    if (data_waiter) |waiter| {
         if (!poll_ready) {
+            ipc_metric.pollBlocker(waiter, .scalar);
             if (comptime ipc_metric.enabled) {
                 if (!is_send) ipc_metric.recordElapsed(if (waiter.recv_memory.active) .generic_receive else .generic_poll, 0);
             }
@@ -994,6 +1013,10 @@ pub fn dispatch(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId
 }
 
 pub fn dispatchAfterScalarMiss(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, frame: *TrapFrame) ?u64 {
+    // Ordinary dispatch probes every remaining syscall through here, including
+    // the K-free runtime calls. The drain moves nodes through `draining` and
+    // is K-owned; running it for those calls races a K owner's registration.
+    if (!ipc_abi.isIpcSyscall(frame.rax)) return null;
     state.drainIpcCancellations(h.free_list);
     const input = frame.*;
     switch (input.rax) {

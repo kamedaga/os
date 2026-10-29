@@ -43,11 +43,11 @@ long pacha_syscall4(uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t
     return pacha_poll_registers(nr, a0, a1, a2, a3);
 }
 long pacha_syscall5(uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4) {
-    if (nr == 51 || nr == 52) return pacha_poll_registers(nr, a0, a1, a2, a3);
+    if (nr == PACHA_FD_SYSCALL_POLL || nr == PACHA_FD_SYSCALL_WAIT_MANY) return pacha_poll_registers(nr, a0, a1, a2, a3);
     return pacha_native_syscall_retry6(nr, a0, a1, a2, a3, a4, 0).status;
 }
 long pacha_syscall6(uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) {
-    if (nr == 51 || nr == 52) return pacha_poll_registers(nr, a0, a1, a2, a3);
+    if (nr == PACHA_FD_SYSCALL_POLL || nr == PACHA_FD_SYSCALL_WAIT_MANY) return pacha_poll_registers(nr, a0, a1, a2, a3);
     return pacha_native_syscall_retry6(nr, a0, a1, a2, a3, a4, a5).status;
 }
 

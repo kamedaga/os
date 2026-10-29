@@ -212,7 +212,7 @@ int64_t lpr_backend_read(const lpr_fd_pin_t *pin, uint64_t buf, uint64_t count, 
         uint64_t consumed = 0;
         for (;;) {
             uint64_t counter = __atomic_load_n(
-                &event->counter, __ATOMIC_ACQUIRE);
+                lpr_event_counter(event), __ATOMIC_ACQUIRE);
             while (counter == 0) {
                 if ((event->flags & LPR_LINUX_O_NONBLOCK) != 0)
                     return -LPR_LINUX_EAGAIN;
@@ -227,13 +227,13 @@ int64_t lpr_backend_read(const lpr_fd_pin_t *pin, uint64_t buf, uint64_t count, 
                     wait_status = lpr_wait_graph_block(&graph, &deadline, wait_not_ready);
                 if (wait_status != 0) return wait_status;
                 counter = __atomic_load_n(
-                    &event->counter, __ATOMIC_ACQUIRE);
+                    lpr_event_counter(event), __ATOMIC_ACQUIRE);
             }
             const uint64_t next =
                 (event->reserved1 & LPR_LINUX_EFD_SEMAPHORE) != 0 ?
                     counter - 1u : 0u;
             if (__atomic_compare_exchange_n(
-                    &event->counter,
+                    lpr_event_counter(event),
                     &counter,
                     next,
                     0,

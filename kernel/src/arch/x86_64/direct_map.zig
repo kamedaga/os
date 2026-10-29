@@ -15,7 +15,7 @@ const nx: u64 = @as(u64, 1) << 63;
 const leaf_flags: u64 = nx | 3;
 const address_mask: u64 = 0x000f_ffff_ffff_f000;
 
-pub const Region = struct { base: u64, bytes: u64, usable: bool, prepare_only: bool = false };
+pub const Region = struct { base: u64, bytes: u64, usable: bool, prepare_only: bool = false, firmware_reserved: bool = false };
 pub const Extent = struct { start: u64, end: u64 };
 pub const Error = error{ InvalidMap, PhysicalLimit, InvalidExclusion, InvalidImage, NoSpace, InvalidTable, OccupiedRoot };
 

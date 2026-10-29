@@ -1,5 +1,6 @@
 #include "../lpr_filed_internal.h"
 #include "../lpr_fd/allocate.h"
+#include <pacha/native_syscall_retry.h>
 
 uint64_t lpr_open_rights(uint64_t flags)
 {
@@ -59,6 +60,9 @@ int64_t lpr_copy_path(char *out, uint64_t capacity, const char *path)
 
 int64_t lpr_dir_handle_for(uint64_t dirfd, const char *path, uint64_t *out)
 {
+    // Linux takes an int: glibc may zero-extend AT_FDCWD in the syscall
+    // register, whereas musl sign-extends it. Ignore the upper register bits.
+    dirfd = (uint64_t)(int64_t)(int32_t)(uint32_t)dirfd;
     if (out == 0 || path == 0) {
         return -LPR_LINUX_EFAULT;
     }
@@ -114,8 +118,14 @@ int64_t lpr_filed_transfer_dup_handle(
     kb2_fs_response_t response;
     const int64_t status = lpr_fs_call(&request, 0, 0, 0, 0, 0, 0,
         &response, lease_fd, 0);
-    if (!status) *out_handle = response.handle;
-    return status;
+    if (status) return status;
+    if (!response.handle) return -LPR_LINUX_EIO;
+    /* The RPC copies the server endpoint. A checked success leaves filed
+     * owning that copy; retaining ours leaks one native channel FD per SCM
+     * send/fork/exec. On failure the caller still owns both endpoints. */
+    (void)lpr_close_native_fd_if_open((uint64_t)lease_fd);
+    *out_handle = response.handle;
+    return 0;
 }
 
 
@@ -248,6 +258,7 @@ int64_t lpr_linux_mknodat(uint64_t dirfd, uint64_t path_raw, uint64_t mode, uint
 
 int64_t lpr_linux_readlinkat_to_buffer(uint64_t dirfd, uint64_t path_raw, char *target, uint64_t capacity);
 int lpr_resolve_final_symlink_path(const char *path, const char *target, char *out, uint64_t capacity);
+static int lpr_linux_proc_self_fd_number(const char *path, uint64_t *out_fd);
 
 int64_t lpr_linux_symlinkat(uint64_t target_raw, uint64_t dirfd, uint64_t path_raw)
 {
@@ -271,6 +282,33 @@ int64_t lpr_linux_linkat(uint64_t old_dirfd, uint64_t old_path_raw,
     const char *from = (const char *)(uintptr_t)old_path_raw;
     const char *to = (const char *)(uintptr_t)new_path_raw;
     uint64_t first, second;
+    uint64_t source_fd;
+    /* /proc/self belongs to this Linux process, not FileD's storage process.
+     * Follow its FD magic link using the existing file-handle operation; pin
+     * the OFD until LINKAT completes so close/reuse cannot change its source. */
+    if ((flags & LPR_LINUX_AT_SYMLINK_FOLLOW) && lpr_linux_proc_self_fd_number(from, &source_fd)) {
+        int64_t status = lpr_filed_endpoint_ready();
+        if (status) return status;
+        lpr_fd_arrays_init();
+        lpr_fd_pin_t pin;
+        if (lpr_fd_table_pin(&lpr_control_fd_table, (uint32_t)source_fd, &pin))
+            return -LPR_LINUX_ENOENT;
+        if (pin.ops_id != LPR_FD_OPS_FILED || !pin.state) {
+            lpr_fd_unpin(&pin);
+            return -LPR_LINUX_ENOENT;
+        }
+        first = ((const lpr_filed_backend_t *)pin.state)->handle;
+        status = lpr_dir_handle_for(new_dirfd, to, &second);
+        if (!status) {
+            kb2_fs_request_t request = {.opcode = KB2_FILESYSTEM_OP_LINKAT,
+                .handle = first, .second_handle = second,
+                .flags = (flags & ~LPR_LINUX_AT_SYMLINK_FOLLOW) | LPR_LINUX_AT_EMPTY_PATH};
+            kb2_fs_response_t response;
+            status = lpr_fs_call(&request, "", to, 0, 0, 0, 0, &response, -1, 0);
+        }
+        lpr_fd_unpin(&pin);
+        return status;
+    }
     int64_t status = lpr_dir_handle_for(old_dirfd, from, &first);
     if (!status) status = lpr_dir_handle_for(new_dirfd, to, &second);
     if (status) return status;
@@ -283,17 +321,21 @@ int64_t lpr_linux_linkat(uint64_t old_dirfd, uint64_t old_path_raw,
 
 static int64_t filed_open_handle_at(uint64_t dirfd, const char *path,
     uint64_t flags, uint64_t mode, uint64_t *out_handle, uint64_t *out_kind,
-    uint8_t *route_stat)
+    uint8_t *route_stat, pacha_fd_t *device_endpoint)
 {
+    if (device_endpoint) *device_endpoint = -1;
     if (!out_handle) return -LPR_LINUX_EFAULT;
     *out_handle = 0;
     if (out_kind) *out_kind = 0;
     uint64_t dir_handle;
     const int64_t status = lpr_dir_handle_for(dirfd, path, &dir_handle);
     if (status) return status;
+    /* Linux open/openat mask mode to permission and special bits before
+     * build_open_flags. Our backend uses openat2, which instead rejects file
+     * type bits: forwarding tar's S_IFREG | 0644 would spuriously fail EINVAL. */
     kb2_fs_request_t request = {.opcode = KB2_FILESYSTEM_OP_OPENAT2,
         .handle = dir_handle, .flags = flags,
-        .mode = (flags & (LPR_LINUX_O_CREAT | 020000000ull)) ? mode : 0,
+        .mode = (flags & (LPR_LINUX_O_CREAT | 020000000ull)) ? mode & 07777u : 0,
         .mask = route_stat ? 0x7ffu : 0, /* STATX_BASIC_STATS */
         .umask = lpr_linux_umask_value};
     kb2_fs_response_t response;
@@ -305,7 +347,8 @@ static int64_t filed_open_handle_at(uint64_t dirfd, const char *path,
          * open failure. Never resend ordinary OPENAT2 through the control plane. */
         request.opcode = KB2_FILESYSTEM_OP_DEVICE_ROUTE;
         int64_t routed = lpr_fs_call(&request, path, 0, 0, 0, route_stat,
-            KB2_FILESYSTEM_STATX_SIZE, &response, -1, 0);
+            KB2_FILESYSTEM_STATX_SIZE, &response, -1, device_endpoint);
+        opened = routed;
         if (!routed) {
             if (!response.handle || !response.service ||
                 response.data_length != KB2_FILESYSTEM_STATX_SIZE) {
@@ -329,7 +372,7 @@ int64_t lpr_filed_open_handle_at(uint64_t dirfd, const char *path,
     uint64_t flags, uint64_t mode, uint64_t *out_handle, uint64_t *out_kind)
 {
     uint8_t route_stat[KB2_FILESYSTEM_STATX_SIZE];
-    return filed_open_handle_at(dirfd,path,flags,mode,out_handle,out_kind,route_stat);
+    return filed_open_handle_at(dirfd,path,flags,mode,out_handle,out_kind,route_stat,0);
 }
 
 int64_t lpr_filed_device_open_route(uint32_t service, const uint8_t *statx, uint64_t flags)
@@ -517,13 +560,23 @@ int64_t lpr_linux_openat_once(
     uint64_t handle = 0;
     uint64_t opened_kind = 0;
     uint8_t route_stat[KB2_FILESYSTEM_STATX_SIZE];
+    pacha_fd_t audio_endpoint = -1;
     const int64_t status = filed_open_handle_at(
-        dirfd, path, flags, mode, &handle, &opened_kind,route_stat);
+        dirfd, path, flags, mode, &handle, &opened_kind,route_stat,&audio_endpoint);
     if (status != 0) {
+        if (audio_endpoint >= 16) (void)lpr_close_native_fd_if_open((uint64_t)audio_endpoint);
         return status;
     }
     if (opened_kind) {
-        int64_t routed = lpr_filed_device_open_route((uint32_t)opened_kind,route_stat,flags);
+        int64_t routed;
+        if (opened_kind == FILED_SERVICE_AUDIOD_PCM) {
+            routed = lpr_audio_install(audio_endpoint, flags);
+            if (routed < 0 && audio_endpoint >= 16)
+                (void)lpr_close_native_fd_if_open((uint64_t)audio_endpoint);
+        } else {
+            if (audio_endpoint >= 16) (void)lpr_close_native_fd_if_open((uint64_t)audio_endpoint);
+            routed = lpr_filed_device_open_route((uint32_t)opened_kind,route_stat,flags);
+        }
         const int64_t closed = lpr_filed_close_handle(handle);
         if (closed) {
             if (routed >= 0) (void)lpr_linux_close((uint64_t)routed);
@@ -582,6 +635,9 @@ int64_t lpr_linux_readlinkat_to_buffer(uint64_t dirfd, uint64_t path_raw, char *
     int64_t proc_status = 0;
     if (lpr_linux_proc_readlink(path, target, capacity, &proc_status))
         return proc_status;
+    uint64_t proc_pid = 0;
+    if (lpr_linux_proc_pid_directory(path, &proc_pid, &proc_status))
+        return proc_status ? proc_status : -LPR_LINUX_EINVAL;
     uint64_t source_fd = 0;
     if (lpr_linux_proc_self_fd_number(path, &source_fd)) {
         const int64_t binding_status = lpr_filed_fd_binding(source_fd);
@@ -730,6 +786,7 @@ int64_t lpr_cwd_install(uint64_t handle)
                 0,
                 remote_lease_fd,
                 &installed_handle);
+            if (!status) remote_lease_fd = -1;
             installed_escrow = installed_handle;
             if (!status) status = lpr_filed_adopt(&installed_handle, installed_lease_fd);
         }
@@ -864,20 +921,25 @@ void lpr_timespec_subtract(
 int64_t lpr_pacha_clock_gettime(uint64_t clock_id, struct pachaos_timespec *out)
 {
     lpr_memset(out, 0, sizeof(*out));
-    int64_t status;
+    struct pacha_native_result result;
     do {
-        status = lpr_pacha_syscall2(
-            PACHAOS_SYSCALL_CLOCK_GETTIME,
-            clock_id,
-            (uint64_t)(uintptr_t)out);
-        if (status == PACHA_SYSCALL_ERR_NOT_READY ||
-            status == -PACHA_SYSCALL_ERR_NOT_READY)
+        /* This helper writes LPR-owned storage. Read the existing scalar
+         * clock result instead of asking the kernel to validate and copy a
+         * timespec into that storage. Linux clock_gettime's user-pointer
+         * validation remains in its separate syscall handler. */
+        result = pacha_native_syscall_retry6(
+            PACHAOS_SYSCALL_CLOCK_READ, clock_id, 0, 0, 0, 0, 0);
+        if (result.status == PACHA_SYSCALL_ERR_NOT_READY ||
+            result.status == -PACHA_SYSCALL_ERR_NOT_READY)
         {
             __asm__ volatile("pause");
         }
-    } while (status == PACHA_SYSCALL_ERR_NOT_READY ||
-             status == -PACHA_SYSCALL_ERR_NOT_READY);
-    return status == 0 ? 0 : lpr_pacha_status_to_errno(status);
+    } while (result.status == PACHA_SYSCALL_ERR_NOT_READY ||
+             result.status == -PACHA_SYSCALL_ERR_NOT_READY);
+    if (result.status) return lpr_pacha_status_to_errno(result.status);
+    out->tv_sec = result.rdx / UINT64_C(1000000000);
+    out->tv_nsec = result.rdx % UINT64_C(1000000000);
+    return 0;
 }
 
 int64_t lpr_pacha_nanosleep(const struct pachaos_timespec *req)

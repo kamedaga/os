@@ -124,6 +124,19 @@ int main(void)
     CHECK(exit_code == 37);
     CHECK(match_count == 1);
 
+    lprs_wait4_t peek = {.token = processes[0].token,
+        .requested_pid = (int64_t)processes[1].pid,
+        .options = LPRS_WNOHANG | LPRS_WAIT4_WNOWAIT};
+    processes[1].credentials.uid = 1234;
+    uint64_t peek_result = 0;
+    CHECK(lprs_wait4(&peek, &peek_result) == 0);
+    CHECK(LPRS_WAIT4_RESULT_PID(peek_result) == processes[1].pid);
+    CHECK(LPRS_WAIT4_RESULT_STATUS(peek_result) == (37u << 8));
+    CHECK(peek.uid == 1234);
+    CHECK(processes[1].active && !processes[1].waited);
+    CHECK(lprs_wait4(&peek, &peek_result) == 0);
+    CHECK(processes[1].active && !processes[1].waited);
+
     lprs_kill_t kill_request = {
         .token = processes[0].token,
         .pid = (int64_t)processes[1].pid,

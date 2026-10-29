@@ -11,7 +11,12 @@
 
 static unsigned active_phase = FRAME_PHASE_COUNT;
 static _Thread_local unsigned nested;
-static int (*next_ioctl)(int, int, ...);
+#if defined(__GLIBC__)
+typedef unsigned long frame_ioctl_request_t;
+#else
+typedef int frame_ioctl_request_t;
+#endif
+static int (*next_ioctl)(int, frame_ioctl_request_t, ...);
 static int (*next_poll)(struct pollfd *, nfds_t, int);
 static struct frame_trace_snapshot counters;
 static unsigned lock;
@@ -51,7 +56,7 @@ static void record(unsigned phase, uint32_t operation, uint64_t start, int faile
     }
     ++counters.overflow; release();
 }
-int ioctl(int fd, int operation, ...)
+int ioctl(int fd, frame_ioctl_request_t operation, ...)
 {
     if (!next_ioctl) { errno = ENOSYS; return -1; }
     va_list arguments; va_start(arguments, operation);

@@ -4,6 +4,7 @@ const capsule_abi = abi_root.capsule_abi;
 const interrupts = @import("../interrupts.zig");
 const kernel = @import("../kernel.zig");
 const pci = @import("../pci.zig");
+const platform_device = @import("../platform_device.zig");
 const user_copy = @import("../user_copy.zig");
 const user_vm = @import("../memory/user_vm.zig");
 const x86_platform = @import("../arch/x86_64/platform.zig");
@@ -117,7 +118,16 @@ fn mmioCacheForRange(flags: u64, paddr: u64, bytes: u64) MmioCacheError!user_vm.
                 else => error.Invalid,
             };
         };
-        if (@import("../boot/boot_diag.zig").enabled or !x86_platform.kernelDeviceCacheAllowed(paddr, bytes, true)) return error.Invalid;
+        // The same ABI status covers independent alias/admission refusals.
+        // Keep the failing boundary visible without weakening its policy.
+        if (@import("../boot/boot_diag.zig").enabled) {
+            kernel_log.writeFmt("mmio: WC refused diagnostic GOP ownership paddr=0x{x} bytes=0x{x}\n", .{ paddr, bytes });
+            return error.Invalid;
+        }
+        if (!x86_platform.kernelDeviceCacheAllowed(paddr, bytes, true)) {
+            kernel_log.writeFmt("mmio: WC refused kernel physical cache admission paddr=0x{x} bytes=0x{x}\n", .{ paddr, bytes });
+            return error.Invalid;
+        }
         return user_vm.MmioCache.wcForPatSlot(proof.pat_slot) orelse error.Invalid;
     }
     if (kind != @intFromEnum(capsule_abi.MmioCache.uc_minus)) return error.Invalid;
@@ -445,6 +455,7 @@ fn rightsForIrq(parent: kernel.FdRights) kernel.FdRights {
 fn capsuleKindForPayload(payload: *const kernel.KernelObjectPayload) ?capsule_abi.CapsuleKind {
     return switch (payload.*) {
         .device => .device,
+        .platform_device => .platform_device,
         .mmio_region => .mmio,
         .dma_buffer => .dma_buffer,
         .dma_mapping => .dma_mapping,
@@ -463,6 +474,14 @@ fn writeFdSnapshot(h: anytype, state: *const kernel.KernelState, proc: kernel.Pr
     words[capsule_abi.snapshot_rights_index] = kernel.fdRightsToBits(view.rights);
     words[capsule_abi.snapshot_owner_index] = @intFromEnum(proc);
     switch (view.payload.*) {
+        .platform_device => |device| {
+            words[capsule_abi.snapshot_device_index] = @intFromEnum(device.grant.resource);
+            words[capsule_abi.snapshot_object_id_index] = device.grant.generation;
+            words[capsule_abi.snapshot_index_index] = capsule_abi.platform_device_i8042;
+            words[capsule_abi.snapshot_flags_index] = capsule_abi.platform_flag_fadt_8042 |
+                (if (view.rights.controller_write) capsule_abi.platform_flag_controller_write else @as(u64, 0)) |
+                capsule_abi.snapshot_flag_platform_source;
+        },
         .device => |device| {
             words[capsule_abi.snapshot_device_index] = device.device;
             const window = iommu.deviceIovaWindow(device.device);
@@ -497,11 +516,15 @@ fn writeFdSnapshot(h: anytype, state: *const kernel.KernelState, proc: kernel.Pr
                 (@as(u32, @intFromEnum(mapping.direction)) & 0x3) | iommu.dmaSnapshotFlags(mapping.device);
         },
         .irq => |irq| {
-            words[capsule_abi.snapshot_device_index] = irq.device;
+            words[capsule_abi.snapshot_device_index] = irq.source.resourceId();
             words[capsule_abi.snapshot_index_index] = irq.vector;
             words[capsule_abi.snapshot_flags_index] = @as(u64, irq.flags) |
                 ((@as(u64, @intFromEnum(irq.kind)) & 0x3) << 16) |
                 (if (irq.retired) capsule_abi.snapshot_flag_irq_retired else @as(u64, 0));
+            if (irq.source == .platform) {
+                words[capsule_abi.snapshot_object_id_index] = irq.source.platform.epoch;
+                words[capsule_abi.snapshot_flags_index] |= capsule_abi.snapshot_flag_platform_source;
+            }
         },
         else => {},
     }
@@ -580,6 +603,24 @@ fn exportDeviceMemoryVmo(h: anytype, state: *kernel.KernelState, proc: kernel.Pr
     };
 }
 
+/// K pins the FD, rights and claim generation through the single PIO operation.
+/// A value return avoids consuming a keyboard byte before a failing copyout.
+pub fn platformPortIo(state: *const kernel.KernelState, proc: kernel.PrincipalId,
+    raw_fd: u64, port: u64, width: u64, writing: bool, value: u64) u64
+{
+    const invalid: u64 = if (writing) sc.syscall_err_invalid else @bitCast(-@as(i64, @intCast(sc.syscall_err_invalid)));
+    const fd = u32Arg(raw_fd) orelse return invalid;
+    const rights: kernel.FdRights = if (writing) .{ .write = true } else .{ .read = true };
+    const view = state.fdPayloadWithRightsConst(proc, fd, rights) orelse return invalid;
+    const grant = switch (view.payload.*) { .platform_device => |dev| dev.grant, else => return invalid };
+    if (!platform_device.ioAllowed(grant, port, width, writing, view.rights.controller_write, value)) return invalid;
+    if (writing) {
+        platform_device.ioWrite(@intCast(port), @intCast(value));
+        return sc.syscall_ok;
+    }
+    return platform_device.ioRead(@intCast(port));
+}
+
 pub fn dispatch(
     h: anytype,
     state: *kernel.KernelState,
@@ -587,9 +628,39 @@ pub fn dispatch(
     frame: *TrapFrame,
 ) ?u64 {
     return switch (frame.rax) {
-        sc.syscall_capsule_query => writeFdSnapshot(h, state, proc, @intCast(frame.rdi), frame.rsi, frame.rdx),
+        sc.syscall_capsule_query => blk: {
+            const fd = u32Arg(frame.rdi) orelse break :blk sc.syscall_err_invalid;
+            break :blk writeFdSnapshot(h, state, proc, fd, frame.rsi, frame.rdx);
+        },
+        sc.syscall_capsule_platform_enumerate => blk: {
+            if (!state.isBootstrapOwner(proc)) break :blk sc.syscall_err_invalid;
+            if (frame.rdi == std.math.maxInt(u64)) {
+                if (!h.write_user_u64(proc, frame.rsi, platform_device.count())) break :blk sc.syscall_err_invalid;
+                break :blk sc.syscall_ok;
+            }
+            if (frame.rdi > std.math.maxInt(usize) or frame.rdx < capsule_abi.platform_function_word_count) break :blk sc.syscall_err_invalid;
+            const descriptor = platform_device.at(@intCast(frame.rdi)) orelse break :blk sc.syscall_err_invalid;
+            if (!h.copy_bytes_to_user_va(proc, frame.rsi, std.mem.asBytes(&descriptor))) break :blk sc.syscall_err_invalid;
+            break :blk capsule_abi.platform_function_word_count;
+        },
+        sc.syscall_capsule_platform_claim => blk: {
+            if (!state.isBootstrapOwner(proc) or frame.rdi > std.math.maxInt(usize)) break :blk sc.syscall_err_invalid;
+            const grant = platform_device.claim(@intCast(frame.rdi)) orelse break :blk sc.syscall_err_invalid;
+            break :blk state.createPlatformDeviceFd(proc, grant, .{
+                .inspect = true, .dup = true, .transfer = true, .set_flags = true,
+                .close = true, .query = true, .read = true, .write = true,
+                .controller_write = true, .derive_irq = true, .irq_wait = true, .irq_ack = true,
+            }, .{}, first_dynamic_fd) catch |err| {
+                platform_device.release(grant);
+                break :blk statusFromKernelError(err);
+            };
+        },
+        sc.syscall_capsule_io_read, sc.syscall_capsule_io_write => blk: {
+            const writing = frame.rax == sc.syscall_capsule_io_write;
+            break :blk platformPortIo(state, proc, frame.rdi, frame.rsi, frame.rdx, writing, frame.r10);
+        },
         sc.syscall_capsule_derive_mmio => blk: {
-            const device_fd: kernel.Fd = @intCast(frame.rdi);
+            const device_fd = u32Arg(frame.rdi) orelse break :blk sc.syscall_err_invalid;
             const view = state.fdPayloadWithRightsConst(proc, device_fd, deviceRequired(.{ .derive_mmio = true })) orelse break :blk sc.syscall_err_invalid;
             const device = switch (view.payload.*) {
                 .device => |dev| dev,
@@ -644,7 +715,10 @@ pub fn dispatch(
                 // its VMA/backing intact through publication and last-close.
                 if (frame.r10 > std.math.maxInt(usize) or
                     !state.userRangeIsUnbackedMmioReservation(proc, frame.rdx, frame.r10))
+                {
+                    if (requested_wc) kernel_log.writeFmt("mmio: WC refused reservation validation proc=0x{x} va=0x{x} bytes=0x{x}\n", .{ @intFromEnum(proc), frame.rdx, frame.r10 });
                     break :blk sc.syscall_err_invalid;
+                }
                 // The global KernelState lock makes this staged FD invisible
                 // to other syscalls. user_va=0 makes failed admission cleanup
                 // inert; there must be no lock drop until publication ends.
@@ -974,6 +1048,18 @@ pub fn dispatch(
         sc.syscall_capsule_derive_irq => blk: {
             const device_fd: kernel.Fd = @intCast(frame.rdi);
             const view = state.fdPayloadWithRightsConst(proc, device_fd, deviceRequired(.{ .derive_irq = true })) orelse break :blk sc.syscall_err_invalid;
+            if (view.payload.* == .platform_device) {
+                if (frame.rsi != @intFromEnum(kernel.CapsuleIrqKind.auto) or frame.rdx != 0 or frame.r10 != 0) break :blk sc.syscall_err_invalid;
+                const grant = platform_device.acquireIrq(view.payload.platform_device.grant) orelse break :blk sc.syscall_err_not_ready;
+                // No hardware unmask before publication. Userland's irq_chip
+                // enables the route only after its handler/worker is ready.
+                break :blk state.createIrqFd(proc, .{
+                    .source = .{ .platform = grant }, .vector = @intCast(platform_device.at(0).?.gsi),
+                }, rightsForIrq(view.rights), .{}, first_dynamic_fd) catch |err| {
+                    platform_device.closeIrq(grant);
+                    break :blk statusFromKernelError(err);
+                };
+            }
             const device = switch (view.payload.*) {
                 .device => |dev| dev,
                 else => break :blk sc.syscall_err_invalid,
@@ -995,7 +1081,7 @@ pub fn dispatch(
                     error.Invalid, error.Unsupported => sc.syscall_err_invalid,
                 };
             const irq_fd = state.createIrqFd(proc, .{
-                .device = device.device,
+                .source = .{ .pci = device.device },
                 .kind = kind,
                 .vector = vector,
                 .flags = flags,
@@ -1014,15 +1100,31 @@ pub fn dispatch(
             const irq = state.irqObjectForFd(proc, fd, .{ .query = true }) orelse
                 break :blk sc.syscall_err_invalid;
             if (irq.retired) break :blk sc.syscall_err_closed;
-            if (!pci.interruptRouteLeased(irq.device, @intFromEnum(irq.kind), irq.vector) or
+            if (irq.source == .platform) {
+                if (!platform_device.irqValid(irq.source.platform) or frame.rdx < capsule_abi.irq_route_word_count) break :blk sc.syscall_err_invalid;
+                const words = [_]u64{ 0, 0, irq.vector };
+                if (!h.copy_bytes_to_user_va(proc, frame.rsi, std.mem.asBytes(&words))) break :blk sc.syscall_err_invalid;
+                break :blk capsule_abi.irq_route_word_count;
+            }
+            const device = irq.source.pci;
+            if (!pci.interruptRouteLeased(device, @intFromEnum(irq.kind), irq.vector) or
                 frame.rdx < capsule_abi.irq_route_word_count) break :blk sc.syscall_err_invalid;
             const bsp = smp.cpuInfo(0) orelse break :blk sc.syscall_err_not_ready;
             const apic_id = bsp.lapic_id orelse break :blk sc.syscall_err_not_ready;
-            const vector = @as(u64, pci.interruptVectorBaseForResourceId(irq.device).?) + irq.vector;
+            const vector = @as(u64, pci.interruptVectorBaseForResourceId(device).?) + irq.vector;
             const words = [_]u64{ 0xfee00000 | (@as(u64, apic_id) << 12), vector, vector };
             if (!h.copy_bytes_to_user_va(proc, frame.rsi, std.mem.asBytes(&words)))
                 break :blk sc.syscall_err_invalid;
             break :blk capsule_abi.irq_route_word_count;
+        },
+        sc.syscall_capsule_irq_set_mask => blk: {
+            const fd = u32Arg(frame.rdi) orelse break :blk sc.syscall_err_invalid;
+            if (frame.rsi > 1) break :blk sc.syscall_err_invalid;
+            const irq = state.irqObjectForFd(proc, fd, .{ .irq_ack = true }) orelse break :blk sc.syscall_err_invalid;
+            if (irq.retired) break :blk sc.syscall_err_closed;
+            if (irq.source != .platform) break :blk sc.syscall_err_invalid;
+            if (!platform_device.setMask(irq.source.platform, frame.rsi != 0)) break :blk sc.syscall_err_not_ready;
+            break :blk sc.syscall_ok;
         },
         sc.syscall_capsule_irq_quiesce, sc.syscall_capsule_irq_retire => blk: {
             const fd = u32Arg(frame.rdi) orelse break :blk sc.syscall_err_invalid;
@@ -1033,7 +1135,9 @@ pub fn dispatch(
                 else => break :blk sc.syscall_err_invalid,
             };
             if (irq.retired) break :blk sc.syscall_err_closed;
-            pci.quiesceInterruptRoute(irq.device, @intFromEnum(irq.kind), irq.vector) catch |err|
+            if (irq.source == .platform) {
+                if (!platform_device.quiesce(irq.source.platform)) break :blk sc.syscall_err_not_ready;
+            } else pci.quiesceInterruptRoute(irq.source.pci, @intFromEnum(irq.kind), irq.vector) catch |err|
                 break :blk switch (err) {
                     error.Invalid, error.Unsupported => sc.syscall_err_invalid,
                     error.Busy, error.NotReady => sc.syscall_err_not_ready,
@@ -1048,7 +1152,10 @@ pub fn dispatch(
                 // acquire the vector, and their destructors become inert.
                 state.unpublishIrqObject(object);
                 irq.retired = true;
-                pci.commitInterruptRouteRetirement(irq.device, @intFromEnum(irq.kind), irq.vector);
+                switch (irq.source) {
+                    .pci => |device| pci.commitInterruptRouteRetirement(device, @intFromEnum(irq.kind), irq.vector),
+                    .platform => |grant| platform_device.commitRetirement(grant),
+                }
                 fd_syscalls.wakeRetiredIrqWaiters(h, state);
             }
             break :blk sc.syscall_ok;

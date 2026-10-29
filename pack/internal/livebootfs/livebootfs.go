@@ -284,7 +284,7 @@ func checkStagedSource(workspace *config.Workspace, app config.App, artifact str
 	if err != nil {
 		return err
 	}
-	if len(source.Rebuild) != 0 {
+	if source.Recipe != "" {
 		return nil
 	}
 	current, err := os.ReadFile(workspace.Path(source.Path))

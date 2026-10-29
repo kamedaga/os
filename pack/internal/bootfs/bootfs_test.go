@@ -2,6 +2,8 @@ package bootfs
 
 import (
 	"encoding/binary"
+	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -48,6 +50,7 @@ func TestLiveExecutablePathsKeepExecutableMetadata(t *testing.T) {
 		"/lib/pacha/lpr-linux-x86_64.so",
 		"/lib/ld-musl-x86_64.so.1",
 		"/lib/linux/ld-musl-x86_64.so.1",
+		"/usr/lib/pachaos/ld-musl-x86_64.so.1",
 	} {
 		if modeBitsForPath(path) != 0o555 || flagsForPath(path) != flagExecutable {
 			t.Fatalf("%s is not executable in bootfs metadata", path)
@@ -76,5 +79,33 @@ func TestRenderSharesSameSourceBytesAcrossAliases(t *testing.T) {
 	}
 	if len(image) != int(first)+len("busybox") {
 		t.Fatalf("image contains duplicate payload: %d bytes", len(image))
+	}
+}
+
+func TestImageUpToDateComparesRenderedArchive(t *testing.T) {
+	dir := t.TempDir()
+	source := filepath.Join(dir, "init.cfg")
+	manifest := filepath.Join(dir, "bootfs.txt")
+	output := filepath.Join(dir, "BOOTFS.IMG")
+	if err := os.WriteFile(source, []byte("v1"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(manifest, []byte("/etc/init.cfg="+source+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if current, err := ImageUpToDate(manifest, output, Options{}); err != nil || current {
+		t.Fatalf("missing image current=%v err=%v", current, err)
+	}
+	if _, err := BuildImage(manifest, output); err != nil {
+		t.Fatal(err)
+	}
+	if current, err := ImageUpToDate(manifest, output, Options{}); err != nil || !current {
+		t.Fatalf("built image current=%v err=%v", current, err)
+	}
+	if err := os.WriteFile(source, []byte("v2"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if current, err := ImageUpToDate(manifest, output, Options{}); err != nil || current {
+		t.Fatalf("changed source current=%v err=%v", current, err)
 	}
 }

@@ -38,6 +38,7 @@ images as needed.
 | Zstandard | `zstd.elf` | BSD OR GPL-2.0 | `tools/build_wsl_zstd.sh`, https://github.com/facebook/zstd |
 | uutils coreutils | `uutils-coreutils*.elf`, `uutils-shim.elf` | MIT | `tools/build_wsl_uutils_*.sh`, https://github.com/uutils/coreutils |
 | fastfetch | `fastfetch.elf` | MIT | `tools/build_wsl_fastfetch.sh`, https://github.com/fastfetch-cli/fastfetch |
+| Azul Zulu OpenJDK 25 | `java25-root/opt/java25/` | GPL-2.0 with Classpath Exception and bundled notices; retained in `legal/` | Unmodified Linux/musl binaries pinned by `tools/manifests/java25-linux-musl-x86_64.lock`; `tools/prepare_java25.sh`, https://www.azul.com/downloads/ |
 
 The small musl-linked smoke/test binaries in `.artifacts/userland-fixtures/`
 are built from local source under `userland/fixtures/src/wsl_musl/`.

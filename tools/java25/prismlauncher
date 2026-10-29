@@ -1,0 +1,16 @@
+#!/bin/sh
+set -eu
+PRISM_ROOT=/opt/prismlauncher
+qt=$PRISM_ROOT/lib/home/runner/work/PrismLauncher/Qt/6.10.2/gcc_64
+# Use the guest's glibc and tested Mesa libraries with the stock Qt bundle.
+LD_LIBRARY_PATH="/opt/java25-openj9/glibc:/opt/lwjgl/system:$PRISM_ROOT/extra:$PRISM_ROOT/lib:$qt/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+QT_PLUGIN_PATH=$qt/plugins
+QT_QPA_PLATFORM=xcb
+XDG_DATA_DIRS="$PRISM_ROOT/share:${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
+# Prism selects each instance's natives through java.library.path.
+LWJGL_NATIVE_PATH=
+LOCPATH=/opt/java25-openj9/glibc/locale
+LC_ALL=C.UTF-8
+SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+export LD_LIBRARY_PATH QT_PLUGIN_PATH QT_QPA_PLATFORM XDG_DATA_DIRS LWJGL_NATIVE_PATH LOCPATH LC_ALL SSL_CERT_FILE
+exec "$PRISM_ROOT/shared/bin/prismlauncher" "$@"

@@ -120,7 +120,7 @@ pub const fd_table_entries: usize = 256;
 pub const fd_number_capacity: usize = @import("kernel_abi_root").fd_abi.thread_self_fd;
 pub const pipe_buffer_bytes: usize = 4096;
 pub const fd_known_flags_mask: u32 = (@as(u32, 1) << 4) - 1;
-pub const fd_known_rights_mask: u64 = (@as(u64, 1) << 46) - 1;
+pub const fd_known_rights_mask: u64 = (@as(u64, 1) << 47) - 1;
 
 pub const FdFlags = packed struct(u32) {
     cloexec: bool = false,
@@ -170,6 +170,7 @@ pub const FdRights = packed struct(u64) {
     query: bool = false,
     config_read: bool = false,
     config_write: bool = false,
+    controller_write: bool = false,
     derive_mmio: bool = false,
     derive_dma: bool = false,
     derive_irq: bool = false,
@@ -185,7 +186,7 @@ pub const FdRights = packed struct(u64) {
     read: bool = false,
     write: bool = false,
     revoke: bool = false,
-    _reserved: u18 = 0,
+    _reserved: u17 = 0,
 };
 
 pub fn fdRightsFromBits(bits: u64) FdRights {
@@ -212,15 +213,27 @@ pub const KernelObjectKind = enum(u16) {
     channel = 6,
     reply = 7,
     device = 8,
-    mmio_region = 9,
-    dma_buffer = 10,
-    dma_mapping = 11,
-    irq = 12,
-    timer = 13,
-    serial = 14,
-    pipe = 15,
-    pager_port = 16,
+    platform_device = 9,
+    mmio_region = 10,
+    dma_buffer = 11,
+    dma_mapping = 12,
+    irq = 13,
+    timer = 14,
+    serial = 15,
+    pipe = 16,
+    pager_port = 17,
 };
+
+comptime {
+    const fd_abi = @import("kernel_abi_root").fd_abi;
+    for (@typeInfo(KernelObjectKind).@"enum".fields) |field| {
+        std.debug.assert(field.value == @field(fd_abi, "fd_kind_" ++ field.name));
+    }
+    for (@typeInfo(FdRights).@"struct".fields) |field| {
+        const name = "right_" ++ field.name;
+        if (@hasDecl(fd_abi, name)) std.debug.assert(@field(fd_abi, name) == @as(u64, 1) << @bitOffsetOf(FdRights, field.name));
+    }
+}
 
 pub const TaskObjectState = enum(u8) {
     active = 1,
@@ -252,6 +265,25 @@ pub const ThreadObject = struct {
 pub const DeviceObject = struct {
     owner_principal_raw: PrincipalRaw = 0,
     device: DmaDeviceId = 0,
+};
+
+pub const PlatformDeviceObject = struct {
+    grant: @import("../platform_device.zig").Grant,
+};
+
+pub const IrqSource = union(enum) {
+    pci: DmaDeviceId,
+    platform: @import("../platform_device.zig").IrqGrant,
+
+    pub fn eql(a: IrqSource, b: IrqSource) bool {
+        return switch (a) {
+            .pci => |device| b == .pci and b.pci == device,
+            .platform => |grant| b == .platform and std.meta.eql(grant, b.platform),
+        };
+    }
+    pub fn resourceId(self: IrqSource) u64 {
+        return switch (self) { .pci => |device| device, .platform => |grant| @intFromEnum(grant.device.resource) };
+    }
 };
 
 pub const MmioRegionObject = struct {
@@ -294,7 +326,7 @@ pub const DmaMappingObject = struct {
 
 pub const IrqObject = struct {
     owner_principal_raw: PrincipalRaw = 0,
-    device: DmaDeviceId = 0,
+    source: IrqSource = .{ .pci = 0 },
     kind: CapsuleIrqKind = .auto,
     vector: u32 = 0,
     event_count: u64 = 0,
@@ -308,7 +340,7 @@ pub const IrqPublishSlot = struct {
     active: u8 = 0,
     generation: u32 = 0,
     owner_principal_raw: PrincipalRaw = 0,
-    device: DmaDeviceId = 0,
+    source: IrqSource = .{ .pci = 0 },
     kind: u8 = 0,
     vector: u32 = 0,
     event_count: u64 = 0,
@@ -376,6 +408,7 @@ pub const KernelObjectPayload = union(KernelObjectKind) {
     channel: IpcChannelHandle,
     reply: IpcReplyRef,
     device: DeviceObject,
+    platform_device: PlatformDeviceObject,
     mmio_region: MmioRegionObject,
     dma_buffer: DmaBufferObject,
     dma_mapping: DmaMappingObject,
@@ -400,6 +433,9 @@ pub const KernelObjectSlot = struct {
     kind: KernelObjectKind = .none,
     generation: u32 = 1,
     ref_count: u32 = 0,
+    // Weak observers do not own communication peers. This index avoids
+    // scanning every retained set for an unrelated temporary VMO close.
+    persistent_observers: u32 = 0,
     payload: KernelObjectPayload = .{ .none = {} },
 };
 
@@ -481,6 +517,9 @@ pub const FdCapability = struct {
 };
 pub const FdTable = struct {
     incarnation: u64 = 0,
+    // Publication changes require retained observers to revalidate descriptor
+    // incarnations, including replacement with an alias of the same object.
+    mutation: u64 = 0,
     retired_next: ?*FdTable = null,
     retirement_queued: bool = false,
     entries: slot_storage.SlotTable(FdEntry) = .{},
@@ -494,6 +533,7 @@ pub const FdTable = struct {
         return if (fd < self.capacity) @intCast(fd) else null;
     }
     pub fn write(self: *FdTable, i: usize, value: FdEntry) void {
+        self.mutation +|= 1;
         self.at(i).replace(value);
         self.entries.mark(@intCast(i), 1, value.isEmpty());
     }
@@ -649,6 +689,7 @@ pub const FdWaitLink = struct {
 };
 
 pub const FdWaitBinding = struct {
+    persistent: ?*@import("persistent_wait_types.zig").Item = null,
     link: ?*FdWaitLink = null,
     group: FdWaitGroupRef = .{},
     link_index: u32 = 0,
@@ -659,6 +700,10 @@ pub const FdWaitBinding = struct {
     // Readiness survives the bounded seed batch. The claimed group owns these
     // snapshots until the result is staged in registers or copied and the group is retired.
     pub fn appendReady(self: *FdWaitBinding, target: ThreadWakeTarget, out: []ThreadWakeTarget, count: *usize) void {
+        if (self.persistent) |item| {
+            item.publish();
+            return;
+        }
         if (self.link) |link| {
             if (link.ready) |*ready| ready.revents |= target.revents else link.ready = target;
         }
@@ -772,6 +817,27 @@ pub const IpcWaitList = struct {
 
     pub fn acquire(self: *const IpcWaitList) @import("../sync/ipc_endpoint.zig").Lock.Guard {
         return if (self.exclusion) |lock| lock.acquire() else .{ .lock = null, .restore = false };
+    }
+
+    /// Requires K and E: K protects the persistent FIFO and invocation, E the
+    /// source list. Data operations cannot close a peer under K/E, so HUP-only
+    /// observers need no publication. An idle observer already in the ready
+    /// FIFO also owns the hint until REUSE rechecks the source under K. If that
+    /// recheck finds nothing, it unqueues before arming: the next producer must
+    /// publish again. Active invocations retain ordinary XSAVE completion.
+    /// Close paths still walk the original list, including these observers.
+    pub fn dataPollAfter(self: *const IpcWaitList, previous: ?*IpcWaiter) ?*IpcWaiter {
+        self.assertHeld();
+        const abi = @import("kernel_abi_root").fd_abi;
+        var cursor = if (previous) |node| node.next else self.poll_head;
+        while (cursor) |node| : (cursor = node.next) {
+            if (!node.active or node.binding.persistent == null or node.recv_memory.active) return node;
+            if (node.events & (abi.event_readable | abi.event_writable) != 0) {
+                const item = node.binding.persistent.?;
+                if (!item.queued or item.set.invocation != null) return node;
+            }
+        }
+        return null;
     }
 
     pub fn appendReceive(self: *IpcWaitList, block: *IpcReplySlot) void {
@@ -900,6 +966,7 @@ pub const IpcWaitList = struct {
         var iterator = self.waiters.iterator();
         while (iterator.next()) |item| {
             const waiter = item.value;
+            if (waiter.binding.persistent != null) continue;
             if (!waiter.active) continue;
             if (waiter.thread_index == thread_index_u32 and waiter.thread_generation == thread_generation) {
                 self.removeWaiter(waiter);
@@ -993,12 +1060,12 @@ pub const IpcTransferredFd = packed struct(u128) {
     object_index: u32 = 0,
     object_generation: u32 = 0,
     object_kind: u8 = 0,
-    permission_bits: u46 = 0,
+    permission_bits: u47 = 0,
     flag_bits: u4 = 0,
-    reserved: u6 = 0,
+    reserved: u5 = 0,
 
     comptime {
-        std.debug.assert(fd_known_rights_mask >> 46 == 0 and fd_known_flags_mask <= 15);
+        std.debug.assert(fd_known_rights_mask >> 47 == 0 and fd_known_flags_mask <= 15);
         for (@typeInfo(KernelObjectKind).@"enum".fields) |field| std.debug.assert(field.value <= 255);
     }
     pub fn init(ref: KernelObjectRef, permissions: FdRights, fd_flags: FdFlags) IpcTransferredFd {
@@ -1434,6 +1501,10 @@ pub const NativeVmoSlot = struct {
     // Borrowed backing may be replaced, but neither a hole nor an attenuated
     // updater FD may enlarge the authority established at publication.
     page_view_sparse: bool = false,
+    // AS-local PTE retirement can run without the shared-VM lock. An atomic
+    // conservative mark bridges disappearing aliases until all-AS collection.
+    // This flag belongs to the view, not its replaceable backing radix root.
+    page_view_dirty_all: bool = false,
     page_view_max_prot: VmaProt = .{ .read = true, .write = true },
     // Cached RAM cannot be recycled at final drop under an inner VM lock.
     // The outer retirement path restores WB before returning owned pages.

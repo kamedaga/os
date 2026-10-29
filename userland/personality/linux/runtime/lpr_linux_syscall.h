@@ -47,6 +47,7 @@ struct lpr_linux_user_frame {
     uint64_t rsp;
     uint64_t rflags;
     uint64_t runtime_signal_state;
+    uint64_t fp_state;
 };
 
 const struct lpr_linux_syscall_info *lpr_linux_syscall_lookup(uint64_t nr);

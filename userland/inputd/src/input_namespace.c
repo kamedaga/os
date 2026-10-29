@@ -232,6 +232,12 @@ int inputd_namespace_publish(pacha_fd_t filed_fd, const struct inputd_public_dev
         d->capabilities & (INPUTD_INPUT_CAP_RELATIVE | INPUTD_INPUT_CAP_ABSOLUTE) ?
             "ID_INPUT_MOUSE=1\n" : "",
         d->pci_segment, d->pci_bus, d->pci_device, d->pci_function);
+    if (d->source_kind == INPUTD_SOURCE_PLATFORM)
+        snprintf(text, sizeof(text),
+            "MAJOR=13\nMINOR=%u\nDEVNAME=input/event%u\nID_INPUT=1\n%s"
+            "PACHA_PLATFORM_DEVICE=%llu\n", minor, index,
+            d->capabilities & INPUTD_INPUT_CAP_KEYBOARD ? "ID_INPUT_KEYBOARD=1\n" : "",
+            (unsigned long long)d->platform_id);
     if (!status) status = attribute(&c, event, "uevent", text);
 #define LINK(format, target, ...) do { \
     snprintf(path, sizeof(path), format, __VA_ARGS__); \

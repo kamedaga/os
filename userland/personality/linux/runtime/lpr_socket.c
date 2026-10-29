@@ -2006,6 +2006,35 @@ static int64_t lpr_linux_socket_wait_events(
     return lpr_linux_socket_wait_events_until(fd, events, &deadline, wait_not_ready);
 }
 
+struct lpr_pipe_poll_batch {
+    struct pacha_pollfd leaves[LPR_WAIT_GRAPH_MAX_LEAVES];
+    lpr_fd_pin_t pins[LPR_WAIT_GRAPH_MAX_LEAVES];
+    uint64_t positions[LPR_WAIT_GRAPH_MAX_LEAVES];
+    uint32_t count;
+};
+
+static int64_t lpr_pipe_poll_batch_complete(struct lpr_pipe_poll_batch *batch,
+    lpr_linux_pollfd_t *fds)
+{
+    if (!batch->count) return 0;
+    /* Pins retain the exact native capabilities while one kernel snapshot
+     * runs; no FD-table lock crosses the syscall or another backend's IPC. */
+    const int64_t status = lpr_pacha_syscall2(PACHAOS_SYSCALL_FD_POLL,
+        (uint64_t)(uintptr_t)batch->leaves, batch->count);
+    int64_t found = 0;
+    for (uint32_t i = 0; i < batch->count; ++i)
+        found += batch->leaves[i].revents != 0;
+    int64_t ready = 0;
+    for (uint32_t i = 0; i < batch->count; ++i) {
+        fds[batch->positions[i]].revents = status != found ? LPR_LINUX_POLLERR :
+            (int16_t)lpr_pipe_poll_events_from_pacha(batch->leaves[i].revents);
+        ready += fds[batch->positions[i]].revents != 0;
+        lpr_fd_unpin(&batch->pins[i]);
+    }
+    batch->count = 0;
+    return ready;
+}
+
 static int64_t lpr_linux_poll_scan(
     lpr_linux_pollfd_t *fds,
     uint64_t nfds,
@@ -2013,6 +2042,7 @@ static int64_t lpr_linux_poll_scan(
 {
     (void)cached_sockets;
     int64_t ready = 0;
+    struct lpr_pipe_poll_batch pipes = {.count = 0};
     for (uint64_t i = 0; i < nfds; i += 1) {
         fds[i].revents = 0;
         if (fds[i].fd < 0) {
@@ -2075,6 +2105,18 @@ static int64_t lpr_linux_poll_scan(
             if (fds[i].revents != 0) ready++;
             continue;
         }
+        if (lpr_audio_backend(fd) != 0) {
+            const int64_t input_events =
+                lpr_audio_poll_events(fd, (uint32_t)fds[i].events);
+            if (input_events < 0) {
+                fds[i].revents = input_events == -LPR_LINUX_EBADF ?
+                    LPR_LINUX_POLLNVAL : LPR_LINUX_POLLERR;
+            } else {
+                fds[i].revents = (int16_t)input_events;
+            }
+            if (fds[i].revents != 0) ready++;
+            continue;
+        }
         if (lpr_linux_input_fd_active(fd)) {
             const int64_t input_events =
                 lpr_input_poll_events(fd, (uint32_t)fds[i].events);
@@ -2088,10 +2130,25 @@ static int64_t lpr_linux_poll_scan(
             continue;
         }
         if (lpr_linux_pipe_fd_active(fd)) {
-            fds[i].revents = (int16_t)lpr_linux_pipe_poll_events(fd, (uint32_t)fds[i].events);
-            if (fds[i].revents != 0) {
+            const uint32_t slot = pipes.count;
+            if (lpr_fd_table_pin(&lpr_control_fd_table, (uint32_t)fd, &pipes.pins[slot]) != 0) {
+                fds[i].revents = LPR_LINUX_POLLNVAL;
                 ready++;
+                continue;
             }
+            const lpr_pipe_backend_t *pipe = pipes.pins[slot].state;
+            if (pipes.pins[slot].ops_id != LPR_FD_OPS_PIPE || !pipe || pipe->native.raw < 16) {
+                lpr_fd_unpin(&pipes.pins[slot]);
+                fds[i].revents = LPR_LINUX_POLLNVAL;
+                ready++;
+                continue;
+            }
+            pipes.leaves[slot] = (struct pacha_pollfd){ .fd = pipe->native.raw,
+                .events = lpr_pipe_poll_events_to_pacha((uint16_t)fds[i].events),
+                .min_write_bytes = fds[i].events & LPR_LINUX_POLLOUT ? LPR_LINUX_PIPE_BUF_BYTES : 0 };
+            pipes.positions[slot] = i;
+            if (++pipes.count == LPR_WAIT_GRAPH_MAX_LEAVES)
+                ready += lpr_pipe_poll_batch_complete(&pipes, fds);
             continue;
         }
         if (lpr_linux_filed_fd_active(fd)) {
@@ -2155,7 +2212,7 @@ static int64_t lpr_linux_poll_scan(
             ready++;
         }
     }
-    return ready;
+    return ready + lpr_pipe_poll_batch_complete(&pipes, fds);
 }
 
 static int64_t lpr_linux_poll_wait(lpr_linux_pollfd_t *fds, uint64_t nfds, int64_t timeout_ms, unsigned *wait_not_ready __attribute__((unused)))
@@ -2450,6 +2507,14 @@ static int64_t lpr_linux_select_scan(
             const int64_t revents = lpr_drm_poll_events(fd, events);
             if (revents < 0) return revents;
             is_read = (revents & LPR_LINUX_POLLIN) != 0;
+            is_except = (revents & LPR_LINUX_POLLERR) != 0;
+        } else if (lpr_audio_backend(fd)) {
+            uint32_t events = 0;
+            if (want_write) events |= LPR_LINUX_POLLOUT;
+            if (want_except) events |= LPR_LINUX_POLLERR;
+            const int64_t revents = lpr_audio_poll_events(fd, events);
+            if (revents < 0) return revents;
+            is_write = (revents & LPR_LINUX_POLLOUT) != 0;
             is_except = (revents & LPR_LINUX_POLLERR) != 0;
         } else if (lpr_linux_input_fd_active(fd)) {
             uint32_t events = 0;

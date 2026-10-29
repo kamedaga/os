@@ -30,12 +30,37 @@ static void output(unsigned group, unsigned key, unsigned stage, uint64_t count,
             line[n++] = "0123456789abcdef"[(values[i] >> shift) & 15];
     }
     line[n++] = '\n';
+#if defined(LPR_UNIX_PROFILE_STDERR) && LPR_UNIX_PROFILE_STDERR
+    (void)lpr_linux_write(2, (uint64_t)(uintptr_t)line, n, NULL);
+#else
     (void)lpr_pacha_syscall2(PACHAOS_SYSCALL_LOG, (uint64_t)(uintptr_t)line, n);
+#endif
+}
+
+void unix_profile_fd_inventory(unsigned phase)
+{
+    static unsigned started;
+    if(!phase && __atomic_exchange_n(&started,1,__ATOMIC_RELAXED))return;
+    struct pacha_fd_table_info info={0};
+    if(!lpr_pacha_syscall2(PACHAOS_SYSCALL_FD_TABLE,0,(uintptr_t)&info))
+        output(UP_FD_TRANSFER,39,phase,info.capacity-info.free_slots,info.capacity);
 }
 
 void unix_profile_dump(void)
 {
     if (__atomic_exchange_n(&dumped, 1, __ATOMIC_RELAXED)) return;
+#if defined(LPR_UNIX_PROFILE_KERNEL_LOG) && LPR_UNIX_PROFILE_KERNEL_LOG
+    uint64_t cursor=0;
+    for(unsigned i=0;i<64;i++) {
+        struct pacha_kernel_log_read log={.cursor=cursor,.limit=PACHA_KERNEL_LOG_READ_MAX_BYTES};
+        int64_t status=lpr_pacha_syscall2(PACHA_KERNEL_LOG_SYSCALL_READ,(uintptr_t)&log,sizeof(log));
+        if(status) { output(UP_GROUPS,1,0,0,(uint64_t)status);break; }
+        if(log.written) (void)lpr_linux_write(2,(uintptr_t)log.bytes,log.written,NULL);
+        if(!log.written||log.next_cursor==cursor)break;
+        cursor=log.next_cursor;
+    }
+#endif
+    unix_profile_fd_inventory(1);
     int any = 0;
     for (unsigned g = 0; g < UP_GROUPS; g++)
         for (unsigned k = 0; k < PROFILE_KEYS; k++)

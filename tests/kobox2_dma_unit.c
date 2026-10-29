@@ -17,12 +17,29 @@ static struct pacha_capsule_info device;
 static long query_result = 11, derive_result = 100, close_result, enable_result;
 static long view_result = VIEW_FD, mmap_result = VIEW;
 static long table_result, table_growth_result, view_close_result;
-static unsigned int failure_logs, table_queries;
+static uint64_t table_free;
+static unsigned int recover_derive, recover_view, derives, table_grows;
+static unsigned int failure_logs, table_queries, ram_failure_logs;
 static char failure_log[384];
 static unsigned int calls, enables, last_enabled, munmaps, page_views;
 static uint64_t last_address, last_iova, last_length, last_direction;
 static jmp_buf fatal_jump;
 static int expect_fatal;
+
+void ph_boot_log_dma_failure(unsigned long failure_stage, long native_status,
+    unsigned long iova, unsigned long bytes, unsigned long mappings,
+    unsigned long mapping_bytes, long fd_status, unsigned long fd_capacity,
+    unsigned long fd_free) {
+    assert(failure_stage <= DMA_FAILURE_SCATTERED);
+    assert(iova == IOVA && bytes > 0 && !(bytes & 4095));
+    assert(strstr(failure_log, "PH_DMA_ERROR stage="));
+    assert(fd_status == table_result);
+    assert(fd_capacity == (fd_status ? 0 : 16));
+    assert(fd_free == (fd_status ? 0 : table_free));
+    assert(mappings == (mapping_bytes ? 1 : 0));
+    (void)native_status;
+    ++ram_failure_logs;
+}
 
 void ph_log(const char *text) {
     if (!strncmp(text, "PH_DMA_ERROR stage=", 19)) {
@@ -58,13 +75,18 @@ long pacha_syscall3(uint64_t nr, uint64_t fd, uint64_t out, uint64_t words) {
 long pacha_syscall2(uint64_t nr, uint64_t first, uint64_t second) {
     ++calls;
     if (nr == PACHA_FD_SYSCALL_TABLE) {
-        assert(first == 0 || first == 19);
+        assert(first == 0 || first == 18 || first == 19);
         if (!first) ++table_queries;
+        else {
+            ++table_grows;
+            if (!table_growth_result && recover_derive) derive_result = 100;
+            if (!table_growth_result && recover_view) view_result = VIEW_FD;
+        }
         *(struct pacha_fd_table_info *)(uintptr_t)second =
             (struct pacha_fd_table_info) {
                 .capacity = first ? 256 : 16,
                 .maximum = PACHA_THREAD_SELF_FD,
-                .free_slots = first ? 240 : 0,
+                .free_slots = first ? 240 : table_free,
             };
         return first ? table_growth_result : table_result;
     }
@@ -101,6 +123,7 @@ long pacha_syscall6(uint64_t nr, uint64_t fd, uint64_t address, uint64_t iova,
         return mmap_result;
     }
     assert(nr == PACHA_CAPSULE_SYSCALL_DERIVE_DMA_MAPPING && fd == DEVICE_FD && flags == 0);
+    ++derives;
     last_address = address; last_iova = iova;
     last_length = length; last_direction = direction;
     return derive_result;
@@ -223,10 +246,10 @@ int main(void) {
     assert(!host->unmap(&dma, IOVA + 4096, 4096));
 
     /* Successful and rejected-input paths do not query or log diagnostics. */
-    assert(!failure_logs && !table_queries);
+    assert(!failure_logs && !table_queries && !ram_failure_logs);
     view_result = PACHA_SYSCALL_ERR_ALLOC;
     assert(host->map_page_list(&dma, IOVA, pages, 3, 3) == -ENOMEM);
-    assert(failure_logs == 1 && table_queries == 1);
+    assert(failure_logs == 1 && table_queries == 2);
     assert(strstr(failure_log, "stage=page-view "));
     assert(strstr(failure_log, " native=0x0000000000000003 "));
     assert(strstr(failure_log, " bytes=0x0000000000003000 "));
@@ -257,8 +280,39 @@ int main(void) {
     assert(strstr(failure_log, " fd_capacity=0x0000000000000000 "));
     assert(strstr(failure_log, " fd_free=0x0000000000000000\n"));
     assert(!mappings[0].length);
-    assert(failure_logs == 5 && table_queries == 5);
+    assert(failure_logs == 5 && table_queries == 8 && ram_failure_logs == 5);
     table_result = 0;
+
+    /* The initial headroom is shared with IRQ/task FDs. A full table is
+     * recoverable once; native memory exhaustion with free FDs is not. */
+    unsigned saved_logs = failure_logs, saved_derives = derives;
+    unsigned saved_grows = table_grows;
+    derive_result = PACHA_SYSCALL_ERR_ALLOC;
+    recover_derive = 1;
+    assert(!host->map(&dma, IOVA, 0, 4096, 3));
+    assert(derives == saved_derives + 2 && table_grows == saved_grows + 1);
+    assert(failure_logs == saved_logs && mappings[0].fd == 100);
+    assert(!host->unmap(&dma, IOVA, 4096));
+    recover_derive = 0;
+    derive_result = PACHA_SYSCALL_ERR_ALLOC;
+    table_free = 1;
+    saved_derives = derives; saved_grows = table_grows;
+    assert(host->map(&dma, IOVA, 0, 4096, 3) == -ENOMEM);
+    assert(derives == saved_derives + 1 && table_grows == saved_grows);
+    table_free = 0;
+    table_growth_result = PACHA_SYSCALL_ERR_ALLOC;
+    saved_derives = derives;
+    assert(host->map(&dma, IOVA, 0, 4096, 3) == -ENOMEM);
+    assert(derives == saved_derives + 1 && !mappings[0].length);
+    table_growth_result = 0;
+    derive_result = 100;
+    view_result = PACHA_SYSCALL_ERR_ALLOC;
+    recover_view = 1;
+    unsigned saved_views = page_views;
+    assert(!host->map_page_list(&dma, IOVA, pages, 3, 3));
+    assert(page_views == saved_views + 2 && mappings[0].view == (void *)VIEW);
+    assert(!host->unmap(&dma, IOVA, 3 * 4096));
+    recover_view = 0;
 
     const long errors[] = {0, 1, 2, 3, 4, 5, 6, PACHA_THREAD_SELF_FD};
     for (size_t i = 0; i < sizeof(errors) / sizeof(errors[0]); ++i) {

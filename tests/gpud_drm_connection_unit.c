@@ -314,7 +314,12 @@ static long protocol_oracle4(uint64_t nr, uint64_t a, uint64_t b, uint64_t c, ui
 }
 long pacha_fd_wait_many_batched(struct pacha_pollfd *fds, uint64_t count, uint64_t ticks)
 {
-    assert(!ticks);
+    (void)fds;(void)count;(void)ticks;
+    assert(0 && "DRM immediate probe must use FD_POLL");
+    return -EIO;
+}
+long pacha_fd_poll(struct pacha_pollfd *fds, uint64_t count)
+{
     long ready = 0;
     for (uint64_t i = 0; i < count; ++i) {
         fds[i].revents = (fds[i].fd == (uint64_t)ready_fd ? PACHA_FD_EVENT_READABLE : 0) |
@@ -323,8 +328,6 @@ long pacha_fd_wait_many_batched(struct pacha_pollfd *fds, uint64_t count, uint64
     }
     return ready;
 }
-long pacha_fd_poll(struct pacha_pollfd *fds, uint64_t count)
-{ (void)fds;(void)count; assert(0); return -EIO; }
 
 static void binding(struct gpud_drm_service *service, int aux)
 {

@@ -1,0 +1,10 @@
+[
+  {"name":"libnl3-dev","version":"3.11.0-r0","sha256":"603c62d29bd6c3022a05841c5d04e21f433a69f6d7c71534c9f01f28eea8410e"},
+  {"name":"libnl3-static","version":"3.11.0-r0","sha256":"b390b3e71545ca12d454a42e2552117ae11096b9111ce1f1357ca47cd1fc353e"},
+  {"name":"linux-headers","version":"6.14.2-r0","sha256":"b0d7184f0e8d926961b82dff3d8a6a1f85db100dfc97e3fa1e6a25bbe9fd0f71"},
+  {"name":"musl-dev","version":"1.2.5-r13","sha256":"2ca496dd68c0b340b50cf9940bc2f3312eac8b56ec2d3284a621be6f0c09ffb1"},
+  {"name":"openssl-dev","version":"3.5.9-r0","sha256":"86cbdf7fbbef81ba79ee238b90a56bfde6d02a70fe71c00a7de05872b9f5d9c4"},
+  {"name":"openssl-libs-static","version":"3.5.9-r0","sha256":"c98f714a5e80c62a0dbfecf6935364e87d53aed58355d3f18cd9f5e3389ac922"},
+  {"name":"zlib-dev","version":"1.3.2-r1","sha256":"606473e68819d075f9d3177aabe6f85459397e9659ee8b69fa7d9e42cf4b8929"},
+  {"name":"zlib-static","version":"1.3.2-r1","sha256":"e219044d19582e16848dfbbd6813dbf405e42b70cdfe67f317928438ba69e508"}
+]

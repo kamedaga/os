@@ -472,6 +472,7 @@ int inputd_input_source_begin(struct inputd_input_island *island,
 
 int inputd_input_source_device(struct inputd_input_island *island,
     uint64_t source_id, uint64_t generation,
+    uint32_t source_kind, uint64_t platform_id,
     uint16_t pci_segment, uint8_t pci_bus, uint8_t pci_device, uint8_t pci_function,
     const struct kobox_linux_input_device_info *info,
     struct inputd_public_device *published)
@@ -481,6 +482,11 @@ int inputd_input_source_device(struct inputd_input_island *island,
         !memchr(info->name, 0, sizeof(info->name)) ||
         !memchr(info->phys, 0, sizeof(info->phys)) ||
         !memchr(info->uniq, 0, sizeof(info->uniq)))
+        return -22;
+    if ((source_kind != INPUTD_SOURCE_PCI && source_kind != INPUTD_SOURCE_PLATFORM) ||
+        (source_kind == INPUTD_SOURCE_PCI && platform_id) ||
+        (source_kind == INPUTD_SOURCE_PLATFORM && (!platform_id || pci_segment ||
+            pci_bus || pci_device || pci_function || info->bus != 0x11)))
         return -22;
     inputd_registry_entry_t *entry = source_entry(island, source_id, generation, info->id);
     const int fresh = entry == NULL;
@@ -521,6 +527,7 @@ int inputd_input_source_device(struct inputd_input_island *island,
             .stable_id = next_source_stable_id++,
             .event_index = slot,
             .generation = 1,
+            .source_kind = source_kind, .platform_id = platform_id,
             .pci_segment = pci_segment, .pci_bus = pci_bus,
             .pci_device = pci_device, .pci_function = pci_function,
         };

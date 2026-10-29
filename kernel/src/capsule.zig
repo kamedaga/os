@@ -7,15 +7,17 @@ pub const known_rights_mask: u64 = (1 << 13) - 1;
 pub const CapsuleKind = enum(u8) {
     none = 0,
     device = 2,
-    mmio = 3,
-    dma_buffer = 4,
-    dma_mapping = 5,
-    irq = 6,
+    platform_device = 3,
+    mmio = 4,
+    dma_buffer = 5,
+    dma_mapping = 6,
+    irq = 7,
 };
 
 comptime {
     std.debug.assert(known_rights_mask == capsule_abi.known_rights_mask);
     std.debug.assert(@intFromEnum(CapsuleKind.device) == @intFromEnum(capsule_abi.CapsuleKind.device));
+    std.debug.assert(@intFromEnum(CapsuleKind.platform_device) == @intFromEnum(capsule_abi.CapsuleKind.platform_device));
     std.debug.assert(@intFromEnum(CapsuleKind.mmio) == @intFromEnum(capsule_abi.CapsuleKind.mmio));
     std.debug.assert(@intFromEnum(CapsuleKind.dma_buffer) == @intFromEnum(capsule_abi.CapsuleKind.dma_buffer));
     std.debug.assert(@intFromEnum(CapsuleKind.dma_mapping) == @intFromEnum(capsule_abi.CapsuleKind.dma_mapping));

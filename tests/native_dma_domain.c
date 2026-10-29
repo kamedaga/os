@@ -23,6 +23,16 @@ void ph_log(const char *text) {
     log_text(text);
 }
 
+/* This boot-only test has no logd endpoint; dma_failure_record already emits
+ * its full serial snapshot through ph_log. */
+void ph_boot_log_dma_failure(unsigned long stage, long native_status,
+    unsigned long iova, unsigned long bytes, unsigned long mappings,
+    unsigned long mapping_bytes, long fd_status, unsigned long fd_capacity,
+    unsigned long fd_free) {
+    (void)stage; (void)native_status; (void)iova; (void)bytes; (void)mappings;
+    (void)mapping_bytes; (void)fd_status; (void)fd_capacity; (void)fd_free;
+}
+
 static void acquire_device(void) {
     CHECK(seed0_bootstrap_descriptor() != NULL);
     const uint64_t source = claim_pci_device(0x1af4, 0x1044);
@@ -71,6 +81,51 @@ static void expect_blocked_request(void) {
         CHECK(r16((uintptr_t)dma_bytes + 2 * PAGE + 2) == 1);
         for (unsigned i = 0; i < 64; ++i) CHECK(r8((uintptr_t)dma_bytes + 3 * PAGE + i) == 0xa5);
     }
+}
+
+/* AX210 retains more than 4096 RX/ring mappings. Exercise that descriptor
+ * inventory on the real kernel, also letting unrelated FDs consume every
+ * slot reserved at init. RAM aliases isolate FD/domain ownership from the
+ * device's packet protocol; no device may DMA while this test runs. */
+static void check_mapping_inventory(void) {
+    enum { COUNT = 4224, FILLERS = 5000 };
+    static struct ph_dma_mapping mappings[COUNT];
+    static pacha_fd_t fillers[FILLERS];
+    struct ph_dma port = {0};
+    struct ph_dma_config settings = {
+        .device_fd = DEVICE_FD, .native_device = query(DEVICE_FD).device,
+        .generation = 2, .ram = dma_bytes, .ram_length = sizeof(dma_bytes),
+        .mappings = mappings, .mapping_capacity = COUNT,
+    };
+    stage = "dma-domain-shared-fd-pressure";
+    CHECK(!ph_dma_init(&port, &settings));
+    struct pacha_fd_table_info before = {0}, full = {0}, after = {0};
+    CHECK(!call(PACHA_FD_SYSCALL_TABLE, 0, (uintptr_t)&before, 0, 0, 0, 0));
+    CHECK(before.free_slots <= FILLERS);
+    for (uint64_t i = 0; i < before.free_slots; ++i) {
+        uint64_t fd = call(PACHA_FD_SYSCALL_DUP, DEVICE_FD, 16,
+            PACHA_FD_RIGHT_QUERY | PACHA_FD_RIGHT_CLOSE, 0, 0, 0);
+        CHECK(is_fd(fd));
+        fillers[i] = (pacha_fd_t)fd;
+    }
+    CHECK(!call(PACHA_FD_SYSCALL_TABLE, 0, (uintptr_t)&full, 0, 0, 0, 0));
+    CHECK(!full.free_slots);
+    stage = "dma-domain-4224-live-mappings";
+    for (unsigned i = 0; i < COUNT; ++i)
+        CHECK(!port.host.map(&port, TEST_IOVA + (uint64_t)i * PAGE,
+            0, PAGE, KOBOX_DMA_DEVICE_READ));
+    CHECK(!call(PACHA_FD_SYSCALL_TABLE, 0, (uintptr_t)&after, 0, 0, 0, 0));
+    CHECK(after.capacity > full.capacity);
+    CHECK(!port.host.enable(&port, 0));
+    for (unsigned i = 0; i < COUNT; ++i)
+        CHECK(!port.host.unmap(&port, TEST_IOVA + (uint64_t)i * PAGE, PAGE));
+    for (uint64_t i = 0; i < before.free_slots; ++i) close_fd(fillers[i]);
+    CHECK(!call(PACHA_FD_SYSCALL_TABLE, 0, (uintptr_t)&after, 0, 0, 0, 0));
+    CHECK(after.capacity - after.free_slots == before.capacity - before.free_slots);
+    CHECK(!(query(DEVICE_FD).flags & PACHA_CAPSULE_DMA_QUARANTINED));
+    CHECK(!ph_dma_revoke(&port, 2));
+    CHECK(!ph_dma_destroy(&port));
+    log_text("NATIVE_DMA_INVENTORY_4224=PASS\n");
 }
 
 int main(void) {
@@ -127,6 +182,7 @@ int main(void) {
     CHECK(ph_dma_revoke(&port, 1) == 0);
     CHECK(host->enable(&port, 1) < 0);
     CHECK(ph_dma_destroy(&port) == 0);
+    check_mapping_inventory();
     for (unsigned i = 0; i < map_count; ++i) close_fd(maps[i].fd);
     close_fd(DEVICE_FD);
     log_text("NATIVE_DMA_DOMAIN=PASS\n");

@@ -14,14 +14,23 @@ mkdir -p "$out"
   "$repo_root/userland/kobox2_adapter/device_dma.c" \
   "$repo_root/userland/libpacha/src/syscall.c" \
   -Wl,-e,_start,--image-base=0x400000,-z,noexecstack -o "$out/native_dma_domain.elf"
-(cd "$repo_root/kernel" && zig build limine)
+kernel="${NATIVE_DMA_KERNEL_ELF:-$repo_root/kernel/zig-out/bin/limine/pacha-kernel.elf}"
+if [[ -z "${NATIVE_DMA_KERNEL_ELF:-}" ]]; then
+  (cd "$repo_root/kernel" && zig build limine)
+fi
+test -f "$kernel"
+aw_bits="${NATIVE_DMA_AW_BITS:-48}"
+[[ "$aw_bits" == 39 || "$aw_bits" == 48 ]]
+# This native DMA test does not load a hosted Linux core. Keep its boot
+# archive independent of unrelated gate-runtime build artifacts.
+: > "$out/bootfs.manifest"
 (cd "$repo_root/pack" && go run ./cmd/bootfs-image \
-  --manifest "$repo_root/tests/kobox2-foundation.bootfs" --output "$out/bootfs.img")
+  --manifest "$out/bootfs.manifest" --output "$out/bootfs.img")
 cp --reflink=auto "$repo_root/.artifacts/limine-boot.img" "$out/boot.img"
-mcopy -o -i "$out/boot.img@@2097152" "$repo_root/kernel/zig-out/bin/limine/pacha-kernel.elf" ::/KERNEL.ELF
+mcopy -o -i "$out/boot.img@@2097152" "$kernel" ::/KERNEL.ELF
 mcopy -o -i "$out/boot.img@@2097152" "$out/native_dma_domain.elf" ::/INITAPP.ELF
 mcopy -o -i "$out/boot.img@@2097152" "$out/bootfs.img" ::/BOOTFS.IMG
-sha256sum "$repo_root/kernel/zig-out/bin/limine/pacha-kernel.elf" \
+sha256sum "$kernel" \
   "$out/native_dma_domain.elf" >"$out/inputs.sha256"
 sha256sum "$repo_root/tests/native_dma_domain.c" "$repo_root/tests/native_device_contract.c" \
   "$repo_root/tests/run-native-dma-domain.sh" \
@@ -31,7 +40,7 @@ sha256sum "$repo_root/tests/native_dma_domain.c" "$repo_root/tests/native_device
 qemu-system-x86_64 -machine q35 -cpu host -enable-kvm -m 2G -smp 2 \
   -trace 'enable=virtio_rng_*' -trace enable=vtd_dmar_fault \
   -trace enable=vtd_dmar_translate \
-  -device intel-iommu,intremap=off,aw-bits=48 \
+  -device intel-iommu,intremap=off,aw-bits="$aw_bits" \
   -device virtio-rng-pci,disable-legacy=on,iommu_platform=on \
   -drive "file=$out/boot.img,format=raw,if=ide" -display none \
   -serial "file:$out/serial.log" -monitor none -no-reboot -net none >"$out/qemu.log" 2>&1 &

@@ -216,6 +216,8 @@ static int device_fields(uint64_t device, netd_device_fields_t *out)
             descriptor.segment, descriptor.bus, descriptor.device,
             descriptor.function), sizeof(out->pci_slot_name)))
         return -22;
+    if (descriptor.platform)
+        out->pci_slot_name[0] = 0;
     out->input_capabilities = descriptor.capabilities;
     out->input = 1;
     out->action = descriptor.action;
@@ -268,8 +270,9 @@ int netd_netlink_publish_device(uint64_t device)
                     (NETD_INPUT_CAP_RELATIVE | NETD_INPUT_CAP_ABSOLUTE)) != 0)
                 length = append_field(message->data, sizeof(message->data), length,
                     "ID_INPUT_MOUSE=1");
-            length = append_field(message->data, sizeof(message->data), length,
-                fields.pci_slot_name);
+            if (fields.pci_slot_name[0])
+                length = append_field(message->data, sizeof(message->data), length,
+                    fields.pci_slot_name);
         }
         length = append_field(message->data, sizeof(message->data), length, seqnum);
         if (length >= sizeof(message->data)) continue;

@@ -347,6 +347,13 @@ pub fn resolutionNs() ?u64 {
     return hpet.resolutionNs();
 }
 
+// Both sources are published during boot and remain available thereafter.
+// A caller may use this admission result until its clock_gettime completes:
+// a later PV fallback retains the monotonic floor, while HPET stays mapped.
+pub fn monotonicSourceReady() bool {
+    return @atomicLoad(bool, &pv_monotonic.enabled, .acquire) or hpet.resolutionNs() != null;
+}
+
 pub fn realtimeNs() ?u64 {
     return highres_realtime_offset_ns +| (monotonicNs() orelse return null);
 }

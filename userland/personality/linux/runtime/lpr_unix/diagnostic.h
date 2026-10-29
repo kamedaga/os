@@ -23,6 +23,10 @@ static inline void lpr_unix_diag(uint64_t op, uint64_t socket, uint64_t a, uint6
     if (op != 'R' && op != 'W' && op != 'N' && op != 'E' && op != 8) return;
     if (a == UINT64_MAX - 10) return; /* Repeated EAGAIN is not a data event. */
 #if LPR_UNIX_DIAG > 2
+    /* A notification target that has gone away and a write to a closed
+     * peer are ordinary teardown outcomes, not UNIX service failures. */
+    if ((op == 8 && (int64_t)a == -2) ||
+        (op == 'W' && (int64_t)a == -32)) return;
     if ((op == 'R' || op == 'W' || op == 8) &&
         ((int64_t)a >= 0 || (int64_t)a == -4 ||
          (op == 8 && ((int64_t)a == -115 || (int64_t)a == -114)))) return;

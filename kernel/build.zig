@@ -202,6 +202,12 @@ pub fn build(b: *std.Build) void {
         .optimize = .Debug,
     }) });
     test_step.dependOn(&b.addRunArtifact(notify_wake_tests).step);
+    const deferred_wake_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("src/sync/deferred_wake.zig"),
+        .target = b.graph.host,
+        .optimize = .Debug,
+    }) });
+    test_step.dependOn(&b.addRunArtifact(deferred_wake_tests).step);
     const ipc_lifetime_tests = b.addTest(.{ .root_module = b.createModule(.{
         .root_source_file = b.path("src/sync/ipc_lifetime.zig"),
         .target = b.graph.host,
@@ -249,6 +255,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     ipc_metric_mod.addImport("kernel_abi_root", kernel_abi_root_mod);
+    addVerifiedSchedulerHostObject(b, ipc_metric_mod, "../verified/scheduling/src/pacha_eevdf.c", "pacha_eevdf_ipc_metric.o");
     const ipc_metric_tests = b.addTest(.{ .root_module = ipc_metric_mod, .filters = &.{"principal syscall counts"} });
     const run_ipc_metric = b.addRunArtifact(ipc_metric_tests);
     test_step.dependOn(&run_ipc_metric.step);
@@ -301,7 +308,7 @@ pub fn build(b: *std.Build) void {
     interrupt_waiter_mod.addImport("kernel_abi_root", kernel_abi_root_mod);
     interrupt_waiter_mod.addCSourceFile(.{ .file = b.path("../tests/interrupt_waiter_host.c"), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" } });
     addVerifiedSchedulerHostObject(b, interrupt_waiter_mod, "../verified/scheduling/src/pacha_eevdf.c", "pacha_eevdf_interrupt_test.o");
-    const interrupt_waiter_tests = b.addTest(.{ .root_module = interrupt_waiter_mod, .filters = &.{ "shootdown interrupt guard", "lifecycle admission", "process timer index", "PIT deadline", "copy window", "poll item snapshot", "MMIO cache admission", "WC identity lease", "WC physical window leases" }, .use_llvm = true });
+    const interrupt_waiter_tests = b.addTest(.{ .root_module = interrupt_waiter_mod, .filters = &.{ "shootdown interrupt guard", "lifecycle admission", "process timer index", "PIT deadline", "copy window", "pager preflight", "poll item snapshot", "MMIO cache admission", "WC identity lease", "WC physical window leases" }, .use_llvm = true });
     interrupt_waiter_tests.stack_size = 512 * 1024 * 1024;
     const interrupt_waiter_run = b.addRunArtifact(interrupt_waiter_tests);
     test_step.dependOn(&interrupt_waiter_run.step);
@@ -329,11 +336,24 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const platform_device_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/platform_device_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    platform_device_test_mod.addImport("kernel_abi_root", kernel_abi_root_mod);
+    addVerifiedSchedulerHostObject(b, platform_device_test_mod, "../verified/scheduling/src/pacha_eevdf.c", "pacha_eevdf_platform_test.o");
+    const platform_device_tests = b.addTest(.{ .root_module = platform_device_test_mod, .filters = &.{"platform "} });
+    const platform_device_run = b.addRunArtifact(platform_device_tests);
+    test_step.dependOn(&platform_device_run.step);
+    b.step("test-platform-device", "Test native platform inventory, PIO and IRQ ownership boundaries").dependOn(&platform_device_run.step);
     vtd_test_mod.addImport("kernel_abi_root", kernel_abi_root_mod);
     addVerifiedSchedulerHostObject(b, vtd_test_mod, "../verified/scheduling/src/pacha_eevdf.c", "pacha_eevdf_vtd_test.o");
     const vtd_tests = b.addTest(.{ .root_module = vtd_test_mod, .filters = &.{"VT-d"} });
     vtd_tests.stack_size = 512 * 1024 * 1024;
-    test_step.dependOn(&b.addRunArtifact(vtd_tests).step);
+    const run_vtd_tests = b.addRunArtifact(vtd_tests);
+    test_step.dependOn(&run_vtd_tests.step);
+    b.step("test-vtd", "Test VT-d isolation, reserved firmware DMA and withdrawal").dependOn(&run_vtd_tests.step);
     const amd_iommu_test_mod = b.createModule(.{
         .root_source_file = b.path("src/amd_iommu.zig"),
         .target = target,
@@ -414,6 +434,15 @@ pub fn build(b: *std.Build) void {
         .filters = if (scheduler_test_filter) |filter| &.{filter} else &.{ "migration waits", "preferred wake", "controlled thread context", "yield handoff", "futex", "context transfer", "IPC direct", "clock read admission", "AP block", "IPC notify", "thread storage", "uninterruptible wait", "deadline" },
     });
     test_step.dependOn(&b.addRunArtifact(scheduler_context_tests).step);
+    const signal_delivery_tests = b.addTest(.{
+        .root_module = scheduler_context_test_mod,
+        .use_llvm = true,
+        .filters = &.{"native signal"},
+    });
+    const signal_delivery_run = b.addRunArtifact(signal_delivery_tests);
+    test_step.dependOn(&signal_delivery_run.step);
+    b.step("test-signal-delivery", "Test native signal stack ownership and pending delivery").dependOn(&signal_delivery_run.step);
+
     const ipc_cost_mod = b.createModule(.{
         .root_source_file = b.path("src/scheduler_connection.zig"),
         .target = b.graph.host,
@@ -581,6 +610,8 @@ pub fn build(b: *std.Build) void {
     _ = diag_font_files.addCopyFile(b.path("../.artifacts/third_party/libvterm-0.3.3/build/font.psf"), "font.psf");
     kernel_boot_api_mod.addImport("boot_diag_font", b.createModule(.{ .root_source_file = diag_font_source }));
     kernel_boot_api_mod.addImport("kernel_abi_root", kernel_abi_root_mod);
+    // All import paths in an executable must share this module instance:
+    // addOptions per consumer gives the same generated file two owners.
     const kernel_lock_options_mod = kernel_lock_check_options.createModule();
     kernel_boot_api_mod.addImport("kernel_lock_check_options", kernel_lock_options_mod);
     limine_mod.addImport("kernel_abi_root", kernel_abi_root_mod);
@@ -651,7 +682,7 @@ pub fn build(b: *std.Build) void {
     diag_mod.addOptions("smp_profile_options", smp_profile_options);
     diag_mod.addOptions("ipc_profile_options", ipc_profile_options);
     diag_mod.addOptions("kernel_log_ring_options", log_ring_options);
-    diag_mod.addOptions("kernel_lock_check_options", kernel_lock_check_options);
+    diag_mod.addImport("kernel_lock_check_options", kernel_lock_options_mod);
     diag_mod.addOptions("stack_paint_options", stack_paint_options);
     diag_mod.addOptions("boot_checkpoint_options", diag_options);
     diag_mod.addImport("kernel_boot_api", kernel_boot_api_mod);
@@ -667,7 +698,7 @@ pub fn build(b: *std.Build) void {
     // QEMU-only display regression: halt after E so the GOP text and the
     // centralized halt-log renderer remain visible for screenshot inspection.
     const diag_test_options = b.addOptions();
-    diag_test_options.addOption([]const u8, "name", "DIAGTEST");
+    diag_test_options.addOption([]const u8, "name", if (b.option(bool, "boot-diag-vtd", "Read firmware VT-d state and halt before IOMMU initialization") orelse false) "DIAGVTD" else "DIAGTEST");
     const diag_test_mod = b.createModule(.{
         .root_source_file = b.path("../bootloader/limine/kernel_entry.zig"),
         .target = limine_target,
@@ -680,7 +711,7 @@ pub fn build(b: *std.Build) void {
     diag_test_mod.addOptions("smp_profile_options", smp_profile_options);
     diag_test_mod.addOptions("ipc_profile_options", ipc_profile_options);
     diag_test_mod.addOptions("kernel_log_ring_options", log_ring_options);
-    diag_test_mod.addOptions("kernel_lock_check_options", kernel_lock_check_options);
+    diag_test_mod.addImport("kernel_lock_check_options", kernel_lock_options_mod);
     diag_test_mod.addOptions("stack_paint_options", stack_paint_options);
     diag_test_mod.addOptions("boot_checkpoint_options", diag_test_options);
     diag_test_mod.addImport("kernel_boot_api", kernel_boot_api_mod);
@@ -712,7 +743,7 @@ pub fn build(b: *std.Build) void {
         checkpoint_mod.addOptions("smp_profile_options", smp_profile_options);
         checkpoint_mod.addOptions("ipc_profile_options", ipc_profile_options);
         checkpoint_mod.addOptions("kernel_log_ring_options", log_ring_options);
-        checkpoint_mod.addOptions("kernel_lock_check_options", kernel_lock_check_options);
+        checkpoint_mod.addImport("kernel_lock_check_options", kernel_lock_options_mod);
         checkpoint_mod.addOptions("stack_paint_options", stack_paint_options);
         checkpoint_mod.addOptions("boot_checkpoint_options", checkpoint_options);
         checkpoint_mod.addImport("kernel_boot_api", kernel_boot_api_mod);

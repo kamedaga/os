@@ -48,7 +48,7 @@ def check(files):
  if 'entry.withdrawn = true' not in withdraw or 'free_head' in withdraw:errors.append('slot quarantine')
  fast=body('syscall/native_ipc.zig','fastDispatchAfterRegisterAdmission')
  # Freeze the K borrow interval: callbacks may abandon the stack or drop K.
- if hashlib.sha256(re.sub(r'\s+','',fast).encode()).hexdigest() != '9e325e5c7f2253de64ef25fd0957ed1a66dcc9f70a846bd9dcd97276308f4cff':errors.append('K IPC borrower changed: audit last pointer use before callbacks')
+ if hashlib.sha256(re.sub(r'\s+','',fast).encode()).hexdigest() != '6160b1d085898ed7fcc3a230a669103f833c77091d9681424beac954b8569848':errors.append('K IPC borrower changed: audit last pointer use before callbacks')
  admission=body('syscalls.zig','syscallIpcScalarDispatch')
  if 'fastDispatchKFree' in admission or 'kernel_state_lock.lock(' not in admission or not admission.index('kernel_state_lock.lock(')<admission.index('fastDispatchAfterRegisterAdmission('):errors.append('IPC fallback must own K')
  borrow=body(c,'resolveIpcUnderK')

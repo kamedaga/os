@@ -1,11 +1,11 @@
 // Pager requests are scoped to the control port and one attached VMO generation.
 // No syscall accepts a destination VMO FD during supply: the port resolves the
 // registered weak identity, so a creator can close its VMO FD after transfer.
-pub const syscall_pager_port_create: u64 = 66;
-pub const syscall_pager_attach: u64 = 67;
-pub const syscall_pager_wait: u64 = 68;
-pub const syscall_pager_supply: u64 = 69;
-pub const syscall_pager_fail: u64 = 70;
+pub const syscall_pager_port_create: u64 = 68;
+pub const syscall_pager_attach: u64 = 69;
+pub const syscall_pager_wait: u64 = 70;
+pub const syscall_pager_supply: u64 = 71;
+pub const syscall_pager_fail: u64 = 72;
 
 pub const event_fault: u32 = 1;
 pub const event_vmo_release: u32 = 2;

@@ -207,9 +207,15 @@ typedef struct lprs_wait4 {
     int64_t requested_pid;
     uint64_t options;
     int64_t result_pid;
-    uint64_t status;
+    /* waitid needs the child's actual UID together with its 32-bit Linux
+     * wait status; the supervisor owns both, including after credential changes. */
+    uint32_t status;
+    uint32_t uid;
     uint64_t exit_code;
 } lprs_wait4_t;
+
+/* Linux WNOWAIT: inspect an exited child without consuming its wait record. */
+#define LPRS_WAIT4_WNOWAIT 0x01000000ull
 
 #define LPRS_WAIT4_RESULT_PACK(pid, status) \
     ((((uint64_t)(uint32_t)(status)) << 32) | (uint64_t)(uint32_t)(pid))

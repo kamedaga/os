@@ -19,6 +19,8 @@ struct inputd_public_device {
     uint32_t event_index;
     uint32_t generation;
     uint32_t capabilities;
+    uint32_t source_kind;
+    uint64_t platform_id;
     uint32_t pci_segment;
     uint32_t pci_bus;
     uint32_t pci_device;
@@ -66,6 +68,7 @@ int inputd_input_source_begin(struct inputd_input_island *island,
     uint64_t source_id, uint64_t generation, int lost_events);
 int inputd_input_source_device(struct inputd_input_island *island,
     uint64_t source_id, uint64_t generation,
+    uint32_t source_kind, uint64_t platform_id,
     uint16_t pci_segment, uint8_t pci_bus, uint8_t pci_device, uint8_t pci_function,
     const struct kobox_linux_input_device_info *info,
     struct inputd_public_device *published);

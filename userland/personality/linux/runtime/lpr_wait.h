@@ -13,6 +13,8 @@ enum {
 // signal delivery.  Linux uses this errno range for the same purpose and it
 // must never escape lpr_dispatch_syscall_frame().
 #define LPR_WAIT_RESTART_SYSCALL (-512ll)
+struct lpr_thread_record;
+void lpr_wait_thread_release(struct lpr_thread_record *);
 
 typedef struct lpr_wait_deadline {
     uint64_t expires_ns;

@@ -25,8 +25,15 @@ pub const syscall_futex_wake: u64 = 36;
 // when wake was unperformed/failed. A completed wake must not be retried.
 pub const syscall_futex_wake_wait: u64 = 37;
 pub const syscall_futex_requeue: u64 = 38;
-pub const syscall_getrandom: u64 = 39;
-pub const syscall_power_control: u64 = 40;
+// FUTEX_WAKE_OP: RDI/RSI=keys, RDX/R10=wake limits, R8=FutexWakeOp pointer.
+// Atomically update the second word and select both wakes under the futex
+// queue lock. Return a nonnegative wake count, or a negative native status;
+// failure commits neither the update nor a wake. Keys remain principal+VA.
+// The updated word requires a writable ordinary-RAM VMA; device and legacy
+// bootstrap-only mappings without that retained backing authority fail MAP.
+pub const syscall_futex_wake_op: u64 = 39;
+pub const syscall_getrandom: u64 = 40;
+pub const syscall_power_control: u64 = 41;
 // GETRANDOM: flags must be zero, length <= 4096. Returns bytes written or
 // negative native status (INVALID=1, MAP=4); positive errors are not counts.
 pub const syscall_runtime_last: u64 = syscall_power_control;
@@ -71,6 +78,16 @@ pub const timespec_nsec_offset: u64 = 8;
 pub const timespec_size: u64 = 16;
 
 pub const futex_wake_all: u64 = ~@as(u64, 0);
+pub const FutexAtomicOperation = enum(u32) { set, add, bit_or, and_not, bit_xor };
+pub const FutexComparison = enum(u32) { equal, not_equal, signed_less, signed_less_equal, signed_greater, signed_greater_equal };
+// Raw tags are validated before use; untrusted enum values must never become
+// an invalid Zig enum. The descriptor is copied before either key is touched.
+pub const FutexWakeOp = extern struct {
+    operation: u32,
+    operand: u32,
+    comparison: u32,
+    compare_operand: u32,
+};
 // FUTEX_WAIT uses the existing EMPTY status to distinguish timer expiry from
 // NOT_READY (value mismatch or signal interruption) without adding a status
 // number to the native ABI.
@@ -96,6 +113,7 @@ test "runtime syscall range is contiguous" {
         syscall_futex_wake,
         syscall_futex_wake_wait,
         syscall_futex_requeue,
+        syscall_futex_wake_op,
         syscall_getrandom,
         syscall_power_control,
     };

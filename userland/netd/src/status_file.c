@@ -18,11 +18,15 @@
 #include <fcntl.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/stat.h>
 
 #define NETD_STATUS_PATH "/tmp/netd-status"
 #define NETD_POLICY_DIR "/run/pacha"
 #define NETD_POLICY_PATH "/run/pacha/network.conf"
 #define NETD_RESOLVER_PATH "/etc/resolv.conf"
+#define NETD_DHCP_HEADER "# generated from DHCP on this live boot\n"
+#define NETD_DNS_HEADER "# generated from live network policy\n"
+static uint64_t policy_publication;
 
 enum { NETD_STATUS_LOG_LINES = 40, NETD_STATUS_LOG_LINE_BYTES = 80 };
 static char progress_log[NETD_STATUS_LOG_LINES][NETD_STATUS_LOG_LINE_BYTES];
@@ -45,8 +49,9 @@ static int status_file_call(pacha_fd_t endpoint, kb2_fs_request_t *request,
     return status ? status : response->result < 0 ? (int)response->result : 0;
 }
 static int status_file_write(pacha_fd_t endpoint, const char *path,
-    const char *text, size_t length, uint64_t flags)
+    const char *text, size_t length, uint64_t flags, int *created)
 {
+    if (created) *created = 0;
     if (endpoint < 16 || !path || (!text && length)) return -EINVAL;
     const int policy_write = strcmp(path, NETD_POLICY_PATH) == 0;
     if (policy_write && memchr(text, 0, length)) return -EINVAL;
@@ -55,6 +60,7 @@ static int status_file_write(pacha_fd_t endpoint, const char *path,
     kb2_fs_response_t response;
     int result = status_file_call(endpoint, &request, path, NULL, 0, NULL, 0, &response);
     if (result) return result;
+    if (created) *created = 1;
     const uint64_t handle = response.handle;
     for (size_t offset = 0; !result && offset < length;) {
         request = (kb2_fs_request_t){.opcode = KB2_FILESYSTEM_OP_PWRITE,
@@ -89,6 +95,78 @@ static int policy_dir_create(pacha_fd_t endpoint)
         NULL, 0, NULL, 0, &response);
     return result == -EEXIST ? 0 : result;
 }
+
+static uint64_t metadata_integer(const unsigned char *bytes, unsigned count)
+{
+    uint64_t value = 0;
+    for (unsigned i = 0; i < count; ++i) value |= (uint64_t)bytes[i] << (i * 8);
+    return value;
+}
+
+static int generated_file_write(pacha_fd_t endpoint, const char *path,
+    const char *header, const char *text, size_t length)
+{
+    kb2_fs_request_t request = {.opcode = KB2_FILESYSTEM_OP_OPENAT2,
+        .flags = O_RDONLY | O_NOFOLLOW | O_CLOEXEC, .resolve = 4};
+    kb2_fs_response_t response;
+    int result = status_file_call(endpoint, &request, path, NULL, 0, NULL, 0, &response);
+    int replace = result != -ENOENT;
+    if (result == -ENOENT) goto stage;
+    if (result == -ELOOP) return -EEXIST; /* A user's resolver symlink is authoritative. */
+    if (result) return result;
+    uint64_t handle = response.handle;
+    unsigned char stat[KB2_FILESYSTEM_STATX_SIZE];
+    request = (kb2_fs_request_t){.opcode = KB2_FILESYSTEM_OP_STATX,
+        .handle = handle, .flags = 0x1000, .mask = 0x7ff};
+    result = status_file_call(endpoint, &request, NULL, NULL, 0, stat, sizeof(stat), &response);
+    if (!result && response.data_length != sizeof(stat)) result = -EPROTO;
+    if (!result) {
+        unsigned mode = (unsigned)metadata_integer(stat + KB2_FILESYSTEM_STATX_MODE_OFFSET, 2);
+        if (!S_ISREG(mode) || (mode & 0022) ||
+            metadata_integer(stat + KB2_FILESYSTEM_STATX_UID_OFFSET, 4) ||
+            metadata_integer(stat + KB2_FILESYSTEM_STATX_NLINK_OFFSET, 4) != 1) result = -EEXIST;
+    }
+    char prefix[64];
+    size_t header_length = strlen(header);
+    if (!result && header_length > sizeof(prefix)) result = -EINVAL;
+    if (!result) {
+        request = (kb2_fs_request_t){.opcode = KB2_FILESYSTEM_OP_PREAD,
+            .handle = handle, .length = header_length};
+        result = status_file_call(endpoint, &request, NULL, NULL, 0, prefix, sizeof(prefix), &response);
+        if (!result && (response.result != (int64_t)header_length ||
+            response.data_length != header_length || memcmp(prefix, header, header_length))) result = -EEXIST;
+    }
+    request = (kb2_fs_request_t){.opcode = KB2_FILESYSTEM_OP_CLOSE, .handle = handle};
+    int closed = status_file_call(endpoint, &request, NULL, NULL, 0, NULL, 0, &response);
+    if (!result) result = closed;
+    if (result) return result;
+stage:;
+    /* Only our generated files are replaceable. Stage a complete sibling
+     * and publish it atomically; never truncate a live policy on failure. */
+    char temporary[128];
+    int size = snprintf(temporary, sizeof(temporary), "%s.netd-%llu", path,
+        (unsigned long long)++policy_publication);
+    if (size < 0 || (size_t)size >= sizeof(temporary)) return -EOVERFLOW;
+    int created = 0;
+    result = status_file_write(endpoint, temporary, text, length, O_CREAT | O_EXCL, &created);
+    if (!result) {
+        request = (kb2_fs_request_t){.opcode = KB2_FILESYSTEM_OP_RENAMEAT2,
+            .flags = replace ? 0 : 1};
+        int status = filedfs_call(endpoint, &request, temporary, path, NULL, 0,
+            NULL, 0, &response, NULL, 0, NULL, NULL);
+        result = status ? status : response.result < 0 ? (int)response.result : 0;
+    }
+    if (result && created) {
+        request = (kb2_fs_request_t){.opcode = KB2_FILESYSTEM_OP_UNLINKAT};
+        (void)status_file_call(endpoint, &request, temporary, NULL, 0, NULL, 0, &response);
+    }
+    return result;
+}
+
+int netd_policy_file_is_generated(const char *text)
+{
+    return text && !strncmp(text, NETD_DHCP_HEADER, sizeof(NETD_DHCP_HEADER) - 1);
+}
 int netd_policy_file_create(pacha_fd_t filed_endpoint_fd,
     const struct netd_dhcp_lease *lease)
 {
@@ -97,7 +175,7 @@ int netd_policy_file_create(pacha_fd_t filed_endpoint_fd,
     if (result != 0) return result;
     char text[256];
     int length = snprintf(text, sizeof(text),
-        "# generated from DHCP on this live boot\n"
+        NETD_DHCP_HEADER
         "address=%u.%u.%u.%u\nnetmask=%u.%u.%u.%u\n"
         "gateway=%u.%u.%u.%u\ndns=%u.%u.%u.%u\n",
         lease->address[0], lease->address[1], lease->address[2], lease->address[3],
@@ -106,9 +184,8 @@ int netd_policy_file_create(pacha_fd_t filed_endpoint_fd,
         lease->dns[0], lease->dns[1], lease->dns[2], lease->dns[3]);
     if (length < 0 || (size_t)length >= sizeof(text)) return -EOVERFLOW;
     if (strlen(text) != (size_t)length) return -EIO;
-    /* Exclusive creation keeps a manually supplied RAM policy authoritative. */
-    return status_file_write(filed_endpoint_fd, NETD_POLICY_PATH,
-        text, (size_t)length, O_CREAT | O_EXCL);
+    return generated_file_write(filed_endpoint_fd, NETD_POLICY_PATH,
+        NETD_DHCP_HEADER, text, (size_t)length);
 }
 
 int netd_resolver_file_create(pacha_fd_t filed_endpoint_fd, const uint8_t dns[4])
@@ -117,14 +194,12 @@ int netd_resolver_file_create(pacha_fd_t filed_endpoint_fd, const uint8_t dns[4]
     if (!(dns[0] | dns[1] | dns[2] | dns[3])) return -ENODATA;
     char text[80];
     int length = snprintf(text, sizeof(text),
-        "# generated from live network policy\n"
+        NETD_DNS_HEADER
         "nameserver %u.%u.%u.%u\n",
         dns[0], dns[1], dns[2], dns[3]);
     if (length < 0 || (size_t)length >= sizeof(text)) return -EOVERFLOW;
-    /* This is a RAM-root file. Exclusive creation preserves a resolver
-     * policy supplied by the user before netd applies its IPv4 policy. */
-    return status_file_write(filed_endpoint_fd, NETD_RESOLVER_PATH,
-        text, (size_t)length, O_CREAT | O_EXCL);
+    return generated_file_write(filed_endpoint_fd, NETD_RESOLVER_PATH,
+        NETD_DNS_HEADER, text, (size_t)length);
 }
 
 int netd_policy_file_read(pacha_fd_t endpoint, char *text,
@@ -233,7 +308,7 @@ void netd_status_file_publish(const struct netd_boot_config *cfg,
     }
     const int written = status_file_write((pacha_fd_t)cfg->filed_endpoint_fd,
         NETD_STATUS_PATH, report, used,
-        O_CREAT | O_TRUNC);
+        O_CREAT | O_TRUNC, NULL);
     if (written != 0)
         fprintf(stderr, "[netd] status file update failed status=%d\n", written);
 }
@@ -267,8 +342,10 @@ static void status_file_progress(const struct netd_boot_config *cfg,
     if (cfg->log_endpoint_fd < 16 ||
         pacha_log_emit((pacha_fd_t)cfg->log_endpoint_fd,
             source, phase, strlen(phase)) != 0) {
+#if defined(NETD_PROGRESS_DIAG) && NETD_PROGRESS_DIAG
         printf("[netd] nic progress #%u %s\n", progress_sequence, phase);
         fflush(stdout);
+#endif
     }
     netd_status_file_publish(cfg, "initializing", NETD_BOOT_STAGE_NIC, 0);
 }

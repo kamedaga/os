@@ -1,6 +1,8 @@
 #include "lpr_filed_internal.h"
 #include <personality/lpr_signal_stack.h>
 #include "lpr_wait_trace.h"
+#include "lpr_vsyscall.h"
+#include "lpr_entry_stack.h"
 
 __asm__(
     ".pushsection .text\n"
@@ -237,6 +239,30 @@ static int lpr_signal_sp_on_altstack(uint64_t rsp)
     return rsp >= lpr_linux_altstack_sp && rsp < end;
 }
 
+int64_t lpr_linux_register_thread_signal_runtime(lpr_signal_thread_state_t *state, int process_owner)
+{
+    if (state->async_registered) return PACHAOS_SYSCALL_OK;
+    uint64_t base, size;
+    lpr_entry_stack_async_range(&base, &size);
+    /* Unlike native fiber runtimes, LPR must never use caller-stack delivery:
+     * the interrupted Linux stack may be a 2 KiB Go goroutine stack. */
+    if (!base || !size) return -LPR_LINUX_ENOMEM;
+    const struct pachaos_signal_registration registration = {
+        .entry = (uintptr_t)lpr_async_signal_entry,
+        .inhibit_start = (uintptr_t)lpr_runtime_text_start,
+        .inhibit_end = (uintptr_t)lpr_runtime_text_end,
+        .inhibit_secondary_start = LPR_ZPOLINE_PAGE_VA,
+        .inhibit_secondary_end = LPR_ZPOLINE_PAGE_VA + LPR_ZPOLINE_PAGE_SIZE,
+        .scratch_base = base, .scratch_size = size,
+        .flags = process_owner ? PACHAOS_SIGNAL_REGISTRATION_PROCESS_OWNER : 0,
+    };
+    _Static_assert(sizeof(registration) == 64, "native signal registration ABI");
+    const int64_t status = lpr_pacha_syscall2(PACHAOS_SYSCALL_PROCESS_SIGNAL_CTL,
+        PACHAOS_PROCESS_SIGNAL_CTL_REGISTER, (uintptr_t)&registration);
+    if (!status) state->async_registered = 1;
+    return status;
+}
+
 void lpr_linux_signal_runtime_init(void)
 {
     /* Runs on the way in from every intercepted Linux syscall, so the early
@@ -266,14 +292,12 @@ void lpr_linux_signal_runtime_init(void)
     }
     lpr_signal_thread_state_prepare_current();
     lpr_linux_fault_runtime_init();
-    const int64_t status = lpr_pacha_syscall6(
-        PACHAOS_SYSCALL_PROCESS_SIGNAL_CTL,
-        PACHAOS_PROCESS_SIGNAL_CTL_REGISTER,
-        (uint64_t)(uintptr_t)lpr_async_signal_entry,
-        (uint64_t)(uintptr_t)lpr_runtime_text_start,
-        (uint64_t)(uintptr_t)lpr_runtime_text_end,
-        LPR_ZPOLINE_PAGE_VA,
-        LPR_ZPOLINE_PAGE_VA + LPR_ZPOLINE_PAGE_SIZE);
+    const int64_t status = lpr_linux_register_thread_signal_runtime(
+        lpr_signal_thread_state_current(), 1);
+    if (status != PACHAOS_SYSCALL_OK) {
+        (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_PROCESS_EXIT, 127);
+        for (;;) {}
+    }
     if (status == PACHAOS_SYSCALL_OK) {
         lpr_signal_thread_state_t *single_state = lpr_signal_thread_state_current();
         lpr_linux_register_thread_signal_hint(single_state);
@@ -591,10 +615,11 @@ void lpr_linux_deliver_native_pending_frame_after_wait(
     // A successful DELIVER_PENDING_FRAME redirects directly to the native
     // signal entry, so the interrupted dispatch and its stack-local frame
     // anchor are abandoned together.
-    (void)lpr_pacha_syscall2(
-        PACHAOS_SYSCALL_PROCESS_SIGNAL_CTL,
-        PACHAOS_PROCESS_SIGNAL_CTL_DELIVER_PENDING_FRAME,
-        (uint64_t)(uintptr_t)interrupted_frame);
+    /* The kernel snapshots live XState. Restore the interrupted Linux FP
+     * image immediately before the native transition, without a C callee
+     * being allowed to clobber it in between. */
+    extern int64_t lpr_deliver_pending_frame(const struct lpr_linux_user_frame *, uint64_t);
+    (void)lpr_deliver_pending_frame(interrupted_frame, interrupted_frame->fp_state);
     lpr_wait_trace_record(8, saved_rax, (uint64_t)interrupted_result);
     // Reached only when no signal frame was installed.
     interrupted_frame->rax = saved_rax;
@@ -831,7 +856,11 @@ static void *lpr_signal_prepare(void *native_raw, uint64_t stack_top, int synchr
 
 void *lpr_linux_async_signal_prepare(void *native_raw)
 {
-    return lpr_signal_prepare(native_raw, (uint64_t)(uintptr_t)native_raw, 0);
+    /* The native scratch is reusable as soon as we leave the inhibit range.
+     * Put the Linux frame (including its native/XState copy) on the original
+     * Linux stack or SA_ONSTACK, and switch RSP there before invoking code. */
+    lpr_pacha_signal_frame_t *native = native_raw;
+    return lpr_signal_prepare(native_raw, native ? native->context.rsp : 0, 0);
 }
 
 static uint32_t lpr_fault_linux_signal(uint64_t vector, uint64_t error_code)
@@ -856,6 +885,12 @@ _Noreturn void lpr_linux_fault_prepare(void *raw)
         fault->signal.size != PACHAOS_PROCESS_FAULT_FRAME_SIZE || fault->signal.signo ||
         fault->signal.xstate_features != PACHAOS_PROCESS_SIGNAL_XSTATE_FEATURE_MASK)
         lpr_linux_exit_for_signal(11);
+    const uintptr_t vsyscall = lpr_vsyscall_fault_target(fault->vector,
+        fault->error_code, fault->signal.context.rip);
+    if (vsyscall) {
+        fault->signal.context.rip = vsyscall;
+        lpr_native_signal_return(&fault->signal);
+    }
     const uint32_t sig = lpr_fault_linux_signal(fault->vector, fault->error_code);
     if (lpr_linux_sigactions[sig].handler == LPR_LINUX_SIG_IGN ||
         (lpr_linux_signal_mask & lpr_linux_signal_bit(sig)))

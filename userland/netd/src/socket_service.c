@@ -445,6 +445,41 @@ static int netd_socket_dispatch(
     }
 }
 
+static int netd_socket_dispatch_notification(
+    const struct pacha_ipc_msg *request,
+    const struct pacha_ipc_fd *fds, int *handled)
+{
+    /* Only UEVENT_PUBLISH admits a zero-correlation one-way SEND. There is
+     * no implicit reply capability to consume; do not manufacture a reply
+     * or relax the correlated RPC contract of any other socket operation. */
+    *handled = request->word1 == NETD_OP_UEVENT_PUBLISH && request->word3 == 0;
+    if (!*handled) return 0;
+    int status = -22;
+    /* A malformed CALL can impersonate the notification's words. Discard
+     * its reply authority or it would prevent the next CALL from entering.
+     * Genuine SEND has no implicit authority and needs no reply syscall. */
+    pacha_fd_t unexpected_reply = pacha_ipc_reply_extract();
+    if (unexpected_reply >= 16) {
+        (void)pacha_fd_close(unexpected_reply);
+    } else if (unexpected_reply != PACHA_ERR_INVALID && unexpected_reply != PACHA_ERR_CLOSED) {
+        /* Extraction may run out of FD slots with the implicit authority
+         * still bound. A descriptor-free error reply drains it in place. */
+        const struct pacha_ipc_msg rejected = {.word0 = PACHA_SERVICE_REPLY_MAGIC,
+            .word1 = (uint64_t)(int64_t)-22};
+        (void)pacha_ipc_reply(PACHA_IPC_REPLY_IMPLICIT, &rejected);
+    } else if (request->word0 == PACHA_SERVICE_REQUEST_MAGIC && request->fd_count == 0)
+        status = netd_netlink_publish_device(request->word2);
+    for (uint64_t i = 0; i < request->fd_count; ++i)
+        if (fds[i].fd >= 16) (void)pacha_fd_close((pacha_fd_t)fds[i].fd);
+    if (status) {
+        ++g_netd_socket_errors;
+        pacha_trace4(PACHA_TRACE_COMPONENT_NETD, PACHA_TRACE_EVENT_NETD_SOCKET,
+            PACHA_TRACE_CLASS_ERROR, request->word1, (uint64_t)status,
+            request->word2, request->fd_count);
+    }
+    return status;
+}
+
 static int netd_socket_dispatch_request(
     const struct pacha_ipc_msg *request,
     const struct pacha_ipc_fd *fds)
@@ -452,6 +487,9 @@ static int netd_socket_dispatch_request(
     if (request == NULL) {
         return -22;
     }
+    int handled = 0;
+    int notification_status = netd_socket_dispatch_notification(request, fds, &handled);
+    if (handled) return notification_status;
 
     const pacha_fd_t reply_fd = PACHA_IPC_REPLY_IMPLICIT;
     if (request->word0 != PACHA_SERVICE_REQUEST_MAGIC || request->word3 == 0) {

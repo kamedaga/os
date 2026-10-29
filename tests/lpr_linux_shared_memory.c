@@ -167,6 +167,71 @@ static int disk_writeback(void)
     return 0;
 }
 
+static int file_identity(void)
+{
+    char first_name[] = "/tmp/shared-identity-XXXXXX";
+    char other_name[] = "/tmp/shared-unrelated-XXXXXX";
+    char link_name[sizeof(first_name) + 8];
+    int first = mkstemp(first_name), other = mkstemp(other_name);
+    CHECK(first >= 0 && other >= 0);
+    CHECK(!ftruncate(first, 8192) && !ftruncate(other, 8192));
+    volatile unsigned char *a = mmap(NULL, 8192, PROT_READ | PROT_WRITE,
+        MAP_SHARED, first, 0);
+    volatile unsigned char *b = mmap(NULL, 8192, PROT_READ | PROT_WRITE,
+        MAP_SHARED, other, 0);
+    CHECK(a != MAP_FAILED && b != MAP_FAILED);
+    a[4096] = 73;
+    b[4096] = 91;
+    CHECK(snprintf(link_name, sizeof(link_name), "%s-link", first_name) > 0);
+    CHECK(!link(first_name, link_name));
+    int alias = open(link_name, O_RDWR);
+    CHECK(alias >= 0 && !close(first));
+    CHECK(!unlink(first_name) && !unlink(link_name));
+    /* A distinct open file and an unlinked hardlink must still refresh the
+     * original mapping. Another inode's aliases must remain unchanged. */
+    CHECK(!ftruncate(alias, 4096));
+    CHECK(!expect_fault(a + 4096, SIGBUS) && b[4096] == 91);
+    CHECK(!ftruncate(alias, 8192) && a[4096] == 0 && b[4096] == 91);
+    unsigned char byte = 123;
+    CHECK(pwrite(alias, &byte, 1, 4096) == 1 && a[4096] == byte);
+    CHECK(!ftruncate(other, 4096));
+    CHECK(!expect_fault(b + 4096, SIGBUS) && a[4096] == byte);
+    CHECK(!munmap((void *)a, 8192) && !munmap((void *)b, 8192));
+    CHECK(!close(alias) && !close(other) && !unlink(other_name));
+    puts("SHARED_MEMORY hardlink/reopen/unlink/independent-inodes=OK");
+    return 0;
+}
+
+static int file_batch_boundary(void)
+{
+    const size_t boundary = 2u * 1024u * 1024u;
+    const size_t bytes = boundary + 17, mapped = boundary + 8192;
+    char name[] = "/tmp/shared-batch-XXXXXX";
+    int writer = mkstemp(name);
+    CHECK(writer >= 0 && !ftruncate(writer, (off_t)bytes));
+    unsigned char pair[2] = {73, 91};
+    CHECK(pwrite(writer, pair, 2, boundary - 1) == 2);
+    int reader = open(name, O_RDONLY);
+    CHECK(reader >= 0 && !unlink(name));
+    volatile unsigned char *a = mmap(NULL, mapped, PROT_READ, MAP_SHARED, reader, 0);
+    volatile unsigned char *b = mmap(NULL, mapped - 4096, PROT_READ,
+        MAP_SHARED, reader, 4096);
+    CHECK(a != MAP_FAILED && b != MAP_FAILED);
+    CHECK(a[4096] == 0 && a[boundary - 1] == 73 && a[boundary] == 91);
+    CHECK(b[boundary - 4096] == 91 && a[bytes - 1] == 0 && a[bytes] == 0);
+    CHECK(!expect_fault(a + boundary + 4096, SIGBUS));
+    CHECK(!expect_fault(b + boundary, SIGBUS));
+    CHECK(!ftruncate(writer, (off_t)boundary));
+    CHECK(a[boundary - 1] == 73 && !expect_fault(a + boundary, SIGBUS));
+    CHECK(!expect_fault(b + boundary - 4096, SIGBUS));
+    CHECK(!ftruncate(writer, (off_t)bytes));
+    CHECK(a[boundary] == 0 && b[boundary - 4096] == 0);
+    CHECK(!munmap((void *)a, mapped) && !munmap((void *)b, mapped - 4096));
+    CHECK(!close(reader) && !close(writer));
+    puts("SHARED_MEMORY file-batch-boundary/offset/partial-EOF/shrink-grow=OK");
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -269,6 +334,8 @@ int main(int argc, char **argv)
     puts("SHARED_MEMORY seals/partial-unmap/mremap/close-lifetime=OK");
 
     CHECK(!readonly_seals());
+    CHECK(!file_identity());
+    CHECK(!file_batch_boundary());
     CHECK(!disk_writeback());
     puts("SHARED_MEMORY=PASS");
     return 0;

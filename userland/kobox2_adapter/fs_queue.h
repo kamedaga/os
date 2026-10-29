@@ -81,6 +81,8 @@ struct ph_fs_queue {
     int closing;
     atomic_flag watch_lock;
     uint64_t watch_epoch, wait_after;
+    /* receive_async owns this on its dedicated native receiver thread. */
+    struct ph_wait_retained wait_set;
     struct ph_ipc wake_tx, wake_rx;
 #ifdef PH_FS_STORAGE_PROFILE
     /* Private aggregate clocks, not part of the filesystem wire schema. */

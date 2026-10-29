@@ -31,10 +31,19 @@ esac
 
 exec >>"$log" 2>&1
 phase=start
+echo "installer: phase=$phase"
 trap 'rc=$?; if [ "$rc" -ne 0 ]; then echo "installer: failed phase=$phase status=$rc"; fi' EXIT
 
-busybox rm -rf "$stage" "$tree"
-busybox mkdir -p "$stage" "$tree"
+# Prepare once before ARM. The deployment process reuses that RAM staging;
+# restarting the NVMe owner must not trigger USB copies or full hashes again.
+if [ "$flags" = 8 ]; then
+    busybox rm -rf "$stage" "$tree"
+    busybox mkdir -p "$stage"
+else
+    [ -f "$stage/prepared" ] || exit 65
+    [ "$(busybox cat "$stage/prepared")" = "$media_esp_offset $media_data_offset" ] || exit 65
+    busybox mkdir -p "$tree"
+fi
 
 report_progress() {
     progress_phase="$1"
@@ -48,8 +57,11 @@ report_progress() {
 # only fixed-position decimal fields; never evaluate text from installation
 # media.  Missing or malformed metadata makes the preflight fail before the
 # target receives write authority.
-phase=copy-install-metadata
-mcopy -o -i "$media@@$media_data_offset" ::/INSTALL.META "$stage/INSTALL.META"
+if [ "$flags" = 8 ]; then
+    phase=copy-install-metadata
+    echo "installer: phase=$phase"
+    mcopy -o -i "$media@@$media_data_offset" ::/INSTALL.META "$stage/INSTALL.META"
+fi
 set -- $(busybox cat "$stage/INSTALL.META")
 [ "$#" -eq 7 ] && [ "$1" = 1 ]
 for field in "$2" "$3" "$4" "$5" "$6" "$7"; do
@@ -64,50 +76,55 @@ config_bytes="$7"
 boot_payload_bytes=$((system_bootfs_bytes + kernel_bytes + initapp_bytes + limine_bytes + config_bytes))
 uefi_payload_bytes=$((system_bootfs_bytes + kernel_bytes + initapp_bytes + limine_bytes * 2 + config_bytes))
 
-if [ $((flags & 8)) -ne 0 ]; then
-    files_phase=1
-    rootfs_phase=2
-else
-    files_phase=3
-    rootfs_phase=4
-fi
+if [ "$flags" = 8 ]; then
+    report_progress 1 "$boot_payload_bytes"
+    # The media writer already hashes and reads back the complete image.
+    # Expensive source verification is an explicit diagnostic option, never
+    # a prerequisite for each install/retry of those immutable media.
+    for item in SYSTEM.BOOTFS SYSTEM.CONF; do
+        phase=copy-$item
+        echo "installer: phase=$phase"
+        mcopy -o -i "$media@@$media_data_offset" "::/$item" "$stage/$item"
+    done
+    for item in KERNEL.ELF INITAPP.ELF; do
+        phase=copy-$item
+        echo "installer: phase=$phase"
+        mcopy -o -i "$media@@$media_esp_offset" "::/$item" "$stage/$item"
+    done
+    phase=copy-uefi-loader
+    echo "installer: phase=$phase"
+    mcopy -o -i "$media@@$media_esp_offset" ::/EFI/PachaOS/LIMINE.EFI "$stage/LIMINE.EFI"
 
-# Validate every payload and every boot component before the target is armed.
-phase=copy-rootfs-hash
-echo "installer: begin flags=$flags phase=$phase"
-report_progress "$files_phase" "$boot_payload_bytes"
-mcopy -o -i "$media@@$media_data_offset" ::/ROOTFS.SHA "$stage/ROOTFS.SHA"
-phase=copy-system-bootfs
-mcopy -o -i "$media@@$media_data_offset" ::/SYSTEM.BOOTFS "$stage/SYSTEM.BOOTFS"
-phase=copy-system-hash
-mcopy -o -i "$media@@$media_data_offset" ::/SYSTEM.SHA "$stage/SYSTEM.SHA"
-phase=copy-system-config
-mcopy -o -i "$media@@$media_data_offset" ::/SYSTEM.CONF "$stage/SYSTEM.CONF"
-phase=copy-kernel
-mcopy -o -i "$media@@$media_esp_offset" ::/KERNEL.ELF "$stage/KERNEL.ELF"
-phase=copy-initapp
-mcopy -o -i "$media@@$media_esp_offset" ::/INITAPP.ELF "$stage/INITAPP.ELF"
-phase=copy-uefi-loader
-mcopy -o -i "$media@@$media_esp_offset" ::/EFI/PachaOS/LIMINE.EFI "$stage/LIMINE.EFI"
-phase=verify-rootfs
-# ROOTFS.TAR is deliberately not copied into tmpfs.  A normal Alpine image is
-# large enough that retaining both the archive and its extracted tree exhausts
-# the live environment before mke2fs can issue its first write.  Read the
-# immutable installer-data file once for verification and again for extraction.
-expected_rootfs_hash="$(busybox head -n 1 "$stage/ROOTFS.SHA")"
-expected_rootfs_hash="${expected_rootfs_hash%% *}"
-[ "${#expected_rootfs_hash}" -eq 64 ]
-report_progress "$rootfs_phase" "$rootfs_bytes"
-actual_rootfs_hash="$(mcopy -i "$media@@$media_data_offset" ::/ROOTFS.TAR - | busybox sha256sum)"
-actual_rootfs_hash="${actual_rootfs_hash%% *}"
-[ "$actual_rootfs_hash" = "$expected_rootfs_hash" ]
-phase=verify-system
-(cd "$stage" && busybox sha256sum -c SYSTEM.SHA)
-
-if [ $((flags & 8)) -ne 0 ]; then
-    echo "installer: payload and boot files verified before target authorization"
+    if [ "${PACHA_INSTALL_VERIFY:-0}" = 1 ]; then
+        phase=verify-rootfs
+        echo "installer: phase=$phase"
+        mcopy -o -i "$media@@$media_data_offset" ::/ROOTFS.SHA "$stage/ROOTFS.SHA"
+        expected_rootfs_hash="$(busybox head -n 1 "$stage/ROOTFS.SHA")"
+        expected_rootfs_hash="${expected_rootfs_hash%% *}"
+        [ "${#expected_rootfs_hash}" -eq 64 ]
+        report_progress 2 "$rootfs_bytes"
+        actual_rootfs_hash="$(mcopy -i "$media@@$media_data_offset" ::/ROOTFS.TAR - | busybox sha256sum)"
+        [ "${actual_rootfs_hash%% *}" = "$expected_rootfs_hash" ]
+        phase=verify-system
+        echo "installer: phase=$phase"
+        mcopy -o -i "$media@@$media_data_offset" ::/SYSTEM.SHA "$stage/SYSTEM.SHA"
+        (cd "$stage" && busybox sha256sum -c SYSTEM.SHA)
+    fi
+    # Existence/shape checks do not stream the multi-gigabyte archive.
+    phase=locate-rootfs
+    echo "installer: phase=$phase"
+    mdir -i "$media@@$media_data_offset" ::/ROOTFS.TAR
+    phase=read-root-identity
+    echo "installer: phase=$phase"
+    "$progress" --root-uuid "$stage/SYSTEM.BOOTFS" > "$stage/root-uuid"
+    [ "$(busybox wc -c < "$stage/root-uuid")" -eq 37 ]
+    busybox printf '%s\n' "$media_esp_offset $media_data_offset" > "$stage/prepared"
+    echo "installer: boot payload prepared before target authorization"
     exit 0
 fi
+root_uuid="$(busybox cat "$stage/root-uuid")"
+[ "${#root_uuid}" -eq 36 ]
+echo "installer: reusing prepared boot payload; no repeated USB copy or hash"
 
 # A root view starts at the selected partition, so unmodified mke2fs sees a
 # complete regular device without learning the whole-disk offset.
@@ -116,6 +133,7 @@ if [ $((flags & 2)) -eq 0 ]; then
     exit 64
 fi
 phase=extract-rootfs
+echo "installer: phase=$phase"
 report_progress 5 "$rootfs_bytes"
 mcopy -i "$media@@$media_data_offset" ::/ROOTFS.TAR - | busybox tar -xf - -C "$tree"
 root_blocks=$((root_bytes / 4096))
@@ -131,7 +149,7 @@ phase=format-root-ext4
 # from actual target writes instead of holding one percentage for the whole
 # mke2fs transaction; the following phase transition closes the range.
 report_progress 6 "$rootfs_bytes"
-mke2fs -F -q -t ext4 -O ^orphan_file -b 4096 -L pacha-root -d "$tree" "$root" "$root_blocks"
+mke2fs -F -q -t ext4 -O ^orphan_file -b 4096 -L pacha-root -U "$root_uuid" -d "$tree" "$root" "$root_blocks"
 phase=verify-root-ext4
 report_progress 7 0
 e2fsck -fn "$root"
@@ -150,6 +168,7 @@ fi
 
 esp="$target"
 phase=deploy-uefi
+echo "installer: phase=$phase"
 report_progress 9 "$uefi_payload_bytes"
 mmd -D o -i "$esp" ::/EFI
 mmd -D o -i "$esp" ::/EFI/BOOT
@@ -168,6 +187,7 @@ mcopy -o -i "$esp" "$stage/SYSTEM.CONF" ::/limine.conf
 
 # Read every installed boot file back through the bounded target port.
 phase=readback-boot
+echo "installer: phase=$phase"
 report_progress 10 "$uefi_payload_bytes"
 for name in KERNEL.ELF INITAPP.ELF BOOTFS.IMG limine.conf; do
     mcopy -o -i "$esp" "::/$name" "$stage/readback-$name"
@@ -183,5 +203,6 @@ busybox cmp "$stage/LIMINE.EFI" "$stage/readback-BOOTX64.EFI"
 busybox cmp "$stage/LIMINE.EFI" "$stage/readback-LIMINE.EFI"
 busybox cmp "$stage/INSTALL.PENDING" "$stage/readback-INSTALL.PENDING"
 phase=complete
+echo "installer: phase=$phase"
 report_progress 11 0
 echo "installer: ext4 root and UEFI boot files verified; fixed-disk registration pending next USB boot"

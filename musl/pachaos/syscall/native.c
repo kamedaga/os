@@ -10,6 +10,7 @@
 #include <sys/syscall.h>
 #include <sys/mman.h>
 #include "native_raw.h"
+#include "poll_wait.h"
 #include "kobox2/filesystem.h"
 #include "filed/payload.h"
 
@@ -29,6 +30,9 @@ static struct native_file *files;
 static int files_lock;
 static uint32_t creation_mask = 0022;
 static uint64_t current_directory;
+/* Musl initializes TLS before application poll calls. The kernel's retained
+ * set is native-thread owned, so a process-global topology would misroute REUSE. */
+static __thread struct pachaos_poll_wait_set poll_wait_set;
 static void lock_files(void)
 {
     while (__sync_lock_test_and_set(&files_lock, 1)) __asm__ volatile("pause");
@@ -323,6 +327,14 @@ static long fcntl_file(long fd,long command,long value)
         .flags=(uint64_t)command,.length=(uint64_t)value};
     return request(&r,NULL,NULL,NULL,0,NULL,0);
 }
+static long poll_wait_call(void *context, uint64_t address, uint64_t count,
+    uint64_t timeout, uint64_t flags)
+{
+    (void)context;
+    return __pachaos_raw4(PACHAOS_SYSCALL_FD_WAIT_MANY,
+        (long)address, (long)count, (long)timeout, (long)flags);
+}
+
 static long poll_native(struct __pachaos_linux_pollfd *fds,long count,long timeout)
 {
     if (count<0 || (size_t)count>SIZE_MAX/sizeof(struct pacha_pollfd)) return -EINVAL;
@@ -346,8 +358,12 @@ static long poll_native(struct __pachaos_linux_pollfd *fds,long count,long timeo
     status=__pachaos_raw2(PACHAOS_SYSCALL_FD_POLL,(long)native,(long)active);
     if (!status && timeout) {
         do {
-            status=__pachaos_raw4(PACHAOS_SYSCALL_FD_WAIT_MANY,(long)native,
-                (long)active,timeout<0 ? -1 : timeout,0);
+            status=active && active<=PACHAOS_POLL_WAIT_MAX ?
+                pachaos_poll_wait_retained(&poll_wait_set,native,active,
+                    timeout<0 ? UINT64_MAX : (uint64_t)timeout,
+                    poll_wait_call,NULL) :
+                __pachaos_raw4(PACHAOS_SYSCALL_FD_WAIT_MANY,(long)native,
+                    (long)active,timeout<0 ? -1 : timeout,0);
             if (status==2) status=__pachaos_raw2(PACHAOS_SYSCALL_FD_POLL,(long)native,(long)active);
         } while (!status && timeout<0);
     }

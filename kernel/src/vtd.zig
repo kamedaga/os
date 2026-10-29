@@ -153,6 +153,17 @@ var driver_state: DriverState = .{};
 fn unitAt(index: usize) *UnitState {
     return if (index == 0) &driver_state.first_unit else driver_state.units.get(@intCast(index)) orelse unreachable;
 }
+
+/// Read only, after successful initialization and before user dispatch.
+/// GSTS.IRES (bit25) forbids legacy-format IOAPIC programming; RTPS/TES do
+/// not prove anything about interrupt remapping. No global command is changed.
+pub fn legacyInterruptRoutingAllowed() bool {
+    for (0..driver_state.unit_count) |index| {
+        const unit = unitAt(index);
+        if (unit.register_base == 0 or (mmioRead32(unit, gsts_reg) & (1 << 25)) != 0) return false;
+    }
+    return true;
+}
 fn prepareUnit(index: usize) ?*UnitState {
     if (index == 0) return &driver_state.first_unit;
     driver_state.units.prepareIndex(@intCast(index), poolAllocator()) catch return null;
@@ -886,7 +897,10 @@ fn explicitScopeMatches(drhd: acpi_dmar.Drhd, location: pci.Location) bool {
     return explicitScopeMatchesWith(pci, drhd, location);
 }
 fn explicitScopeMatchesWith(comptime Reader: type, drhd: acpi_dmar.Drhd, location: pci.Location) bool {
-    var scopes = drhd.scopes();
+    return scopesMatchWith(Reader, drhd.scopes(), location);
+}
+fn scopesMatchWith(comptime Reader: type, initial: acpi_dmar.Scopes, location: pci.Location) bool {
+    var scopes = initial;
     while (scopes.next()) |scope| {
         const endpoint = resolveScopeWith(Reader, &scope) orelse continue;
         if (samePciLocation(endpoint, location)) return true;
@@ -1099,6 +1113,13 @@ pub fn init(rsdp_paddr: u64, free_list: *types.FreePageList) void {
         logInitFailure("PCI coverage changed");
         return;
     }
+    if (!installFirmwareReservedMappings(info)) {
+        // All tables are still unpublished. Do not enable a partial RMRR
+        // policy or silently continue without firmware-required DMA access.
+        logInitFailure("firmware reserved DMA grant rejected");
+        releaseDraftTables();
+        @import("halt.zig").haltWithMessage("VT-d RMRR construction failed before publication");
+    }
     for (0..driver_state.unit_count) |index| {
         const unit = unitAt(index);
         if (!enableHardwareUnit(unit)) {
@@ -1113,6 +1134,78 @@ pub fn init(rsdp_paddr: u64, free_list: *types.FreePageList) void {
     dumpFaults();
 }
 
+/// Opt-in pre-userland evidence only. Never call prepareHardwareUnit: its
+/// rejection path can stop bus masters and erase the very display we observe.
+/// All MMIO is read-only, with the same RAM exclusion and all-CPU UC proof as
+/// production. No driver state, DMA tables, fault flags or PCI command is changed.
+pub fn diagnosticSnapshot(rsdp_paddr: u64) void {
+    const platform = @import("arch/x86_64/platform.zig");
+    const table = acpi_dmar.findDmar(rsdp_paddr) orelse {
+        kernel_log.write("VTD SNAPSHOT: DMAR missing\n");
+        return;
+    };
+    const info = acpi_dmar.parseDmar(table.bytes) catch {
+        kernel_log.write("VTD SNAPSHOT: DMAR invalid; no MMIO read\n");
+        return;
+    };
+    kernel_log.writeFmt("VTD SNAPSHOT: DMAR=0x{x} HAW={} flags=0x{x} units={}\n", .{
+        table.paddr.toInt(), info.hostAddressWidthBits(), info.flags, info.drhd_count,
+    });
+    var units = info.drhds();
+    var index: usize = 0;
+    while (units.next()) |unit| : (index += 1) {
+        const base = unit.register_base;
+        if (unit.segment != 0 or base == 0 or base % page_size != 0 or
+            !platform.kernelMmioRangeFits(base, page_size) or
+            !smp.ucMinusMmioAllowed(base, page_size) or
+            !platform.mapBootMmioRange(base, page_size))
+        {
+            kernel_log.writeFmt("VTD{} base=0x{x} SKIPPED: segment/range/cache/map proof failed\n", .{ index, base });
+            continue;
+        }
+        const registers = platform.kernelMmioBorrow(base, page_size) orelse {
+            kernel_log.writeFmt("VTD{} SKIPPED: borrow unavailable\n", .{index});
+            continue;
+        };
+        kernel_log.writeFmt("VTD{} base=0x{x} VER=0x{x} CAP=0x{x} ECAP=0x{x}\n", .{
+            index, base, registers.read(u32, 0), registers.read(u64, cap_reg), registers.read(u64, ecap_reg),
+        });
+        kernel_log.writeFmt("VTD{} GSTS=0x{x} RTADDR=0x{x} FSTS=0x{x} all={}\n", .{
+            index, registers.read(u32, gsts_reg), registers.read(u64, rtaddr_reg), registers.read(u32, fsts_reg), @intFromBool(unit.include_pci_all),
+        });
+        var scopes = unit.scopes();
+        while (scopes.next()) |scope| diagnosticScope(scope);
+    }
+    // parseDmar validated every record and scope before this bounded traversal.
+    var bytes = info.structures;
+    while (bytes.len != 0) {
+        const length = std.mem.readInt(u16, bytes[2..4], .little);
+        const record = bytes[0..length];
+        bytes = bytes[length..];
+        if (std.mem.readInt(u16, record[0..2], .little) != 1) continue;
+        kernel_log.writeFmt("RMRR segment={} base=0x{x} limit=0x{x}\n", .{
+            std.mem.readInt(u16, record[6..8], .little), std.mem.readInt(u64, record[8..16], .little), std.mem.readInt(u64, record[16..24], .little),
+        });
+        var scopes = acpi_dmar.Scopes{ .bytes = record[24..] };
+        while (scopes.next()) |scope| diagnosticScope(scope);
+    }
+    const igd = pci.Location{ .bus = 0, .device = 2, .function = 0 };
+    if (pci.readVendorId(igd) != 0x8086 or pci.readClassCode(igd) != 3) {
+        kernel_log.write("PCI 00:02.0 is not an Intel display function\n");
+        return;
+    }
+    kernel_log.writeFmt("PCI 00:02.0 vendor=0x{x} device=0x{x} command=0x{x}\n", .{
+        pci.readVendorId(igd), pci.readDeviceId(igd), pci.readConfigU16(igd, 4),
+    });
+}
+
+fn diagnosticScope(scope: acpi_dmar.DeviceScope) void {
+    kernel_log.writeFmt(" scope type={} bus={} path=", .{ scope.scope_type, scope.start_bus });
+    for (scope.path[0..scope.path_count]) |path|
+        kernel_log.writeFmt("{x}:{x}/", .{ path.device, path.function });
+    kernel_log.write("\n");
+}
+
 // Only unpublished boot tables can be returned here; runtime withdrawal has
 // separate drain/quarantine ownership. Keep a rejected grant in its field.
 fn returnDraftPage(address: *u64) bool {
@@ -1125,7 +1218,7 @@ fn releaseDraftTables() void {
     std.debug.assert(!initializationRequiresHalt());
     var released = true;
     for (0..driver_state.domain_count) |index| {
-        if (!returnDraftPage(&domainAt(index).second_level_root_paddr)) released = false;
+        if (!releaseDraftSecondLevel(&domainAt(index).second_level_root_paddr, 4)) released = false;
     }
     for (0..driver_state.unit_count) |index| {
         const unit = unitAt(index);
@@ -1141,6 +1234,171 @@ fn releaseDraftTables() void {
         driver_state.domain_count = 0;
         driver_state.unit_count = 0;
     }
+}
+
+/// Only unpublished second-level tables enter here. Level-one targets are
+/// firmware data, not allocations: release tables recursively, never those PFNs.
+/// A rejected PMM return keeps the live parent link and all remaining ownership.
+fn releaseDraftSecondLevel(address: *u64, level: u3) bool {
+    return releaseDraftSecondLevelWith(address, level, returnDraftPage);
+}
+fn releaseDraftSecondLevelWith(address: *u64, level: u3, comptime release: fn (*u64) bool) bool {
+    if (address.* == 0) return true;
+    if (level > 1) {
+        const page = tableAt(address.*);
+        var released = true;
+        for (page) |*entry| {
+            var child = pageAddress(entry.*);
+            if (child == 0) continue;
+            if (releaseDraftSecondLevelWith(&child, level - 1, release)) entry.* = 0 else released = false;
+        }
+        if (!released) return false;
+    }
+    return release(address);
+}
+
+const firmware_dma = @import("firmware_dma.zig");
+
+test "VT-d RMRR mappings stay outside dynamic APIs and preserve neighboring pages" {
+    const fixture = try DmaWithdrawalFixture.init();
+    defer fixture.deinit();
+    try fixture.list.installRegions(fixture.regions);
+    try fixture.list.seedContiguousRange(@intFromPtr(fixture.backing.ptr), 128);
+    try TestSupport.begin(fixture.list, DmaWithdrawalFixture.device);
+    const other = prepareDomain(1).?;
+    other.* = .{ .device = 222, .did = 2, .second_level_root_paddr = allocTablePage().? };
+    driver_state.domain_count = 2;
+    const start: u64 = 0x66001000;
+    driver_state.iova_end = start;
+    const grant = firmware_dma.ReservedGrant{ .start = start, .end = start + 8192 };
+    try std.testing.expect(mapFirmwareReserved(domainAt(0), grant));
+    try std.testing.expectEqual(start | 3, reservedLeafEntry(domainAt(0), start));
+    try std.testing.expectEqual((start + 4096) | 3, reservedLeafEntry(domainAt(0), start + 4096));
+    try std.testing.expectEqual(@as(u64, 0), reservedLeafEntry(domainAt(0), start - 4096));
+    try std.testing.expectEqual(@as(u64, 0), reservedLeafEntry(domainAt(0), grant.end));
+    try std.testing.expectEqual(@as(u64, 0), reservedLeafEntry(other, start));
+    try std.testing.expect(!mapPages(DmaWithdrawalFixture.device, .fromInt(start), &.{start}, true, true));
+    try std.testing.expect(!mapPages(DmaWithdrawalFixture.device, .fromInt(start - 4096), &.{ start, start + 4096 }, true, true));
+    try std.testing.expect(!unmapRangeForDevice(DmaWithdrawalFixture.device, .fromInt(start), 4096));
+    try std.testing.expect(!reserveIova(DmaWithdrawalFixture.device, .fromInt(start), 1));
+    freeIova(DmaWithdrawalFixture.device, .fromInt(start), 1);
+    try std.testing.expectEqual(start | 3, reservedLeafEntry(domainAt(0), start));
+    try std.testing.expectEqual(@as(usize, 0), driver_state.leaf_count);
+    // The last dynamic IOVA and first reserved IOVA share the same PT page.
+    const data = try fixture.list.popFront();
+    try std.testing.expect(mapPages(DmaWithdrawalFixture.device, .fromInt(start - 4096), &.{data}, true, true));
+    try std.testing.expect(unmapRangeForDevice(DmaWithdrawalFixture.device, .fromInt(start - 4096), 4096));
+    try std.testing.expectEqual(start | 3, reservedLeafEntry(domainAt(0), start));
+}
+
+test "VT-d unpublished RMRR table OOM returns every allocated table and never data" {
+    for (0..4) |available| {
+        const fixture = try DmaWithdrawalFixture.init();
+        defer fixture.deinit();
+        try fixture.list.installRegions(fixture.regions);
+        try fixture.list.seedContiguousRange(@intFromPtr(fixture.backing.ptr), 128);
+        try TestSupport.begin(fixture.list, DmaWithdrawalFixture.device);
+        while (fixture.list.pageCount() > available) _ = try fixture.list.popFront();
+        const grant = firmware_dma.ReservedGrant{ .start = 0x66000000, .end = 0x66001000 };
+        try std.testing.expectEqual(available == 3, mapFirmwareReserved(domainAt(0), grant));
+        driver_state.active = false;
+        try std.testing.expect(releaseDraftSecondLevel(&domainAt(0).second_level_root_paddr, 4));
+        try std.testing.expectEqual(@as(u64, 0), domainAt(0).second_level_root_paddr);
+        try std.testing.expectEqual(available + 1, fixture.list.pageCount());
+        try std.testing.expect(!fixture.isFree(grant.start));
+    }
+}
+
+test "VT-d RMRR deep return rejection retains ancestors and permits one retry" {
+    const fixture = try DmaWithdrawalFixture.init();
+    defer fixture.deinit();
+    try fixture.list.installRegions(fixture.regions);
+    try fixture.list.seedContiguousRange(@intFromPtr(fixture.backing.ptr), 128);
+    try TestSupport.begin(fixture.list, DmaWithdrawalFixture.device);
+    const before = fixture.list.pageCount();
+    const root = &domainAt(0).second_level_root_paddr;
+    try std.testing.expect(mapFirmwareReserved(domainAt(0), .{ .start = 0x66001000, .end = 0x66002000 }));
+    const Reject = struct {
+        var calls: usize = 0;
+        fn release(address: *u64) bool {
+            calls += 1;
+            if (calls == 1) return false;
+            return returnDraftPage(address);
+        }
+    };
+    Reject.calls = 0;
+    const root_before = root.*;
+    try std.testing.expect(!releaseDraftSecondLevelWith(root, 4, Reject.release));
+    try std.testing.expectEqual(@as(usize, 1), Reject.calls);
+    try std.testing.expectEqual(root_before, root.*);
+    try std.testing.expectEqual(before - 3, fixture.list.pageCount());
+    try std.testing.expect(releaseDraftSecondLevel(root, 4));
+    try std.testing.expectEqual(before + 1, fixture.list.pageCount());
+    try std.testing.expectEqual(@as(u64, 0), root.*);
+}
+
+fn reservedLeafEntry(domain: *const Domain, iova: u64) u64 {
+    var page = tableAt(domain.second_level_root_paddr);
+    for ([_]u6{ 39, 30, 21 }) |shift| {
+        const child = pageAddress(page[@intCast((iova >> shift) & 511)]);
+        if (child == 0) return 0;
+        page = tableAt(child);
+    }
+    return page[@intCast((iova >> 12) & 511)];
+}
+
+/// Boot-owned mappings have no dynamic lease/refcount. Their IOVAs are outside
+/// the allocation window clipped by parseDmar, so runtime map/unmap cannot
+/// withdraw them. A later domain stop still removes root permission normally.
+fn mapFirmwareReserved(domain: *const Domain, grant: firmware_dma.ReservedGrant) bool {
+    var physical = grant.start;
+    while (physical < grant.end) : (physical += page_size) {
+        var page = tableAt(domain.second_level_root_paddr);
+        for ([_]u6{ 39, 30, 21 }) |shift| {
+            const next = ensureChildTable(page, @intCast((physical >> shift) & 511)) orelse return false;
+            page = tableAt(next);
+        }
+        const index: usize = @intCast((physical >> 12) & 511);
+        const wanted = physical | tables.second_level_read | tables.second_level_write;
+        if (page[index] != 0 and page[index] != wanted) return false;
+        if (!tables.setSecondLevelEntry(page, index, physical, true, true)) return false;
+        flushTableCache(&page[index], @sizeOf(u64));
+    }
+    return true;
+}
+
+fn installFirmwareReservedMappings(info: acpi_dmar.DmarInfo) bool {
+    var reservations = info.rmrrs();
+    while (reservations.next()) |reservation| {
+        if (reservation.segment != 0) return false;
+        const layout = @import("arch/x86_64/boot_direct_map.zig").layout orelse return false;
+        const image = @import("boot/image_range.zig");
+        const physical_limit = firmware_dma.platformLimit(info.hostAddressWidthBits(), layout.limit) catch return false;
+        const grant = firmware_dma.validate(layout.regions,
+            .{ .start = image.base_paddr, .end = image.base_paddr + image.size_bytes },
+            reservation.base, reservation.last, physical_limit) catch return false;
+        var scopes = reservation.scopes();
+        while (scopes.next()) |scope| {
+            if (resolveEndpointScope(&scope) == null) return false;
+        }
+        var matched = false;
+        for (0..driver_state.domain_count) |index| {
+            const domain = domainAt(index);
+            const location = pci.locationFromResourceId(domain.device) orelse return false;
+            if (!scopesMatchWith(pci, reservation.scopes(), location)) continue;
+            if (ownerForLocation(location) != domain.unit_index) return false;
+            const unit = unitAt(domain.unit_index);
+            const bits: u7 = @as(u7, @intCast((unit.cap >> 16) & 63)) + 1;
+            if (bits < 64 and grant.end > (@as(u64, 1) << @as(u6, @intCast(bits)))) return false;
+            if (!mapFirmwareReserved(domain, grant)) return false;
+            matched = true;
+            kernel_log.writeFmt("vtd: RMRR bdf={x}:{x}:{x} identity=0x{x}..0x{x} RW scope-only\n", .{
+                location.bus, location.device, location.function, grant.start, grant.end,
+            });
+        }
+        if (!matched) return false;
+    }
+    return true;
 }
 
 fn selectUnits(info: acpi_dmar.DmarInfo) bool {
@@ -2637,6 +2895,16 @@ test "VT-d bridge scope follows hierarchy and excludes unrelated buses" {
     const endpoint = resolveScopeWith(Reader, &.{ .scope_type = 1, .path = &path, .path_count = 2 }).?;
     try std.testing.expectEqual(@as(u8, 4), endpoint.bus);
     try std.testing.expectEqual(@as(u8, 2), endpoint.device);
+    const rmrr = acpi_dmar.Rmrr{ .segment = 0, .base = 0x66000000, .last = 0x687fffff, .scope_bytes = &scope };
+    try std.testing.expect(scopesMatchWith(Reader, rmrr.scopes(), .{ .bus = 0, .device = 1, .function = 0 }));
+    const endpoint_bytes = [_]u8{ 1, 8, 0, 0, 0, 0, 2, 0 };
+    for ([_]pci.Location{
+        .{ .bus = 0, .device = 2, .function = 0 }, .{ .bus = 1, .device = 2, .function = 0 },
+        .{ .bus = 0, .device = 3, .function = 0 }, .{ .bus = 0, .device = 2, .function = 1 },
+    }, 0..) |location, i| try std.testing.expectEqual(i == 0,
+        scopesMatchWith(Reader, .{ .bytes = &endpoint_bytes }, location));
+    const invalid_bytes = [_]u8{ 1, 8, 0, 0, 0, 0, 32, 0 };
+    try std.testing.expect(!scopesMatchWith(Reader, .{ .bytes = &invalid_bytes }, .{ .bus = 0, .device = 0, .function = 0 }));
 }
 
 test "VT-d multiple roots reuse local DIDs and unpublished rollback returns tables" {

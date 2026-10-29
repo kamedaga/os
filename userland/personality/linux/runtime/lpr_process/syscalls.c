@@ -1,6 +1,9 @@
 #include "../lpr_filed_internal.h"
 #include "../lpr_gui_detail.h"
 #include "../lpr_unix/cache.h"
+#include "../lpr_vfs/control_cache.h"
+#include "../lpr_mlock.h"
+#include "../lpr_entry_stack.h"
 #if defined(LPR_BOOT_DIAGNOSTICS) && LPR_BOOT_DIAGNOSTICS
 #include "../lpr_common/boot_diagnostic.h"
 #endif
@@ -23,6 +26,13 @@ enum {
 };
 
 _Static_assert(offsetof(lpr_thread_record_t, unix_context) == 80u, "thread launch prefix size");
+
+struct lpr_thread_launch {
+    lpr_thread_record_t record;
+    struct lpr_linux_user_frame frame;
+    _Alignas(16) unsigned char fp_state[512];
+};
+enum { LPR_THREAD_LAUNCH_BYTES = (sizeof(struct lpr_thread_launch) + 4095u) & ~4095u };
 
 /* Linux musl's x86_64 __unmapself switches directly from SYS_munmap to
  * SYS_exit without touching its former stack.  LPR's zpoline dispatch needs
@@ -121,6 +131,7 @@ static volatile uint32_t lpr_process_fork_lock;
 static unsigned char lpr_fork_child_stack[LPR_FORK_CHILD_STACK_BYTES]
     __attribute__((aligned(16)));
 static struct lpr_linux_user_frame lpr_fork_child_return_frame;
+static unsigned char lpr_fork_child_fp_state[512] __attribute__((aligned(16)));
 static lpr_exec_transaction_t *lpr_fork_child_transaction;
 
 static int lpr_reserve_fork_bootstrap_fd(void)
@@ -147,8 +158,14 @@ static int lpr_reserve_fork_bootstrap_fd(void)
 
 const struct lpr_linux_user_frame *lpr_fork_child_bootstrap(void)
 {
+    if (lpr_fork_child_return_frame.fp_state) {
+        lpr_memcpy(lpr_fork_child_fp_state,
+            (const void *)(uintptr_t)lpr_fork_child_return_frame.fp_state, 512);
+        lpr_fork_child_return_frame.fp_state = (uint64_t)(uintptr_t)lpr_fork_child_fp_state;
+    }
+    lpr_mlock_after_fork_child();
     lpr_drm_mapping_fork_child();
-    if (lpr_unix_cache_fork_child() != 0) {
+    if (lpr_fs_control_fork_child() != 0 || lpr_unix_cache_fork_child() != 0) {
         (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_PROCESS_EXIT, 127);
         for (;;) {}
     }
@@ -316,9 +333,18 @@ static void lpr_thread_count_start_failed(void)
 
 void lpr_thread_after_fork_child(void)
 {
-    /* Contexts are inline in the copied records, not heap allocations. Their
-     * PRIVATE capabilities were excluded by native fork; do not close the
-     * copied FD numbers or traverse another thread's inherited record. */
+    lpr_entry_stack_after_fork_child();
+    /* Clone publication and exit reclamation hold the fork lock. The copied
+     * registry is therefore complete, and this child runs on the independent
+     * fork bootstrap stack while discarding all inherited launch pages. */
+    for (lpr_thread_record_t *record = lpr_state.threads.head; record != NULL;) {
+        lpr_thread_record_t *next = record->next;
+        if (record->allocation)
+            (void)lpr_pacha_syscall2(PACHAOS_SYSCALL_MUNMAP, record->allocation, LPR_THREAD_LAUNCH_BYTES);
+        record = next;
+    }
+    /* Context capabilities were excluded by native fork. Do not destroy the
+     * inherited contexts or close copied FD numbers in this new process. */
     lpr_memset(&lpr_state.threads, 0, sizeof(lpr_state.threads));
     lpr_signal_thread_state_single_invalidate();
     __atomic_store_n(&lpr_state.thread_count, 1u, __ATOMIC_RELEASE);
@@ -340,6 +366,11 @@ int lpr_linux_thread_exists(uint64_t tid)
 {
     if (tid == 0) return 1;
     if (tid > UINT32_MAX) return 0;
+    /* Linux's process ID also names its leader thread. Supervisor PIDs and
+     * native TIDs are different namespaces here; comparing only native IDs
+     * makes sched_getaffinity(getpid()) incorrectly return ESRCH. */
+    const int64_t process_pid=lpr_linux_getpid();
+    if (process_pid>0 && tid==(uint64_t)process_pid) return 1;
     const int64_t current = lpr_linux_gettid();
     if (current >= 0 && tid == (uint64_t)current) return 1;
     lpr_state_lock(&lpr_state.threads.lock_word);
@@ -372,6 +403,7 @@ int64_t lpr_linux_set_tid_address(uint64_t tid_address)
 
 void lpr_linux_exit_thread(uint64_t code)
 {
+    lpr_state_lock(&lpr_process_fork_lock);
     const int64_t raw_tid = lpr_linux_gettid();
     volatile uint32_t *clear_tid = 0;
     int last_thread = 0;
@@ -386,11 +418,14 @@ void lpr_linux_exit_thread(uint64_t code)
     }
     lpr_state_unlock(&lpr_state.threads.lock_word);
 
-    if (record != NULL) lpr_unix_context_destroy(&record->unix_context);
+    if (record != NULL) { lpr_wait_thread_release(record); lpr_unix_context_destroy(&record->unix_context); }
     if (last_thread) {
         lpr_linux_prepare_process_exit(code);
     }
     lpr_signal_thread_state_release_current();
+    if (record != NULL && record->allocation)
+        (void)lpr_pacha_syscall2(PACHAOS_SYSCALL_MUNMAP, record->allocation, LPR_THREAD_LAUNCH_BYTES);
+    lpr_state_unlock(&lpr_process_fork_lock);
     (void)lpr_pacha_syscall3(
         PACHAOS_SYSCALL_THREAD_EXIT,
         code,
@@ -400,9 +435,19 @@ void lpr_linux_exit_thread(uint64_t code)
     }
 }
 
-void lpr_linux_unmapself_exit(uint64_t base, uint64_t size)
+int64_t lpr_linux_unmapself_exit(uint64_t base, uint64_t size)
 {
     lpr_state_lock(&lpr_unmapself_lock);
+    lpr_state_lock(&lpr_process_fork_lock);
+    lpr_mlock_fork_lock();
+    /* The raw unmap below abandons the caller's stack. Until its success can
+     * be committed from that exit stack, reject locked stacks without changing
+     * either their mappings or their accounting. */
+    if (lpr_mlock_overlaps(base,size)) {
+        /* musl's __unmapself cannot recover from an error return. */
+        (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_PROCESS_EXIT,127);
+        __builtin_trap();
+    }
 
     const int64_t raw_tid = lpr_linux_gettid();
     volatile uint32_t *clear_tid = 0;
@@ -420,11 +465,14 @@ void lpr_linux_unmapself_exit(uint64_t base, uint64_t size)
     }
     lpr_state_unlock(&lpr_state.threads.lock_word);
 
-    if (record != NULL) lpr_unix_context_destroy(&record->unix_context);
+    if (record != NULL) { lpr_wait_thread_release(record); lpr_unix_context_destroy(&record->unix_context); }
     if (last_thread) {
         lpr_linux_prepare_process_exit(0);
     }
     lpr_signal_thread_state_release_current();
+    if (record != NULL && record->allocation)
+        (void)lpr_pacha_syscall2(PACHAOS_SYSCALL_MUNMAP, record->allocation, LPR_THREAD_LAUNCH_BYTES);
+    lpr_state_unlock(&lpr_process_fork_lock);
 
     register uint64_t syscall_number __asm__("rax") = PACHAOS_SYSCALL_MUNMAP;
     register uint64_t arg0 __asm__("rdi") = base;
@@ -437,8 +485,24 @@ void lpr_linux_unmapself_exit(uint64_t base, uint64_t size)
         (uint64_t)(uintptr_t)clear_tid;
     register uint64_t exit_flags __asm__("r12") =
         clear_tid != 0 ? PACHAOS_THREAD_EXIT_CLEAR_TID : 0u;
+    register uint64_t memory_lock __asm__("r13") =
+        (uint64_t)(uintptr_t)lpr_mlock_lock_address();
     __asm__ volatile(
         "mov %%r9, %%rsp\n\t"
+        "syscall\n\t"
+        "test %%rax, %%rax\n\t"
+        "jz 1f\n\t"
+        "mov %[process_exit], %%rax\n\t"
+        "mov $127, %%rdi\n\t"
+        "syscall\n\t"
+        "ud2\n\t"
+        "1:\n\t"
+        /* Keep the interval update and actual unmap one transaction, even
+         * after abandoning this thread's stack. The lock lives in LPR BSS. */
+        "movl $0, (%%r13)\n\t"
+        "mov %[futex_wake], %%rax\n\t"
+        "mov %%r13, %%rdi\n\t"
+        "mov $1, %%rsi\n\t"
         "syscall\n\t"
         /* No instruction after publishing this stack may read or write it:
          * another detached thread can reuse it as soon as FUTEX_WAKE runs. */
@@ -455,8 +519,9 @@ void lpr_linux_unmapself_exit(uint64_t base, uint64_t size)
         "ud2"
         : "+a"(syscall_number), "+D"(arg0), "+S"(arg1),
           "+r"(lock_address), "+r"(stack_top), "+r"(clear_tid_address),
-          "+r"(exit_flags)
+          "+r"(exit_flags), "+r"(memory_lock)
         : [futex_wake] "i"(PACHAOS_SYSCALL_FUTEX_WAKE),
+          [process_exit] "i"(PACHAOS_SYSCALL_PROCESS_EXIT),
           [thread_exit] "i"(PACHAOS_SYSCALL_THREAD_EXIT)
         : "rcx", "rdx", "r11", "memory");
     __builtin_unreachable();
@@ -506,14 +571,18 @@ static _Noreturn void lpr_clone_thread_bootstrap_abort(
     }
 }
 
-void lpr_clone_thread_bootstrap(lpr_thread_record_t *record)
+const struct lpr_linux_user_frame *lpr_clone_thread_bootstrap(lpr_thread_record_t *record)
 {
+    lpr_entry_stack_initialize_current();
     const int64_t raw_tid = lpr_linux_gettid();
     if (record == 0 || raw_tid < 0 || raw_tid > UINT32_MAX) {
         lpr_clone_thread_bootstrap_abort("gettid", raw_tid);
     }
     const uint32_t tid = (uint32_t)raw_tid;
     lpr_signal_thread_state_t *signal_state = lpr_signal_thread_state_current();
+    const int64_t registration_status = lpr_linux_register_thread_signal_runtime(signal_state, 0);
+    if (registration_status != 0)
+        lpr_clone_thread_bootstrap_abort("signal-scratch", registration_status);
     lpr_linux_fault_runtime_init();
     lpr_linux_register_thread_signal_hint(signal_state);
     const pacha_fd_t signal_fd = lpr_thread_open_signal_fd();
@@ -549,10 +618,7 @@ void lpr_clone_thread_bootstrap(lpr_thread_record_t *record)
             0u,
             0u, PACHA_WAIT_UNINTERRUPTIBLE);
     }
-    int (*start_function)(void *) =
-        (int (*)(void *))(uintptr_t)record->start_function;
-    const int result = start_function((void *)(uintptr_t)record->start_argument);
-    lpr_linux_exit_thread((uint64_t)(uint32_t)result);
+    return record->return_frame;
 }
 
 static int64_t lpr_linux_clone_thread(
@@ -571,8 +637,7 @@ static int64_t lpr_linux_clone_thread(
         LPR_CLONE_CHILD_SETTID | LPR_CLONE_CHILD_CLEARTID | LPR_CLONE_DETACHED;
     if (user_frame == 0 || (flags & 0xffu) != 0 ||
         (flags & required_flags) != required_flags ||
-        (flags & ~allowed_flags) != 0 || child_stack < sizeof(lpr_thread_record_t) ||
-        user_frame->r9 == 0 || tls == 0 ||
+        (flags & ~allowed_flags) != 0 || child_stack < 32 || tls == 0 ||
         (((flags & LPR_CLONE_PARENT_SETTID) != 0) && parent_tid == 0) ||
         (((flags & (LPR_CLONE_CHILD_SETTID | LPR_CLONE_CHILD_CLEARTID)) != 0) && child_tid == 0))
     {
@@ -587,13 +652,31 @@ static int64_t lpr_linux_clone_thread(
         return signal_reservation_status;
     }
 
-    const uint64_t launch_stack =
-        (child_stack - sizeof(lpr_thread_record_t)) & ~0xfull;
-    lpr_thread_record_t *record =
-        (lpr_thread_record_t *)(uintptr_t)launch_stack;
+    /* Resume the syscall with RAX=0 and the caller's child RSP. Registers and
+     * stack words belong to the caller: musl and glibc store their pthread
+     * function/argument differently. Keep registry metadata outside that stack
+     * so normal child calls cannot overwrite it; thread exit owns its page. */
+    const int64_t allocation = lpr_pacha_syscall6(PACHAOS_SYSCALL_MMAP,
+        0, 0, LPR_THREAD_LAUNCH_BYTES, PACHAOS_PROT_READ | PACHAOS_PROT_WRITE,
+        PACHAOS_MMAP_PRIVATE | PACHAOS_MMAP_ANONYMOUS, 0);
+    if (allocation < 4096) {
+        lpr_signal_thread_release_start_reservation();
+        return lpr_pacha_status_to_errno(allocation);
+    }
+    struct lpr_thread_launch *launch = (void *)(uintptr_t)allocation;
+    lpr_thread_record_t *record = &launch->record;
     lpr_memset(record, 0, sizeof(*record));
-    record->start_function = user_frame->r9;
-    record->start_argument = *(const uint64_t *)(uintptr_t)child_stack;
+    record->allocation = (uint64_t)allocation;
+    record->return_frame = &launch->frame;
+    lpr_memcpy(&launch->frame, user_frame, sizeof(launch->frame));
+    if (user_frame->fp_state != 0) {
+        lpr_memcpy(launch->fp_state, (const void *)(uintptr_t)user_frame->fp_state,
+            sizeof(launch->fp_state));
+        launch->frame.fp_state = (uint64_t)(uintptr_t)launch->fp_state;
+    }
+    launch->frame.rsp = child_stack;
+    const uint64_t launch_stack = lpr_entry_stack_acquire_bootstrap() - 16u;
+    *(lpr_thread_record_t **)(uintptr_t)launch_stack = record;
     record->clone_flags = flags;
     record->signal_mask = lpr_linux_signal_mask;
     record->parent_tid = (volatile uint32_t *)(uintptr_t)parent_tid;
@@ -613,6 +696,8 @@ static int64_t lpr_linux_clone_thread(
         tls,
         thread_rights);
     if (thread_fd < 16) {
+        lpr_entry_stack_release_bootstrap();
+        (void)lpr_pacha_syscall2(PACHAOS_SYSCALL_MUNMAP, allocation, LPR_THREAD_LAUNCH_BYTES);
         lpr_signal_thread_release_start_reservation();
         return lpr_pacha_status_to_errno(thread_fd);
     }
@@ -623,6 +708,7 @@ static int64_t lpr_linux_clone_thread(
         PACHAOS_SYSCALL_THREAD_START,
         (uint64_t)(uint32_t)thread_fd);
     if (start_status != 0) {
+        lpr_entry_stack_release_bootstrap();
         (void)lpr_pacha_syscall2(
             PACHAOS_SYSCALL_THREAD_KILL,
             (uint64_t)(uint32_t)thread_fd,
@@ -635,6 +721,7 @@ static int64_t lpr_linux_clone_thread(
         (void)lpr_pacha_syscall1(
             PACHAOS_SYSCALL_FD_CLOSE,
             (uint64_t)(uint32_t)thread_fd);
+        (void)lpr_pacha_syscall2(PACHAOS_SYSCALL_MUNMAP, allocation, LPR_THREAD_LAUNCH_BYTES);
         return lpr_pacha_status_to_errno(start_status);
     }
     (void)lpr_pacha_syscall1(
@@ -783,7 +870,9 @@ static int64_t lpr_linux_clone_frame_impl(const struct lpr_linux_user_frame *use
     native_child_frame.rsp = (uint64_t)(uintptr_t)(
         lpr_fork_child_stack + sizeof(lpr_fork_child_stack));
     lpr_fork_child_transaction = &fork_transaction;
+    lpr_mlock_fork_lock();
     lpr_unix_cache_fork_lock();
+    lpr_fs_control_fork_lock();
     lpr_drm_mapping_fork_lock();
     /* Child reconstruction may discard post-snapshot entries. Copy only a
      * coherent table, never an allocator's half-published record. The child
@@ -800,7 +889,9 @@ static int64_t lpr_linux_clone_frame_impl(const struct lpr_linux_user_frame *use
     lpr_state_unlock(&lpr_state.signal.fault_registry_lock);
     lpr_fd_table_unlock(&lpr_control_fd_table);
     lpr_drm_mapping_fork_unlock();
+    lpr_fs_control_fork_unlock();
     lpr_unix_cache_fork_unlock();
+    lpr_mlock_vm_end();
     lpr_fork_child_transaction = 0;
     lpr_trace_clone_frame("after_syscall", &child_frame, ret);
     if (ret >= 16) {
@@ -872,10 +963,8 @@ static int64_t lpr_linux_clone_frame_impl(const struct lpr_linux_user_frame *use
 
 int64_t lpr_linux_clone_frame(const struct lpr_linux_user_frame *user_frame, uint64_t flags, uint64_t child_stack, uint64_t parent_tid, uint64_t child_tid, uint64_t tls)
 {
-    if ((flags & LPR_CLONE_THREAD) != 0) {
-        return lpr_linux_clone_frame_impl(
-            user_frame, flags, child_stack, parent_tid, child_tid, tls);
-    }
+    /* Also serialize launch-page publication/reclamation with native fork;
+     * its child must be able to reclaim a complete copied registry. */
     lpr_state_lock(&lpr_process_fork_lock);
     const int64_t result = lpr_linux_clone_frame_impl(
         user_frame, flags, child_stack, parent_tid, child_tid, tls);
@@ -1304,7 +1393,7 @@ int64_t lpr_linux_rt_sigprocmask(uint64_t how, uint64_t set_raw, uint64_t oldset
     return dispatch_pending ? lpr_linux_dispatch_pending_signals_with_result(0) : 0;
 }
 
-int64_t lpr_linux_wait4(uint64_t pid, uint64_t status_raw, uint64_t options, uint64_t rusage, unsigned *wait_not_ready __attribute__((unused)))
+static int64_t lpr_linux_wait4_impl(uint64_t pid, uint64_t status_raw, uint64_t options, uint64_t rusage, unsigned *wait_not_ready, int nowait, uint32_t *child_uid)
 {
     (void)rusage;
     if ((options & ~(LPR_LINUX_WNOHANG | LPR_LINUX_WUNTRACED | LPR_LINUX_WCONTINUED)) != 0) {
@@ -1323,7 +1412,8 @@ int64_t lpr_linux_wait4(uint64_t pid, uint64_t status_raw, uint64_t options, uin
         lprs_wait4_t *wait_req = (lprs_wait4_t *)lpr_supervisor_payload(page);
         wait_req->token = lpr_supervisor_token;
         wait_req->requested_pid = requested;
-        wait_req->options = options & LPR_LINUX_WNOHANG;
+        wait_req->options = (options & LPR_LINUX_WNOHANG) |
+            (nowait ? LPRS_WAIT4_WNOWAIT : 0);
         uint64_t packed_result = 0;
         const int64_t wait_status = lpr_supervisor_call(
             LPRS_OP_PROCESS_WAIT4,
@@ -1353,6 +1443,7 @@ int64_t lpr_linux_wait4(uint64_t pid, uint64_t status_raw, uint64_t options, uin
                     *(int *)(uintptr_t)status_raw = (int)wait_result_status;
                 }
                 result = (int64_t)result_pid;
+                if (child_uid != 0) *child_uid = wait_req->uid;
             }
         } else {
             result = wait_status;
@@ -1407,10 +1498,55 @@ int64_t lpr_linux_wait4(uint64_t pid, uint64_t status_raw, uint64_t options, uin
         *out_status = (int)((exit_code & 0xffu) << 8);
     }
     const int32_t linux_pid = selected->linux_pid;
+    if (nowait) return (int64_t)linux_pid;
     (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, (uint64_t)(uint32_t)selected->process_fd);
     lpr_memset(selected, 0, sizeof(*selected));
     lpr_trace_process_event("wait4_reaped", (uint64_t)(uint32_t)linux_pid, exit_code & 0xffu, 0);
     return (int64_t)linux_pid;
+}
+
+int64_t lpr_linux_wait4(uint64_t pid, uint64_t status_raw, uint64_t options, uint64_t rusage, unsigned *wait_not_ready)
+{
+    return lpr_linux_wait4_impl(pid, status_raw, options, rusage, wait_not_ready, 0, 0);
+}
+
+int64_t lpr_linux_waitid(uint64_t which, uint64_t id, uint64_t info_raw, uint64_t options, uint64_t rusage, unsigned *wait_not_ready)
+{
+    enum { WEXITED = 4u, WNOWAIT = 0x01000000u };
+    if ((options & ~(LPR_LINUX_WNOHANG | WEXITED | WNOWAIT)) != 0 ||
+        (options & WEXITED) == 0)
+        return -LPR_LINUX_EINVAL;
+    int64_t requested;
+    switch ((uint32_t)which) {
+    case 0: requested = -1; break; /* P_ALL */
+    case 1: /* P_PID */
+        if (id == 0 || id > INT32_MAX) return -LPR_LINUX_EINVAL;
+        requested = (int64_t)id;
+        break;
+    case 2: /* P_PGID; zero selects the caller's process group. */
+        if (id > INT32_MAX) return -LPR_LINUX_EINVAL;
+        requested = -(int64_t)id;
+        break;
+    default: return -LPR_LINUX_EINVAL; /* No pidfd support. */
+    }
+    if (info_raw == 0 || !lpr_user_range_plausible(info_raw, 128u))
+        return -LPR_LINUX_EFAULT;
+    int status = 0;
+    uint32_t uid = 0;
+    const int64_t result = lpr_linux_wait4_impl((uint64_t)requested,
+        (uint64_t)(uintptr_t)&status, options & LPR_LINUX_WNOHANG,
+        rusage, wait_not_ready, (options & WNOWAIT) != 0, &uid);
+    if (result < 0) return result;
+    int32_t *info = (int32_t *)(uintptr_t)info_raw;
+    lpr_memset(info, 0, 128u);
+    if (result != 0) {
+        info[0] = 17; /* SIGCHLD */
+        info[2] = (status & 0x7f) == 0 ? 1 : ((status & 0x80) ? 3 : 2);
+        info[4] = (int32_t)result;
+        info[5] = (int32_t)uid;
+        info[6] = (status & 0x7f) == 0 ? (status >> 8) & 0xff : status & 0x7f;
+    }
+    return 0;
 }
 
 int64_t lpr_linux_execve(uint64_t path_raw, uint64_t argv_raw, uint64_t envp_raw)

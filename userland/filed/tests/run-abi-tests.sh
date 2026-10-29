@@ -21,8 +21,12 @@ mkdir -p .artifacts/fs-cutover-filed-tests
   userland/filed/src/exec/linux_lpr/script.c \
   -o .artifacts/fs-cutover-filed-tests/shebang-test
 .artifacts/fs-cutover-filed-tests/shebang-test
-for test in relay identity client_retirement lease_retirement register_reply exec_self_reply; do
+for test in audio_route relay identity client_retirement lease_retirement register_reply exec_self_reply; do
   sources=()
+  link_flags=()
+  if [[ "$test" == relay ]]; then
+    link_flags+=(-Wl,--wrap=filed_pager_create)
+  fi
   if [[ "$test" == identity || "$test" == client_retirement ]]; then
     sources+=(userland/filed/src/dispatch/identity.c)
   elif [[ "$test" == register_reply || "$test" == exec_self_reply ]]; then
@@ -36,7 +40,7 @@ for test in relay identity client_retirement lease_retirement register_reply exe
     -Iuserland/personality/include -Iuserland/storage/include \
     "userland/filed/tests/${test}_test.c" userland/filed/src/snapshot_cache.c userland/filed/tests/pager_stub.c "${sources[@]}" \
     kobox2/protocol/src/filesystem.c kobox2/protocol/src/virtqueue.c \
-    kobox2/protocol/src/protocol.c \
+    kobox2/protocol/src/protocol.c "${link_flags[@]}" \
     -o ".artifacts/fs-cutover-filed-tests/${test}-test"
   ".artifacts/fs-cutover-filed-tests/${test}-test"
 done

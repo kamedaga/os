@@ -3,7 +3,7 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "$0")/../../.." && pwd)"
 cd "$repo_root"
 mkdir -p .artifacts/filed-tests
-zydis=.artifacts/third_party/zydis-v4.1.1/source
+zydis="$(bash pack/scripts/download_zydis.sh)"
 /usr/bin/clang -std=c11 -O2 -Wall -Wextra -Werror \
   -DZYDIS_STATIC_BUILD -DZYDIS_MINIMAL_MODE -DZYDIS_DISABLE_ENCODER \
   -DZYDIS_DISABLE_FORMATTER -DZYDIS_DISABLE_SEGMENT -DZYAN_NO_LIBC \

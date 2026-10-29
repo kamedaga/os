@@ -5,12 +5,39 @@
 
 enum { WORK_IDLE, WORK_READY, WORK_BUSY, WORK_DONE };
 
+static int wait_ready_writable(struct ph_ipc *ipc) {
+    struct pacha_pollfd event = {.fd = ipc->fd,
+        .events = PACHA_FD_EVENT_WRITABLE | PACHA_FD_EVENT_HANGUP | PACHA_FD_EVENT_ERROR};
+    for (;;) {
+        event.revents = 0;
+        /* The opening Linux task may migrate between native threads, so this
+         * wait is transient rather than borrowing a thread's retained set. */
+        long status = pacha_syscall4(PACHA_FD_SYSCALL_WAIT_MANY,
+            (uintptr_t)&event, 1, PACHA_FD_WAIT_FOREVER, 0);
+        if (status == PACHA_SYSCALL_ERR_NOT_READY && !event.revents) continue;
+        if (status < 0) return (int)status;
+        if (status != 1 || !event.revents || (event.revents & ~event.events)) return -EIO;
+        // Closure wins even when a stale writable hint accompanies it.
+        if (event.revents & PACHA_FD_EVENT_HANGUP) return -EPIPE;
+        if (event.revents & PACHA_FD_EVENT_ERROR) return -EIO;
+        return 0;
+    }
+}
+
 static int ready(void *context) {
     struct ph_lifecycle *lifecycle = context;
     struct ph_ipc_packet packet = {.operation = PH_LIFECYCLE_READY,
         .generation = lifecycle->generation};
-    int result = ph_ipc_send(lifecycle->ipc, &packet);
-    if (result) return result;
+    for (;;) {
+        int result = ph_ipc_send(lifecycle->ipc, &packet);
+        if (!result) break;
+        if (result != -EAGAIN) return result;
+        /* Progress and READY share the bounded channel. A full diagnostic
+         * queue is not a failed boot. Only the opening task owns IPC until
+         * READY is enqueued; leave the receiver parked throughout the wait. */
+        result = wait_ready_writable(lifecycle->ipc);
+        if (result) return result;
+    }
     atomic_store_explicit(&lifecycle->start, 1, memory_order_release);
     ph_wake(&lifecycle->start);
     return 0;
@@ -258,7 +285,23 @@ static int async_finish(void *context, void *service) {
     return result > 0 ? -EPROTO : result;
 }
 
-static int receive_async(struct ph_lifecycle *lifecycle) {
+static long wait_receiver(struct ph_wait_retained *wait_set,
+    struct pacha_pollfd *events, size_t count, uint64_t timeout) {
+    for (;;) {
+        long status = ph_wait_many_retained(wait_set, events, count, timeout);
+        size_t ready = 0;
+        for (size_t i = 0; i < count; ++i) ready += events[i].revents != 0;
+        if (status > 0 && (size_t)status == ready) return status;
+        if (status == PACHA_SYSCALL_ERR_NOT_READY && !ready) {
+            if (timeout != PACHA_FD_WAIT_FOREVER) return status;
+            continue;
+        }
+        return -EIO;
+    }
+}
+
+static int receive_async(struct ph_lifecycle *lifecycle,
+    struct ph_wait_retained *wait_set) {
     for (;;) {
         if (atomic_load_explicit(&lifecycle->work, memory_order_acquire) == WORK_DONE)
             return 0;
@@ -282,7 +325,7 @@ static int receive_async(struct ph_lifecycle *lifecycle) {
                 .events = PACHA_FD_EVENT_READABLE | PACHA_FD_EVENT_HANGUP},
                 {.fd = lifecycle->ipc->fd,
                 .events = PACHA_FD_EVENT_READABLE | PACHA_FD_EVENT_HANGUP}};
-            result = ph_wait_readable(events, 2) < 0 ? -EIO : 0;
+            result = wait_receiver(wait_set, events, 2, PACHA_FD_WAIT_FOREVER) < 0 ? -EIO : 0;
         }
         if (atomic_load_explicit(&lifecycle->work, memory_order_acquire) == WORK_DONE)
             return 0;
@@ -303,6 +346,8 @@ static int receive_async(struct ph_lifecycle *lifecycle) {
 
 static void *receive(void *context) {
     struct ph_lifecycle *lifecycle = context;
+    /* ph_thread_create gives this receiver a stable native thread. */
+    struct ph_wait_retained wait_set = {0};
     unsigned int start;
     while (!(start = atomic_load_explicit(&lifecycle->start, memory_order_acquire)))
         ph_wait(&lifecycle->start, 0);
@@ -313,7 +358,7 @@ static void *receive(void *context) {
         return NULL;
     }
     if (lifecycle->service.advance) {
-        (void)receive_async(lifecycle);
+        (void)receive_async(lifecycle, &wait_set);
         return NULL;
     }
     int result;
@@ -360,8 +405,7 @@ static void *receive(void *context) {
              * time while this native receiver has no incoming IPC. Polling
              * only this inspection profile bounds its join to one second.
              */
-            long waited = pacha_syscall4(PACHA_FD_SYSCALL_WAIT_MANY,
-                (uintptr_t)events, count, 1000, 0);
+            long waited = wait_receiver(&wait_set, events, count, 1000);
             size_t ready = 0;
             for (size_t i = 0; i < count; ++i)
                 ready += events[i].revents != 0;
@@ -373,7 +417,7 @@ static void *receive(void *context) {
                 break;
             }
         } else {
-            (void)ph_wait_readable(events, count);
+            PH_CHECK(wait_receiver(&wait_set, events, count, PACHA_FD_WAIT_FOREVER) > 0);
         }
     }
     if (!result) {

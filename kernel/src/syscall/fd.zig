@@ -2,6 +2,7 @@ const abi_root = @import("kernel_abi_root");
 const std_rc = @import("std");
 const interrupts = @import("../interrupts.zig");
 const ipc_metric = @import("../ipc_metric.zig");
+const lock_profile = @import("../lock_profile.zig");
 const kernel = @import("../kernel.zig");
 const kernel_log = @import("../kernel_log.zig");
 const scheduler = @import("../scheduler.zig").connection;
@@ -733,6 +734,8 @@ test "poll item snapshot copies one range and preserves validation" {
 }
 
 fn pollCached(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, items: []const PollItem, frame: *TrapFrame) ?u64 {
+    const poll_scan_sample = if (comptime lock_profile.enabled) lock_profile.stageBegin() else {};
+    defer if (comptime lock_profile.enabled) lock_profile.stageEnd(.poll_scan, poll_scan_sample);
     var ready_count: u64 = 0;
     var first_index: usize = 0;
     var first_events: u64 = 0;
@@ -767,7 +770,8 @@ fn registerCachedWaitersForPoll(
     group: kernel.FdWaitGroupRef,
 ) kernel.KernelError!void {
     for (items) |item| {
-        if (try state.registerTaskReadableWaiterForFd(
+        const reg_task_sample = if (comptime lock_profile.enabled) lock_profile.stageBegin() else {};
+        const task_registered = try state.registerTaskReadableWaiterForFd(
             proc,
             item.fd,
             item.events,
@@ -776,10 +780,11 @@ fn registerCachedWaitersForPoll(
             thread_generation,
             wait_token,
             group,
-        )) {
-            continue;
-        }
-        if (try state.registerPipeWaiterForFd(
+        );
+        if (comptime lock_profile.enabled) lock_profile.stageEnd(.reg_task, reg_task_sample);
+        if (task_registered) continue;
+        const reg_pipe_sample = if (comptime lock_profile.enabled) lock_profile.stageBegin() else {};
+        const pipe_registered = try state.registerPipeWaiterForFd(
             proc,
             item.fd,
             item.events,
@@ -789,9 +794,11 @@ fn registerCachedWaitersForPoll(
             thread_generation,
             wait_token,
             group,
-        )) {
-            continue;
-        }
+        );
+        if (comptime lock_profile.enabled) lock_profile.stageEnd(.reg_pipe, reg_pipe_sample);
+        if (pipe_registered) continue;
+        const reg_ipc_sample = if (comptime lock_profile.enabled) lock_profile.stageBegin() else {};
+        defer if (comptime lock_profile.enabled) lock_profile.stageEnd(.reg_ipc, reg_ipc_sample);
         _ = try state.registerIpcPollWaitersForFd(
             proc,
             item.fd,
@@ -858,6 +865,162 @@ fn timerNowNs() u64 {
     return @import("../realtime_clock.zig").monotonicNs() orelse scheduler.lapic_tick_count * 1_000_000;
 }
 
+fn replacePersistentSet(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId,
+    address: u64, count: u64, thread: usize, generation: u32) kernel.KernelError!*kernel.persistent_wait.Set {
+    const wait_register_sample = if (comptime lock_profile.enabled) lock_profile.stageBegin() else {};
+    defer if (comptime lock_profile.enabled) lock_profile.stageEnd(.wait_register, wait_register_sample);
+    var storage: [max_pollfds]PollItem = undefined;
+    const items = readPollItems(h, proc, address, count, &storage) orelse return kernel.KernelError.InvalidState;
+    const set = try kernel.persistent_wait.draft(state, proc, thread, generation, items.len);
+    errdefer kernel.persistent_wait.destroy(state, set);
+    // The transient group is only a failure-atomic construction transaction.
+    // K excludes producers until every binding is converted; none of its token
+    // or user-VA state becomes part of the published persistent subscriptions.
+    const group = try state.beginFdWaitGroup(proc, thread, generation, 1);
+    defer state.cancelFdWaitGroup(group, 1);
+    const now = timerNowNs();
+    for (items, 0..) |source, i| {
+        const fd = state.fdEntryConst(proc, source.fd) orelse return kernel.KernelError.InvalidState;
+        const ready = state.fdPollEventsWithWriteMin(proc, source.fd, source.events, now,
+            source.min_write_bytes) orelse return kernel.KernelError.InvalidState;
+        const item = set.items.get(@intCast(i)).?;
+        item.* = .{ .set = set, .index = @intCast(i), .fd = source.fd,
+            .descriptor_seq = fd.seq, .object = fd.object, .events = source.events,
+            .min_write_bytes = source.min_write_bytes };
+        const object = state.kernelObjectSlot(item.object).?;
+        object.persistent_observers = std_rc.math.add(u32, object.persistent_observers, 1) catch
+            return kernel.KernelError.TableFull;
+        item.observing = true;
+        const begin = state.fd_wait_groups.get(group.index).?.link_count;
+        try registerCachedWaitersForPoll(state, proc, &.{source}, thread, generation, 1, group);
+        const draft = state.fd_wait_groups.get(group.index).?;
+        if (draft.link_count - begin > item.registrations.len) return kernel.KernelError.InvalidState;
+        for (begin..draft.link_count) |index| {
+            item.registrations[item.registration_count] = draft.links.?.get(@intCast(index)).?.registration;
+            item.registration_count += 1;
+        }
+        if (ready != 0) item.publish();
+    }
+    // Prepare the directory publication before changing any source binding.
+    _ = state.persistent_wait_threads.claimIndex(@intCast(thread)) catch return kernel.KernelError.OutOfFreePages;
+    var iterator = set.items.iterator();
+    while (iterator.next()) |entry| {
+        const item = entry.value;
+        for (item.registrations[0..item.registration_count]) |registration|
+            state.makePersistentRegistration(registration, item);
+    }
+    set.table_mutation = (try state.fdTableForActiveProcessConst(proc)).mutation;
+    try kernel.persistent_wait.commit(state, set);
+    return set;
+}
+
+fn persistentReady(h: anytype, state: *kernel.KernelState, set: *kernel.persistent_wait.Set,
+    output: u64, frame: *TrapFrame) u64 {
+    const wait_set_sample = if (comptime lock_profile.enabled) lock_profile.stageBegin() else {};
+    defer if (comptime lock_profile.enabled) lock_profile.stageEnd(.wait_set, wait_set_sample);
+    if (!kernel.persistent_wait.validate(state, set)) return fd_abi.wait_set_invalidated;
+    // Only entries present at entry are examined: requeued level-ready entries
+    // cannot monopolize one invocation. Idle readiness is a hint, never authority.
+    const limit = set.queued;
+    var count: u64 = 0;
+    var first_index: u32 = 0;
+    var first_events: u64 = 0;
+    const now = timerNowNs();
+    for (0..limit) |_| {
+        const item = set.pop().?;
+        const events = state.fdPollEventsWithWriteMin(set.owner, item.fd, item.events, now,
+            item.min_write_bytes) orelse return fd_abi.wait_set_invalidated;
+        if (item.object.kind == .timer) state.markTimerDeadlineDirty();
+        if (events == 0) continue;
+        item.publish();
+        count += 1;
+        if (count == 1) { first_index = item.index; first_events = events; }
+        if (count == 2 and !h.write_user_u64(set.owner, output + first_index * fd_abi.pollfd_size +
+            fd_abi.pollfd_revents_offset, first_events)) return 0 -% sc.syscall_err_invalid;
+        if (count > 1 and !h.write_user_u64(set.owner, output + item.index * fd_abi.pollfd_size +
+            fd_abi.pollfd_revents_offset, events)) return 0 -% sc.syscall_err_invalid;
+    }
+    if (count == 1) {
+        frame.r10 = first_index;
+        frame.r8 = first_events;
+    }
+    return count;
+}
+
+/// Called with K after inner endpoint locks have ended. A marked set has at
+/// most one invocation; source publication never copies user memory or calls T
+/// under E. Timeout/signal invalidate the claim and retain only subscriptions.
+pub fn completePersistentWaiters(h: anytype, state: *kernel.KernelState) void {
+    var pending = state.persistent_wait_sets.marked(1);
+    while (pending.next()) |index| {
+        state.persistent_wait_sets.mark(@intCast(index), 1, false);
+        const set = state.persistent_wait_sets.get(@intCast(index)).?;
+        const invocation = set.invocation orelse continue;
+        set.invocation = null;
+        const claim = scheduler.claimWaitTokenCompletion(set.thread, set.thread_generation, set.owner, invocation.token);
+        if (claim == .stale) continue;
+        const target: kernel.ThreadWakeTarget = .{ .owner = set.owner, .thread_index = set.thread,
+            .thread_generation = set.thread_generation, .wait_token = invocation.token };
+        const output = scheduler.claimedWaitOutput(target);
+        var registers: TrapFrame = undefined;
+        registers.r10 = 0;
+        registers.r8 = 0;
+        var result = if (output) |address| persistentReady(h, state, set, address, &registers)
+            else 0 -% sc.syscall_err_invalid;
+        // Preserve the native singleton ABI on asynchronous completion too.
+        // A foreign user-VA copy here would add VM/AS work to every wake even
+        // though the claimed scheduler token can carry these two scalars.
+        if (result == 1 and !scheduler.stagePollResult(target, registers.r10, registers.r8))
+            result = 0 -% sc.syscall_err_invalid;
+        _ = scheduler.publishClaimedWaitCompletion(set.thread, set.thread_generation, set.owner, invocation.token,
+            if (result == 0) sc.syscall_err_not_ready else result);
+    }
+}
+
+fn fdWaitPersistent(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId,
+    frame: *TrapFrame, flags: u64) u64 {
+    const operation = flags & (fd_abi.wait_set_replace | fd_abi.wait_set_reuse | fd_abi.wait_set_clear);
+    if (operation == 0 or operation & (operation - 1) != 0 or
+        flags & ~(fd_abi.wait_uninterruptible | fd_abi.wait_set_replace | fd_abi.wait_set_reuse | fd_abi.wait_set_clear) != 0)
+        return 0 -% sc.syscall_err_invalid;
+    const thread = scheduler.currentThread();
+    const generation = scheduler.currentThreadGeneration() orelse return 0 -% sc.syscall_err_invalid;
+    if (operation == fd_abi.wait_set_clear) {
+        if (frame.rdi != 0 or frame.rsi != 0 or frame.rdx != 0 or flags != operation) return 0 -% sc.syscall_err_invalid;
+        kernel.persistent_wait.clearThread(state, proc, thread, generation);
+        return sc.syscall_ok;
+    }
+    if (!persistentOutputValid(frame.rdi, frame.rsi)) return 0 -% sc.syscall_err_invalid;
+    const set = if (operation == fd_abi.wait_set_replace)
+        replacePersistentSet(h, state, proc, frame.rdi, frame.rsi, thread, generation) catch |err| return 0 -% statusFromKernelError(err)
+    else kernel.persistent_wait.current(state, proc, thread, generation) orelse return fd_abi.wait_set_invalidated;
+    if (set.count != frame.rsi) return 0 -% sc.syscall_err_invalid;
+    set.invocation = null;
+    const ready = persistentReady(h, state, set, frame.rdi, frame);
+    if (ready != 0) return ready;
+    if (frame.rdx == 0) return sc.syscall_err_not_ready;
+    const token = scheduler.reserveCurrentWaitToken(generation) orelse return 0 -% sc.syscall_err_invalid;
+    set.invocation = .{ .token = token };
+    // Registration, readiness observation and parking are under K. A producer
+    // either populated the FIFO above or will mark this exact invocation.
+    const ticks = if (frame.rdx == fd_abi.wait_forever) 0 else frame.rdx;
+    lock_profile.parkBegin();
+    defer lock_profile.parkEnd();
+    if (h.block_current_thread_for_event(frame, true, flags & fd_abi.wait_uninterruptible != 0,
+        token, ticks, sc.syscall_err_not_ready, h.before_current_thread_leave)) return frame.rax;
+    scheduler.cancelCurrentWaitToken(generation, token);
+    set.invocation = null;
+    return sc.syscall_err_not_ready;
+}
+
+fn persistentOutputValid(address: u64, count: u64) bool {
+    if (count > fd_abi.max_pollfds) return false;
+    if (count == 0) return true;
+    const bytes = count * fd_abi.pollfd_size;
+    return address >= 4096 and address < 0x0000_8000_0000_0000 and
+        bytes <= 0x0000_8000_0000_0000 - address;
+}
+
 fn fdPoll(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, frame: *TrapFrame) u64 {
     frame.r10 = 0;
     frame.r8 = 0;
@@ -871,12 +1034,23 @@ fn fdWaitMany(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, 
     const count = frame.rsi;
     const timeout_ticks = frame.rdx;
     const flags = frame.r10;
+    if (comptime lock_profile.enabled) {
+        const operation = flags & (fd_abi.wait_set_replace | fd_abi.wait_set_reuse | fd_abi.wait_set_clear);
+        if (operation == 0 or operation == fd_abi.wait_set_replace) {
+            // Only the kernel can pair this principal with the K lock hold
+            // that ends at a scheduler leave or syscall return.
+            lock_profile.waitCaller(@intFromEnum(proc), state.tryProcessLabel(proc) orelse kernel.principalLabel(proc), count,
+                operation == fd_abi.wait_set_replace);
+        }
+    }
     const trace = @import("../wake_trace.zig");
     trace.record(.fd_wait_enter, count, pollfds_va, scheduler.currentThread());
     // INVALID and singleton count both have numeric value 1. A nonzero
     // event register distinguishes success, including error returns before block.
     frame.r10 = 0;
     frame.r8 = 0;
+    if (flags & (fd_abi.wait_set_replace | fd_abi.wait_set_reuse | fd_abi.wait_set_clear) != 0)
+        return fdWaitPersistent(h, state, proc, frame, flags);
     if ((flags & ~fd_abi.wait_uninterruptible) != 0) return sc.syscall_err_invalid;
     var poll_items_storage: [max_pollfds]PollItem = undefined;
     const poll_items = readPollItems(h, proc, pollfds_va, count, poll_items_storage[0..]) orelse return sc.syscall_err_invalid;
@@ -886,9 +1060,11 @@ fn fdWaitMany(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, 
 
     const current_thread = scheduler.currentThread();
     const current_generation = scheduler.currentThreadGeneration() orelse return sc.syscall_err_invalid;
+    const register_sample = if (comptime lock_profile.enabled) lock_profile.stageBegin() else {};
     state.unregisterFdWaitersForThread(proc, current_thread, current_generation);
     const wait_token = scheduler.reserveCurrentWaitToken(current_generation) orelse
         return sc.syscall_err_invalid;
+    const wait_group_sample = if (comptime lock_profile.enabled) lock_profile.stageBegin() else {};
     const group = beginFdWaitGroupWithReclaim(
         state,
         proc,
@@ -900,6 +1076,7 @@ fn fdWaitMany(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, 
         return statusFromKernelError(err);
     };
     state.fd_wait_groups.get(group.index).?.pollfds_va = pollfds_va;
+    if (comptime lock_profile.enabled) lock_profile.stageEnd(.wait_group, wait_group_sample);
     const register_start = ipc_metric.timestamp();
     registerCachedWaitersForPoll(
         state,
@@ -920,6 +1097,7 @@ fn fdWaitMany(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, 
         return statusFromKernelError(err);
     };
     ipc_metric.record(.wait_register, register_start);
+    if (comptime lock_profile.enabled) lock_profile.stageEnd(.wait_register, register_sample);
     trace.record(.fd_wait_register, count, wait_token, current_thread);
     const repoll_start = ipc_metric.timestamp();
     const ready_after_register = pollCached(h, state, proc, poll_items, frame) orelse {
@@ -937,6 +1115,8 @@ fn fdWaitMany(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, 
 
     const block_ticks: u64 = if (timeout_ticks == fd_abi.wait_forever) 0 else timeout_ticks;
     trace.record(.fd_wait_block, count, wait_token, current_thread);
+    lock_profile.parkBegin();
+    defer lock_profile.parkEnd();
     if (h.block_current_thread_for_event(
         frame,
         true,
@@ -1140,7 +1320,10 @@ fn pagerSupply(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId,
         desc.source_fd >= kernel.fd_number_capacity) return sc.syscall_err_invalid;
     const count: usize = @intCast(desc.length / 4096);
     const source_view = state.fdPayloadWithRightsConst(proc, @intCast(desc.source_fd), .{ .map_read = true }) orelse return sc.syscall_err_invalid;
-    const source_ref = switch (source_view.payload.*) { .vmo => |ref| ref, else => return sc.syscall_err_invalid };
+    const source_ref = switch (source_view.payload.*) {
+        .vmo => |ref| ref,
+        else => return sc.syscall_err_invalid,
+    };
     var source_pages: [128]u64 = undefined;
     var target_ref: kernel.NativeVmoRef = .{};
     user_vm.lockSharedVmObjects();
@@ -1372,6 +1555,44 @@ const PageViewInvalidator = struct {
         return user_vm.invalidatePresentUserLinearRegionPtes(owner, start, @intCast(bytes));
     }
 };
+
+const PageViewDirtyWalker = struct {
+    pub fn collect(_: @This(), owner: kernel.PrincipalId, start: u64, bytes: u64, first: u64, visitor: anytype) bool {
+        return user_vm.collectUserPteDirty(owner, start, bytes, first, visitor);
+    }
+};
+
+fn collectPageViewDirtyFd(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, fd: u64, out_va: u64, words: u64, flags: u64) u64 {
+    const dirty = kernel.page_view_dirty;
+    if (fd >= kernel.fd_number_capacity or out_va == 0 or out_va & 7 != 0 or flags != 0 or !user_vm.pageViewDirtyTrackingAvailable()) return sc.syscall_err_invalid;
+    user_vm.lockAllVmTransactions();
+    defer user_vm.unlockAllVmTransactions();
+    const view = state.nativeVmoRefForRevokeFd(proc, @intCast(fd)) catch return sc.syscall_err_invalid;
+    const slot = state.nativeVmoSlot(view) orelse return sc.syscall_err_invalid;
+    if (slot.kind != .page_view or words != dirty.wordCount(slot) or out_va > std_rc.math.maxInt(u64) - words * 8) return sc.syscall_err_invalid;
+    // Entry preflight resolves writable output (including COW). All-AS retains
+    // its physical identity through collection/copyout. Reject actual PFNs,
+    // including parent-RAM aliases, before any D bit is cleared.
+    var page_va = out_va & ~@as(u64, 4095);
+    const last = (out_va + words * 8 - 1) & ~@as(u64, 4095);
+    while (true) {
+        const paddr = user_vm.lookupUserPhysicalPageWithAddressSpaceLocked(proc, .fromInt(page_va), true, false) orelse return sc.syscall_err_invalid;
+        if (dirty.containsPhysicalPage(slot, paddr.toInt())) return sc.syscall_err_invalid;
+        if (page_va == last) break;
+        page_va += 4096;
+    }
+    dirty.harvest(state, view, PageViewDirtyWalker{}) catch return sc.syscall_err_invalid;
+    const Sink = struct {
+        hooks: @TypeOf(h),
+        owner: kernel.PrincipalId,
+        base: u64,
+        pub fn write(sink: @This(), first: usize, values: []const u64) bool {
+            return sink.hooks.copy_bytes_to_user_va(sink.owner, sink.base + first * 8, std_rc.mem.sliceAsBytes(values));
+        }
+    };
+    if (!dirty.deliver(slot, Sink{ .hooks = h, .owner = proc, .base = out_va })) return sc.syscall_err_invalid;
+    return sc.syscall_ok;
+}
 
 fn refreshPageViewVmoFd(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, view_fd: u64, parent_fd: u64, indices_va: u64, count: u64) u64 {
     if (view_fd >= kernel.fd_number_capacity or parent_fd >= kernel.fd_number_capacity or
@@ -1844,7 +2065,11 @@ fn madviseVmaRange(
     // NORMAL/RANDOM/SEQUENTIAL/WILLNEED are paging hints. We accept them
     // without extra prefetch; advice requiring discard or inheritance changes
     // must not falsely succeed until those operations are implemented.
-    if (advice > 3) return sc.syscall_err_invalid;
+    // POPULATE has already performed checked, pager-aware prefault in syscall
+    // preflight before K. Revalidate the VMA coverage here against concurrent
+    // mapping changes; do not turn unsupported discard into a successful hint.
+    if (advice > 3 and advice != vm_abi.madvise_populate_read and
+        advice != vm_abi.madvise_populate_write) return sc.syscall_err_invalid;
     if ((base_va & 0xFFF) != 0) return sc.syscall_err_invalid;
     if (size_bytes == 0) return sc.syscall_ok;
     const size = pageAlignUp(size_bytes) orelse return sc.syscall_err_invalid;
@@ -2177,6 +2402,7 @@ pub fn dispatch(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId
             break :blk sc.syscall_ok;
         },
         sc.syscall_vmo_revoke => revokeVmoFd(state, proc, @intCast(frame.rdi), h.free_list),
+        sc.syscall_vmo_collect_dirty => collectPageViewDirtyFd(h, state, proc, frame.rdi, frame.rsi, frame.rdx, frame.r10),
         sc.syscall_vmo_refresh_page_view => refreshPageViewVmoFd(h, state, proc, frame.rdi, frame.rsi, frame.rdx, frame.r10),
         sc.syscall_vmo_create_page_view => if (frame.rdi >= kernel.fd_number_capacity) sc.syscall_err_invalid else createPageViewVmoFd(
             h,
@@ -2323,4 +2549,261 @@ test "poll item snapshot ready zero single multiple maximum and fault" {
     // Minimum is input-only and zero means a one-byte request.
     items[0].min_write_bytes = std.math.maxInt(u64);
     try std.testing.expectEqual(@as(?u64, 0), pollCached(h, state, owner, items[0..1], &frame));
+}
+
+test "poll item snapshot persistent subscriptions reuse rollback close and bounded FIFO" {
+    const std = @import("std");
+    const arena = try std.testing.allocator.alignedAlloc(u8, .fromByteUnits(4096), kernel.runtimeStorageBytes());
+    defer std.testing.allocator.free(arena);
+    try std.testing.expect(kernel.initRuntimeStorage(arena));
+    const state = try std.testing.allocator.create(kernel.KernelState);
+    defer std.testing.allocator.destroy(state);
+    try state.initFromDetectedRegionsInPlace(1);
+    defer state.deinitPools();
+    const owner = kernel.processPrincipalFromIndex(0).?;
+    try std.testing.expect(!persistentOutputValid(std.math.maxInt(u64) - 8, 2));
+    try std.testing.expect(!persistentOutputValid(0x0000_7fff_ffff_fff0, 2));
+    try std.testing.expect(!persistentOutputValid(0, 1));
+    try std.testing.expect(persistentOutputValid(0x1000, max_pollfds));
+    const pair = try state.createPipePairFds(owner, .{}, 16);
+    const Mock = struct {
+        var bytes: [max_pollfds * fd_abi.pollfd_size]u8 = @splat(0);
+        var reads: usize = 0;
+        var writes: usize = 0;
+        fn copy(_: kernel.PrincipalId, address: u64, out: []u8) bool {
+            std.debug.assert(address == 0x1000 and out.len <= bytes.len);
+            reads += 1;
+            @memcpy(out, bytes[0..out.len]);
+            return true;
+        }
+        fn write(_: kernel.PrincipalId, address: u64, value: u64) bool {
+            const offset = address - 0x1000;
+            std.debug.assert(offset % fd_abi.pollfd_size == fd_abi.pollfd_revents_offset);
+            writes += 1;
+            std.mem.writeInt(u64, bytes[offset..][0..8], value, .little);
+            return true;
+        }
+        fn item(index: usize, fd: kernel.Fd) void {
+            const wire = bytes[index * fd_abi.pollfd_size..][0..fd_abi.pollfd_size];
+            @memset(wire, 0);
+            std.mem.writeInt(u64, wire[0..8], fd, .little);
+            std.mem.writeInt(u64, wire[8..16], fd_abi.event_writable, .little);
+        }
+    };
+    const h = .{ .copy_user_bytes_from_va = Mock.copy, .write_user_u64 = Mock.write };
+    Mock.reads = 0;
+    Mock.writes = 0;
+    Mock.item(0, pair.write);
+    const set = try replacePersistentSet(h, state, owner, 0x1000, 1, 4, 9);
+    try std.testing.expectEqual(@as(usize, 0), state.fd_wait_groups.live);
+    for (0..32) |_| {
+        var frame = std.mem.zeroes(TrapFrame);
+        try std.testing.expectEqual(@as(u64, 1), persistentReady(h, state, set, 0x1000, &frame));
+        try std.testing.expectEqual(fd_abi.event_writable, frame.r8);
+        try std.testing.expectEqual(@as(usize, 1), set.queued);
+    }
+    try std.testing.expectEqual(@as(usize, 1), Mock.reads);
+    // A late invalid FD must leave the prior native set and its subscriptions.
+    Mock.item(1, @intCast(kernel.fd_table_entries - 1));
+    try std.testing.expectError(kernel.KernelError.InvalidState,
+        replacePersistentSet(h, state, owner, 0x1000, 2, 4, 9));
+    try std.testing.expect(kernel.persistent_wait.current(state, owner, 4, 9).? == set);
+    try std.testing.expectEqual(@as(usize, 1), state.persistent_wait_sets.live);
+    try std.testing.expectEqual(@as(usize, 0), state.fd_wait_groups.live);
+    // Same-object descriptor reuse is a new incarnation, not the old watch.
+    const entry = state.fdEntryConst(owner, pair.write).?.*;
+    const alias = try state.dupFd(owner, pair.write, 16, entry.rights, entry.flags);
+    try state.closeFd(owner, pair.write);
+    const replacement = try state.dupFd(owner, alias, pair.write, entry.rights, entry.flags);
+    try std.testing.expectEqual(pair.write, replacement);
+    var frame = std.mem.zeroes(TrapFrame);
+    try std.testing.expectEqual(fd_abi.wait_set_invalidated, persistentReady(h, state, set, 0x1000, &frame));
+    for (0..max_pollfds) |i| Mock.item(i, replacement);
+    const many = try replacePersistentSet(h, state, owner, 0x1000, max_pollfds, 4, 9);
+    try std.testing.expectEqual(max_pollfds, many.queued);
+    try std.testing.expectEqual(@as(u64, max_pollfds), persistentReady(h, state, many, 0x1000, &frame));
+    try std.testing.expectEqual(max_pollfds, Mock.writes);
+    try std.testing.expectEqual(max_pollfds, many.queued);
+    kernel.persistent_wait.clearThread(state, owner, 4, 9);
+    try std.testing.expectEqual(@as(usize, 0), state.persistent_wait_sets.live);
+    try std.testing.expectEqual(@as(usize, 0), state.persistent_wait_threads.live);
+}
+
+test "poll item snapshot persistent HUP observers preserve data admission and close wake" {
+    const std = @import("std");
+    const arena = try std.testing.allocator.alignedAlloc(u8, .fromByteUnits(4096), kernel.runtimeStorageBytes());
+    defer std.testing.allocator.free(arena);
+    try std.testing.expect(kernel.initRuntimeStorage(arena));
+    const state = try std.testing.allocator.create(kernel.KernelState);
+    defer std.testing.allocator.destroy(state);
+    try state.initFromDetectedRegionsInPlace(1);
+    defer state.deinitPools();
+    const owner = kernel.processPrincipalFromIndex(0).?;
+    const pair = try state.createIpcChannelPairFds(owner,
+        .{ .send = true, .recv = true, .wait = true, .poll = true, .close = true }, .{}, 16);
+    const Mock = struct {
+        var fd: kernel.Fd = 0;
+        var events: u64 = 0;
+        fn copy(_: kernel.PrincipalId, _: u64, out: []u8) bool {
+            @memset(out, 0);
+            std.mem.writeInt(u64, out[0..8], fd, .little);
+            std.mem.writeInt(u64, out[8..16], events, .little);
+            return true;
+        }
+        fn write(_: kernel.PrincipalId, _: u64, _: u64) bool { return true; }
+    };
+    Mock.fd = pair.a;
+    Mock.events = 0;
+    const h = .{ .copy_user_bytes_from_va = Mock.copy, .write_user_u64 = Mock.write };
+    const set = try replacePersistentSet(h, state, owner, 0x1000, 1, 4, 9);
+    const member = set.items.get(0).?;
+    var transient: kernel.IpcWaiter = .{ .active = true, .events = fd_abi.event_readable };
+    var before: kernel.IpcWaiter = .{ .active = true, .binding = .{ .persistent = member }, .next = &transient };
+    var after: kernel.IpcWaiter = .{ .active = true, .binding = .{ .persistent = member } };
+    transient.next = &after;
+    const list: kernel.IpcWaitList = .{ .poll_head = &before };
+    try std.testing.expect(list.dataPollAfter(null).? == &transient);
+    try std.testing.expect(list.dataPollAfter(&transient) == null);
+    after.events = fd_abi.event_writable;
+    try std.testing.expect(list.dataPollAfter(&transient).? == &after);
+    member.publish();
+    try std.testing.expect(list.dataPollAfter(&transient) == null);
+    set.invocation = .{ .token = 1 };
+    try std.testing.expect(list.dataPollAfter(&transient).? == &after);
+    set.invocation = null;
+    _ = set.pop();
+    try std.testing.expect(list.dataPollAfter(&transient).? == &after);
+    before.recv_memory.active = true;
+    try std.testing.expect(list.dataPollAfter(null).? == &before);
+
+    const closed_handle = state.kernelObjectSlotConst(state.fdEntryConst(owner, pair.b).?.object).?.payload.channel;
+    var free: kernel.FreePageList = .{};
+    try state.ipcSend(owner, pair.b, .{ .words = .{ 1, 2, 3, 4 } }, &free);
+    var targets: [1]kernel.ThreadWakeTarget = undefined;
+    try std.testing.expectEqual(@as(usize, 0), try state.wakeIpcPollWaitersForSendFd(owner, pair.b, &targets));
+    var frame = std.mem.zeroes(TrapFrame);
+    try std.testing.expectEqual(@as(u64, 0), persistentReady(h, state, set, 0x1000, &frame));
+    try state.closeFd(owner, pair.b);
+    try std.testing.expectEqual(@as(usize, 0), state.takeIpcChannelPeerCloseWaiters(closed_handle, &targets));
+    try std.testing.expectEqual(@as(u64, 1), persistentReady(h, state, set, 0x1000, &frame));
+    try std.testing.expectEqual(fd_abi.event_hangup, frame.r8);
+
+    const data_pair = try state.createIpcChannelPairFds(owner,
+        .{ .send = true, .recv = true, .wait = true, .poll = true, .close = true }, .{}, 16);
+    Mock.fd = data_pair.a;
+    Mock.events = fd_abi.event_readable;
+    const data_set = try replacePersistentSet(h, state, owner, 0x1000, 1, 4, 9);
+    const object = state.kernelObjectSlotConst(state.fdEntryConst(owner, data_pair.a).?.object).?;
+    const actual_list = state.ipcWaitListForRecvPayload(&object.payload).?;
+    try state.ipcSend(owner, data_pair.b, .{}, &free);
+    _ = try state.wakeIpcPollWaitersForSendFd(owner, data_pair.b, &targets);
+    try std.testing.expectEqual(@as(u64, 1), persistentReady(h, state, data_set, 0x1000, &frame));
+    _ = try state.ipcRecv(owner, data_pair.a, 0, 16, &free);
+    {
+        var guard = actual_list.acquire();
+        defer guard.end();
+        try std.testing.expect(actual_list.dataPollAfter(null) == null);
+    }
+    // An idle stale hint survives a fast producer that need not republish it.
+    // REUSE must observe the new message, then unqueue after it is consumed.
+    try state.ipcSend(owner, data_pair.b, .{}, &free);
+    try std.testing.expectEqual(@as(u64, 1), persistentReady(h, state, data_set, 0x1000, &frame));
+    _ = try state.ipcRecv(owner, data_pair.a, 0, 16, &free);
+    try std.testing.expectEqual(@as(u64, 0), persistentReady(h, state, data_set, 0x1000, &frame));
+    {
+        var guard = actual_list.acquire();
+        defer guard.end();
+        try std.testing.expect(actual_list.dataPollAfter(null) != null);
+    }
+    try state.ipcSend(owner, data_pair.b, .{}, &free);
+    _ = try state.wakeIpcPollWaitersForSendFd(owner, data_pair.b, &targets);
+    try std.testing.expectEqual(@as(u64, 1), persistentReady(h, state, data_set, 0x1000, &frame));
+}
+
+test "poll item snapshot persistent parked wake timeout signal and thread reuse" {
+    const std = @import("std");
+    const kernel_runtime = @import("../kernel_runtime.zig");
+    scheduler.initializeStaticStorage();
+    defer scheduler.initializeStaticStorage();
+    const tid = 7;
+    const generation = 11;
+    const token = 41;
+    const ctx = scheduler.threadContextMutable(tid).?;
+    const saved = ctx.*;
+    defer ctx.* = saved;
+    const arena = try std.testing.allocator.alignedAlloc(u8, .fromByteUnits(4096), kernel.runtimeStorageBytes());
+    defer std.testing.allocator.free(arena);
+    try std.testing.expect(kernel.initRuntimeStorage(arena));
+    const state = try std.testing.allocator.create(kernel.KernelState);
+    defer std.testing.allocator.destroy(state);
+    try state.initFromDetectedRegionsInPlace(1);
+    defer state.deinitPools();
+    const saved_state = kernel_runtime.kernel_state_global;
+    kernel_runtime.kernel_state_global = state;
+    defer kernel_runtime.kernel_state_global = saved_state;
+    const owner = kernel.processPrincipalFromIndex(0).?;
+    const pair = try state.createPipePairFds(owner, .{}, 16);
+    const pipe = state.kernelObjectSlotConst(state.fdEntryConst(owner, pair.read).?.object).?.payload.pipe.pipe;
+    const Mock = struct {
+        var fd: kernel.Fd = 0;
+        var copies: usize = 0;
+        fn copy(_: kernel.PrincipalId, _: u64, bytes: []u8) bool {
+            @memset(bytes, 0);
+            var offset: usize = 0;
+            while (offset < bytes.len) : (offset += fd_abi.pollfd_size) {
+                std.mem.writeInt(u64, bytes[offset..][0..8], fd, .little);
+                std.mem.writeInt(u64, bytes[offset + 8..][0..8], fd_abi.event_readable, .little);
+            }
+            return true;
+        }
+        fn write(_: kernel.PrincipalId, address: u64, events: u64) bool {
+            std.debug.assert((address == 0x1018 or address == 0x1038) and events == fd_abi.event_readable);
+            copies += 1;
+            return true;
+        }
+    };
+    Mock.fd = pair.read;
+    const h = .{ .copy_user_bytes_from_va = Mock.copy, .write_user_u64 = Mock.write };
+    for (0..5) |race| {
+        ctx.* = .{ .id = tid, .allocated = true, .generation = generation, .owner_process = owner,
+            .stopped = true, .wait_mailbox = true, .active_wait_token = token };
+        ctx.frame.rdi = 0x1000;
+        Mock.copies = 0;
+        const count: u64 = if (race == 4) 2 else 1;
+        const set = try replacePersistentSet(h, state, owner, 0x1000, count, tid, generation);
+        try std.testing.expectEqual(@as(usize, 0), set.queued);
+        set.invocation = .{ .token = token };
+        if (race == 1) {
+            _ = scheduler.wakeIfWaitingTokenGenerationWithRax(tid, generation, owner, token, 77);
+        } else if (race == 2) {
+            ctx.stopped = false;
+            const delivered = scheduler.deliverThreadSignal(owner, tid, generation, 1, 77).?;
+            try std.testing.expect(delivered.was_blocked);
+        } else if (race == 3) {
+            ctx.generation += 1;
+        }
+        try std.testing.expectEqual(@as(usize, 1), try state.pipeWriteBytes(owner, pair.write, "x", true));
+        var targets: [1]kernel.ThreadWakeTarget = undefined;
+        // Source publication only queues the observer; no old thread/token/VA
+        // is embedded in it, and it survives a cancelled wait invocation.
+        try std.testing.expectEqual(@as(usize, 0), state.takePipeWaiters(pipe, false, fd_abi.event_readable, &targets));
+        completePersistentWaiters(h, state);
+        try std.testing.expectEqual(@as(usize, if (race == 4) 2 else 0), Mock.copies);
+        if (race == 0 or race == 4) try std.testing.expectEqual(count, ctx.frame.rax);
+        if (race == 0) {
+            try std.testing.expectEqual(@as(u64, 0), ctx.frame.r10);
+            try std.testing.expectEqual(fd_abi.event_readable, ctx.frame.r8);
+        }
+        if (race == 1 or race == 2) try std.testing.expectEqual(@as(u64, 77), ctx.frame.rax);
+        try std.testing.expect(set.invocation == null);
+        var frame = std.mem.zeroes(TrapFrame);
+        try std.testing.expectEqual(count, persistentReady(h, state, set, 0x1000, &frame));
+        var byte: [1]u8 = undefined;
+        try std.testing.expectEqual(@as(usize, 1), try state.pipeReadBytes(owner, pair.read, &byte));
+        try std.testing.expectEqual(@as(u64, 0), persistentReady(h, state, set, 0x1000, &frame));
+        kernel.persistent_wait.clearThread(state, owner, tid, generation);
+        try std.testing.expectEqual(@as(usize, 0), state.persistent_wait_sets.live);
+        try std.testing.expectEqual(@as(usize, 0), state.persistent_wait_threads.live);
+        try std.testing.expectEqual(@as(u32, 0), state.kernelObjectSlot(state.fdEntryConst(owner, pair.read).?.object).?.persistent_observers);
+    }
 }

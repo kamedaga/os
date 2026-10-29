@@ -11,15 +11,14 @@ _start:
     ud2
 .size _start, .-_start
 
+
 .global ph_vm_client_fault_entry
 .type ph_vm_client_fault_entry,@function
 ph_vm_client_fault_entry:
     mov %rdi, %r12
     call ph_vm_client_fault
-    mov %r12, %rsi
-    mov $PACHA_PROCESS_SIGNAL_CTL_RETURN, %edi
-    mov $PACHA_PROCESS_SYSCALL_SIGNAL_CTL, %eax
-    syscall
+    mov %r12, %rdi
+    call ph_vm_client_fault_return
     ud2
 .size ph_vm_client_fault_entry, .-ph_vm_client_fault_entry
 
@@ -27,6 +26,7 @@ ph_vm_client_fault_entry:
  * This tests LPR dispatch transport, not executable rewriting. In particular,
  * out-of-range syscall numbers still enter LPR instead of call *rax faulting.
  * The Linux ABI clobbers RCX/R11; every other register is captured by LPR. */
+#if PH_VM_CLIENT_FIXTURES
 .global ph_vm_client_linux_call
 .type ph_vm_client_linux_call,@function
 ph_vm_client_linux_call:
@@ -43,6 +43,7 @@ ph_vm_client_linux_call:
 .Llinux_return:
     ret
 .size ph_vm_client_linux_call, .-ph_vm_client_linux_call
+#endif
 
 /* zpoline has already put the post-SYSCALL IP in RCX and restored guest RSP.
  * Save FP before entering the shared capture code or any native helper. */

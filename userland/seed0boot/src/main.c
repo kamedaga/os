@@ -146,10 +146,37 @@ static int send_root_handoff(pacha_fd_t channel_fd, int live_mode, int installer
             .device_id = device.device_id,
             .subsystem_id = device.subsystem_id,
             .class_code = device.class_code,
+            .resource_kind = PACHA_ROOT_DEVICE_PCI,
             .pci_segment = 0,
             .pci_bus = (uint32_t)device.bus,
             .pci_device = (uint32_t)device.device,
             .pci_function = (uint32_t)device.function,
+        };
+    }
+    const long platform_count = pacha_capsule_platform_function_count();
+    if (platform_count < 0) { status = (int)platform_count; goto fail; }
+    for (uint64_t index = 0; index < (uint64_t)platform_count; index++) {
+        struct pacha_capsule_platform_function platform;
+        status = pacha_capsule_platform_function_at(index, &platform);
+        if (status) goto fail;
+        if (platform.kind != PACHA_PLATFORM_DEVICE_I8042 || platform.data_port != 0x60 ||
+            platform.command_port != 0x64 || platform.irq != 1 ||
+            !(platform.flags & PACHA_PLATFORM_FADT_8042)) {
+            status = -22; goto fail;
+        }
+        if (handoff.device_count == PACHA_ROOT_HANDOFF_BATCH_DEVICES) {
+            status = send_root_batch(channel_fd, &handoff, selected);
+            if (status) goto fail;
+            handoff.device_count = 0;
+            memset(handoff.devices, 0, sizeof(handoff.devices));
+        }
+        const pacha_fd_t fd = pacha_capsule_platform_claim(index);
+        if (fd < 16) { status = (int)fd; goto fail; }
+        const uint64_t slot = handoff.device_count++;
+        selected[slot] = fd;
+        handoff.devices[slot] = (struct pacha_root_device_record){
+            .transfer_index = slot, .resource_id = platform.resource_id,
+            .resource_kind = PACHA_ROOT_DEVICE_PLATFORM, .platform_kind = platform.kind,
         };
     }
     handoff.flags = PACHA_ROOT_HANDOFF_FLAG_LAST;

@@ -39,7 +39,13 @@ pub const Lock = struct {
     }
 };
 
-pub const Leaf = struct { pages: [256]u64 = .{0} ** 256, used: u32 = 0 };
+pub const Leaf = struct {
+    pages: [256]u64 = .{0} ** 256,
+    used: u32 = 0,
+    // Survives removal of the last CPU alias; metadata is reserved alongside
+    // PFNs, so retiring mappings never needs an allocation to retain writes.
+    dirty: [4]u64 = .{0} ** 4,
+};
 const Directory = @import("radix.zig").Directory(Leaf);
 const Node = Directory.Node;
 const levels = 4;
@@ -304,6 +310,22 @@ pub const Store = struct {
             _ = @atomicRmw(u64, &used_pages, .Sub, 1, .monotonic);
         }
     }
+    pub fn markDirtyLocked(self: *Store, index: u32) bool {
+        const leaf = Directory.get(self.root, index >> 8, levels) orelse return false;
+        leaf.dirty[(index & 255) >> 6] |= @as(u64, 1) << @intCast(index & 63);
+        return true;
+    }
+
+    pub fn dirtyWordLocked(self: *Store, word: u32) u64 {
+        const leaf = Directory.get(self.root, word >> 2, levels) orelse return 0;
+        return leaf.dirty[word & 3];
+    }
+
+    pub fn clearDirtyWordLocked(self: *Store, word: u32) void {
+        const leaf = Directory.get(self.root, word >> 2, levels) orelse return;
+        leaf.dirty[word & 3] = 0;
+    }
+
     fn visit(self: *Store) void {
         if (builtin.is_test) self.visits += 1;
     }

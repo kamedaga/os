@@ -10,6 +10,8 @@
 #include "../userland/personality/linux/runtime/lpr_vfs/session.h"
 #include "../userland/personality/linux/runtime/lpr_common/boot_diagnostic.h"
 #include <personality/zpoline.h>
+#include <filed/inline_control.h>
+#include "../userland/personality/linux/runtime/lpr_vfs/control_cache.h"
 #include <pacha/status.h>
 #include "../userland/personality/linux/runtime/lpr_linux_syscall.h"
 
@@ -68,6 +70,13 @@ int64_t lpr_input_close_handle(uint64_t h) { (void)h;assert(0);return -1; }
 int64_t lpr_block_close_state(const void *s) { (void)s;assert(0);return -1; }
 int64_t lpr_termd_call_handle(uint32_t op,uint64_t h,uint64_t *r) { (void)op;(void)h;(void)r;assert(0);return -1; }
 int64_t lpr_drm_close_handle(uint64_t h) { (void)h;assert(0);return -1; }
+int64_t lpr_event_counter_close(lpr_event_backend_t *event) { (void)event;assert(0);return -1; }
+/* This fixture requires inline mapping requests; another unit exercises
+ * the generic control scratch allocator's complete lifetime. */
+int64_t lpr_fs_control_acquire(struct lpr_fs_control_lease *lease,uint64_t bytes)
+{ (void)lease;(void)bytes;assert(0);return -1; }
+void lpr_fs_control_release(struct lpr_fs_control_lease *lease,int completed)
+{ (void)lease;(void)completed;assert(0); }
 int64_t lpr_socket_close_backend(void *s) { (void)s;assert(0);return -1; }
 int64_t lpr_device_description_close(lpr_device_backend_t *s) { (void)s;assert(0);return -1; }
 int64_t lpr_unix_socket_close(void *s) { (void)s;assert(0);return -1; }
@@ -133,9 +142,9 @@ static int64_t fixture_prepare_request(uint64_t nr,uint64_t a,uint64_t b)
 }
 static int64_t unit_ipc_call(uint64_t fd,struct pacha_ipc_msg *msg)
 {
-    assert(fd==50 && msg->fd_count==1 && msg->fds[0].fd==40);
+    assert(fd==50 && !msg->fd_count);
     kb2_fs_request_t r;
-    assert(!kb2_fs_request_decode(rpc_memory,msg->word1,msg->word1,&r));
+    assert(!filed_control_request_decode(msg,&r));
     assert(r.opcode==KB2_FILESYSTEM_OP_FILE_VMO && r.handle==123);
     assert((uint64_t)r.offset==expected_snapshot_offset && r.length==expected_snapshot_bytes &&
         !r.path.length && !r.data.length);
@@ -148,9 +157,8 @@ static int64_t unit_ipc_call(uint64_t fd,struct pacha_ipc_msg *msg)
     kb2_fs_response_t response={.opcode=r.opcode,.generation=r.generation,.sequence=r.sequence,
         .result=snapshot_error ? snapshot_error :
             (int64_t)(r.length < file_bytes-(uint64_t)r.offset ? r.length : file_bytes-(uint64_t)r.offset)};
-    assert(!kb2_fs_response_encode(rpc_memory,rpc_size,&response));
-    completion=(struct pacha_ipc_msg){.word0=r.opcode,.word1=response.result,
-        .word2=KB2_FILESYSTEM_RESPONSE_SIZE,.word3=r.sequence};
+    completion=(struct pacha_ipc_msg){.word0=FILED_CONTROL_INLINE|r.opcode,
+        .word1=response.result,.word2=0,.word3=0};
     return 41;
 }
 static int64_t unit_ipc_recv(uint64_t fd,struct pacha_ipc_msg *msg)
@@ -216,6 +224,7 @@ static int64_t checked_mmap(uint64_t address,uint64_t length,uint64_t prot,
         (file_bytes<4096 ? file_bytes : 4096);
     if(offset<file_bytes && expected_snapshot_bytes>image-offset)
         expected_snapshot_bytes=image-offset;
+    if((prot&4u) && !offset) expected_snapshot_bytes=image;
     return lpr_linux_mmap(address,length,prot,flags,fd,offset, 0);
 }
 #define lpr_linux_mmap checked_mmap
@@ -245,6 +254,11 @@ int main(void)
     reset(); file_bytes=256ull*1024*1024;
     assert(lpr_linux_mmap(0,8192,1,2,3,128ull*1024*1024, 0)>=4096);
     assert(snapshots==1 && snapshot_bytes==8192 && !exec_snapshots);
+    reset(); expected_flags=FILED_FILE_VMO_EXEC;
+    /* The section table can follow all mapped PT_LOADs. Validate the complete
+     * initial RX file while mapping only the loader's requested extent. */
+    assert(lpr_linux_mmap(0,0x40000,5,2,3,0,0)>=4096);
+    assert(snapshot_bytes==0x49000 && mappings[0].size==0x40000);
     for(unsigned scenario=0;scenario<5;++scenario) {
         reset(); expected_flags=FILED_FILE_VMO_EXEC;
         snapshot_error=scenario==0 ? -LPR_LINUX_EACCES : -LPR_LINUX_EIO;

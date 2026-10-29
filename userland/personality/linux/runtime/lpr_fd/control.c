@@ -139,6 +139,7 @@ uint64_t lpr_backend_state_bytes_for_ops(uint8_t ops_id)
     case LPR_FD_OPS_TTY: return sizeof(lpr_tty_backend_t);
     case LPR_FD_OPS_DRM: return sizeof(lpr_drm_backend_t);
     case LPR_FD_OPS_INPUT: return sizeof(lpr_input_backend_t);
+    case LPR_FD_OPS_AUDIO: return sizeof(lpr_audio_backend_t);
     case LPR_FD_OPS_PIPE: return sizeof(lpr_pipe_backend_t);
     case LPR_FD_OPS_EVENT: return sizeof(lpr_event_backend_t);
     case LPR_FD_OPS_SOCKET: return sizeof(lpr_socket_backend_t);
@@ -165,6 +166,8 @@ static uint32_t lpr_backend_rights(uint8_t ops_id, uint64_t linux_flags)
         return common | readable | writable | LPR_FD_RIGHT_IOCTL;
     case LPR_FD_OPS_DRM:
         return common | LPR_FD_RIGHT_READ | LPR_FD_RIGHT_IOCTL | LPR_FD_RIGHT_MMAP;
+    case LPR_FD_OPS_AUDIO:
+        return common | LPR_FD_RIGHT_WRITE | LPR_FD_RIGHT_IOCTL;
     case LPR_FD_OPS_INPUT:
         return common | LPR_FD_RIGHT_READ | LPR_FD_RIGHT_IOCTL;
     case LPR_FD_OPS_PIPE:
@@ -365,6 +368,11 @@ lpr_tty_backend_t *lpr_tty_backend(uint64_t fd)
 lpr_drm_backend_t *lpr_drm_backend(uint64_t fd)
 {
     return (lpr_drm_backend_t *)lpr_backend_state_for_fd(fd, LPR_FD_OPS_DRM);
+}
+
+lpr_audio_backend_t *lpr_audio_backend(uint64_t fd)
+{
+    return (lpr_audio_backend_t *)lpr_backend_state_for_fd(fd, LPR_FD_OPS_AUDIO);
 }
 
 lpr_input_backend_t *lpr_input_backend(uint64_t fd)
@@ -735,6 +743,8 @@ int64_t lpr_control_close_fd_status(uint64_t fd)
         lpr_filed_endpoint_ready() : 0;
     lpr_fd_drop_t drop;
     const int closed = lpr_fd_table_close_pinned(&lpr_control_fd_table, &pin, &drop);
+    const int64_t lock_status=(!closed && !binding_status) ?
+        lpr_filed_close_posix_locks(&pin) : 0;
     if (binding_status && pin.ops_id == LPR_FD_OPS_FILED) {
         lpr_fd_table_lock(&lpr_control_fd_table);
         lpr_ofd_t *ofd = &lpr_control_fd_table.ofds[pin.ofd_index];
@@ -751,7 +761,8 @@ int64_t lpr_control_close_fd_status(uint64_t fd)
      * concurrent close/reuse. A failed close must still remove the old FD. */
     (void)lpr_fd_table_unpin(&lpr_control_fd_table, &pin, &drop);
     const int64_t drop_status = drop.ready ? lpr_backend_finish_drop(&drop) : 0;
-    return binding_status ? binding_status : closed ? -LPR_LINUX_EBADF : drop_status;
+    return binding_status ? binding_status : closed ? -LPR_LINUX_EBADF :
+        lock_status ? lock_status : drop_status;
 }
 
 void lpr_control_close_fd(uint64_t fd)
@@ -814,6 +825,7 @@ void lpr_control_sync_backend_flags(uint64_t fd)
     case LPR_FD_OPS_INSTALL_DISK: backend_flags = &((lpr_block_backend_t *)pin.state)->flags; break;
     case LPR_FD_OPS_TTY: backend_flags = &((lpr_tty_backend_t *)pin.state)->flags; break;
     case LPR_FD_OPS_DRM: backend_flags = &((lpr_drm_backend_t *)pin.state)->flags; break;
+    case LPR_FD_OPS_AUDIO: backend_flags = &((lpr_audio_backend_t *)pin.state)->flags; break;
     case LPR_FD_OPS_INPUT: backend_flags = &((lpr_input_backend_t *)pin.state)->flags; break;
     case LPR_FD_OPS_DMABUF: backend_flags = &((lpr_dmabuf_backend_t *)pin.state)->flags; break;
     case LPR_FD_OPS_SYNC_FILE: backend_flags = &((lpr_sync_file_backend_t *)pin.state)->flags; break;
@@ -1109,6 +1121,16 @@ static int lpr_manifest_install_first(
             return 0;
         }
     }
+    if (ofd->backend_id == LPR_FD_OPS_EVENT &&
+        ((lpr_event_backend_t *)state)->subtype == LPR_EVENT_BACKEND_EVENTFD)
+    {
+        lpr_event_backend_t *event = state;
+        event->counter_map = 0;
+        if (lpr_event_counter_map(event)) {
+            (void)lpr_backend_state_free(state, ofd->record_bytes);
+            return 0;
+        }
+    }
     const lpr_fd_install_t install = {
         .ops_id = (uint8_t)ofd->backend_id,
         .fd_flags = entry->fd_flags,
@@ -1124,6 +1146,9 @@ static int lpr_manifest_install_first(
          * discard only the speculative mapping in this address space. */
         if (ofd->backend_id == LPR_FD_OPS_DEVICE)
             (void)lpr_device_description_unmap(state);
+        if (ofd->backend_id == LPR_FD_OPS_EVENT &&
+            ((lpr_event_backend_t *)state)->subtype == LPR_EVENT_BACKEND_EVENTFD)
+            (void)lpr_event_counter_unmap(state);
         (void)lpr_backend_state_free(state, ofd->record_bytes);
         return 0;
     }

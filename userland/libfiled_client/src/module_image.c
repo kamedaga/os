@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <errno.h>
 
 static uint64_t rd64(const unsigned char *p)
 {
@@ -19,8 +20,9 @@ static int close_handle(pacha_fd_t endpoint,uint64_t handle)
     int status=filedfs_call(endpoint,&r,NULL,NULL,NULL,0,NULL,0,&response,NULL,0,NULL,NULL);
     return status ? status : response.result<0 ? (int)response.result : 0;
 }
-int filed_client_load_module_image_limited(pacha_fd_t endpoint,const char *path,
-    const char *name,size_t max_bytes,struct filed_client_module_image *out)
+static int load_module_image(pacha_fd_t endpoint,const char *path,
+    const char *name,size_t max_bytes,struct filed_client_module_image *out,
+    int optional)
 {
     if(endpoint<16 || !path || !name || !out || !max_bytes) return -22;
     memset(out,0,sizeof(*out));
@@ -28,7 +30,11 @@ int filed_client_load_module_image_limited(pacha_fd_t endpoint,const char *path,
     kb2_fs_response_t response={0};
     int status=filedfs_call(endpoint,&r,path,NULL,NULL,0,NULL,0,&response,NULL,0,NULL,NULL);
     if(!status && response.result<0) status=(int)response.result;
-    if(status) { printf("[module-image] OPEN %s status=%d\n",path,status);return status; }
+    if(status) {
+        if (!optional || status != -ENOENT)
+            printf("[module-image] OPEN %s status=%d\n",path,status);
+        return status;
+    }
     uint64_t handle=response.handle;
     unsigned char stat[KB2_FILESYSTEM_STATX_SIZE];
     r=(kb2_fs_request_t){.opcode=KB2_FILESYSTEM_OP_STATX,.handle=handle,
@@ -69,6 +75,16 @@ int filed_client_load_module_image_limited(pacha_fd_t endpoint,const char *path,
     if(!copy) return -12;
     *out=(struct filed_client_module_image){.data=copy,.size=(size_t)size,.name=name};
     return 0;
+}
+int filed_client_load_module_image_limited(pacha_fd_t endpoint,const char *path,
+    const char *name,size_t max_bytes,struct filed_client_module_image *out)
+{
+    return load_module_image(endpoint,path,name,max_bytes,out,0);
+}
+int filed_client_load_optional_module_image_limited(pacha_fd_t endpoint,const char *path,
+    const char *name,size_t max_bytes,struct filed_client_module_image *out)
+{
+    return load_module_image(endpoint,path,name,max_bytes,out,1);
 }
 int filed_client_load_module_image(pacha_fd_t endpoint,const char *path,const char *name,
     struct filed_client_module_image *out)

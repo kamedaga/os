@@ -3,6 +3,7 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "$0")/../.." && pwd)"
+source "$repo_root/pack/scripts/lib/jobs.sh"
 # The kobox2 core is pinned to nix's LLVM 18.1.8, and kbuild host tools
 # (fixdep, objtool) must link against nix's glibc and libelf. Only this build
 # enters nix; pacgo and every other build stay outside it.
@@ -10,9 +11,9 @@ if [[ -z "${IN_NIX_SHELL:-}" ]]; then
     exec nix develop "$repo_root" --command bash "$0" "$@"
 fi
 source_tree="$repo_root/kobox2/linux-sandbox"
+jobs="${JOBS:-${PACGO_BUILD_JOBS:-2}}"
 canonical="$repo_root/.artifacts/kobox2-storage-production-canonical"
 output="$repo_root/.artifacts/kobox2-storage-production"
-jobs="${JOBS:-${PACGO_BUILD_JOBS:-2}}"
 
 if [[ -n "${CAPOS_LINUX_LLVM18_BIN:-}" ]]; then
     PATH="$CAPOS_LINUX_LLVM18_BIN:$PATH"
@@ -64,8 +65,8 @@ if [[ "$(sha256sum "$canonical/.config" | cut -d' ' -f1)" != "$expected_config_d
     echo 'storage canonical config differs from its pinned profile' >&2
     exit 1
 fi
-make -C "$source_tree" O="$canonical" ARCH=x86 LLVM=-18 \
-    KBUILD_KCONFIG="$kbuild_kconfig" -j"$jobs" vmlinux modules
+pacgo_make "$jobs" -C "$source_tree" O="$canonical" ARCH=x86 LLVM=-18 \
+    KBUILD_KCONFIG="$kbuild_kconfig" vmlinux modules
 
 python3 "$source_tree/kobox/manifest/generate_boot_core_inventory.py" \
     --source-tree "$source_tree" --build-dir "$canonical" \
@@ -79,6 +80,7 @@ python3 "$source_tree/kobox/manifest/generate_closure_inventory.py" \
 identity="$(sha256sum "$canonical/.config" "$canonical/vmlinux" \
     "$canonical/vmlinux.a" | sha256sum | cut -d' ' -f1)"
 provider="$repo_root/.artifacts/kobox2-storage-providers/$identity"
+pacgo_reserve_jobs "$jobs" >/dev/null
 python3 "$source_tree/kobox/boot/build_boot_runtime.py" \
     --source-tree "$source_tree" --canonical-build-dir "$canonical" \
     --provider-build-dir "$provider" --output-dir "$output/runtime" \
@@ -86,23 +88,18 @@ python3 "$source_tree/kobox/boot/build_boot_runtime.py" \
     --llvm=-18 --ar llvm-ar-18 --nm llvm-nm-18 \
     --objdump llvm-objdump-18 --objcopy llvm-objcopy-18 \
     --module-inventory "$output/closure-inventory.json" \
-    --link --jobs "$jobs"
-bash "$repo_root/userland/kobox2_adapter/build-sandbox.sh" \
-    "$output/sandbox.elf" --storage
-install -m 0555 "$output/sandbox.elf" "$output/package/sandbox.elf"
+    --link --jobs "$PACGO_RESERVED_JOBS"
+pacgo_release_jobs
+printf '%s\n' "${provider#"$repo_root/"}" > "$output/provider-kbuild-dir"
+# storage_sandbox adds sandbox.elf and publishes the bootfs package directory.
 python3 "$source_tree/kobox/manifest/build_pci_package.py" \
     --inventory "$output/closure-inventory.json" \
-    --runtime-dir "$output/runtime" --output-dir "$output/package" \
+    --runtime-dir "$output/runtime" --output-dir "$output/pci-package" \
     --protocol-dir "$repo_root/kobox2/protocol" --profile storage \
     --generator-dir "$output/manifest-build"
 
 if llvm-nm-18 --defined-only "$output/runtime/linux-boot-runtime.so" |
     rg ' [TtDdBb] (drm_|kobox_linux_drm_|kobox_linux_input_port_)'; then
     echo 'GPU/USB input service leaked into the storage hosted core' >&2
-    exit 1
-fi
-if nm --defined-only "$output/package/sandbox.elf" |
-    rg ' [TtDdBb] (gpud_gpu_|ph_gpu_|ph_usb_input_|ph_net_frame_)'; then
-    echo 'GPU/USB input service leaked into the storage sandbox' >&2
     exit 1
 fi

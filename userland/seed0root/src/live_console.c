@@ -54,6 +54,7 @@ struct live_console {
     VTermScreen *screen;
     VTermPos cursor;
     int cursor_visible;
+    int display_handed_off;
     unsigned modifiers;
     char pending[4096];
     size_t pending_len;
@@ -966,9 +967,25 @@ void live_console_finish_boot(struct live_console *console)
     render(console);
 }
 
+void live_console_report_installer_error(struct live_console *console, int status)
+{
+    if (!console) return;
+    char line[192];
+    (void)snprintf(line,sizeof(line),
+        "Installer startup failed: %d. Recovery shell.\r\n"
+        "Details: /run/pacha/installer-boot-status\r\n",status);
+    vterm_input_write(console->vt,line,strlen(line));
+    console->redraw=1;
+    render(console);
+}
+
 int live_console_step(struct live_console *console)
 {
     if (console == NULL) return -22;
+    /* The GPU owner still relies on this process's control endpoint. After
+     * handoff, neither background TTY/input failures nor desktop keystrokes
+     * belong to the boot console. Its timer loop keeps supervising services. */
+    if (console->display_handed_off) return 0;
     int changed = 0;
     int status = scan_inputs(console);
     if (status == 0) {
@@ -1023,6 +1040,11 @@ int live_console_release_framebuffer(struct live_console *console)
         console->framebuffer_reservation = NULL;
         console->framebuffer_reservation_size = 0;
     }
+    console->display_handed_off = 1;
+    console->pending_len = 0;
+    console->modifiers = 0;
+    for (size_t i = 0; i < console->slot_count; ++i)
+        input_slot_close(console, i);
     return 0;
 }
 

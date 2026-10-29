@@ -17,6 +17,7 @@ if [[ "$mode" == profile ]]; then flags+=(-DPH_FS_STORAGE_PROFILE=1); fi
   -I "$protocol/include" -I "$protocol/generated/include" \
   "$repo_root/tests/kobox2_fs_queue_unit.c" \
   "$repo_root/userland/kobox2_adapter/fs_queue.c" \
+  "$repo_root/userland/kobox2_adapter/wait_retained.c" \
   "$repo_root/userland/kobox2_owner/fs_channel.c" \
   "$protocol/src/filesystem.c" "$protocol/src/protocol.c" \
   "$protocol/src/virtqueue.c" "$protocol/src/virtqueue_memory.c" \

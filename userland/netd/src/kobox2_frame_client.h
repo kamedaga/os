@@ -21,6 +21,13 @@ int netd_kobox2_frame_read(struct netd_kobox2_frame_client *client,
     size_t *count);
 int netd_kobox2_frame_write(struct netd_kobox2_frame_client *client,
     struct ph_ipc *ipc, pacha_fd_t process_fd, const void *frame, size_t length);
+int netd_kobox2_wifi_request(struct netd_kobox2_frame_client *client,
+    struct ph_ipc *ipc, pacha_fd_t process_fd, const void *command, size_t length,
+    void *reply, size_t capacity, size_t *received);
+int netd_kobox2_wifi_configure(struct netd_kobox2_frame_client *client,
+    struct ph_ipc *ipc, pacha_fd_t process_fd, const void *configuration, size_t length);
+int netd_kobox2_wifi_events(struct netd_kobox2_frame_client *client,
+    struct ph_ipc *ipc, pacha_fd_t process_fd, uint32_t *events);
 int netd_kobox2_frame_close(struct netd_kobox2_frame_client *client);
 
 #endif

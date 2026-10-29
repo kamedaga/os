@@ -12,10 +12,18 @@ extern "C" {
 
 enum {
     PACHA_CAPSULE_KIND_DEVICE = 2,
-    PACHA_CAPSULE_KIND_MMIO = 3,
-    PACHA_CAPSULE_KIND_DMA_BUFFER = 4,
-    PACHA_CAPSULE_KIND_DMA_MAPPING = 5,
-    PACHA_CAPSULE_KIND_IRQ = 6,
+    PACHA_CAPSULE_KIND_PLATFORM_DEVICE = 3,
+    PACHA_CAPSULE_KIND_MMIO = 4,
+    PACHA_CAPSULE_KIND_DMA_BUFFER = 5,
+    PACHA_CAPSULE_KIND_DMA_MAPPING = 6,
+    PACHA_CAPSULE_KIND_IRQ = 7,
+    PACHA_PLATFORM_DEVICE_I8042 = 1,
+    PACHA_PLATFORM_IRQ_ACTIVE_LOW = 1,
+    PACHA_PLATFORM_IRQ_LEVEL = 2,
+    PACHA_PLATFORM_FADT_8042 = 1,
+    /* All writes to either controller port require this authority: a data
+     * byte can finish a previous owner's reset-capable controller command. */
+    PACHA_PLATFORM_CONTROLLER_WRITE = 2,
 
     PACHA_CAPSULE_DMA_TO_DEVICE = 1,
     PACHA_CAPSULE_DMA_FROM_DEVICE = 2,
@@ -52,6 +60,7 @@ enum {
      * alone are not evidence of isolation. Absent on a quarantined device. */
     PACHA_CAPSULE_DMA_TRANSLATED = UINT64_C(1) << 33,
     PACHA_CAPSULE_IRQ_RETIRED = UINT64_C(1) << 34,
+    PACHA_CAPSULE_PLATFORM_SOURCE = UINT64_C(1) << 35,
 
     PACHA_CAPSULE_IRQ_CURRENT_COUNT = UINT64_MAX,
 };
@@ -78,6 +87,26 @@ struct pacha_capsule_bar_info {
     uint64_t size;
     uint64_t flags;
 };
+
+struct pacha_capsule_platform_function {
+    uint64_t resource_id;
+    uint64_t kind;
+    uint64_t data_port;
+    uint64_t command_port;
+    uint64_t irq;
+    uint64_t gsi;
+    uint64_t irq_flags;
+    uint64_t flags;
+};
+
+long pacha_capsule_platform_function_count(void);
+int pacha_capsule_platform_function_at(uint64_t index, struct pacha_capsule_platform_function *out);
+pacha_fd_t pacha_capsule_platform_claim(uint64_t index);
+/* Byte accesses only. Either port's write requires WRITE + CONTROLLER_WRITE. */
+int pacha_capsule_io_read(pacha_fd_t fd, uint16_t port, unsigned width, uint32_t *out);
+int pacha_capsule_io_write(pacha_fd_t fd, uint16_t port, unsigned width, uint32_t value);
+/* Platform IRQs start masked. Masking also drains pending CPU delivery. */
+int pacha_capsule_irq_set_mask(pacha_fd_t fd, unsigned masked);
 
 struct pacha_capsule_pci_function {
     uint64_t resource_id;

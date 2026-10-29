@@ -67,6 +67,7 @@ def check(sources):
             if not re.search(r'lock_diagnostics\.assertRootEmpty\(\);\s*$', prefix):
                 errors.append(name + ': noreturn AP transition abandons unchecked holds')
     syscalls = code_only(sources['syscalls.zig'])
+    syscalls_raw = sources['syscalls.zig']
     compact = lambda code: re.sub(r'\s+', '', code)
     admission = compact(function_body(syscalls, 'interruptCanCompleteUserWait'))
     if admission != 'returnfrom_userorscheduler.currentCpuInLockFreeIdleWait();':
@@ -103,8 +104,36 @@ def check(sources):
         if timer.count(call) != 1:
             errors.append('timer IRQ: interrupted user mode must reach every copyout admission')
     device = compact(function_body(traps, 'deviceInterruptDispatch'))
-    if device.count('completePendingIrqFdWaitersFromInterrupt((frame.cs&3)==3and(frame.ss&3)==3)') != 1:
+    if device.count('completeDeviceIrqFdWaitersFromInterrupt((frame.cs&3)==3and(frame.ss&3)==3)') != 1:
         errors.append('device IRQ: interrupted privilege must reach copyout admission')
+    # The device entry publishes the pending hint before probing K (Dekker with
+    # the owner's post-release fence), then takes the ordinary admission path.
+    wrapper = compact(function_body(syscalls, 'completeDeviceIrqFdWaitersFromInterrupt'))
+    if wrapper != ('@atomicStore(bool,&irq_fd_completion_pending,true,.seq_cst);'
+                   'completePendingIrqFdWaitersFromInterrupt(from_user);'):
+        errors.append('device IRQ: pending hint must be published before the K probe')
+    # Handoff runs only after an eligible IRQ released K, never ahead of the
+    # privilege gate, and rechecks the shootdown guard before each tryLock.
+    admission = compact(function_body(syscalls, 'completePendingIrqFdWaitersFromInterrupt'))
+    if (not admission.endswith('kernel_state_lock.unlock();handOffIrqFdWaitersAfterRelease();')
+            or admission.count('handOffIrqFdWaitersAfterRelease(') != 1):
+        errors.append('IRQ FD admission: handoff must follow its own K release')
+    handoff = compact(function_body(syscalls, 'handOffIrqFdWaitersAfterRelease'))
+    # code_only drops string literals; bind the barrier's mnemonic on raw text.
+    if compact(function_body(syscalls_raw, 'handOffIrqFdWaitersAfterRelease')).count('asmvolatile("mfence":::.{.memory=true});') != 1:
+        errors.append('IRQ FD handoff: release->hint store-load barrier missing')
+    order = [handoff.find(token) for token in (
+        'asmvolatile(:::.{.memory=true});',
+        '@atomicLoad(bool,&irq_fd_completion_pending,.monotonic)',
+        'user_copy.tlbShootdownActiveOnCurrentCpu()',
+        'kernel_state_lock.tryLock()',
+        'completePendingIrqFdWaitersLocked(h);',
+        'kernel_state_lock.unlock();')]
+    if min(order) < 0 or order != sorted(order):
+        errors.append('IRQ FD handoff: fence, hint, shootdown guard and K must stay ordered')
+    worker = compact(function_body(syscalls, 'completePendingIrqFdWaitersLocked'))
+    if not worker.startswith('_=@atomicRmw(bool,&irq_fd_completion_pending,.Xchg,false,.acquire);'):
+        errors.append('IRQ FD worker: pending hint must be consumed before the scan')
     # Each audited primitive must serialize CAS + intrusive publication with
     # local IRQs. These are actual method bodies, not test-only model locks.
     for path, marker, class_name in (
@@ -223,7 +252,16 @@ def main():
         ('syscalls.zig', 'if (!interruptCanCompleteUserWait(from_user)) return;', ''),
         ('syscalls.zig', '!interruptCanCompleteUserWait(from_user) or ', ''),
         ('traps.zig', 'completePendingIrqFdWaitersFromInterrupt(user_mode)', 'completePendingIrqFdWaitersFromInterrupt(true)'),
-        ('traps.zig', 'completePendingIrqFdWaitersFromInterrupt((frame.cs & 3) == 3 and (frame.ss & 3) == 3)', 'completePendingIrqFdWaitersFromInterrupt(true)'),
+        ('traps.zig', 'completeDeviceIrqFdWaitersFromInterrupt((frame.cs & 3) == 3 and (frame.ss & 3) == 3)', 'completeDeviceIrqFdWaitersFromInterrupt(true)'),
+        ('traps.zig', 'completeDeviceIrqFdWaitersFromInterrupt((frame.cs & 3) == 3 and (frame.ss & 3) == 3)', 'completePendingIrqFdWaitersFromInterrupt((frame.cs & 3) == 3 and (frame.ss & 3) == 3)'),
+        ('syscalls.zig', '    @atomicStore(bool, &irq_fd_completion_pending, true, .seq_cst);\n    completePendingIrqFdWaitersFromInterrupt(from_user);',
+         '    completePendingIrqFdWaitersFromInterrupt(from_user);\n    @atomicStore(bool, &irq_fd_completion_pending, true, .seq_cst);'),
+        ('syscalls.zig', '    kernel_state_lock.unlock();\n    // This context passed the copyout checks above, so it can also take over\n    // a device IRQ that lost tryLock to this hold.\n    handOffIrqFdWaitersAfterRelease();',
+         '    handOffIrqFdWaitersAfterRelease();\n    kernel_state_lock.unlock();'),
+        ('syscalls.zig', 'asm volatile ("mfence" ::: .{ .memory = true });', 'asm volatile ("" ::: .{ .memory = true });'),
+        ('syscalls.zig', '        if (user_copy.tlbShootdownActiveOnCurrentCpu()) return;\n        if (!kernel_state_lock.tryLock()) return;\n        const h = getHooks();',
+         '        if (!kernel_state_lock.tryLock()) return;\n        const h = getHooks();'),
+        ('syscalls.zig', '    _ = @atomicRmw(bool, &irq_fd_completion_pending, .Xchg, false, .acquire);\n', ''),
         (PATHS[0], 'lock_diagnostics.beforeAcquire(', 'bypass.beforeAcquire('),
         (PATHS[0], 'lock_diagnostics.acquired(', 'bypass.acquired('),
         (PATHS[0], 'lock_diagnostics.releasing(', 'bypass.releasing('),

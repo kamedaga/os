@@ -4,6 +4,69 @@ const kernel = @import("kernel.zig");
 var invocation_allocator = kernel.InvocationStorageTestAllocator{};
 const mtrr = @import("arch/x86_64/mtrr.zig");
 
+test "MMIO overlay pager admission survives unrelated RAM cache policy" {
+    const copy = @import("user_copy.zig");
+    const policy = @import("memory/ram_cache_policy.zig");
+    var fixture = try MmioRetirementFixture.start();
+    defer fixture.end();
+    defer copy.publishRamCacheSnapshot(null);
+    const state = fixture.state;
+    const client = kernel.processPrincipalFromIndex(1).?;
+    const port = try state.createPagerPortFd(owner, .{}, 16);
+    const fd = try state.createPagerVmoFd(owner, 8192, .{
+        .close = true,
+        .map_read = true,
+        .map_write = true,
+        .map_exec = true,
+        .pager_attach = true,
+    }, .{}, 16);
+    _ = try state.attachPagerVmo(owner, port, fd, 1);
+    const ref = state.nativeVmoRefForFd(owner, fd).?;
+    // The resolver must still distinguish a missing pager source from an
+    // anonymous zero page; only mapping admission may accept that absence.
+    try std.testing.expectEqual(@as(?u64, null), state.nativeVmoResolvedPagePaddrOrZero(ref, 0));
+    _ = try state.mmapFdIntoProcess(owner, fd, client, base, 8192, .{ .read = true, .exec = true }, .{ .private = true }, 0);
+    const spans = [_]policy.Span{.{ .base = physical, .bytes = 4096, .owner = 9, .mode = .wc, .pat_slot = 4 }};
+    const active: policy.Snapshot = .{ .policy = &spans };
+    copy.publishRamCacheSnapshot(&active);
+    _ = try state.mmapFdIntoProcess(owner, fd, client, base + 8192, 8192, .{ .read = true, .write = true }, .{ .private = true }, 0);
+    _ = try state.mmapFdIntoProcess(owner, fd, client, base + 16384, 8192, .{ .read = true, .exec = true }, .{ .private = true }, 0);
+    try state.setVmaProtRange(client, base, 8192, .{ .read = true });
+    try state.setVmaProtRange(client, base, 8192, .{ .read = true, .exec = true });
+    try std.testing.expectEqual(@as(?u64, null), state.nativeVmoResolvedPagePaddrOrZero(ref, 0));
+    try std.testing.expect(state.nativeVmoUnsuppliedPagerPage(ref, 0));
+    try std.testing.expect(!state.nativeVmoUnsuppliedPagerPage(ref, 2));
+    try std.testing.expect(!state.nativeVmoUnsuppliedPagerPage(.{ .index = ref.index, .generation = ref.generation + 1 }, 0));
+
+    const slot = state.nativeVmoSlot(ref).?;
+    const store_owner = slot.page_store_owner;
+    slot.page_store_owner ^= 1;
+    try std.testing.expect(!state.nativeVmoUnsuppliedPagerPage(ref, 0));
+    try std.testing.expectError(kernel.KernelError.InvalidState, state.mmapFdIntoProcess(owner, fd, client, base + 24576, 8192, .{ .read = true }, .{ .private = true }, 0));
+    slot.page_store_owner = store_owner;
+    try std.testing.expectError(kernel.KernelError.InvalidState, state.mmapFd(owner, fd, base + 24576, 8192, .{ .read = true }, .{ .private = true }, 0));
+
+    // Once supplied, the same pager must undergo the normal physical cache
+    // checks; accepting holes must not exempt its resident pages.
+    copy.publishRamCacheSnapshot(null);
+    try fixture.free_list.installRegions(&.{.{ .id = 0, .start = physical, .end = physical + 16 * 4096 }});
+    try fixture.free_list.seedContiguousRange(physical, 16);
+    const supplied = (try state.allocPhysicalPage(fixture.free_list)).paddr;
+    try state.publishPagerPages(ref, 0, &.{supplied}, fixture.free_list);
+    try std.testing.expect(!state.nativeVmoUnsuppliedPagerPage(ref, 0));
+    try std.testing.expectEqual(@as(?u64, supplied), state.nativeVmoResolvedPagePaddrOrZero(ref, 0));
+    const resident_spans = [_]policy.Span{.{ .base = supplied, .bytes = 4096, .owner = 9, .mode = .wc, .pat_slot = 4 }};
+    const cached: policy.Snapshot = .{ .policy = &resident_spans };
+    const pending: policy.Snapshot = .{ .pending = &resident_spans };
+    for ([_]*const policy.Snapshot{ &cached, &pending }) |snapshot_policy| {
+        copy.publishRamCacheSnapshot(snapshot_policy);
+        for ([_]kernel.VmaProt{ .{ .read = true, .exec = true }, .{ .read = true, .write = true } }) |prot|
+            try std.testing.expectError(kernel.KernelError.InvalidState, state.mmapFdIntoProcess(owner, fd, client, base + 24576, 8192, prot, .{ .private = true }, 0));
+    }
+    copy.publishRamCacheSnapshot(null);
+    _ = try state.mmapFdIntoProcess(owner, fd, client, base + 24576, 8192, .{ .read = true, .exec = true }, .{ .private = true }, 0);
+}
+
 test "MMIO overlay overflow storage tests" {
     _ = @import("memory/pt_storage.zig");
     _ = @import("page_fault_log.zig");
@@ -971,6 +1034,15 @@ test "MMIO overlay COW invalidates before releasing shared dirty backing" {
     try free_list.installRegions(&.{.{ .id = 0, .start = physical, .end = (physical) + (16) * 4096 }});
     try free_list.seedContiguousRange(physical, 16);
     _ = try state.createAnonymousVmaWithPages(owner, base, 4096, .{ .read = true, .write = true }, .{ .read = true, .write = true }, .{ .private = true, .anonymous = true, .fork_cow = true }, &free_list);
+    const source = try state.allocPhysicalPage(&free_list);
+    const vmo = state.vmaEntryForVaConst(owner, base).?.vmo;
+    _ = try state.resolveOrInstallNativeVmoPage(vmo, 0, source.paddr, &free_list);
+    const pristine = state.nativeVmaInitialMapping(owner, base).?.paddr;
+    const pristine_free = free_list.len;
+    try state.setVmaProtRange(owner, base, 4096, .{});
+    try std.testing.expectEqual(pristine, state.nativeVmaInitialMapping(owner, base).?.paddr);
+    try std.testing.expectEqual(pristine_free, free_list.len);
+    try state.setVmaProtRange(owner, base, 4096, .{ .read = true, .write = true });
     const initial = state.ensureNativeVmaCowMappingLockedSlow(owner, base, true, false, &free_list) orelse return error.TestUnexpectedResult;
     const old_ref = state.vmaEntryForVaConst(owner, base).?.cow_table;
     const child = kernel.processPrincipalFromIndex(1).?;
@@ -996,6 +1068,13 @@ test "MMIO overlay COW invalidates before releasing shared dirty backing" {
     try std.testing.expectEqual(@as(u64, 0), resolved.invalidate_size_bytes);
     try std.testing.expect(state.nativeCowTableIsUnique(old_ref));
     try std.testing.expectEqual(before_fork - 1, free_list.len);
+    // Residency survives PTE protection withdrawal: both pristine VMO backing
+    // above and this private dirty/COW page retain their owning references.
+    try state.setVmaProtRange(owner, base, 4096, .{});
+    try std.testing.expectEqual(resolved.paddr, state.entryDirtyPagePaddr(state.vmaEntryForVaConst(owner, base).?, base).?);
+    try std.testing.expectEqual(before_fork - 1, free_list.len);
+    try state.setVmaProtRange(owner, base, 4096, .{ .read = true, .write = true });
+    try std.testing.expectEqual(resolved.paddr, state.nativeVmaInitialMapping(owner, base).?.paddr);
     state.releasePrincipalNativeMemory(owner, &free_list);
     state.releasePrincipalNativeMemory(child, &free_list);
     try std.testing.expectEqual(@as(usize, 16), free_list.len);

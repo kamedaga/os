@@ -67,6 +67,9 @@ pub const DmarInfo = struct {
     pub fn drhds(self: DmarInfo) Drhds {
         return .{ .bytes = self.structures };
     }
+    pub fn rmrrs(self: DmarInfo) Rmrrs {
+        return .{ .bytes = self.structures };
+    }
     pub fn drhdAt(self: DmarInfo, index: usize) Drhd {
         var it = self.drhds();
         for (0..index) |_| _ = it.next().?;
@@ -74,6 +77,27 @@ pub const DmarInfo = struct {
     }
     pub fn hostAddressWidthBits(self: DmarInfo) u16 {
         return @as(u16, self.host_address_width) + 1;
+    }
+};
+
+pub const Rmrr = struct {
+    segment: u16,
+    base: u64,
+    last: u64,
+    scope_bytes: []const u8,
+    pub fn scopes(self: Rmrr) Scopes { return .{ .bytes = self.scope_bytes }; }
+};
+pub const Rmrrs = struct {
+    bytes: []const u8,
+    pub fn next(self: *Rmrrs) ?Rmrr {
+        while (self.bytes.len != 0) {
+            const bytes = self.bytes[0..readLe16(self.bytes, 2)];
+            self.bytes = self.bytes[bytes.len..];
+            if (readLe16(bytes, 0) != 1) continue;
+            return .{ .segment = readLe16(bytes, 6), .base = readLe64(bytes, 8),
+                .last = readLe64(bytes, 16), .scope_bytes = bytes[24..] };
+        }
+        return null;
     }
 };
 

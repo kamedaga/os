@@ -15,6 +15,10 @@ enum netd_libuinet_state {
 };
 
 int netd_libuinet_start(struct netd_runtime *runtime);
+/* Admission closes before changing Wi-Fi networks. DHCP uses the separate
+ * raw frame path; cached IPv4 sockets must not emit an old LAN's address. */
+void netd_libuinet_ipv4_suspend(void);
+int netd_libuinet_reconfigure(struct netd_runtime *runtime);
 int netd_libuinet_receive_frame(const struct netd_upper_frame *frame);
 void netd_libuinet_poll(void);
 int netd_libuinet_collect_runtime_wait_sources(

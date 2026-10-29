@@ -1,6 +1,7 @@
 #include "lpr_linux_syscall.h"
 #include "lpr_filed_internal.h"
 #include "lpr_memory.h"
+#include "lpr_mlock.h"
 #include "lpr_random.h"
 #include "lpr_socket.h"
 #include <unixd/profile.h>
@@ -9,6 +10,7 @@
 #include "support/syscall.h"
 #include "support/mmap_profile.h"
 #include "lpr_wait_trace.h"
+#include "lpr_futex_wake_op.h"
 #include <pacha/ipc.h>
 #include <pacha/status.h>
 #include <pacha/trace.h>
@@ -38,6 +40,7 @@
 #define LPR_LINUX_FUTEX_WAIT 0ull
 #define LPR_LINUX_FUTEX_WAKE 1ull
 #define LPR_LINUX_FUTEX_REQUEUE 3ull
+#define LPR_LINUX_FUTEX_WAKE_OP 5ull
 #define LPR_LINUX_FUTEX_LOCK_PI 6ull
 #define LPR_LINUX_FUTEX_UNLOCK_PI 7ull
 #define LPR_LINUX_FUTEX_TRYLOCK_PI 8ull
@@ -53,6 +56,7 @@ static uint64_t lpr_linux_prot_to_pacha(uint64_t prot);
 static uint32_t lpr_linux_private_expedited_registered;
 
 #include "lpr_gui_profile.h"
+#include "lpr_ephy_profile.h"
 #include "lpr_frame_anchor.h"
 
 const struct lpr_linux_user_frame *lpr_current_linux_user_frame(void)
@@ -1049,7 +1053,7 @@ static void lpr_dbus_wait_diag_log(
                 if (event != 0) {
                     event_state =
                         (__atomic_load_n(
-                             &event->counter, __ATOMIC_ACQUIRE) << 1u) |
+                             lpr_event_counter(event), __ATOMIC_ACQUIRE) << 1u) |
                         __atomic_load_n(
                             &event->notify_pending, __ATOMIC_ACQUIRE);
                     native_wait_fd = event->wait_fd.raw;
@@ -1090,7 +1094,7 @@ static void lpr_dbus_wait_diag_log(
                     if (event != 0) {
                         event_state =
                             (__atomic_load_n(
-                                 &event->counter,
+                                 lpr_event_counter(event),
                                  __ATOMIC_ACQUIRE) << 1u) |
                             __atomic_load_n(
                                 &event->notify_pending,
@@ -2242,11 +2246,14 @@ int64_t lpr_backend_mmap(uint64_t addr, uint64_t len, uint64_t prot, uint64_t fl
             requested_end > whole_file_map_len;
         const uint64_t direct_file_map_len = split_file_image ?
             whole_file_map_len - offset : map_len;
-        /* Each mmap needs only its file range, not a second complete image
-         * for every PT_LOAD. Whole-file snapshots multiply LLVM-sized images
-         * and keep unrelated pages alive for the lifetime of each VMA. */
+        /* Offset-zero executable images need the complete ELF metadata:
+         * section tables/debug symbols can follow the last mapped PT_LOAD.
+         * FileD's pager validates that snapshot but supplies only mapped pages.
+         * Other PT_LOADs retain range snapshots rather than multiplying whole
+         * LLVM-sized images for every segment. */
         const uint64_t snapshot_offset = offset < whole_file_bytes ? offset : 0;
-        const uint64_t snapshot_length = offset < whole_file_bytes ? direct_file_map_len :
+        const uint64_t snapshot_length = executable && offset==0 ? whole_file_map_len :
+            offset < whole_file_bytes ? direct_file_map_len :
             (whole_file_bytes < 4096 ? whole_file_bytes : 4096);
         int64_t authorized_vmo = -1;
         int authorized_pager = 0, pager_rx_mapping = 0;
@@ -2263,8 +2270,10 @@ int64_t lpr_backend_mmap(uint64_t addr, uint64_t len, uint64_t prot, uint64_t fl
             authorized_vmo = lpr_linux_file_vmo(
                 fd, snapshot_offset, snapshot_length, 1, &authorized_loaded, &authorized_offset,
                 &authorized_pager);
-            if (authorized_vmo < 16)
+            if (authorized_vmo < 16) {
+                lpr_trace_mmap_error("exec_file_vmo",addr,len,prot,flags,fd,offset,authorized_vmo);
                 return authorized_vmo < 0 ? authorized_vmo : -LPR_LINUX_EIO;
+            }
         }
         if (split_file_image) {
             lpr_startup_profile_mmap_route(
@@ -2355,6 +2364,7 @@ int64_t lpr_backend_mmap(uint64_t addr, uint64_t len, uint64_t prot, uint64_t fl
                 }
                 lpr_startup_profile_mmap_route(
                     LPR_STARTUP_MMAP_ROUTE_FILE_VMO_MAP_FAILED);
+                lpr_trace_mmap_error("private_file_image",addr,len,prot,flags,fd,offset,mapped);
                 (void)lpr_pacha_syscall1(
                     PACHAOS_SYSCALL_FD_CLOSE,
                     (uint64_t)(uint32_t)file_vmo_fd);
@@ -2567,41 +2577,34 @@ static int64_t lpr_dispatch_msync(uint64_t addr, uint64_t len, uint64_t flags)
     return lpr_linux_sync();
 }
 
-static uint32_t lpr_linux_online_cpu_count(void)
-{
-    uint32_t eax = 0;
-    uint32_t ebx = 0;
-    uint32_t ecx = 0;
-    uint32_t edx = 0;
-    __asm__ volatile("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx) : "a"(0), "c"(0));
-    const uint32_t max_leaf = eax;
-    uint32_t count = 0;
-    if (max_leaf >= 0xbu) {
-        for (uint32_t level = 0; level < 8; level++) {
-            __asm__ volatile("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx) : "a"(0xbu), "c"(level));
-            if (ebx == 0) break;
-            if (((ecx >> 8u) & 0xffu) == 2u) count = ebx & 0xffffu;
-        }
-    }
-    if (count == 0 && max_leaf >= 1u) {
-        __asm__ volatile("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx) : "a"(1), "c"(0));
-        count = (ebx >> 16u) & 0xffu;
-    }
-    if (count == 0) count = 1;
-    if (count > 4u) count = 4u;
-    return count;
-}
-
 static int64_t lpr_dispatch_sched_getaffinity(uint64_t tid, uint64_t size, uint64_t mask_raw)
 {
-    const uint64_t kernel_mask_bytes = sizeof(uint64_t);
     if (mask_raw == 0) return -LPR_LINUX_EFAULT;
-    if (size < kernel_mask_bytes) return -LPR_LINUX_EINVAL;
+    if (size < sizeof(uint64_t)) return -LPR_LINUX_EINVAL;
     if (!lpr_linux_thread_exists(tid)) return -LPR_LINUX_ESRCH;
-    const uint32_t cpu_count = lpr_linux_online_cpu_count();
-    *(uint64_t *)(uintptr_t)mask_raw = (1ull << cpu_count) - 1ull;
-    return (int64_t)kernel_mask_bytes;
+
+    /* CPUID topology describes a package, not the CPUs online in this OS.
+     * Use the same native inventory as /proc/cpuinfo and /proc/stat. No
+     * per-thread affinity restriction is currently supported by LPR. */
+    pachaos_system_info_t info = {0};
+    const int64_t status = lpr_linux_pacha_status_to_errno(lpr_pacha_syscall1(
+        PACHAOS_SYSCALL_SYSTEM_INFO, (uint64_t)(uintptr_t)&info));
+    if (status != 0) return status;
+    const uint64_t count = info.online_cpu_count;
+    if (count == 0) return -LPR_LINUX_EIO;
+    const uint64_t words = count / 64u + (count % 64u != 0);
+    const uint64_t bytes = words * sizeof(uint64_t);
+    if (size < bytes) return -LPR_LINUX_EINVAL;
+    if (!lpr_user_range_plausible(mask_raw, bytes)) return -LPR_LINUX_EFAULT;
+    for (uint64_t i = 0; i < words; ++i) {
+        uint64_t mask = UINT64_MAX;
+        if (i == words - 1u && count % 64u != 0)
+            mask = (UINT64_C(1) << (count % 64u)) - 1u;
+        lpr_memcpy((void *)(uintptr_t)(mask_raw + i * sizeof(mask)), &mask, sizeof(mask));
+    }
+    return (int64_t)bytes;
 }
+
 
 typedef int64_t (*lpr_syscall_handler_t)(
     uint64_t a0,
@@ -2647,7 +2650,13 @@ static int64_t lpr_sys_lstat(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
 static int64_t lpr_sys_lseek(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a3; (void)a4; (void)a5; return lpr_linux_lseek(a0, a1, a2); }
 static int64_t lpr_sys_mmap(uint64_t a0, uint64_t a1, uint64_t a2,
     uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) {
-    return lpr_linux_mmap(a0, a1, a2, a3, a4, a5, wait_not_ready);
+    if (!(a3&LPR_LINUX_MAP_FIXED)) return lpr_linux_mmap(a0,a1,a2,a3,a4,a5,wait_not_ready);
+    const int64_t status=lpr_mlock_vm_begin();
+    if (status) return status;
+    const int64_t result=lpr_linux_mmap(a0,a1,a2,a3,a4,a5,wait_not_ready);
+    if (result>=0) lpr_mlock_forget((uint64_t)result,a1);
+    lpr_mlock_vm_end();
+    return result;
 }
 static int64_t lpr_sys_mremap(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a5; return lpr_linux_mremap(a0, a1, a2, a3, a4); }
 static int64_t lpr_sys_madvise(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused)))
@@ -2655,6 +2664,24 @@ static int64_t lpr_sys_madvise(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a
     (void)a3; (void)a4; (void)a5;
     return pacha_kernel_status_to_errno(lpr_pacha_syscall3(PACHA_VM_SYSCALL_MADVISE, a0, a1, a2));
 }
+static int64_t lpr_mprotect_native_range(uint64_t address, uint64_t length, uint64_t prot)
+{
+    const int64_t status = lpr_pacha_syscall3(
+        PACHAOS_SYSCALL_MPROTECT, address, length, prot);
+    if (status != PACHA_SYSCALL_ERR_INVALID || length <= 4096u) return status;
+
+    /* Native MPROTECT accepts one VMA; Linux accepts adjacent mappings too.
+     * Split only a rejected range, retaining the single-call common path and
+     * native permission checks. Page-aligned halves bound recursion by address
+     * width without duplicating the kernel's VMA table in this personality.
+     * Stop on the first error: Linux also permits earlier pages to have changed
+     * when a later part of an mprotect range cannot be protected. */
+    const uint64_t first = (length / 2u) & ~4095ull;
+    const int64_t first_status = lpr_mprotect_native_range(address, first, prot);
+    if (first_status != 0) return first_status;
+    return lpr_mprotect_native_range(address + first, length - first, prot);
+}
+
 static int64_t lpr_sys_mprotect(
     uint64_t a0,
     uint64_t a1,
@@ -2666,11 +2693,13 @@ static int64_t lpr_sys_mprotect(
     (void)a3;
     (void)a4;
     (void)a5;
-    const int64_t status = lpr_pacha_syscall3(
-        PACHAOS_SYSCALL_MPROTECT,
-        a0,
-        a1,
-        lpr_linux_prot_to_pacha(a2));
+    if ((a0 & 4095u) != 0 || a1 > UINT64_MAX - 4095u)
+        return -LPR_LINUX_EINVAL;
+    const uint64_t length = (a1 + 4095u) & ~4095ull;
+    if (a0 > UINT64_MAX - length) return -LPR_LINUX_EINVAL;
+    if (length == 0) return 0;
+    const int64_t status = lpr_mprotect_native_range(
+        a0, length, lpr_linux_prot_to_pacha(a2));
     if (status != 0) {
         lpr_trace_mmap_error(
             "mprotect",
@@ -2701,11 +2730,15 @@ static int64_t lpr_sys_munmap(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3
         };
         if (lpr_memcmp(next, unmapself_tail, sizeof(unmapself_tail)) == 0) {
             lpr_trace_mmap_call("unmapself", a0, a1, 0, 0, 0, 0, 0);
-            lpr_linux_unmapself_exit(a0, a1);
+            return lpr_linux_unmapself_exit(a0, a1);
         }
     }
+    const int64_t lock_status=lpr_mlock_vm_begin();
+    if (lock_status) return lock_status;
     const int64_t result = lpr_linux_pacha_status_to_errno(
         lpr_drm_native_munmap(a0, a1));
+    if (!result) lpr_mlock_forget(a0,a1);
+    lpr_mlock_vm_end();
     lpr_trace_mmap_call("munmap", a0, a1, 0, 0, 0, 0, result);
     return result;
 }
@@ -2773,6 +2806,7 @@ static int64_t lpr_sys_execve(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3
 static int64_t lpr_sys_exit(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; lpr_linux_exit_thread(a0); }
 static int64_t lpr_sys_exit_group(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; lpr_linux_exit_group(a0); }
 static int64_t lpr_sys_wait4(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a4; (void)a5; return lpr_linux_wait4(a0, a1, a2, a3, wait_not_ready); }
+static int64_t lpr_sys_waitid(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready) { (void)a5; return lpr_linux_waitid(a0, a1, a2, a3, a4, wait_not_ready); }
 static int64_t lpr_sys_kill(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_kill(a0, a1); }
 static int64_t lpr_sys_tkill(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_tkill(a0, a1); }
 static int64_t lpr_sys_tgkill(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a3; (void)a4; (void)a5; return lpr_linux_tgkill(a0, a1, a2); }
@@ -2806,6 +2840,7 @@ static int64_t lpr_sys_rmdir(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
 static int64_t lpr_sys_link(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_linkat(LPR_LINUX_AT_FDCWD, a0, LPR_LINUX_AT_FDCWD, a1, 0); }
 static int64_t lpr_sys_unlink(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_unlinkat(LPR_LINUX_AT_FDCWD, a0, 0); }
 static int64_t lpr_sys_symlink(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_symlinkat(a0, LPR_LINUX_AT_FDCWD, a1); }
+static int64_t lpr_sys_readlinkat(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a4; (void)a5; return lpr_linux_readlinkat(a0, a1, a2, a3); }
 static int64_t lpr_sys_readlink(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a3; (void)a4; (void)a5; return lpr_linux_readlink(a0, a1, a2); }
 static int64_t lpr_sys_chmod(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_fchmodat(LPR_LINUX_AT_FDCWD, a0, a1, 0); }
 static int64_t lpr_sys_fchmod(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_fchmod(a0, a1); }
@@ -2829,8 +2864,8 @@ static int64_t lpr_sys_setreuid(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t 
 static int64_t lpr_sys_setregid(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_setregid(a0, a1); }
 static int64_t lpr_sys_setresuid(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a3; (void)a4; (void)a5; return lpr_linux_setresuid(a0, a1, a2); }
 static int64_t lpr_sys_setresgid(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a3; (void)a4; (void)a5; return lpr_linux_setresgid(a0, a1, a2); }
-static int64_t lpr_sys_capget(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_capget(a0, a1, lpr_linux_getpid()); }
-static int64_t lpr_sys_capset(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_capset(a0, a1, lpr_linux_getpid()); }
+static int64_t lpr_sys_capget(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_capget(a0, a1, lpr_linux_getpid(), lpr_linux_gettid()); }
+static int64_t lpr_sys_capset(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_capset(a0, a1, lpr_linux_getpid(), lpr_linux_gettid()); }
 static int64_t lpr_sys_getppid(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a0; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_getppid(); }
 static int64_t lpr_sys_getpgrp(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a0; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_getpgrp(); }
 static int64_t lpr_sys_setpgid(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_setpgid(a0, a1); }
@@ -2915,9 +2950,16 @@ static int64_t lpr_sys_futex(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
     if ((flags & ~allowed_flags) != 0 ||
         (command != LPR_LINUX_FUTEX_WAIT &&
          command != LPR_LINUX_FUTEX_WAKE &&
+         command != LPR_LINUX_FUTEX_WAKE_OP &&
          command != LPR_LINUX_FUTEX_REQUEUE && !wait_bitset)) {
         return -LPR_LINUX_ENOSYS;
     }
+    // Native keys are principal+VA. Do not claim Linux's interprocess shared
+    // key identity for this new operation; Qt/glibc private semaphores use it.
+    if (command == LPR_LINUX_FUTEX_WAKE_OP && !(flags & LPR_LINUX_FUTEX_PRIVATE_FLAG))
+        return -LPR_LINUX_ENOSYS;
+    if (command == LPR_LINUX_FUTEX_WAKE_OP)
+        return lpr_futex_wake_op(a0, a4, a2, a3, a5);
     if (a0 == 0 || (a0 & 3u) != 0) {
         return -LPR_LINUX_EINVAL;
     }
@@ -3121,6 +3163,110 @@ static int64_t lpr_sys_sched_yield(uint64_t a0, uint64_t a1, uint64_t a2, uint64
     return lpr_linux_pacha_status_to_errno(lpr_pacha_syscall0(PACHA_RUNTIME_SYSCALL_YIELD));
 }
 
+static int64_t lpr_sys_mlock(uint64_t a0,uint64_t a1,uint64_t a2,
+    uint64_t a3,uint64_t a4,uint64_t a5,unsigned *wait_not_ready __attribute__((unused)))
+{
+    (void)a2;(void)a3;(void)a4;(void)a5;
+    lpr_linux_rlimits_init();
+    return lpr_linux_mlock(a0,a1,lpr_linux_rlimits[LPR_LINUX_RLIMIT_MEMLOCK].cur);
+}
+
+static int64_t lpr_sys_munlock(uint64_t a0,uint64_t a1,uint64_t a2,
+    uint64_t a3,uint64_t a4,uint64_t a5,unsigned *wait_not_ready __attribute__((unused)))
+{
+    (void)a2;(void)a3;(void)a4;(void)a5;
+    return lpr_linux_munlock(a0,a1);
+}
+
+static int64_t lpr_linux_sched_priority_bound(uint64_t policy,int maximum)
+{
+    /* Linux defines policy priority bounds independently of thread admission.
+     * glibc uses even SCHED_OTHER's zero bounds to validate pthread attributes;
+     * ENOSYS here prevents OMR from initializing its thread library. This
+     * query does not grant or pretend to apply a real-time scheduling policy. */
+    switch ((int32_t)policy) {
+    case 1: case 2: return maximum ? 99 : 1; /* FIFO, RR */
+    case 0: case 3: case 5: case 6: case 7: return 0; /* OTHER, BATCH, IDLE, DEADLINE, EXT */
+    default: return -LPR_LINUX_EINVAL;
+    }
+}
+
+static int64_t lpr_sys_sched_get_priority_max(uint64_t a0,uint64_t a1,uint64_t a2,
+    uint64_t a3,uint64_t a4,uint64_t a5,unsigned *wait_not_ready __attribute__((unused)))
+{
+    (void)a1;(void)a2;(void)a3;(void)a4;(void)a5;
+    return lpr_linux_sched_priority_bound(a0,1);
+}
+
+static int64_t lpr_sys_sched_get_priority_min(uint64_t a0,uint64_t a1,uint64_t a2,
+    uint64_t a3,uint64_t a4,uint64_t a5,unsigned *wait_not_ready __attribute__((unused)))
+{
+    (void)a1;(void)a2;(void)a3;(void)a4;(void)a5;
+    return lpr_linux_sched_priority_bound(a0,0);
+}
+
+static int64_t lpr_sched_target(uint64_t pid)
+{
+    const int32_t tid=(int32_t)pid;
+    if (tid<0) return -LPR_LINUX_EINVAL;
+    return lpr_linux_thread_exists((uint32_t)tid) ? 0 : -LPR_LINUX_ESRCH;
+}
+
+static int64_t lpr_sched_set_normal(uint64_t pid,int32_t policy,uint64_t param)
+{
+    if (policy<0 || lpr_linux_sched_priority_bound((uint32_t)policy,0)<0)
+        return -LPR_LINUX_EINVAL;
+    if (!param) return -LPR_LINUX_EINVAL;
+    if (!lpr_user_range_plausible(param,sizeof(int32_t))) return -LPR_LINUX_EFAULT;
+    int32_t priority;
+    lpr_memcpy(&priority,(const void *)(uintptr_t)param,sizeof(priority));
+    if (priority<lpr_linux_sched_priority_bound((uint32_t)policy,0) ||
+        priority>lpr_linux_sched_priority_bound((uint32_t)policy,1))
+        return -LPR_LINUX_EINVAL;
+    const int64_t target=lpr_sched_target(pid);
+    if (target) return target;
+    if (policy!=0) return -LPR_LINUX_EOPNOTSUPP;
+    /* Every native thread uses the normal EEVDF class; LPR cannot change its
+     * class or weight. Reapplying OTHER/0 is therefore an idempotent request,
+     * including glibc's explicit-scheduling pthread startup. Other classes
+     * require native admission and must not be accepted as normal threads. */
+    return 0;
+}
+
+static int64_t lpr_sys_sched_setparam(uint64_t a0,uint64_t a1,uint64_t a2,
+    uint64_t a3,uint64_t a4,uint64_t a5,unsigned *wait_not_ready __attribute__((unused)))
+{
+    (void)a2;(void)a3;(void)a4;(void)a5;
+    return lpr_sched_set_normal(a0,0,a1);
+}
+
+static int64_t lpr_sys_sched_getparam(uint64_t a0,uint64_t a1,uint64_t a2,
+    uint64_t a3,uint64_t a4,uint64_t a5,unsigned *wait_not_ready __attribute__((unused)))
+{
+    (void)a2;(void)a3;(void)a4;(void)a5;
+    if (!a1) return -LPR_LINUX_EINVAL;
+    if (!lpr_user_range_plausible(a1,sizeof(int32_t))) return -LPR_LINUX_EFAULT;
+    const int64_t target=lpr_sched_target(a0);
+    if (target) return target;
+    const int32_t priority=0;
+    lpr_memcpy((void *)(uintptr_t)a1,&priority,sizeof(priority));
+    return 0;
+}
+
+static int64_t lpr_sys_sched_setscheduler(uint64_t a0,uint64_t a1,uint64_t a2,
+    uint64_t a3,uint64_t a4,uint64_t a5,unsigned *wait_not_ready __attribute__((unused)))
+{
+    (void)a3;(void)a4;(void)a5;
+    return lpr_sched_set_normal(a0,(int32_t)a1,a2);
+}
+
+static int64_t lpr_sys_sched_getscheduler(uint64_t a0,uint64_t a1,uint64_t a2,
+    uint64_t a3,uint64_t a4,uint64_t a5,unsigned *wait_not_ready __attribute__((unused)))
+{
+    (void)a1;(void)a2;(void)a3;(void)a4;(void)a5;
+    return lpr_sched_target(a0); /* Normal policy is SCHED_OTHER (zero). */
+}
+
 static int64_t lpr_sys_clock_gettime(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused)))
 {
     (void)a2;
@@ -3153,8 +3299,53 @@ static int64_t lpr_sys_clock_gettime(uint64_t a0, uint64_t a1, uint64_t a2, uint
         }
     } while (native_status == PACHA_SYSCALL_ERR_NOT_READY ||
              native_status == -PACHA_SYSCALL_ERR_NOT_READY);
+    if (native_status == PACHAOS_SYSCALL_ERR_INVALID ||
+        native_status == -PACHAOS_SYSCALL_ERR_INVALID ||
+        native_status == PACHAOS_SYSCALL_ERR_MAP ||
+        native_status == -PACHAOS_SYSCALL_ERR_MAP)
+        return -LPR_LINUX_EFAULT;
     return lpr_linux_pacha_status_to_errno(native_status);
 }
+static int64_t lpr_sys_gettimeofday(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused)))
+{
+    (void)a2; (void)a3; (void)a4; (void)a5;
+    if (a0 != 0) {
+        /* x86-64 timeval and timespec have the same two-i64 layout. Let
+         * the native clock validate and fill the output before converting
+         * its nanoseconds to microseconds in place. */
+        const int64_t status = lpr_sys_clock_gettime(
+            LPR_LINUX_CLOCK_REALTIME, a0, 0, 0, 0, 0, wait_not_ready);
+        if (status != 0) return status;
+        int64_t *tv = (int64_t *)(uintptr_t)a0;
+        tv[1] /= 1000;
+    }
+    if (a1 != 0) {
+        if (!lpr_user_range_plausible(a1, 2u * sizeof(int32_t)))
+            return -LPR_LINUX_EFAULT;
+        /* Linux's obsolete timezone output is UTC with no DST policy. */
+        int32_t *tz = (int32_t *)(uintptr_t)a1;
+        tz[0] = 0;
+        tz[1] = 0;
+    }
+    return 0;
+}
+
+static int64_t lpr_sys_time(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused)))
+{
+    (void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
+    struct pachaos_timespec ts;
+    const int64_t status = lpr_sys_clock_gettime(
+        LPR_LINUX_CLOCK_REALTIME, (uint64_t)(uintptr_t)&ts,
+        0, 0, 0, 0, wait_not_ready);
+    if (status != 0) return status;
+    if (a0 != 0) {
+        if (!lpr_user_range_plausible(a0, sizeof(int64_t)))
+            return -LPR_LINUX_EFAULT;
+        *(int64_t *)(uintptr_t)a0 = (int64_t)ts.tv_sec;
+    }
+    return (int64_t)ts.tv_sec;
+}
+
 static int64_t lpr_sys_clock_getres(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused)))
 {
     (void)a2;
@@ -3284,6 +3475,7 @@ static int64_t lpr_sys_ppoll(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
 static int64_t lpr_sys_epoll_wait(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a4; (void)a5; return lpr_linux_epoll_wait(a0, a1, a2, a3, wait_not_ready); }
 static int64_t lpr_sys_epoll_ctl(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a4; (void)a5; return lpr_linux_epoll_ctl(a0, a1, a2, a3); }
 static int64_t lpr_sys_epoll_pwait(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { return lpr_linux_epoll_pwait(a0, a1, a2, a3, a4, a5, wait_not_ready); }
+static int64_t lpr_sys_epoll_create(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_epoll_create(a0); }
 static int64_t lpr_sys_epoll_create1(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_epoll_create1(a0); }
 static int64_t lpr_sys_utimensat(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a4; (void)a5; return lpr_linux_utimensat(a0, a1, a2, a3); }
 static int64_t lpr_sys_eventfd(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_eventfd2(a0, 0); }
@@ -3358,6 +3550,12 @@ static int64_t lpr_sys_poll(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, 
 
 static lpr_syscall_entry_t lpr_syscall_table[LPR_LINUX_SYS_LAST + 1u] = {
     LPR_SYSCALL(LPR_LINUX_SYS_SCHED_YIELD, "sched_yield", LPR_LINUX_SYSCALL_CLASS_THREAD_ARCH, LPR_LINUX_SYSCALL_BACKEND_PACHA_DIRECT, lpr_sys_sched_yield, 0),
+    LPR_SYSCALL(LPR_LINUX_SYS_SCHED_SETPARAM, "sched_setparam", LPR_LINUX_SYSCALL_CLASS_THREAD_ARCH, LPR_LINUX_SYSCALL_BACKEND_LOCAL_STATE, lpr_sys_sched_setparam, 0),
+    LPR_SYSCALL(LPR_LINUX_SYS_SCHED_GETPARAM, "sched_getparam", LPR_LINUX_SYSCALL_CLASS_THREAD_ARCH, LPR_LINUX_SYSCALL_BACKEND_LOCAL_STATE, lpr_sys_sched_getparam, 0),
+    LPR_SYSCALL(LPR_LINUX_SYS_SCHED_SETSCHEDULER, "sched_setscheduler", LPR_LINUX_SYSCALL_CLASS_THREAD_ARCH, LPR_LINUX_SYSCALL_BACKEND_LOCAL_STATE, lpr_sys_sched_setscheduler, 0),
+    LPR_SYSCALL(LPR_LINUX_SYS_SCHED_GETSCHEDULER, "sched_getscheduler", LPR_LINUX_SYSCALL_CLASS_THREAD_ARCH, LPR_LINUX_SYSCALL_BACKEND_LOCAL_STATE, lpr_sys_sched_getscheduler, 0),
+    LPR_SYSCALL(LPR_LINUX_SYS_SCHED_GET_PRIORITY_MAX, "sched_get_priority_max", LPR_LINUX_SYSCALL_CLASS_THREAD_ARCH, LPR_LINUX_SYSCALL_BACKEND_LOCAL_STATE, lpr_sys_sched_get_priority_max, 0),
+    LPR_SYSCALL(LPR_LINUX_SYS_SCHED_GET_PRIORITY_MIN, "sched_get_priority_min", LPR_LINUX_SYSCALL_CLASS_THREAD_ARCH, LPR_LINUX_SYSCALL_BACKEND_LOCAL_STATE, lpr_sys_sched_get_priority_min, 0),
     LPR_SYSCALL(LPR_LINUX_SYS_READ, "read", LPR_LINUX_SYSCALL_CLASS_FD_IO, LPR_LINUX_SYSCALL_BACKEND_PACHA_DIRECT, lpr_sys_read, LPR_SYSCALL_TRACE),
     LPR_SYSCALL(LPR_LINUX_SYS_WRITE, "write", LPR_LINUX_SYSCALL_CLASS_FD_IO, LPR_LINUX_SYSCALL_BACKEND_PACHA_DIRECT, lpr_sys_write, LPR_SYSCALL_TRACE),
     LPR_SYSCALL(LPR_LINUX_SYS_OPEN, "open", LPR_LINUX_SYSCALL_CLASS_VFS_PATH, LPR_LINUX_SYSCALL_BACKEND_FILED, lpr_sys_open, 0),
@@ -3368,6 +3566,8 @@ static lpr_syscall_entry_t lpr_syscall_table[LPR_LINUX_SYS_LAST + 1u] = {
     LPR_SYSCALL(LPR_LINUX_SYS_POLL, "poll", LPR_LINUX_SYSCALL_CLASS_FD_IO, LPR_LINUX_SYSCALL_BACKEND_COORDINATOR, lpr_sys_poll, LPR_SYSCALL_TRACE),
     LPR_SYSCALL(LPR_LINUX_SYS_LSEEK, "lseek", LPR_LINUX_SYSCALL_CLASS_FD_CONTROL, LPR_LINUX_SYSCALL_BACKEND_FILED, lpr_sys_lseek, 0),
     LPR_SYSCALL(LPR_LINUX_SYS_MMAP, "mmap", LPR_LINUX_SYSCALL_CLASS_MEMORY, LPR_LINUX_SYSCALL_BACKEND_PACHA_DIRECT, lpr_sys_mmap, 0),
+    LPR_SYSCALL(LPR_LINUX_SYS_MLOCK, "mlock", LPR_LINUX_SYSCALL_CLASS_MEMORY, LPR_LINUX_SYSCALL_BACKEND_LOCAL_STATE, lpr_sys_mlock, 0),
+    LPR_SYSCALL(LPR_LINUX_SYS_MUNLOCK, "munlock", LPR_LINUX_SYSCALL_CLASS_MEMORY, LPR_LINUX_SYSCALL_BACKEND_LOCAL_STATE, lpr_sys_munlock, 0),
     LPR_SYSCALL(LPR_LINUX_SYS_MPROTECT, "mprotect", LPR_LINUX_SYSCALL_CLASS_MEMORY, LPR_LINUX_SYSCALL_BACKEND_PACHA_DIRECT, lpr_sys_mprotect, 0),
     LPR_SYSCALL(LPR_LINUX_SYS_MUNMAP, "munmap", LPR_LINUX_SYSCALL_CLASS_MEMORY, LPR_LINUX_SYSCALL_BACKEND_PACHA_DIRECT, lpr_sys_munmap, 0),
     LPR_SYSCALL(LPR_LINUX_SYS_MREMAP, "mremap", LPR_LINUX_SYSCALL_CLASS_MEMORY, LPR_LINUX_SYSCALL_BACKEND_PACHA_DIRECT, lpr_sys_mremap, 0),
@@ -3412,8 +3612,10 @@ static lpr_syscall_entry_t lpr_syscall_table[LPR_LINUX_SYS_LAST + 1u] = {
     LPR_SYSCALL(LPR_LINUX_SYS_EXECVE, "execve", LPR_LINUX_SYSCALL_CLASS_PROCESS, LPR_LINUX_SYSCALL_BACKEND_FILED, lpr_sys_execve, 0),
     LPR_SYSCALL(LPR_LINUX_SYS_EXIT, "exit", LPR_LINUX_SYSCALL_CLASS_PROCESS, LPR_LINUX_SYSCALL_BACKEND_PACHA_DIRECT, lpr_sys_exit, 0),
     LPR_SYSCALL(LPR_LINUX_SYS_WAIT4, "wait4", LPR_LINUX_SYSCALL_CLASS_PROCESS, LPR_LINUX_SYSCALL_BACKEND_LOCAL_STATE, lpr_sys_wait4, 0),
+    LPR_SYSCALL(LPR_LINUX_SYS_WAITID, "waitid", LPR_LINUX_SYSCALL_CLASS_PROCESS, LPR_LINUX_SYSCALL_BACKEND_LOCAL_STATE, lpr_sys_waitid, 0),
     LPR_SYSCALL(LPR_LINUX_SYS_KILL, "kill", LPR_LINUX_SYSCALL_CLASS_PROCESS, LPR_LINUX_SYSCALL_BACKEND_LOCAL_STATE, lpr_sys_kill, 0),
     LPR_SYSCALL(LPR_LINUX_SYS_TKILL, "tkill", LPR_LINUX_SYSCALL_CLASS_PROCESS, LPR_LINUX_SYSCALL_BACKEND_LOCAL_STATE, lpr_sys_tkill, 0),
+    LPR_SYSCALL(LPR_LINUX_SYS_TIME, "time", LPR_LINUX_SYSCALL_CLASS_TIME_RANDOM, LPR_LINUX_SYSCALL_BACKEND_PACHA_DIRECT, lpr_sys_time, 0),
     LPR_SYSCALL(LPR_LINUX_SYS_TGKILL, "tgkill", LPR_LINUX_SYSCALL_CLASS_PROCESS, LPR_LINUX_SYSCALL_BACKEND_LOCAL_STATE, lpr_sys_tgkill, 0),
     LPR_SYSCALL(LPR_LINUX_SYS_UNAME, "uname", LPR_LINUX_SYSCALL_CLASS_PROCESS, LPR_LINUX_SYSCALL_BACKEND_LOCAL_STATE, lpr_sys_uname, 0),
     LPR_SYSCALL(LPR_LINUX_SYS_FCNTL, "fcntl", LPR_LINUX_SYSCALL_CLASS_FD_CONTROL, LPR_LINUX_SYSCALL_BACKEND_FILED, lpr_sys_fcntl, LPR_SYSCALL_TRACE),
@@ -3432,6 +3634,7 @@ static lpr_syscall_entry_t lpr_syscall_table[LPR_LINUX_SYS_LAST + 1u] = {
     LPR_SYSCALL(LPR_LINUX_SYS_LINK, "link", LPR_LINUX_SYSCALL_CLASS_VFS_PATH, LPR_LINUX_SYSCALL_BACKEND_FILED, lpr_sys_link, 0),
     LPR_SYSCALL(LPR_LINUX_SYS_UNLINK, "unlink", LPR_LINUX_SYSCALL_CLASS_VFS_PATH, LPR_LINUX_SYSCALL_BACKEND_FILED, lpr_sys_unlink, 0),
     LPR_SYSCALL(LPR_LINUX_SYS_SYMLINK, "symlink", LPR_LINUX_SYSCALL_CLASS_VFS_PATH, LPR_LINUX_SYSCALL_BACKEND_FILED, lpr_sys_symlink, 0),
+    LPR_SYSCALL(LPR_LINUX_SYS_READLINKAT, "readlinkat", LPR_LINUX_SYSCALL_CLASS_VFS_PATH, LPR_LINUX_SYSCALL_BACKEND_FILED, lpr_sys_readlinkat, LPR_SYSCALL_TRACE),
     LPR_SYSCALL(LPR_LINUX_SYS_READLINK, "readlink", LPR_LINUX_SYSCALL_CLASS_VFS_PATH, LPR_LINUX_SYSCALL_BACKEND_FILED, lpr_sys_readlink, LPR_SYSCALL_TRACE),
     LPR_SYSCALL(LPR_LINUX_SYS_CHMOD, "chmod", LPR_LINUX_SYSCALL_CLASS_VFS_PATH, LPR_LINUX_SYSCALL_BACKEND_FILED, lpr_sys_chmod, 0),
     LPR_SYSCALL(LPR_LINUX_SYS_FCHMOD, "fchmod", LPR_LINUX_SYSCALL_CLASS_FD_CONTROL, LPR_LINUX_SYSCALL_BACKEND_FILED, lpr_sys_fchmod, 0),
@@ -3439,6 +3642,7 @@ static lpr_syscall_entry_t lpr_syscall_table[LPR_LINUX_SYS_LAST + 1u] = {
     LPR_SYSCALL(LPR_LINUX_SYS_FCHOWN, "fchown", LPR_LINUX_SYSCALL_CLASS_FD_CONTROL, LPR_LINUX_SYSCALL_BACKEND_FILED, lpr_sys_fchown, 0),
     LPR_SYSCALL(LPR_LINUX_SYS_LCHOWN, "lchown", LPR_LINUX_SYSCALL_CLASS_VFS_PATH, LPR_LINUX_SYSCALL_BACKEND_FILED, lpr_sys_lchown, 0),
     LPR_SYSCALL(LPR_LINUX_SYS_UMASK, "umask", LPR_LINUX_SYSCALL_CLASS_PROCESS, LPR_LINUX_SYSCALL_BACKEND_LOCAL_STATE, lpr_sys_umask, 0),
+    LPR_SYSCALL(LPR_LINUX_SYS_GETTIMEOFDAY, "gettimeofday", LPR_LINUX_SYSCALL_CLASS_TIME_RANDOM, LPR_LINUX_SYSCALL_BACKEND_PACHA_DIRECT, lpr_sys_gettimeofday, 0),
     LPR_SYSCALL(LPR_LINUX_SYS_GETRLIMIT, "getrlimit", LPR_LINUX_SYSCALL_CLASS_PROCESS, LPR_LINUX_SYSCALL_BACKEND_LOCAL_STATE, lpr_sys_getrlimit, 0),
     LPR_SYSCALL(LPR_LINUX_SYS_GETUID, "getuid", LPR_LINUX_SYSCALL_CLASS_PROCESS, LPR_LINUX_SYSCALL_BACKEND_LOCAL_STATE, lpr_sys_getuid, 0),
     LPR_SYSCALL(LPR_LINUX_SYS_GETGID, "getgid", LPR_LINUX_SYSCALL_CLASS_PROCESS, LPR_LINUX_SYSCALL_BACKEND_LOCAL_STATE, lpr_sys_getgid, 0),
@@ -3522,6 +3726,7 @@ static lpr_syscall_entry_t lpr_syscall_table[LPR_LINUX_SYS_LAST + 1u] = {
     LPR_SYSCALL(LPR_LINUX_SYS_TIMERFD_GETTIME, "timerfd_gettime", LPR_LINUX_SYSCALL_CLASS_FD_CONTROL, LPR_LINUX_SYSCALL_BACKEND_LOCAL_STATE, lpr_sys_timerfd_gettime, LPR_SYSCALL_TRACE),
     LPR_SYSCALL(LPR_LINUX_SYS_SIGNALFD4, "signalfd4", LPR_LINUX_SYSCALL_CLASS_FD_CONTROL, LPR_LINUX_SYSCALL_BACKEND_LOCAL_STATE, lpr_sys_signalfd4, LPR_SYSCALL_TRACE),
     LPR_SYSCALL(LPR_LINUX_SYS_EVENTFD2, "eventfd2", LPR_LINUX_SYSCALL_CLASS_FD_CONTROL, LPR_LINUX_SYSCALL_BACKEND_LOCAL_STATE, lpr_sys_eventfd2, 0),
+    LPR_SYSCALL(LPR_LINUX_SYS_EPOLL_CREATE, "epoll_create", LPR_LINUX_SYSCALL_CLASS_FD_CONTROL, LPR_LINUX_SYSCALL_BACKEND_LOCAL_STATE, lpr_sys_epoll_create, 0),
     LPR_SYSCALL(LPR_LINUX_SYS_EPOLL_CREATE1, "epoll_create1", LPR_LINUX_SYSCALL_CLASS_FD_CONTROL, LPR_LINUX_SYSCALL_BACKEND_LOCAL_STATE, lpr_sys_epoll_create1, 0),
     LPR_SYSCALL(LPR_LINUX_SYS_DUP3, "dup3", LPR_LINUX_SYSCALL_CLASS_FD_CONTROL, LPR_LINUX_SYSCALL_BACKEND_LOCAL_STATE, lpr_sys_dup3, 0),
     LPR_SYSCALL(LPR_LINUX_SYS_PIPE2, "pipe2", LPR_LINUX_SYSCALL_CLASS_FD_CONTROL, LPR_LINUX_SYSCALL_BACKEND_LOCAL_STATE, lpr_sys_pipe2, 0),
@@ -3549,6 +3754,12 @@ static void lpr_syscall_table_init(void)
     }
     (void)lpr_load_manifest();
     lpr_syscall_table[LPR_LINUX_SYS_SCHED_YIELD].handler = lpr_sys_sched_yield;
+    lpr_syscall_table[LPR_LINUX_SYS_SCHED_SETPARAM].handler = lpr_sys_sched_setparam;
+    lpr_syscall_table[LPR_LINUX_SYS_SCHED_GETPARAM].handler = lpr_sys_sched_getparam;
+    lpr_syscall_table[LPR_LINUX_SYS_SCHED_SETSCHEDULER].handler = lpr_sys_sched_setscheduler;
+    lpr_syscall_table[LPR_LINUX_SYS_SCHED_GETSCHEDULER].handler = lpr_sys_sched_getscheduler;
+    lpr_syscall_table[LPR_LINUX_SYS_SCHED_GET_PRIORITY_MAX].handler = lpr_sys_sched_get_priority_max;
+    lpr_syscall_table[LPR_LINUX_SYS_SCHED_GET_PRIORITY_MIN].handler = lpr_sys_sched_get_priority_min;
     lpr_syscall_table[LPR_LINUX_SYS_READ].handler = lpr_sys_read;
     lpr_syscall_table[LPR_LINUX_SYS_WRITE].handler = lpr_sys_write;
     lpr_syscall_table[LPR_LINUX_SYS_OPEN].handler = lpr_sys_open;
@@ -3559,6 +3770,8 @@ static void lpr_syscall_table_init(void)
     lpr_syscall_table[LPR_LINUX_SYS_POLL].handler = lpr_sys_poll;
     lpr_syscall_table[LPR_LINUX_SYS_LSEEK].handler = lpr_sys_lseek;
     lpr_syscall_table[LPR_LINUX_SYS_MMAP].handler = lpr_sys_mmap;
+    lpr_syscall_table[LPR_LINUX_SYS_MLOCK].handler = lpr_sys_mlock;
+    lpr_syscall_table[LPR_LINUX_SYS_MUNLOCK].handler = lpr_sys_munlock;
     lpr_syscall_table[LPR_LINUX_SYS_MPROTECT].handler = lpr_sys_mprotect;
     lpr_syscall_table[LPR_LINUX_SYS_MUNMAP].handler = lpr_sys_munmap;
     lpr_syscall_table[LPR_LINUX_SYS_MREMAP].handler = lpr_sys_mremap;
@@ -3605,8 +3818,10 @@ static void lpr_syscall_table_init(void)
     lpr_syscall_table[LPR_LINUX_SYS_EXECVE].handler = lpr_sys_execve;
     lpr_syscall_table[LPR_LINUX_SYS_EXIT].handler = lpr_sys_exit;
     lpr_syscall_table[LPR_LINUX_SYS_WAIT4].handler = lpr_sys_wait4;
+    lpr_syscall_table[LPR_LINUX_SYS_WAITID].handler = lpr_sys_waitid;
     lpr_syscall_table[LPR_LINUX_SYS_KILL].handler = lpr_sys_kill;
     lpr_syscall_table[LPR_LINUX_SYS_TKILL].handler = lpr_sys_tkill;
+    lpr_syscall_table[LPR_LINUX_SYS_TIME].handler = lpr_sys_time;
     lpr_syscall_table[LPR_LINUX_SYS_TGKILL].handler = lpr_sys_tgkill;
     lpr_syscall_table[LPR_LINUX_SYS_UNAME].handler = lpr_sys_uname;
     lpr_syscall_table[LPR_LINUX_SYS_FCNTL].handler = lpr_sys_fcntl;
@@ -3625,6 +3840,7 @@ static void lpr_syscall_table_init(void)
     lpr_syscall_table[LPR_LINUX_SYS_LINK].handler = lpr_sys_link;
     lpr_syscall_table[LPR_LINUX_SYS_UNLINK].handler = lpr_sys_unlink;
     lpr_syscall_table[LPR_LINUX_SYS_SYMLINK].handler = lpr_sys_symlink;
+    lpr_syscall_table[LPR_LINUX_SYS_READLINKAT].handler = lpr_sys_readlinkat;
     lpr_syscall_table[LPR_LINUX_SYS_READLINK].handler = lpr_sys_readlink;
     lpr_syscall_table[LPR_LINUX_SYS_CHMOD].handler = lpr_sys_chmod;
     lpr_syscall_table[LPR_LINUX_SYS_FCHMOD].handler = lpr_sys_fchmod;
@@ -3632,6 +3848,7 @@ static void lpr_syscall_table_init(void)
     lpr_syscall_table[LPR_LINUX_SYS_FCHOWN].handler = lpr_sys_fchown;
     lpr_syscall_table[LPR_LINUX_SYS_LCHOWN].handler = lpr_sys_lchown;
     lpr_syscall_table[LPR_LINUX_SYS_UMASK].handler = lpr_sys_umask;
+    lpr_syscall_table[LPR_LINUX_SYS_GETTIMEOFDAY].handler = lpr_sys_gettimeofday;
     lpr_syscall_table[LPR_LINUX_SYS_GETRLIMIT].handler = lpr_sys_getrlimit;
     lpr_syscall_table[LPR_LINUX_SYS_GETUID].handler = lpr_sys_getuid;
     lpr_syscall_table[LPR_LINUX_SYS_GETGID].handler = lpr_sys_getgid;
@@ -3713,6 +3930,7 @@ static void lpr_syscall_table_init(void)
     lpr_syscall_table[LPR_LINUX_SYS_TIMERFD_GETTIME].handler = lpr_sys_timerfd_gettime;
     lpr_syscall_table[LPR_LINUX_SYS_SIGNALFD4].handler = lpr_sys_signalfd4;
     lpr_syscall_table[LPR_LINUX_SYS_EVENTFD2].handler = lpr_sys_eventfd2;
+    lpr_syscall_table[LPR_LINUX_SYS_EPOLL_CREATE].handler = lpr_sys_epoll_create;
     lpr_syscall_table[LPR_LINUX_SYS_EPOLL_CREATE1].handler = lpr_sys_epoll_create1;
     lpr_syscall_table[LPR_LINUX_SYS_DUP3].handler = lpr_sys_dup3;
     lpr_syscall_table[LPR_LINUX_SYS_PIPE2].handler = lpr_sys_pipe2;
@@ -3963,6 +4181,13 @@ int64_t lpr_dispatch_syscall_frame(struct lpr_linux_user_frame *frame,
         lpr_trace_socket_syscall_event("enter", nr, a0, a1, a2, 0);
     }
     lpr_linux_ensure_default_stdio(&wait_not_ready);
+#if defined(LPR_EPHY_PROFILE) && LPR_EPHY_PROFILE
+    ephy_begin();
+    if (nr == LPR_LINUX_SYS_EXIT || nr == LPR_LINUX_SYS_EXIT_GROUP)
+        ephy_dump(1, a0);
+    if (nr == LPR_LINUX_SYS_EXECVE || nr == 322u)
+        ephy_dump(3, 0);
+#endif
     if (nr == LPR_LINUX_SYS_EXIT_GROUP) unix_profile_dump();
 #if defined(LPR_GLYCIN_DIAG) && LPR_GLYCIN_DIAG
     const int glycin_diag_owner =
@@ -4024,12 +4249,23 @@ int64_t lpr_dispatch_syscall_frame(struct lpr_linux_user_frame *frame,
 #endif
 #endif
     for (;;) {
+#if defined(LPR_EPHY_PROFILE) && LPR_EPHY_PROFILE
+        const uint64_t ephy_t0 = ephy_main() ? pacha_trace_read_tsc() : 0;
+#endif
 #if defined(LPR_GUI_PROFILE) && LPR_GUI_PROFILE
         const uint64_t gui_start = gui_main ? pacha_trace_read_tsc() : 0;
 #endif
         const uint64_t start_cycles = trace_metrics ? pacha_trace_read_tsc() : 0;
         result = lpr_dispatch_syscall_inner(entry, frame, a0, a1, a2, a3, a4, a5, &wait_not_ready);
         const uint64_t end_cycles = trace_metrics ? pacha_trace_read_tsc() : 0;
+#if defined(LPR_EPHY_PROFILE) && LPR_EPHY_PROFILE
+        if (ephy_t0) {
+            const uint64_t ephy_t1 = pacha_trace_read_tsc();
+            ephy_record(nr, a0, a1, a2, a3, ephy_t0, ephy_t1, result);
+            ephy_socket_record(nr, a0, a1, a2, ephy_t0, ephy_t1, result);
+            ephy_timed_dump();
+        }
+#endif
 #if defined(LPR_GUI_PROFILE) && LPR_GUI_PROFILE
         /* Delivering a signal can abandon this stack, so finish the span
          * before every delivery/restart point. Count restarted attempts. */

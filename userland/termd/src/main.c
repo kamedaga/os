@@ -124,6 +124,7 @@ int main(int argc, char **argv)
             termd_linux_tty_island_pump(&tty_island);
         if (status == PACHA_ERR_EMPTY || status == PACHA_ERR_NOT_READY) {
             static struct pacha_service_wait_set wait_set;
+            static struct pacha_fd_wait_retained retained_wait;
             static pacha_fd_t notify_fds[PACHA_SERVICE_WAIT_MAX_FDS];
             if (pacha_service_wait_init(&wait_set, (pacha_fd_t)cfg->tty_endpoint_fd) != 0)
                 return 1;
@@ -143,7 +144,7 @@ int main(int argc, char **argv)
                     return 1;
             }
             const int wait_status =
-                pacha_service_wait(&wait_set, PACHA_FD_WAIT_FOREVER);
+                pacha_service_wait_retained(&wait_set, &retained_wait, PACHA_FD_WAIT_FOREVER);
             pacha_trace3(
                 PACHA_TRACE_COMPONENT_TERMD,
                 PACHA_TRACE_EVENT_TERMD_TTY_STATE,

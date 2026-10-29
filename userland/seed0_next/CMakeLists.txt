@@ -1,25 +1,12 @@
 cmake_minimum_required(VERSION 3.16)
-
-set(CMAKE_SYSTEM_NAME Generic)
-set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
-
+if(NOT DEFINED CMAKE_TOOLCHAIN_FILE)
+  set(CMAKE_TOOLCHAIN_FILE "${CMAKE_CURRENT_SOURCE_DIR}/../cmake/pachaos-native.toolchain.cmake")
+endif()
 project(seed0_next C ASM)
 
 set(REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../..")
-include("${REPO_ROOT}/userland/cmake/pachaos_native_dependencies.cmake")
-set(SEED0_NEXT_ELF "${CMAKE_BINARY_DIR}/seed0_next.elf")
+include("${REPO_ROOT}/userland/cmake/pachaos_native.cmake")
 
-add_custom_command(
-  OUTPUT "${SEED0_NEXT_ELF}"
-  COMMAND
-    ${CMAKE_COMMAND} -E env
-      "PACHAOS_MUSL_APP_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/src/main.c"
-      bash "${REPO_ROOT}/musl/pachaos/build/build-smokes.sh" "${SEED0_NEXT_ELF}"
-  DEPENDS ${PACHAOS_NATIVE_DEPENDENCIES}
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/main.c"
-    "${REPO_ROOT}/musl/pachaos/build/build-smokes.sh"
-  WORKING_DIRECTORY "${REPO_ROOT}"
-  VERBATIM
-)
-
-add_custom_target(seed0_next ALL DEPENDS "${SEED0_NEXT_ELF}")
+pachaos_native_executable(seed0_next
+  SOURCES
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/main.c")

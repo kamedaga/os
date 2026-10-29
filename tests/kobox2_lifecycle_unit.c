@@ -28,6 +28,12 @@ static atomic_uint async_stop_requested, async_unblock, async_wakes, async_start
 static int async_inject;
 static int ready_failure, startup_failure;
 static unsigned startup_started, startup_finished, startup_stopped;
+static unsigned ready_mode, ready_sends, ready_waits, ready_completed_waits;
+static unsigned ready_queued, ready_enqueues;
+static int ready_closed;
+static long ready_wait_status;
+static uint64_t ready_wait_events;
+static pthread_t ready_owner;
 
 static void async_changed(void) {
     pthread_mutex_lock(&lock);
@@ -36,9 +42,19 @@ static void async_changed(void) {
 }
 
 long pacha_syscall4(uint64_t op, uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
-    /* Inspection-only timed waits are outside this normal-lifecycle fixture;
-     * retaining a hard failure makes accidentally entering that path visible. */
-    (void)op;(void)a;(void)b;(void)c;(void)d;abort();
+    assert(ready_mode && pthread_equal(pthread_self(), ready_owner));
+    assert(op == PACHA_FD_SYSCALL_WAIT_MANY && b == 1 && c == PACHA_FD_WAIT_FOREVER && !d);
+    struct pacha_pollfd *event = (void *)(uintptr_t)a;
+    assert(event->fd == 16 && !event->revents);
+    assert(event->events == (PACHA_FD_EVENT_WRITABLE | PACHA_FD_EVENT_HANGUP | PACHA_FD_EVENT_ERROR));
+    pthread_mutex_lock(&lock);
+    ++ready_waits;
+    pthread_cond_broadcast(&changed);
+    while (ready_completed_waits < ready_waits) pthread_cond_wait(&changed, &lock);
+    event->revents = ready_wait_events;
+    long status = ready_wait_status;
+    pthread_mutex_unlock(&lock);
+    return status;
 }
 
 _Noreturn void ph_fail(const char *file, unsigned int line, uint64_t result) {
@@ -83,10 +99,26 @@ const struct kobox_linux_task_host_operations ph_task_ops = {.cpu_notify = notif
 
 int ph_ipc_send(struct ph_ipc *ipc, struct ph_ipc_packet *packet) {
     assert(ipc->generation == packet->generation && packet->operation == PH_LIFECYCLE_READY);
+    if (ready_mode) {
+        assert(pthread_equal(pthread_self(), ready_owner));
+        assert(!atomic_load_explicit(&lifecycle.start, memory_order_acquire));
+        assert(!packet->correlation && !packet->value && !packet->fd_count);
+        pthread_mutex_lock(&lock);
+        ++ready_sends;
+        int result = ready_closed ? -EPIPE : ready_queued == 16 ? -EAGAIN : 0;
+        if (!result) { ++ready_queued; ++ready_enqueues; }
+        pthread_mutex_unlock(&lock);
+        return result;
+    }
     return ready_failure;
 }
 
 int ph_ipc_receive(struct ph_ipc *ipc, uint64_t generation, struct ph_ipc_packet *packet) {
+    if (ready_mode) {
+        assert(pthread_equal(pthread_self(), receiver));
+        assert(atomic_load_explicit(&lifecycle.start, memory_order_acquire) == 1);
+        assert(ready_enqueues == 1); // No IPC admission while READY waits.
+    }
     if (ring_mode == 10) {
         assert(!pthread_equal(pthread_self(), receiver));
         assert(ipc->generation == generation && next_packet < 3);
@@ -161,6 +193,14 @@ long ph_wait_readable(struct pacha_pollfd *descriptors, size_t count) {
         return 1;
     }
     abort(); /* All packets are already queued in the packet-only race. */
+}
+long ph_wait_many_retained(struct ph_wait_retained *cache,
+    struct pacha_pollfd *fds, size_t count, uint64_t timeout) {
+    (void)cache;
+    assert(timeout == PACHA_FD_WAIT_FOREVER);
+    long result = ph_wait_readable(fds, count);
+    if (result > 0) fds[0].revents = PACHA_FD_EVENT_READABLE;
+    return result;
 }
 
 static int prepare(void *context, struct ph_ipc_packet *packet) {
@@ -512,7 +552,94 @@ static void run_async_startup_failure(int stage) {
     assert(!lifecycle.receiver);
     ready_failure = 0;
 }
+static void *ready_peer(void *unused) {
+    (void)unused;
+    const unsigned rounds = ready_mode == 5 || ready_mode == 6 ? 2 : 1;
+    pthread_mutex_lock(&lock);
+    for (unsigned round = 1; round <= rounds; ++round) {
+        while (ready_waits < round) pthread_cond_wait(&changed, &lock);
+        assert(!ready_enqueues && !next_packet && !atomic_load(&lifecycle.start));
+        ready_wait_status = 1;
+        ready_wait_events = PACHA_FD_EVENT_WRITABLE;
+        if (ready_mode == 5 && round == 1) {
+            ready_wait_status = PACHA_SYSCALL_ERR_NOT_READY;
+            ready_wait_events = 0; // Interrupted wait: retry WAIT, not SEND.
+        } else if (ready_mode == 6 && round == 1) {
+            // A stale hint is not permission to spin on a full queue.
+        } else if (ready_mode == 2 || ready_mode == 3) {
+            ready_closed = 1;
+            ready_wait_events = PACHA_FD_EVENT_HANGUP |
+                (ready_mode == 3 ? PACHA_FD_EVENT_WRITABLE : 0);
+        } else if (ready_mode == 4) {
+            ready_wait_events = PACHA_FD_EVENT_ERROR;
+        } else if (ready_mode == 7) {
+            ready_wait_events = 0; // Invalid ready-count/output combination.
+        } else if (ready_mode == 8) {
+            ready_wait_status = -EIO;
+            ready_wait_events = 0;
+        } else if (ready_mode == 9) {
+            ready_wait_events = PACHA_FD_EVENT_READABLE;
+        } else if (ready_mode == 10) {
+            ready_closed = 1; // Peer closes between writable wake and SEND.
+        } else {
+            ready_queued = 0; // Peer consumes its queued progress messages.
+        }
+        ready_completed_waits = round;
+        pthread_cond_broadcast(&changed);
+    }
+    pthread_mutex_unlock(&lock);
+    return NULL;
+}
+
+static void run_ready_backpressure(unsigned mode, int async_cleanup) {
+    memset(&lifecycle, 0, sizeof(lifecycle));
+    ready_owner = pthread_self();
+    ready_mode = mode;
+    ready_sends = ready_waits = ready_completed_waits = ready_enqueues = 0;
+    ready_queued = 16;
+    ready_closed = 0;
+    ring_mode = ready_failure = 0;
+    next_packet = 0;
+    packets[0] = (struct ph_ipc_packet){.operation = PH_LIFECYCLE_QUIESCE,
+        .generation = 9, .correlation = 99};
+    struct ph_ipc ipc = {.generation = 9, .fd = 16, .admitted = 1};
+    if (async_cleanup) {
+        startup_started = startup_finished = startup_stopped = 0;
+        startup_failure = 0;
+        struct ph_lifecycle_service service = {.context = &lifecycle,
+            .prepare = async_prepare, .complete = async_complete, .release = async_release,
+            .start = startup_start, .advance = async_advance, .finish = startup_finish,
+            .stop = startup_stop, .wake = async_wake, .wake_fd = 30};
+        assert(!ph_lifecycle_start_service(&lifecycle, &ipc, &service));
+        assert(!lifecycle.port.start(&lifecycle, &task));
+    } else assert(!ph_lifecycle_start(&lifecycle, &ipc));
+    pthread_t peer;
+    assert(!pthread_create(&peer, NULL, ready_peer, NULL));
+    int result = lifecycle.port.ready(&lifecycle);
+    assert(!pthread_join(peer, NULL));
+    const int success = mode == 1 || mode == 5 || mode == 6;
+    const int expected = success ? 0 : mode == 2 || mode == 3 || mode == 10 ? -EPIPE : -EIO;
+    assert(result == expected);
+    if (async_cleanup) {
+        assert(!success && startup_started == 1 && !startup_finished && !startup_stopped);
+        // Match Linux lifecycle's READY-error unwind after start succeeded.
+        assert(!lifecycle.port.finish(&lifecycle, &task));
+        assert(startup_finished == 1 && startup_stopped == 1);
+    }
+    ph_lifecycle_finish(&lifecycle);
+    if (async_cleanup) assert(startup_finished == 1 && startup_stopped == 1);
+    assert(ready_enqueues == (unsigned)success);
+    assert(next_packet == (unsigned)success && !lifecycle.receiver);
+    assert(atomic_load(&lifecycle.start) == (success ? 1u : 2u));
+    assert(ready_waits == (mode == 5 || mode == 6 ? 2u : 1u));
+    assert(ready_sends == (mode == 6 ? 3u : success || mode == 10 ? 2u : 1u));
+    ready_mode = 0;
+}
+
 int main(void) {
+    for (unsigned mode = 1; mode <= 10; ++mode) run_ready_backpressure(mode, 0);
+    for (unsigned mode = 2; mode <= 10; ++mode)
+        if (mode != 5 && mode != 6) run_ready_backpressure(mode, 1);
     for (int repeat = 0; repeat < 32; ++repeat)
         for (int injected = 0; injected <= 5; ++injected) run_case(injected);
     for (int repeat = 0; repeat < 32; ++repeat)
@@ -523,6 +650,6 @@ int main(void) {
         for (int inject = 0; inject <= 4; ++inject) run_async_case(inject);
         for (int stage = 0; stage <= 2; ++stage) run_async_startup_failure(stage);
     }
-    puts("native lifecycle: PASS legacy dispatch, async single owner, out-of-order completion, STOP drain, failure cleanup");
+    puts("native lifecycle: PASS READY backpressure/peer close, legacy dispatch, async single owner, out-of-order completion, STOP drain, failure cleanup");
     return 0;
 }

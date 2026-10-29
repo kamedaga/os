@@ -17,12 +17,73 @@
 #include <pacha/bootstrap.h>
 #include <pacha/capsule.h>
 #include <pacha/ipc.h>
+#include <filed_client/client.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 enum { USBD_RESOURCE_SET_ID = 1, USBD_SANDBOX_ID = 1 };
+
+static const struct gpud_lifecycle *status_lifecycle;
+
+/* Keep controller startup evidence readable from the local shell. Native
+ * stdout goes to serial, which is usually unavailable on a laptop. */
+static void status_note(const struct usbd_boot_config *config,
+    const char *stage, int error) {
+    if (config->kind != USBD_KIND_USB_XHCI) return;
+    const struct gpud_lifecycle empty = {0};
+    const struct gpud_lifecycle *s = status_lifecycle ? status_lifecycle : &empty;
+    char path[96], temporary[100], text[768];
+    snprintf(path, sizeof(path), "/tmp/usbd-%04x-%02x-%02x.%u.status",
+        config->pci_segment, config->pci_bus, config->pci_device, config->pci_function);
+    snprintf(temporary, sizeof(temporary), "%s.tmp", path);
+    int length = snprintf(text, sizeof(text),
+        "pci=%04x:%02x:%02x.%u\nstage=%s\nstatus=%d\n"
+        "generation=%llu\nprogress_count=%u\nprogress_phase=%u\n"
+        "module_index=%u\nprogress_status=%d\nnative_error=%d\n"
+        "failure_loaded=%u\nfailure_pci_bound=%u\n"
+        "failure_source=%llu\nfailure_line=%u\n"
+        "fault_vector=%u\nfault_ip=0x%llx\nfault_address=0x%llx\n",
+        config->pci_segment, config->pci_bus, config->pci_device, config->pci_function,
+        stage, error, (unsigned long long)s->generation, s->progress_count,
+        s->progress_phase, s->progress_module_index, s->progress_status, s->native_error,
+        s->failure_loaded, s->failure_pci_bound,
+        (unsigned long long)s->failure_source, s->failure_line, s->failure_vector,
+        (unsigned long long)s->failure_ip, (unsigned long long)s->failure_address);
+    if (length < 0 || (size_t)length >= sizeof(text)) return;
+    kb2_fs_request_t request = {.opcode = KB2_FILESYSTEM_OP_OPENAT2,
+        .flags = O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC, .mode = 0644};
+    kb2_fs_response_t response = {0};
+    int result = filedfs_call(config->filed_endpoint_fd, &request, temporary,
+        NULL, NULL, 0, NULL, 0, &response, NULL, 0, NULL, NULL);
+    if (result || response.result < 0) return;
+    const uint64_t handle = response.handle;
+    for (size_t offset = 0; !result && offset < (size_t)length;) {
+        request = (kb2_fs_request_t){.opcode = KB2_FILESYSTEM_OP_PWRITE,
+            .handle = handle, .offset = (int64_t)offset, .length = length - offset};
+        result = filedfs_call(config->filed_endpoint_fd, &request, NULL, NULL,
+            text + offset, length - offset, NULL, 0, &response, NULL, 0, NULL, NULL);
+        if (!result && (response.result <= 0 || (uint64_t)response.result > length - offset))
+            result = -EIO;
+        if (!result) offset += (size_t)response.result;
+    }
+    request = (kb2_fs_request_t){.opcode = KB2_FILESYSTEM_OP_CLOSE, .handle = handle};
+    int closed = filedfs_call(config->filed_endpoint_fd, &request, NULL, NULL,
+        NULL, 0, NULL, 0, &response, NULL, 0, NULL, NULL);
+    if (result || closed || response.result < 0) goto cleanup;
+    request = (kb2_fs_request_t){.opcode = KB2_FILESYSTEM_OP_RENAMEAT2};
+    result = filedfs_call(config->filed_endpoint_fd, &request, temporary, path,
+        NULL, 0, NULL, 0, &response, NULL, 0, NULL, NULL);
+    if (!result && response.result >= 0) return;
+cleanup:
+    /* Only a successful exclusive OPEN above reaches here: remove our own
+     * incomplete file so a transient failure does not disable later notes. */
+    request = (kb2_fs_request_t){.opcode = KB2_FILESYSTEM_OP_UNLINKAT};
+    (void)filedfs_call(config->filed_endpoint_fd, &request, temporary, NULL,
+        NULL, 0, NULL, 0, &response, NULL, 0, NULL, NULL);
+}
 
 /* These gpud-prefixed helpers are Kobox2 controller/process/IPC plumbing;
  * no GPU or DRM service source is linked into usbd. */
@@ -59,6 +120,9 @@ static int wait_process(pacha_fd_t process_fd) {
  * Leave lower-priority ready FDs undrained: the next wait sees them again. */
 static int wait_process_or_tick(pacha_fd_t process_fd, pacha_fd_t timer_fd,
     pacha_fd_t installer_fd, pacha_fd_t input_fd) {
+    /* This loop runs on the service thread. The helper replaces the set when
+     * optional endpoints arrive or disappear. */
+    static struct pacha_fd_wait_retained wait_set;
     struct pacha_pollfd events[4] = {
         {.fd = process_fd, .events = PACHA_FD_EVENT_READABLE | PACHA_FD_EVENT_HANGUP},
         {.fd = timer_fd, .events = PACHA_FD_EVENT_READABLE},
@@ -70,7 +134,7 @@ static int wait_process_or_tick(pacha_fd_t process_fd, pacha_fd_t timer_fd,
     if (installer_fd >= 16) events[count++] = events[2];
     const size_t input_index = count;
     if (input_fd >= 16) events[count++] = events[3];
-    long result = pacha_fd_wait_many(events, count,
+    long result = pacha_fd_wait_many_retained(&wait_set, events, count,
         PACHA_FD_WAIT_FOREVER);
     if (result <= 0) return -EIO;
     if (events[0].revents) return 0;
@@ -134,7 +198,7 @@ static int start_generation(kb2_controller_t *controller, struct usbd_package *p
     struct ph_sandbox_config sandbox_config = {.size = sizeof(struct ph_sandbox_config),
         .identity = package->identity,
         .artifact_count = package->artifact_count, .resource_count = 1,
-        .device = package->device};
+        .device = package->device, .platform = package->platform};
     const struct ph_block_write_policy block_policy = {
         .magic = PH_BLOCK_POLICY_MAGIC,
         .generation = generation,
@@ -154,10 +218,14 @@ static int start_generation(kb2_controller_t *controller, struct usbd_package *p
         .lifecycle = &current->lifecycle,
         .resource_set_id = USBD_RESOURCE_SET_ID, .sandbox_id = USBD_SANDBOX_ID,
         .sandbox_config = &sandbox_config, .image = package->sandbox,
-        .image_size = package->sandbox_size, .extra_blobs = blobs, .extra_blob_count = 1,
+        .image_size = package->sandbox_size,
+        .extra_blobs = config->kind == USBD_KIND_PS2 ? NULL : blobs,
+        .extra_blob_count = config->kind == USBD_KIND_PS2 ? 0 : 1,
         .items = package->items, .artifact_count = package->artifact_count,
         .resource_count = 1, .log_endpoint_fd = -1};
     struct ph_owner_boot boot = {0};
+    status_lifecycle = &current->lifecycle;
+    status_note(config, "sandbox-launch", 0);
     if (ph_owner_boot_begin(&boot, &start) != KB2_STATUS_OK)
         return -EIO;
     while (boot.phase != PH_OWNER_BOOT_COMPLETE) {
@@ -165,11 +233,14 @@ static int start_generation(kb2_controller_t *controller, struct usbd_package *p
         if (status != KB2_STATUS_OK && status != KB2_STATUS_ACTION_PENDING)
             return -EIO;
     }
+    status_note(config, "module-probe", 0);
+    unsigned observed_progress = 0;
     for (;;) {
         kb2_status_t status = gpud_lifecycle_ready(&current->lifecycle);
         if (status == KB2_STATUS_OK) {
+            status_note(config, "input-bridge", 0);
             int connected = 0;
-            if (config->kind == USBD_KIND_USB_XHCI) {
+            if (config->kind == USBD_KIND_USB_XHCI || config->kind == USBD_KIND_PS2) {
                 connected = usbd_input_bridge_open(&current->input, &current->ipc,
                     current->launch.process.fd, generation);
                 if (!connected)
@@ -177,15 +248,26 @@ static int start_generation(kb2_controller_t *controller, struct usbd_package *p
                         (pacha_fd_t)config->input_source_endpoint_fd, config->resource_id,
                         generation, config->pci_segment, config->pci_bus,
                         config->pci_device, config->pci_function);
+                if (!connected && config->kind == USBD_KIND_PS2) {
+                    current->source.source_kind = INPUTD_SOURCE_PLATFORM;
+                    current->source.platform_id = config->resource_id;
+                }
                 if (!connected)
                     connected = usbd_source_sync(&current->source,
                         &current->input, &current->ipc,
                         current->launch.process.fd, 0);
             }
-            if (!connected)
+            if (!connected && config->kind != USBD_KIND_PS2)
                 connected = ph_block_client_open(&current->block,
                     &current->ipc, current->launch.process.fd, generation);
+            status_note(config, connected ? "bridge-failed" : "ready", connected);
             return connected;
+        }
+        if (status != KB2_STATUS_ACTION_PENDING)
+            status_note(config, "module-probe-failed", current->lifecycle.native_error);
+        else if (current->lifecycle.progress_count != observed_progress) {
+            observed_progress = current->lifecycle.progress_count;
+            status_note(config, "module-probe", 0);
         }
         if (status != KB2_STATUS_ACTION_PENDING ||
             wait_readable(current->ipc.fd, current->launch.process.fd))
@@ -243,7 +325,8 @@ static int restart_generation(kb2_controller_t *controller,
             continue;
         }
         if (type == KB2_ACTION_REVOKE_RESOURCES) {
-            int error = pacha_capsule_dma_set_enabled(package->device_fd, 0);
+            int error = package->kind == USBD_KIND_PS2 ? 0 :
+                pacha_capsule_dma_set_enabled(package->device_fd, 0);
             if (error)
                 return error;
             if (complete_action(controller, type, 0, 0))
@@ -263,6 +346,7 @@ static int restart_generation(kb2_controller_t *controller,
 }
 
 static int run(const struct usbd_boot_config *config) {
+    status_note(config, "package-open", 0);
     struct usbd_package package = {0};
     int error = usbd_package_open(&package,
         (pacha_fd_t)config->filed_endpoint_fd, (pacha_fd_t)config->device_fd, config->kind);
@@ -292,7 +376,8 @@ static int run(const struct usbd_boot_config *config) {
         if (current.id == 1 && (error = send_ready(config, 0)))
             return error;
         printf("[usbd] %s ready generation=%llu modules=%u\n",
-            config->kind == USBD_KIND_NVME ? "nvme" : "xhci",
+            config->kind == USBD_KIND_NVME ? "nvme" :
+                config->kind == USBD_KIND_PS2 ? "ps2" : "xhci",
             (unsigned long long)current.id, (unsigned)(package.artifact_count - 1));
         fflush(stdout);
         const uint64_t timer_rights = PACHA_FD_RIGHT_READ | PACHA_FD_RIGHT_WAIT |
@@ -300,7 +385,7 @@ static int run(const struct usbd_boot_config *config) {
         pacha_fd_t timer_fd = pacha_timerfd_create(UINT64_C(1000000000),
             UINT64_C(1000000000), timer_rights, 0);
         if (timer_fd < 16) return timer_fd < 0 ? timer_fd : -EIO;
-        if (config->kind == USBD_KIND_USB_XHCI) {
+        if (config->kind == USBD_KIND_USB_XHCI || config->kind == USBD_KIND_PS2) {
             printf("[usbd] input transport=event-driven frames=preserved\n");
             fflush(stdout);
         }
@@ -332,6 +417,7 @@ static int run(const struct usbd_boot_config *config) {
                 continue;
             }
             if (wake == 1) {
+                if (config->kind == USBD_KIND_PS2) continue;
                 size_t count = 0;
                 uint64_t next = 0;
                 error = ph_block_client_snapshot(&current.block, &current.ipc,
@@ -379,12 +465,15 @@ int main(int argc, char **argv) {
         config.size != sizeof(config) ||
         config.device_fd < 16 || config.filed_endpoint_fd < 16 ||
         config.ready_channel_fd < 16 ||
-        (config.kind != USBD_KIND_USB_XHCI && config.kind != USBD_KIND_NVME) ||
-        (config.kind == USBD_KIND_USB_XHCI && config.input_source_endpoint_fd < 16) ||
+        (config.kind != USBD_KIND_USB_XHCI && config.kind != USBD_KIND_NVME && config.kind != USBD_KIND_PS2) ||
+        ((config.kind == USBD_KIND_USB_XHCI || config.kind == USBD_KIND_PS2) && config.input_source_endpoint_fd < 16) ||
+        (config.kind == USBD_KIND_PS2 && (config.installer_channel_fd || config.pci_segment ||
+            config.pci_bus || config.pci_device || config.pci_function)) ||
         (config.installer_channel_fd && config.installer_channel_fd < 16) ||
         !config.resource_id || config.pci_device > 31 || config.pci_function > 7)
         return 1;
     int status = run(&config);
+    status_note(&config, "stopped", status);
     fprintf(stderr, "[usbd] stopped status=%d\n", status);
     (void)send_ready(&config, status);
     return 1;

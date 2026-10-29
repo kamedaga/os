@@ -107,9 +107,16 @@ int main(void) {
     long fd = pacha_syscall4(PACHA_FD_SYSCALL_DUP, PACHA_THREAD_SELF_FD, 16, rights, 0);
     CHECK(fd >= 16); self_fd = fd;
     CHECK(!pacha_syscall6(PACHA_PROCESS_SYSCALL_SIGNAL_CTL, PACHA_PROCESS_SIGNAL_CTL_REGISTER,
-        (uintptr_t)clock_fp_signal_entry, (uintptr_t)__start_clock_fp_handlers,
-        (uintptr_t)__stop_clock_fp_handlers, (uintptr_t)clock_fp_pending_begin,
-        (uintptr_t)clock_fp_pending_end));
+        (uintptr_t)&(struct pacha_signal_registration){
+            .entry = (uintptr_t)clock_fp_signal_entry,
+            .inhibit_start = (uintptr_t)__start_clock_fp_handlers,
+            .inhibit_end = (uintptr_t)__stop_clock_fp_handlers,
+            .inhibit_secondary_start = (uintptr_t)clock_fp_pending_begin,
+            .inhibit_secondary_end = (uintptr_t)clock_fp_pending_end,
+            .scratch_base = 0,
+            .scratch_size = 0,
+            .flags = PACHA_SIGNAL_REGISTRATION_PROCESS_OWNER,
+        }, 0, 0, 0, 0));
     CHECK(!pacha_syscall2(PACHA_PROCESS_SYSCALL_SIGNAL_CTL, PACHA_PROCESS_SIGNAL_CTL_SET_MASK, 0));
     CHECK(!checked(clock_fp_pending_call, (uintptr_t)&output, &seed));
     CHECK(signal_count == 1 && output == signal_value);

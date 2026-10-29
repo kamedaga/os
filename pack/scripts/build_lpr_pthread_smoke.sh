@@ -8,11 +8,16 @@ cc="${PACHAOS_HOST_CLANG:-/usr/bin/clang}"
 sysroot="${repo_root}/.artifacts/userland-fixtures/alpine-clang-root"
 runtime_libc="${repo_root}/.artifacts/userland-fixtures/lpr-linux-musl-libc.so"
 
+# The sysroot and the runtime libc are the outputs of the wsl_alpine_clang and
+# copy_lpr_linux_musl recipes, which every fixture recipe needs: building them
+# here would race between fixtures and hide them from pacgo's staleness check.
 if [[ ! -e "${sysroot}/usr/lib/Scrt1.o" ]]; then
-  bash "${repo_root}/tools/build_wsl_alpine_clang.sh"
+  echo "missing ${sysroot}; build the wsl_alpine_clang recipe first" >&2
+  exit 1
 fi
 if [[ ! -e "${runtime_libc}" ]]; then
-  bash "${repo_root}/tools/copy_lpr_linux_musl.sh" ".artifacts/userland-fixtures/lpr-linux-musl-libc.so"
+  echo "missing ${runtime_libc}; build the copy_lpr_linux_musl recipe first" >&2
+  exit 1
 fi
 
 out_abs="${repo_root}/${out_base}"

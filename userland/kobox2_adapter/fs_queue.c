@@ -93,6 +93,17 @@ static int shared_refresh(void *context, uint64_t id, const uint64_t *pages, siz
     return error;
 }
 
+static int shared_collect_dirty(void *context, uint64_t id, uint64_t *bitmap, size_t words) {
+    struct ph_fs_queue *queue = context;
+    uint64_t mask = shared_lock(queue);
+    struct ph_fs_shared_export *view = *shared_find(queue, id);
+    int error = !view ? -ESTALE :
+        pacha_syscall4(PACHA_FD_SYSCALL_VMO_COLLECT_DIRTY, view->fd,
+            (uintptr_t)bitmap, words, 0) ? -EIO : 0;
+    shared_unlock(queue, mask);
+    return error;
+}
+
 static int shared_retire(void *context, uint64_t id, int force) {
     struct ph_fs_queue *queue = context;
     uint64_t mask = shared_lock(queue);
@@ -790,7 +801,8 @@ static int start(void *context, void *linux_service) {
     queue->filesystem = io->filesystem;
     struct kobox_linux_fs_shared_ops shared_ops = {.context = queue,
         .budget_bytes = ph_core.ram_size / 8, .create = shared_create,
-        .refresh = shared_refresh, .retire = shared_retire};
+        .refresh = shared_refresh, .collect_dirty = shared_collect_dirty,
+        .retire = shared_retire};
     int error = queue->shared_bind(io->filesystem, &shared_ops);
     if (!error) error = queue->create(io->filesystem, &queue->worker_config, &queue->workers);
     if (error) return error;
@@ -871,8 +883,11 @@ static int stop(void *context) {
     return error;
 }
 
-static int wait_events(struct pacha_pollfd *events, size_t count, uint64_t timeout) {
-    long status = pacha_syscall4(PACHA_FD_SYSCALL_WAIT_MANY, (uintptr_t)events, count, timeout, 0);
+static int wait_events(struct ph_fs_queue *queue, struct pacha_pollfd *events,
+    size_t count, uint64_t timeout) {
+    /* A zero deadline is a snapshot; only the blocking path retains links. */
+    long status = timeout ? ph_wait_many_retained(&queue->wait_set, events, count, timeout) :
+        pacha_syscall2(PACHA_FD_SYSCALL_POLL, (uintptr_t)events, count);
     size_t ready = 0;
     for (size_t i = 0; i < count; ++i) ready += events[i].revents != 0;
     if (ready) return status > 0 && (size_t)status == ready ? 1 : -EIO;
@@ -957,7 +972,7 @@ static int wait_clients(void *context, pacha_fd_t control_fd, uint64_t timeout) 
             struct pacha_pollfd events[256];
             size_t count; uint64_t epoch; int whole;
             after = wait_snapshot(queue, control_fd, after, events, &count, &epoch, &whole);
-            int ready = wait_events(events, count, 0);
+            int ready = wait_events(queue, events, count, 0);
             if (ready > 0) drain_doorbells(queue, events, count, epoch);
             watch_lock(queue);
             int changed = epoch != queue->watch_epoch;
@@ -970,7 +985,7 @@ static int wait_clients(void *context, pacha_fd_t control_fd, uint64_t timeout) 
         size_t count; uint64_t epoch; int whole;
         uint64_t following = wait_snapshot(queue, control_fd, queue->wait_after,
             events, &count, &epoch, &whole);
-        int ready = wait_events(events, count, whole ? timeout : 1);
+        int ready = wait_events(queue, events, count, whole ? timeout : 1);
         if (ready > 0) drain_doorbells(queue, events, count, epoch);
         queue->wait_after = following;
         watch_lock(queue);

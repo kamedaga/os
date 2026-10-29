@@ -13,7 +13,9 @@ pub const types = @import("state/types.zig");
 const memory_state = @import("state/memory.zig");
 const process_state = @import("state/process.zig");
 const fd_state = @import("state/fd.zig");
+pub const persistent_wait = @import("state/persistent_wait.zig");
 const vmo_state = @import("state/vmo.zig");
+pub const page_view_dirty = @import("state/page_view_dirty.zig");
 const vma_state = @import("state/vma.zig");
 const pipe_state = @import("state/pipe.zig");
 const ipc_state = @import("state/ipc.zig");
@@ -55,6 +57,8 @@ pub const TaskObjectState = types.TaskObjectState;
 pub const ProcessObject = types.ProcessObject;
 pub const ThreadObject = types.ThreadObject;
 pub const DeviceObject = types.DeviceObject;
+pub const PlatformDeviceObject = types.PlatformDeviceObject;
+pub const IrqSource = types.IrqSource;
 pub const MmioRegionObject = types.MmioRegionObject;
 pub const DmaBufferObject = types.DmaBufferObject;
 pub const DmaMappingObject = types.DmaMappingObject;
@@ -216,6 +220,8 @@ pub const KernelState = struct {
     // Storage is zero-filled, so resets set it explicitly.
     timer_deadline_dirty: bool = true,
     fd_wait_groups: slot_storage.SlotTable(FdWaitGroupSlot) = .{},
+    persistent_wait_sets: slot_storage.SlotTable(@import("state/persistent_wait_types.zig").Set) = .{},
+    persistent_wait_threads: slot_storage.SlotTable(@import("state/persistent_wait_types.zig").ThreadEntry) = .{},
     // K owns the link table for each live group. After cancellation its
     // grants belong to the detached cache and are independently reclaimable.
     fd_wait_group_links: slot_storage.SlotTable(slot_storage.SlotTable(types.FdWaitLink)) = .{},
@@ -298,6 +304,9 @@ pub const KernelState = struct {
     /// and finalized payload resources. FD K borrows must have ended; stable
     /// FD table bodies and nested owners must outlive entry/pool teardown.
     pub fn deinitPools(self: *KernelState) void {
+        persistent_wait.clearAll(self);
+        self.persistent_wait_sets.deinit();
+        self.persistent_wait_threads.deinit();
         @import("state/fd_capability.zig").deinit(self);
         self.fd_tables_extra.deinit();
         // Source borrowers ended with the existing pool-teardown contract.
@@ -349,6 +358,7 @@ pub const KernelState = struct {
     pub const pageViewProtAllowed = vma_state.pageViewProtAllowed;
     pub const nativeVmaFaultBackingUnavailable = vma_state.nativeVmaFaultBackingUnavailable;
     pub const nativeVmoSparsePageViewHole = vmo_state.nativeVmoSparsePageViewHole;
+    pub const nativeVmoUnsuppliedPagerPage = vmo_state.nativeVmoUnsuppliedPagerPage;
     pub const refreshNativePageView = vmo_state.refreshNativePageView;
     pub const nativePageViewRefreshAuthority = vmo_state.nativePageViewRefreshAuthority;
     pub const createNativeDeviceMemoryBacking = vmo_state.createNativeDeviceMemoryBacking;
@@ -625,8 +635,10 @@ pub const KernelState = struct {
     pub const irqKindMatchesInterrupt = fd_state.irqKindMatchesInterrupt;
     pub const appendUniquePrincipal = fd_state.appendUniquePrincipal;
     pub const recordDeviceInterruptEvent = fd_state.recordDeviceInterruptEvent;
+    pub const recordInterruptEvent = fd_state.recordInterruptEvent;
     pub const irqEventCountForFd = fd_state.irqEventCountForFd;
     pub const createDeviceFd = fd_state.createDeviceFd;
+    pub const createPlatformDeviceFd = fd_state.createPlatformDeviceFd;
     pub const publishMmioOverlayAddress = fd_state.publishMmioOverlayAddress;
     pub const createMmioRegionFd = fd_state.createMmioRegionFd;
     pub const createDmaBufferFd = fd_state.createDmaBufferFd;
@@ -693,6 +705,8 @@ pub const KernelState = struct {
     pub const beginFdWaitGroup = fd_state.beginFdWaitGroup;
     pub const armFdWaitGroup = fd_state.armFdWaitGroup;
     pub const linkFdWaitRegistration = fd_state.linkFdWaitRegistration;
+    pub const makePersistentRegistration = fd_state.makePersistentRegistration;
+    pub const retirePersistentRegistration = fd_state.retirePersistentRegistration;
     pub const detachFdWaitGroup = fd_state.detachFdWaitGroup;
     pub const takeFdWaitGroupReadyBatch = fd_state.takeFdWaitGroupReadyBatch;
     pub const cancelFdWaitGroup = fd_state.cancelFdWaitGroup;

@@ -1,17 +1,17 @@
 cmake_minimum_required(VERSION 3.16)
-
-set(CMAKE_SYSTEM_NAME Generic)
-set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
-
+if(NOT DEFINED CMAKE_TOOLCHAIN_FILE)
+  set(CMAKE_TOOLCHAIN_FILE "${CMAKE_CURRENT_SOURCE_DIR}/../cmake/pachaos-native.toolchain.cmake")
+endif()
 project(seed0root C ASM)
 
 set(REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../..")
-include("${REPO_ROOT}/userland/cmake/pachaos_native_dependencies.cmake")
-set(SEED0ROOT_ELF "${CMAKE_BINARY_DIR}/seed0root.elf")
+include("${REPO_ROOT}/userland/cmake/pachaos_native.cmake")
+# Written by pack/scripts/prepare_live_console_assets.sh (the
+# live_console_assets pacgo recipe).
 set(LIVE_VTERM_BUILD "${REPO_ROOT}/.artifacts/third_party/libvterm-0.3.3/build")
-set(LIVE_VTERM_SOURCES "")
+set(LIVE_VTERM_SOURCES)
 foreach(VTERM_UNIT encoding keyboard mouse parser pen screen state unicode vterm)
-  string(APPEND LIVE_VTERM_SOURCES " ${LIVE_VTERM_BUILD}/src/${VTERM_UNIT}.c")
+  list(APPEND LIVE_VTERM_SOURCES "${LIVE_VTERM_BUILD}/src/${VTERM_UNIT}.c")
 endforeach()
 option(SEED0ROOT_NATIVE_FD_GROWTH_TEST "Run native FD capacity probe after host full-workload marker (test image only)" OFF)
 option(SEED0ROOT_UNIXD_CONTRACT_TEST "Run native/UNIX probes with netd stopped (test image only)" OFF)
@@ -22,7 +22,6 @@ option(SEED0ROOT_REAL_SERVICE_TEST "Isolated D-Bus service-account acceptance la
 option(SEED0ROOT_GPUD_RESTART_TEST "Force and verify one production gpud sandbox restart" OFF)
 option(SEED0ROOT_LPR_THREAD_SIGNAL_TEST "Run LPR thread signals before GPU startup (test image only)" OFF)
 option(SEED0ROOT_USB_HID_INPUT_TEST "Read QEMU USB HID events through inputd IPC (test image only)" OFF)
-set(SEED0ROOT_TEST_ENV)
 set(SEED0ROOT_TEST_CFLAGS "$ENV{PACHAOS_MUSL_EXTRA_CFLAGS}")
 if(SEED0ROOT_LPR_THREAD_SIGNAL_TEST)
   string(APPEND SEED0ROOT_TEST_CFLAGS " -DSEED0ROOT_LPR_THREAD_SIGNAL_TEST=1")
@@ -52,70 +51,43 @@ endif()
 if(SEED0ROOT_CREDENTIAL_TEST)
   string(APPEND SEED0ROOT_TEST_CFLAGS " -DSEED0ROOT_CREDENTIAL_TEST=1")
 endif()
-list(APPEND SEED0ROOT_TEST_ENV "PACHAOS_MUSL_EXTRA_CFLAGS=${SEED0ROOT_TEST_CFLAGS}")
+separate_arguments(SEED0ROOT_TEST_CFLAGS UNIX_COMMAND "${SEED0ROOT_TEST_CFLAGS}")
 
-add_custom_command(
-  OUTPUT "${SEED0ROOT_ELF}"
-  COMMAND
-    bash "${REPO_ROOT}/pack/scripts/prepare_live_console_assets.sh"
-  COMMAND
-    ${CMAKE_COMMAND} -E env
-      ${SEED0ROOT_TEST_ENV}
-      "PACHAOS_MUSL_APP_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/src/main.c"
-      "PACHAOS_MUSL_EXTRA_SOURCES=${REPO_ROOT}/userland/seed0root/src/live_console.c ${REPO_ROOT}/userland/libipc/src/ipc.c ${REPO_ROOT}/userland/libipc/src/status.c ${REPO_ROOT}/userland/libpacha/src/syscall.c ${REPO_ROOT}/userland/libcapsule/src/capsule.c ${REPO_ROOT}/userland/personality/src/lpr_manifest.c ${REPO_ROOT}/userland/libfiled_client/src/client.c ${REPO_ROOT}/userland/filed/src/exec_payload.c ${REPO_ROOT}/kobox2/protocol/src/filesystem.c ${SEED0ROOT_USB_HID_TEST_SOURCE}${LIVE_VTERM_SOURCES}"
-      "PACHAOS_MUSL_EXTRA_INCLUDE_DIRS=${REPO_ROOT}/kobox2/protocol/include ${REPO_ROOT}/kobox2/protocol/generated/include ${REPO_ROOT}/userland/libfiled_client/include ${REPO_ROOT}/userland/seed0root/src ${LIVE_VTERM_BUILD} ${LIVE_VTERM_BUILD}/include ${REPO_ROOT}/userland/filed/include ${REPO_ROOT}/userland/storage/include ${REPO_ROOT}/userland/lpr_supervisor/include ${REPO_ROOT}/userland/personality/include ${REPO_ROOT}/userland/libipc/include ${REPO_ROOT}/userland/libpacha/include ${REPO_ROOT}/userland/libcapsule/include ${REPO_ROOT}/userland/netd/include ${REPO_ROOT}/userland/logd/include ${REPO_ROOT}/userland/termd/include ${REPO_ROOT}/userland/gpud/include ${REPO_ROOT}/userland/usbd/include ${REPO_ROOT}/userland/inputd/include ${REPO_ROOT}/userland/unixd/include"
-      bash "${REPO_ROOT}/musl/pachaos/build/build-smokes.sh" "${SEED0ROOT_ELF}"
-  DEPENDS ${PACHAOS_NATIVE_DEPENDENCIES}
-    "${REPO_ROOT}/userland/libfiled_client/include/filed_client/client.h"
+pachaos_native_executable(seed0root
+  SOURCES
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/main.c"
+    "${REPO_ROOT}/userland/libpacha/src/log.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/live_console.c"
+    "${REPO_ROOT}/userland/libipc/src/ipc.c"
+    "${REPO_ROOT}/userland/libipc/src/status.c"
+    "${REPO_ROOT}/userland/libpacha/src/syscall.c"
+    "${REPO_ROOT}/userland/libcapsule/src/capsule.c"
+    "${REPO_ROOT}/userland/personality/src/lpr_manifest.c"
     "${REPO_ROOT}/userland/libfiled_client/src/client.c"
     "${REPO_ROOT}/userland/filed/src/exec_payload.c"
     "${REPO_ROOT}/kobox2/protocol/src/filesystem.c"
-    "${REPO_ROOT}/kobox2/protocol/generated/include/kobox2/filesystem_layout.h"
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/main.c"
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/live_console.c"
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/live_console.h"
-    "${REPO_ROOT}/pack/scripts/prepare_live_console_assets.sh"
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/usb_input_smoke.c"
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/linux_services.h"
-    "${REPO_ROOT}/userland/installer/bootstrap.h"
-    "${REPO_ROOT}/userland/filed/include/filed/flags.h"
-    "${REPO_ROOT}/userland/filed/include/filed/payload.h"
-    "${REPO_ROOT}/userland/filed_smoke/include/filed_smoke/bootstrap.h"
-    "${REPO_ROOT}/userland/filed/include/filed/ipc_protocol.h"
-    "${REPO_ROOT}/userland/storage/include/storage/bootstrap.h"
-    "${REPO_ROOT}/userland/storage/include/storage/stack.h"
-    "${REPO_ROOT}/userland/storage/include/storage/stack.def"
-    "${REPO_ROOT}/userland/lpr_supervisor/include/lpr_supervisor/boot_config.h"
-    "${REPO_ROOT}/userland/lpr_supervisor/include/lpr_supervisor/ipc_protocol.h"
-    "${REPO_ROOT}/userland/termd/include/termd/ipc_protocol.h"
-    "${REPO_ROOT}/userland/personality/include/personality/linux_lpr.h"
-    "${REPO_ROOT}/userland/personality/include/personality/lpr_manifest.h"
-    "${REPO_ROOT}/userland/personality/src/lpr_manifest.c"
-    "${REPO_ROOT}/userland/libipc/src/ipc.c"
-    "${REPO_ROOT}/userland/libipc/include/pacha/ipc.h"
-    "${REPO_ROOT}/userland/libipc/include/pacha/launch.h"
-    "${REPO_ROOT}/userland/libipc/src/status.c"
-    "${REPO_ROOT}/userland/libipc/include/pacha/status.h"
-    "${REPO_ROOT}/userland/libpacha/include/pacha/abi.h"
-    "${REPO_ROOT}/userland/libpacha/include/pacha/live_bootstrap.h"
-    "${REPO_ROOT}/userland/libpacha/include/pacha/root_handoff.h"
-    "${REPO_ROOT}/userland/netd/include/netd/boot_config.h"
-    "${REPO_ROOT}/userland/logd/include/logd/boot_config.h"
-    "${REPO_ROOT}/userland/unixd/include/unixd/ipc_protocol.h"
-    "${REPO_ROOT}/userland/unixd/include/unixd/poll.h"
-    "${REPO_ROOT}/userland/unixd/include/unixd/transport.h"
-    "${REPO_ROOT}/userland/unixd/include/unixd/transfer.h"
-    "${REPO_ROOT}/userland/termd/include/termd/boot_config.h"
-    "${REPO_ROOT}/userland/gpud/include/gpud/boot_config.h"
-    "${REPO_ROOT}/userland/usbd/include/usbd/boot_config.h"
-    "${REPO_ROOT}/userland/inputd/include/inputd/boot_config.h"
-    "${REPO_ROOT}/userland/libpacha/src/syscall.c"
-    "${REPO_ROOT}/userland/libcapsule/src/capsule.c"
-    "${REPO_ROOT}/userland/libcapsule/include/pacha/capsule.h"
-    "${REPO_ROOT}/musl/pachaos/build/build-smokes.sh"
-    "${REPO_ROOT}/musl/pachaos/include/pachaos/abi.h"
-  WORKING_DIRECTORY "${REPO_ROOT}"
-  VERBATIM
-)
-
-add_custom_target(seed0root ALL DEPENDS "${SEED0ROOT_ELF}")
+    ${SEED0ROOT_USB_HID_TEST_SOURCE}
+    ${LIVE_VTERM_SOURCES}
+  INCLUDE_DIRECTORIES
+    "${REPO_ROOT}/kobox2/protocol/include"
+    "${REPO_ROOT}/kobox2/protocol/generated/include"
+    "${REPO_ROOT}/userland/libfiled_client/include"
+    "${REPO_ROOT}/userland/seed0root/src"
+    "${LIVE_VTERM_BUILD}"
+    "${LIVE_VTERM_BUILD}/include"
+    "${REPO_ROOT}/userland/filed/include"
+    "${REPO_ROOT}/userland/storage/include"
+    "${REPO_ROOT}/userland/lpr_supervisor/include"
+    "${REPO_ROOT}/userland/personality/include"
+    "${REPO_ROOT}/userland/libipc/include"
+    "${REPO_ROOT}/userland/libpacha/include"
+    "${REPO_ROOT}/userland/libcapsule/include"
+    "${REPO_ROOT}/userland/netd/include"
+    "${REPO_ROOT}/userland/logd/include"
+    "${REPO_ROOT}/userland/termd/include"
+    "${REPO_ROOT}/userland/gpud/include"
+    "${REPO_ROOT}/userland/usbd/include"
+    "${REPO_ROOT}/userland/inputd/include"
+    "${REPO_ROOT}/userland/unixd/include"
+  COMPILE_OPTIONS
+    ${SEED0ROOT_TEST_CFLAGS})

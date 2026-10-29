@@ -16,6 +16,7 @@ static size_t vmo_bytes[5];
 static struct ph_ipc_packet client_packets[2];
 static atomic_uint client_sends;
 static unsigned client_bound, client_released, client_closed, wait_calls;
+static unsigned snapshot_polls, retained_replaces, retained_reuses;
 static int many_clients;
 static unsigned data_calls, owner_calls, sends, allocations;
 static unsigned released;
@@ -75,7 +76,27 @@ void ph_free(void *memory, size_t bytes) {
     (void)bytes; assert(allocations); allocations--; free(memory);
 }
 
+static long mock_wait_events(uint64_t a, uint64_t b, int probe) {
+    assert(b && b <= 256);
+    struct pacha_pollfd *events = (void *)(uintptr_t)a;
+    assert(events[0].fd == 40);
+    assert(b >= 2 && events[1].fd == 31);
+    long ready = 0;
+    for (size_t i = 2; i < b; ++i) {
+        assert(many_clients ? events[i].fd == 100 : events[i].fd == 100 || events[i].fd == 101);
+        events[i].revents = !many_clients && client_readable[events[i].fd - 100] ?
+            PACHA_FD_EVENT_READABLE : 0;
+        ready += events[i].revents != 0;
+    }
+    ++wait_calls;
+    return ready ? ready : probe ? 0 : PACHA_SYSCALL_ERR_NOT_READY;
+}
+
 long pacha_syscall2(uint64_t op, uint64_t a, uint64_t b) {
+    if (op == PACHA_FD_SYSCALL_POLL) {
+        ++snapshot_polls;
+        return mock_wait_events(a, b, 1);
+    }
 #ifdef PH_FS_STORAGE_PROFILE
     if (op == 1) {
         const char *line = (void *)(uintptr_t)a;
@@ -155,24 +176,20 @@ long pacha_syscall6(uint64_t op, uint64_t a, uint64_t b, uint64_t c,
 }
 
 long pacha_syscall4(uint64_t op, uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    if (op == PACHA_FD_SYSCALL_VMO_COLLECT_DIRTY) {
+        assert(a == 200 && b && c == 1 && d == 0);
+        *(uint64_t *)(uintptr_t)b = 2;
+        return shared_refresh_failure ? PACHA_SYSCALL_ERR_INVALID : 0;
+    }
     if (op == PACHA_FD_SYSCALL_VMO_REFRESH_PAGE_VIEW) {
         assert(a == 200 && b == (uint64_t)ph_core.ram_fd && c && d == 2);
         return shared_refresh_failure ? PACHA_SYSCALL_ERR_INVALID : 0;
     }
-    assert(op == PACHA_FD_SYSCALL_WAIT_MANY && b && b <= 256 && !d);
-    struct pacha_pollfd *events = (void *)(uintptr_t)a;
-    assert(events[0].fd == 40);
-    assert(b >= 2 && events[1].fd == 31);
-    long ready = 0;
-    for (size_t i = 2; i < b; ++i) {
-        assert(many_clients ? events[i].fd == 100 : events[i].fd == 100 || events[i].fd == 101);
-        events[i].revents = !many_clients && client_readable[events[i].fd - 100] ?
-            PACHA_FD_EVENT_READABLE : 0;
-        ready += events[i].revents != 0;
-    }
-    assert(c == 0 || c == 1);
-    ++wait_calls;
-    return ready ? ready : PACHA_SYSCALL_ERR_NOT_READY;
+    assert(op == PACHA_FD_SYSCALL_WAIT_MANY && c == 1);
+    assert(d == PACHA_FD_WAIT_SET_REPLACE || d == PACHA_FD_WAIT_SET_REUSE);
+    if (d == PACHA_FD_WAIT_SET_REPLACE) ++retained_replaces;
+    else ++retained_reuses;
+    return mock_wait_events(a, b, 0);
 }
 
 int ph_ipc_init(struct ph_ipc *ipc, pacha_fd_t fd, uint64_t generation) {
@@ -885,6 +902,12 @@ int main(void) {
     assert(mock_shared.retire(mock_shared.context, shared_id, 1) == -EBUSY);
     assert(shared_revokes == 1);
     assert(mock_shared.refresh(mock_shared.context, shared_id, shared_pages, 2) == -ESTALE);
+    uint64_t dirty_bitmap = 0;
+    assert(!mock_shared.collect_dirty(mock_shared.context, shared_id, &dirty_bitmap, 1));
+    assert(dirty_bitmap == 2); // failed revoke must not block collection/retry
+    shared_refresh_failure = 1;
+    assert(mock_shared.collect_dirty(mock_shared.context, shared_id, &dirty_bitmap, 1) == -EIO);
+    shared_refresh_failure = 0;
     shared_revoke_failure = 0;
     assert(mock_shared.retire(mock_shared.context, shared_id, 1) == 1);
     assert(shared_revokes == 2);
@@ -999,6 +1022,18 @@ int main(void) {
     free(vmos[0]); free(vmos[1]);
     vmos[0] = vmos[1] = NULL;
     for (unsigned scenario = 0; scenario < 4; ++scenario) rejected_bind(scenario);
+    struct ph_wait_retained retained = {0};
+    struct pacha_pollfd fds[2] = {
+        {.fd = 40, .events = PACHA_FD_EVENT_READABLE},
+        {.fd = 31, .events = PACHA_FD_EVENT_READABLE},
+    };
+    unsigned replace_before = retained_replaces, reuse_before = retained_reuses;
+    assert(ph_wait_many_retained(&retained, fds, 2, 1) == PACHA_SYSCALL_ERR_NOT_READY);
+    assert(ph_wait_many_retained(&retained, fds, 2, 1) == PACHA_SYSCALL_ERR_NOT_READY);
+    fds[1].events |= PACHA_FD_EVENT_HANGUP;
+    assert(ph_wait_many_retained(&retained, fds, 2, 1) == PACHA_SYSCALL_ERR_NOT_READY);
+    assert(retained_replaces == replace_before + 2 && retained_reuses == reuse_before + 1);
+    assert(snapshot_polls > 0);
     puts("kobox2 FS queue: worker publication before collect, descriptor reuse, sender retirement, snapshots, out-of-order completion, client barrier, quota rollback, drain-before-ACK, forgery isolation, 513-client wait, oversized exchange PASS");
     return 0;
 }

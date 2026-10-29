@@ -52,7 +52,8 @@ enum {
 #define NETD_UEVENT_INPUT_TAG (UINT64_C(1) << 63)
 /* Action uses formerly reserved bits so the existing publish operation can
  * distinguish hotplug add/remove without a second endpoint or opcode. */
-#define NETD_UEVENT_INPUT_RESERVED_MASK UINT64_C(0x7c00000000000000)
+#define NETD_UEVENT_INPUT_RESERVED_MASK UINT64_C(0x7800000000000000)
+#define NETD_UEVENT_INPUT_PLATFORM_TAG (UINT64_C(1) << 58)
 #define NETD_UEVENT_INPUT_ACTION_SHIFT 56u
 #define NETD_UEVENT_INPUT_CAPABILITIES_SHIFT 48u
 #define NETD_UEVENT_INPUT_EVENT_INDEX_SHIFT 32u
@@ -65,6 +66,7 @@ typedef struct netd_input_uevent_descriptor {
     uint8_t capabilities;
     uint16_t event_index;
     uint8_t action;
+    uint8_t platform;
 } netd_input_uevent_descriptor_t;
 
 enum {
@@ -75,12 +77,13 @@ enum {
 
 static inline uint64_t netd_input_uevent_encode(netd_input_uevent_descriptor_t descriptor)
 {
-    const uint32_t bdf =
+    const uint32_t bdf = descriptor.platform ? 0 :
         ((uint32_t)descriptor.segment << 16u) |
         ((uint32_t)descriptor.bus << 8u) |
         (((uint32_t)descriptor.device & 0x1fu) << 3u) |
         ((uint32_t)descriptor.function & 0x07u);
     return NETD_UEVENT_INPUT_TAG |
+        (descriptor.platform ? NETD_UEVENT_INPUT_PLATFORM_TAG : 0) |
         ((uint64_t)(descriptor.action & 3u) << NETD_UEVENT_INPUT_ACTION_SHIFT) |
         ((uint64_t)descriptor.capabilities << NETD_UEVENT_INPUT_CAPABILITIES_SHIFT) |
         ((uint64_t)descriptor.event_index << NETD_UEVENT_INPUT_EVENT_INDEX_SHIFT) |
@@ -96,6 +99,8 @@ static inline int netd_input_uevent_decode(
         ((encoded >> NETD_UEVENT_INPUT_ACTION_SHIFT) & 3u) > NETD_UEVENT_REMOVE)
         return 0;
     const uint32_t bdf = (uint32_t)encoded;
+    out_descriptor->platform = !!(encoded & NETD_UEVENT_INPUT_PLATFORM_TAG);
+    if (out_descriptor->platform && bdf) return 0;
     out_descriptor->segment = (uint16_t)(bdf >> 16u);
     out_descriptor->bus = (uint8_t)(bdf >> 8u);
     out_descriptor->device = (uint8_t)((bdf >> 3u) & 0x1fu);

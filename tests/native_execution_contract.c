@@ -155,9 +155,16 @@ __attribute__((used, noreturn)) static void competitor_body(void)
 __attribute__((used, noreturn)) static void worker_body(unsigned i)
 {
     if (native(PACHA_PROCESS_SYSCALL_SIGNAL_CTL, PACHA_PROCESS_SIGNAL_CTL_REGISTER,
-        (uintptr_t)notification_entry, (uintptr_t)__start_native_handlers,
-        (uintptr_t)__stop_native_handlers, (uintptr_t)__start_native_inhibited,
-        (uintptr_t)__stop_native_inhibited)) fail();
+        (uintptr_t)&(struct pacha_signal_registration){
+            .entry = (uintptr_t)notification_entry,
+            .inhibit_start = (uintptr_t)__start_native_handlers,
+            .inhibit_end = (uintptr_t)__stop_native_handlers,
+            .inhibit_secondary_start = (uintptr_t)__start_native_inhibited,
+            .inhibit_secondary_end = (uintptr_t)__stop_native_inhibited,
+            .scratch_base = 0,
+            .scratch_size = 0,
+            .flags = PACHA_SIGNAL_REGISTRATION_PROCESS_OWNER,
+        }, 0, 0, 0, 0)) fail();
     if (native(PACHA_PROCESS_SYSCALL_SIGNAL_CTL, PACHA_PROCESS_SIGNAL_CTL_SET_MASK,
         MASK, 0, 0, 0, 0)) fail();
     STORE(tids[i], native(PACHA_RUNTIME_SYSCALL_GETTID, 0, 0, 0, 0, 0, 0));
@@ -212,8 +219,16 @@ int main(void)
     _Static_assert(sizeof(struct pacha_native_fault_frame) == 1048, "fault frame");
     /* Children inherit a blocked delivery configuration before START. */
     if (native(PACHA_PROCESS_SYSCALL_SIGNAL_CTL, PACHA_PROCESS_SIGNAL_CTL_REGISTER,
-        (uintptr_t)notification_entry, (uintptr_t)__start_native_handlers,
-        (uintptr_t)__stop_native_handlers, 0, 0) ||
+        (uintptr_t)&(struct pacha_signal_registration){
+            .entry = (uintptr_t)notification_entry,
+            .inhibit_start = (uintptr_t)__start_native_handlers,
+            .inhibit_end = (uintptr_t)__stop_native_handlers,
+            .inhibit_secondary_start = 0,
+            .inhibit_secondary_end = 0,
+            .scratch_base = 0,
+            .scratch_size = 0,
+            .flags = PACHA_SIGNAL_REGISTRATION_PROCESS_OWNER,
+        }, 0, 0, 0, 0) ||
         native(PACHA_PROCESS_SYSCALL_SIGNAL_CTL, PACHA_PROCESS_SIGNAL_CTL_SET_MASK,
         MASK, 0, 0, 0, 0)) fail();
     uint64_t fd[2] = { create_worker(0), create_worker(1) };

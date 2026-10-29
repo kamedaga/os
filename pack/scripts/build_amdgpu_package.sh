@@ -4,19 +4,17 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "$0")/../.." && pwd)"
+source "$repo_root/pack/scripts/lib/jobs.sh"
+jobs="${JOBS:-${PACGO_BUILD_JOBS:-8}}"
 source_tree="$repo_root/kobox2/linux-sandbox"
 inventory="$repo_root/.artifacts/kobox2-amdgpu-profile/closure-inventory.json"
 runtime="$repo_root/.artifacts/kobox2-amdgpu-hosted"
 firmware="$repo_root/.artifacts/kobox2-amdgpu-firmware"
 digest_file="$source_tree/kobox/manifest/profiles/amdgpu-firmware.sha256"
 output="$repo_root/.artifacts/kobox2-amdgpu-package"
-archive="$repo_root/.artifacts/kobox2-amdgpu-driver.tar.gz"
-sandbox_options=(--amdgpu)
 if [[ $# -eq 1 && "$1" == --cache-preflight ]]; then
     # Keep the early cache diagnostic out of the normal optional package.
     output="$repo_root/.artifacts/kobox2-amdgpu-cache-preflight-package"
-    archive="$repo_root/.artifacts/kobox2-amdgpu-cache-preflight-driver.tar.gz"
-    sandbox_options+=(--cache-preflight)
 elif [[ $# -ne 0 ]]; then
     echo "usage: $0 [--cache-preflight]" >&2
     exit 2
@@ -36,11 +34,13 @@ fi
 (cd "$firmware" && sha256sum --check "$digest_file")
 identity="$(sha256sum "$canonical/.config" "$canonical/vmlinux" \
     "$canonical/vmlinux.a" | sha256sum | cut -d' ' -f1)"
+pacgo_reserve_jobs "$jobs" >/dev/null
 python3 "$source_tree/kobox/boot/build_gem_modules.py" \
     --source-tree "$source_tree" --canonical-build-dir "$canonical" \
     --provider-build-dir "$repo_root/.artifacts/kobox2-amdgpu-providers/$identity" \
     --output-dir "$mapping" --core-dir "$runtime" \
-    --mapping-only --jobs "${JOBS:-8}"
+    --mapping-only --jobs "$PACGO_RESERVED_JOBS"
+pacgo_release_jobs
 python3 "$source_tree/kobox/manifest/build_pci_package.py" \
     --profile amdgpu --inventory "$inventory" --runtime-dir "$runtime" \
     --output-dir "$output" --protocol-dir "$repo_root/kobox2/protocol" \
@@ -62,19 +62,5 @@ if [[ "$owner_digest" != "$actual_digest" ]]; then
     echo 'AMDGPU bundle does not match the pinned gpud owner digest' >&2
     exit 1
 fi
-bash "$repo_root/userland/kobox2_adapter/build-sandbox.sh" \
-    "$output/sandbox.elf" "${sandbox_options[@]}"
-if nm --defined-only "$output/sandbox.elf" |
-    rg ' [TtDdBb] (ph_usb_input_|ph_net_frame_)'; then
-    echo 'Unrelated device service leaked into the AMDGPU sandbox' >&2
-    exit 1
-fi
-manifest_digest="$(sha256sum "$output/manifest.bin" | cut -d' ' -f1)"
-sandbox_digest="$(sha256sum "$output/sandbox.elf" | cut -d' ' -f1)"
-install -m 0644 "$repo_root/pack/live-amdgpu-probe.conf" \
-    "$output/owner-policy.conf"
-printf 'manifest_sha256=%s\nsandbox_sha256=%s\n' \
-    "$manifest_digest" "$sandbox_digest" >> "$output/owner-policy.conf"
-bash "$repo_root/pack/scripts/build_amdgpu_driver_archive.sh" "$output" "$archive"
-echo "AMDGPU optional package staged: $output"
-echo 'No GPU probe was performed; the separate live overlay only arms manual control.'
+echo "AMDGPU Linux package staged: $output"
+echo 'build_amdgpu_sandbox.sh adds the sandbox, owner policy and driver archive.'

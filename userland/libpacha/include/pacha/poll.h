@@ -1,8 +1,9 @@
 #ifndef PACHA_POLL_H
 #define PACHA_POLL_H
 #include <stdint.h>
+#include "abi.h"
 #include "native_syscall_retry.h"
-/* Shared FD_POLL=51 / FD_WAIT_MANY=52 wire record. Minimum is input-only;
+/* Shared FD_POLL / FD_WAIT_MANY wire record. Minimum is input-only;
  * zero requests one writable byte. revents is output-only. */
 struct pacha_pollfd {
     uint64_t fd, events, min_write_bytes, revents;
@@ -14,7 +15,7 @@ static inline long pacha_poll_registers(uint64_t nr, uint64_t address,
     uint64_t count, uint64_t timeout, uint64_t flags)
 {
     struct pacha_pollfd *fds = (void *)(uintptr_t)address;
-    const int poll = nr == 51 || nr == 52;
+    const int poll = nr == PACHA_FD_SYSCALL_POLL || nr == PACHA_FD_SYSCALL_WAIT_MANY;
     if (!poll) return pacha_native_syscall_retry6(nr, address, count, timeout, flags, 0, 0).status;
     if (poll && fds && count <= 256)
         for (uint64_t i = 0; i < count; ++i) fds[i].revents = 0;

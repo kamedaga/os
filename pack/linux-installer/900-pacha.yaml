@@ -1,0 +1,14 @@
+---
+global:
+    copytoram: false
+    checksum: false
+    nofirewall: true
+    dostartx: false
+    rootshell: "/bin/bash"
+autorun:
+    ar_nowait: true
+    exec:
+        200-pacha:
+            path: "/run/archiso/bootmnt/autorun/pacha-setup"
+            wait: on_error
+            on_error: break

@@ -252,6 +252,7 @@ static int next_event(void *context, uint32_t cpu, struct kobox_linux_irq_event 
 
 static void *collect_irqs(void *context) {
     struct ph_irq *irq = context;
+    struct ph_wait_retained wait_set = {0};
     for (;;) {
         struct pacha_pollfd fds[1 + PH_IRQ_ROUTES] = {0};
         size_t count = 1;
@@ -269,8 +270,8 @@ static void *collect_irqs(void *context) {
         uint64_t epoch = irq->wait_epoch;
         irq_unlock(irq, previous, false);
 
-        long result = pacha_syscall4(PACHA_FD_SYSCALL_WAIT_MANY,
-            (uintptr_t)fds, count, PACHA_FD_WAIT_FOREVER, 0);
+        long result = ph_wait_many_retained(&wait_set,
+            fds, count, PACHA_FD_WAIT_FOREVER);
         previous = irq_lock(irq);
         size_t ready = 0;
         for (size_t i = 0; i < count; ++i) ready += fds[i].revents != 0;

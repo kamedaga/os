@@ -45,9 +45,15 @@ int main(void)
     prime.token = 19;
     assert(lpr_exec_manifest_capability_count(LPR_FD_OPS_DMABUF, &prime) == 2);
     lpr_dmabuf_backend_t high = {.native.raw = 0x80000000ll, .lease_fd.raw = 0xfffffffdll};
-    pacha_fd_t native[2];
+    pacha_fd_t native[LPR_EXEC_BACKEND_NATIVE_FDS];
     assert(lpr_exec_backend_native_fds(LPR_FD_OPS_DMABUF, &high, native) == 2);
     assert(native[0] == 0x80000000ll && native[1] == 0xfffffffdll);
+    lpr_event_backend_t event = {.subtype = LPR_EVENT_BACKEND_EVENTFD,
+        .wait_fd.raw = 40, .notify_fd.raw = 41, .counter_fd.raw = 42};
+    assert(lpr_exec_backend_native_fds(LPR_FD_OPS_EVENT, &event, native) == 3);
+    assert(native[0] == 40 && native[1] == 41 && native[2] == 42);
+    event.subtype = LPR_EVENT_BACKEND_TIMERFD;
+    assert(lpr_exec_backend_native_fds(LPR_FD_OPS_EVENT, &event, native) == 2);
     lpr_dmabuf_backend_t replaced = high;
     replaced.lease_fd.raw = 31;
     lpr_fork_close_displaced_capabilities(LPR_FD_OPS_DMABUF, &high, &replaced);

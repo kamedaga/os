@@ -4,21 +4,22 @@
 #include <pacha/ipc.h>
 #include <errno.h>
 #include <string.h>
+#include <stdatomic.h>
 
 static int wait_reply(struct ph_ipc *ipc, pacha_fd_t process_fd,
     uint64_t operation, uint64_t correlation)
 {
     for (;;) {
         struct ph_ipc_packet reply = {0};
-        int result = ph_ipc_receive(ipc, ipc->generation, &reply);
+        /* The reply endpoint is the sole progress source. Bound the native
+         * IPC wait so process death is still detected if a peer retains a
+         * channel reference after the sandbox exits. */
+        int result = ph_ipc_receive_wait(ipc, ipc->generation, &reply, 100);
         if (result == -EAGAIN) {
-            struct pacha_pollfd events[2] = {
-                {.fd = ipc->fd, .events = PACHA_FD_EVENT_READABLE | PACHA_FD_EVENT_HANGUP},
-                {.fd = process_fd, .events = PACHA_FD_EVENT_READABLE | PACHA_FD_EVENT_HANGUP},
-            };
-            long waited = pacha_fd_wait_many(events, 2, PACHA_FD_WAIT_FOREVER);
-            if (waited <= 0 || events[1].revents ||
-                events[0].revents != PACHA_FD_EVENT_READABLE)
+            struct pacha_pollfd process = {.fd = process_fd,
+                .events = PACHA_FD_EVENT_READABLE | PACHA_FD_EVENT_HANGUP};
+            long polled = pacha_fd_poll(&process, 1);
+            if (polled != 0 || process.revents)
                 return -EPIPE;
             continue;
         }
@@ -56,6 +57,7 @@ static int request(struct netd_kobox2_frame_client *client,
     if (result) return result;
     result = wait_reply(ipc, process_fd, operation, correlation);
     if (result) return result;
+    atomic_thread_fence(memory_order_acquire);
     if (client->shared->magic != PH_NET_FRAME_SHARED_MAGIC ||
         client->shared->generation != client->generation ||
         client->shared->operation != operation)
@@ -121,6 +123,55 @@ int netd_kobox2_frame_write(struct netd_kobox2_frame_client *client,
     memcpy(client->shared->frames[0].bytes, frame, length);
     int result = request(client, ipc, process_fd, PH_NET_FRAME_WRITE, -1);
     if (!result && client->shared->count != 1) return -EPROTO;
+    return result;
+}
+
+static void wipe_wifi(struct netd_kobox2_frame_client *client)
+{
+    for (size_t i = 0; i < PH_NET_WIFI_BYTES; ++i)
+        ((volatile unsigned char *)client->shared->wifi_bytes)[i] = 0;
+    client->shared->wifi_length = 0;
+}
+
+int netd_kobox2_wifi_request(struct netd_kobox2_frame_client *client,
+    struct ph_ipc *ipc, pacha_fd_t process_fd, const void *command, size_t length,
+    void *reply, size_t capacity, size_t *received)
+{
+    if (!client || !client->shared || !command || !length || length > PH_NET_WIFI_BYTES ||
+        !reply || !capacity || capacity > PH_NET_WIFI_BYTES || !received) return -EINVAL;
+    *received = 0;
+    memcpy(client->shared->wifi_bytes, command, length);
+    client->shared->wifi_length = (uint32_t)length;
+    int result = request(client, ipc, process_fd, PH_NET_WIFI_REQUEST, -1);
+    if (!result) {
+        size_t count = client->shared->wifi_length;
+        if (count > PH_NET_WIFI_BYTES) result = -EPROTO;
+        else if (count > capacity) result = -EMSGSIZE;
+        else { memcpy(reply, client->shared->wifi_bytes, count); *received = count; }
+    }
+    wipe_wifi(client);
+    return result;
+}
+
+int netd_kobox2_wifi_configure(struct netd_kobox2_frame_client *client,
+    struct ph_ipc *ipc, pacha_fd_t process_fd, const void *configuration, size_t length)
+{
+    if (!client || !client->shared || !configuration || !length || length > PH_NET_WIFI_BYTES)
+        return -EINVAL;
+    memcpy(client->shared->wifi_bytes, configuration, length);
+    client->shared->wifi_length = (uint32_t)length;
+    int result = request(client, ipc, process_fd, PH_NET_WIFI_CONFIG, -1);
+    wipe_wifi(client);
+    return result;
+}
+
+int netd_kobox2_wifi_events(struct netd_kobox2_frame_client *client,
+    struct ph_ipc *ipc, pacha_fd_t process_fd, uint32_t *events)
+{
+    if (!client || !client->shared || !events) return -EINVAL;
+    client->shared->wifi_events = 0;
+    int result = request(client, ipc, process_fd, PH_NET_WIFI_EVENTS, -1);
+    if (!result) *events = client->shared->wifi_events;
     return result;
 }
 

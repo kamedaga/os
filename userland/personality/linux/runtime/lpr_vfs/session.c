@@ -344,8 +344,8 @@ static int wait_endpoint(struct lpr_fs_session *s, uint64_t events)
         struct pacha_pollfd fds[2] = {
             {.fd = s->doorbell, .events = events | PACHA_FD_EVENT_HANGUP},
             {.fd = s->wake_read, .events = PACHA_FD_EVENT_READABLE | PACHA_FD_EVENT_HANGUP}};
-        int64_t status = lpr_pacha_syscall4(PACHA_FD_SYSCALL_WAIT_MANY,
-            (uint64_t)(uintptr_t)fds, 2, PACHA_FD_WAIT_FOREVER, PACHA_WAIT_UNINTERRUPTIBLE);
+        int64_t status = lpr_wait_native_retained_fds(fds, 2,
+            PACHA_FD_WAIT_FOREVER, PACHA_WAIT_UNINTERRUPTIBLE);
         lpr_fs_diag(30, status, (uint64_t)fds[0].revents | ((uint64_t)fds[1].revents << 32));
         if (fds[1].revents || (fds[0].revents & PACHA_FD_EVENT_HANGUP)) return -LPR_LINUX_EIO;
         if (status > 0 && (fds[0].revents & events)) return 0;

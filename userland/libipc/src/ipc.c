@@ -213,15 +213,52 @@ static long pacha_fd_ready_count(const struct pacha_pollfd *fds, uint64_t count)
     return ready;
 }
 
-long pacha_fd_wait_many(struct pacha_pollfd *fds, uint64_t count, uint64_t timeout_ticks) {
+static int pacha_fd_wait_same(const struct pacha_fd_wait_retained *retained,
+    const struct pacha_pollfd *fds, uint64_t count) {
+    if (!retained->valid || retained->count != count) return 0;
+    for (uint64_t i = 0; i < count; ++i)
+        if (retained->items[i].fd != fds[i].fd ||
+            retained->items[i].events != fds[i].events ||
+            retained->items[i].min_write_bytes != fds[i].min_write_bytes)
+            return 0;
+    return 1;
+}
+
+static void pacha_fd_wait_remember(struct pacha_fd_wait_retained *retained,
+    const struct pacha_pollfd *fds, uint64_t count) {
+    retained->count = count;
+    for (uint64_t i = 0; i < count; ++i) {
+        retained->items[i].fd = fds[i].fd;
+        retained->items[i].events = fds[i].events;
+        retained->items[i].min_write_bytes = fds[i].min_write_bytes;
+    }
+    retained->valid = 1;
+}
+
+static long pacha_fd_wait_many_impl(struct pacha_fd_wait_retained *retained,
+    struct pacha_pollfd *fds, uint64_t count, uint64_t timeout_ticks) {
+    uint64_t flags = retained ?
+        (pacha_fd_wait_same(retained, fds, count) ? PACHA_FD_WAIT_SET_REUSE : PACHA_FD_WAIT_SET_REPLACE) : 0;
     for (;;) {
-        const long ret = pacha_syscall4(PACHA_FD_SYSCALL_WAIT_MANY, (uint64_t)(uintptr_t)fds, count, timeout_ticks, 0);
-        if (ret > 0 && fds != NULL && (uint64_t)ret <= count) {
-            const long ready = pacha_fd_ready_count(fds, count);
-            if (ready != 0) {
-                return ready;
+        const long ret = pacha_syscall4(PACHA_FD_SYSCALL_WAIT_MANY,
+            (uint64_t)(uintptr_t)fds, count, timeout_ticks, flags);
+        if (retained && ret == PACHA_FD_WAIT_SET_INVALIDATED && flags == PACHA_FD_WAIT_SET_REUSE) {
+            retained->valid = 0;
+            flags = PACHA_FD_WAIT_SET_REPLACE;
+            continue;
+        }
+        const long ready = ret > 0 && fds != NULL && (uint64_t)ret <= count ?
+            pacha_fd_ready_count(fds, count) : 0;
+        /* A successful REPLACE installs the set even when the wait times out.
+         * Positive error codes overlap ready counts, so require revents. */
+        if (retained && flags == PACHA_FD_WAIT_SET_REPLACE) {
+            retained->valid = 0;
+            if (ready || ret == PACHA_SYSCALL_ERR_NOT_READY) {
+                pacha_fd_wait_remember(retained, fds, count);
+                flags = PACHA_FD_WAIT_SET_REUSE;
             }
         }
+        if (ready) return ready;
         if (ret == PACHA_SYSCALL_ERR_NOT_READY || ret == PACHA_ERR_NOT_READY) {
             if (timeout_ticks == 0) return PACHA_ERR_NOT_READY;
             if (timeout_ticks != UINT64_MAX) return PACHA_ERR_NOT_READY;
@@ -232,6 +269,18 @@ long pacha_fd_wait_many(struct pacha_pollfd *fds, uint64_t count, uint64_t timeo
         }
         return ret;
     }
+}
+
+long pacha_fd_wait_many(struct pacha_pollfd *fds, uint64_t count, uint64_t timeout_ticks) {
+    return pacha_fd_wait_many_impl(NULL, fds, count, timeout_ticks);
+}
+
+long pacha_fd_wait_many_retained(struct pacha_fd_wait_retained *retained,
+    struct pacha_pollfd *fds, uint64_t count, uint64_t timeout_ticks) {
+    if (!retained || !fds || !count || count > SIZE_MAX / sizeof(*fds)) return PACHA_ERR_INVALID;
+    if (count > PACHA_FD_WAIT_RETAINED_MAX_FDS)
+        return pacha_fd_wait_many_batched(fds, count, timeout_ticks);
+    return pacha_fd_wait_many_impl(retained, fds, count, timeout_ticks);
 }
 
 int pacha_service_wait_init(struct pacha_service_wait_set *set, pacha_fd_t endpoint_fd) {
@@ -255,6 +304,13 @@ int pacha_service_wait_add(struct pacha_service_wait_set *set, pacha_fd_t fd, ui
 long pacha_service_wait(struct pacha_service_wait_set *set, uint64_t timeout_ticks) {
     if (set == NULL || set->count == 0 || set->count > PACHA_SERVICE_WAIT_MAX_FDS) return -1;
     return pacha_fd_wait_many_batched(set->fds, set->count, timeout_ticks);
+}
+
+long pacha_service_wait_retained(struct pacha_service_wait_set *set,
+    struct pacha_fd_wait_retained *retained, uint64_t timeout_ticks) {
+    if (!set || !retained || !set->count || set->count > PACHA_SERVICE_WAIT_MAX_FDS)
+        return PACHA_ERR_INVALID;
+    return pacha_fd_wait_many_retained(retained, set->fds, set->count, timeout_ticks);
 }
 
 long pacha_fd_wait_many_batched(struct pacha_pollfd *fds, uint64_t total,

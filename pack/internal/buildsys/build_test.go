@@ -7,11 +7,23 @@ import (
 	"capabilityos/pack/internal/config"
 )
 
-func TestKernelOutputForBootDiagnostic(t *testing.T) {
-	got := kernelOutputForStep("kernel", "boot-diag")
-	want := filepath.Join("kernel", "zig-out", "bin", "limine", "DIAGBOOT.ELF")
-	if got != want {
-		t.Fatalf("boot diagnostic output = %q, want %q", got, want)
+func TestKernelOutputPath(t *testing.T) {
+	workspace := &config.Workspace{Root: t.TempDir(), Kernel: config.Kernel{Dir: "kernel"}}
+	for _, test := range []struct {
+		step string
+		want string
+	}{
+		{"limine", filepath.Join("kernel", "zig-out", "bin", "limine", "pacha-kernel.elf")},
+		{"boot-diag", filepath.Join("kernel", "zig-out", "bin", "limine", "DIAGBOOT.ELF")},
+		{"check", filepath.Join("kernel", "zig-out", "bin", "check")},
+	} {
+		t.Run(test.step, func(t *testing.T) {
+			got := KernelOutputPath(workspace, test.step)
+			want := workspace.Path(test.want)
+			if got != want {
+				t.Fatalf("KernelOutputPath(%q) = %q, want %q", test.step, got, want)
+			}
+		})
 	}
 }
 

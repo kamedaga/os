@@ -1,6 +1,7 @@
 #include "internal.h"
 
 #include <patch_scan.h>
+#include <stdlib.h>
 #include <string.h>
 
 int lpr_exec_validate_elf(const lpr_exec_image_t *image)
@@ -247,12 +248,24 @@ int lpr_exec_patch_syscalls(
         return -22;
     }
     *out_patched = 0;
+    if (size > SIZE_MAX) return -75;
+    if (size == 0) return 0;
+    unsigned char *original = malloc((size_t)size);
+    if (original == NULL) return -12;
+    memcpy(original, bytes, (size_t)size);
     lpr_patch_scan_result_t result;
-    if (lpr_patch_scan_syscalls(
-            bytes, size, LPR_PATCH_SCAN_START_BOUNDARY, &result) != 0)
-    {
-        return -8;
+    int status = lpr_patch_scan_syscalls(
+        bytes, size, LPR_PATCH_SCAN_START_BOUNDARY, &result);
+    if (status != 0) {
+        /* Match executable snapshot manifests: an executable section may
+         * contain assembler data, so retry the conservative candidate scan
+         * on immutable input. Ambiguous syscall candidates still reject. */
+        memcpy(bytes, original, (size_t)size);
+        status = lpr_patch_scan_syscalls(bytes, size, 0, &result);
     }
+    if (status != 0) memcpy(bytes, original, (size_t)size);
+    free(original);
+    if (status != 0) return -8;
     *out_patched = result.patched_sites;
     return 0;
 }

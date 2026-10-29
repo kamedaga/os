@@ -10,15 +10,16 @@ enum {
     LPR_FD_OPS_TTY = 3u,
     LPR_FD_OPS_DRM = 4u,
     LPR_FD_OPS_INPUT = 5u,
-    LPR_FD_OPS_PIPE = 6u,
-    LPR_FD_OPS_EVENT = 7u,
-    LPR_FD_OPS_SOCKET = 8u,
-    LPR_FD_OPS_UNIX = 9u,
-    LPR_FD_OPS_EPOLL = 10u,
-    LPR_FD_OPS_DMABUF = 11u,
-    LPR_FD_OPS_SYNC_FILE = 12u,
-    LPR_FD_OPS_INSTALL_DISK = 13u,
-    LPR_FD_OPS_COUNT = 14u,
+    LPR_FD_OPS_AUDIO = 6u,
+    LPR_FD_OPS_PIPE = 7u,
+    LPR_FD_OPS_EVENT = 8u,
+    LPR_FD_OPS_SOCKET = 9u,
+    LPR_FD_OPS_UNIX = 10u,
+    LPR_FD_OPS_EPOLL = 11u,
+    LPR_FD_OPS_DMABUF = 12u,
+    LPR_FD_OPS_SYNC_FILE = 13u,
+    LPR_FD_OPS_INSTALL_DISK = 14u,
+    LPR_FD_OPS_COUNT = 15u,
 
     LPR_FD_ENTRY_CLOEXEC = 1u << 0,
 
@@ -75,10 +76,18 @@ typedef struct lpr_event_backend {
     uint8_t reserved1;
     uint32_t flags;
     uint64_t counter;
-    uint64_t deadline_ns;
+    union {
+        uint64_t deadline_ns;
+        uint64_t counter_map; /* eventfd's shared open-description counter */
+    };
     uint64_t interval_ns;
-    int32_t clock_id;
-    uint32_t reserved2;
+    union {
+        struct {
+            int32_t clock_id;
+            uint32_t reserved2;
+        };
+        lpr_native_fd_t counter_fd; /* eventfd's shared counter VMO */
+    };
     lpr_native_fd_t wait_fd;
     lpr_native_fd_t notify_fd;
 } lpr_event_backend_t;
@@ -156,6 +165,13 @@ typedef struct lpr_input_backend {
     lpr_native_fd_t wait_fd;
     lpr_native_fd_t lease_fd;
 } lpr_input_backend_t;
+
+typedef struct lpr_audio_backend {
+    uint8_t active;
+    uint8_t reserved[3];
+    uint32_t flags;
+    lpr_native_fd_t native;
+} lpr_audio_backend_t;
 
 typedef struct lpr_dmabuf_backend {
     uint8_t active;

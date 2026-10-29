@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: MIT */
 #include "../src/relay.c"
+#include "no_audio_control.h"
 #include "no_session_control.h"
 #include <assert.h>
 #include <stdio.h>

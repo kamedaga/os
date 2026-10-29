@@ -2,6 +2,7 @@
 #include "filed/manifest.h"
 #include <kobox2/sha256.h>
 #include <patch_scan.h>
+#include <elf.h>
 #include <errno.h>
 #include <stdlib.h>
 #include <string.h>
@@ -55,6 +56,132 @@ static void page_digest(const uint8_t *raw,size_t length,uint64_t page,
     memcpy(out,hash,FILED_RX_HASH_BYTES);
 }
 
+/* A loader's initial RX reservation can contain the complete ELF file,
+ * including later writable PT_LOADs. Their bytes are data, not instructions.
+ * Recognize only a complete file snapshot whose first load is RX at offset
+ * zero and contains the program headers. Partial/range mappings keep the raw
+ * scanner; PF_X is not a general substitute for mmap's requested protection.
+ * Validate all headers before patching, and retain guards over ALL file bytes. */
+static int initial_elf_loads(const uint8_t *raw,size_t length,uint64_t offset,
+    const uint8_t identity[KB2_FILESYSTEM_SNAPSHOT_STAT_SIZE],Elf64_Ehdr *header)
+{
+    const uint64_t file_size=get64(identity+
+        KB2_FILESYSTEM_SNAPSHOT_STAT_STATX_OFFSET+KB2_FILESYSTEM_STATX_SIZE_OFFSET);
+    if (offset || length!=file_size || length<SELFMAG ||
+        memcmp(raw,ELFMAG,SELFMAG)) return 0;
+    if (length<sizeof(*header)) return -ENOEXEC;
+    memcpy(header,raw,sizeof(*header));
+    if (header->e_ident[EI_CLASS]!=ELFCLASS64 ||
+        header->e_ident[EI_DATA]!=ELFDATA2LSB ||
+        header->e_ident[EI_VERSION]!=EV_CURRENT ||
+        header->e_version!=EV_CURRENT || header->e_machine!=EM_X86_64 ||
+        (header->e_type!=ET_DYN && header->e_type!=ET_EXEC) ||
+        header->e_ehsize!=sizeof(*header) ||
+        header->e_phentsize!=sizeof(Elf64_Phdr) || !header->e_phnum ||
+        header->e_phoff<sizeof(*header) || header->e_phoff>length ||
+        header->e_phnum>(length-header->e_phoff)/sizeof(Elf64_Phdr))
+        return -ENOEXEC;
+    const uint64_t table_end=header->e_phoff+
+        (uint64_t)header->e_phnum*sizeof(Elf64_Phdr);
+    unsigned loads=0;
+    int initial_rx=0,ordered=1;
+    uint64_t previous_end=0;
+    for (unsigned i=0;i<header->e_phnum;++i) {
+        Elf64_Phdr ph;
+        memcpy(&ph,raw+header->e_phoff+(size_t)i*sizeof(ph),sizeof(ph));
+        if (ph.p_type!=PT_LOAD) continue;
+        if (ph.p_filesz>ph.p_memsz || ph.p_offset>length ||
+            ph.p_filesz>length-ph.p_offset || ph.p_vaddr>UINT64_MAX-ph.p_memsz ||
+            (ph.p_align>1 && ((ph.p_align&(ph.p_align-1)) ||
+                (ph.p_offset&(ph.p_align-1))!=(ph.p_vaddr&(ph.p_align-1)))))
+            return -ENOEXEC;
+        /* Overlapping or reordered loads need their actual mapping order.
+         * They are not the initial-reservation case handled here. */
+        if (loads && ph.p_offset<previous_end) ordered=0;
+        if (!loads) initial_rx=ph.p_offset==0 && ph.p_filesz>=table_end &&
+            (ph.p_flags&(PF_R|PF_W|PF_X))==(PF_R|PF_X);
+        previous_end=ph.p_offset+ph.p_filesz;
+        ++loads;
+    }
+    return initial_rx && ordered && loads>1;
+}
+
+static int patch_exec_section(const uint8_t *raw,uint8_t *patched,size_t length)
+{
+    lpr_patch_scan_result_t scan;
+    if (!lpr_patch_scan_syscalls(patched,length,LPR_PATCH_SCAN_START_BOUNDARY,&scan))
+        return 0;
+    /* SHF_EXECINSTR does not promise a continuous instruction stream:
+     * assembler functions can be separated by inline strings/tables. Restore
+     * immutable bytes before checking every candidate with the conservative
+     * overlapping-stream decoder. Ambiguous candidates still reject the image;
+     * an undecodable data byte is never itself a reason to skip a candidate. */
+    memcpy(patched,raw,length);
+    return lpr_patch_scan_syscalls(patched,length,0,&scan) ? -EIO : 0;
+}
+
+static int patch_snapshot(const uint8_t *raw,uint8_t *patched,size_t length,uint64_t offset,
+    const uint8_t identity[KB2_FILESYSTEM_SNAPSHOT_STAT_SIZE])
+{
+    Elf64_Ehdr header;
+    const int elf=initial_elf_loads(raw,length,offset,identity,&header);
+    if (elf<0) return elf;
+    lpr_patch_scan_result_t scan;
+    if (!elf) return lpr_patch_scan_syscalls(patched,length,0,&scan) ? -EIO : 0;
+    /* Older linkers place unwind tables and rodata in the RX PT_LOAD too.
+     * Section flags (not section names or symbols) identify instruction bytes.
+     * No section table remains supported by the conservative segment scan. */
+    if (header.e_shoff || header.e_shnum) {
+        if (!header.e_shoff || !header.e_shnum ||
+            header.e_shentsize!=sizeof(Elf64_Shdr) || header.e_shoff>length ||
+            header.e_shnum>(length-header.e_shoff)/sizeof(Elf64_Shdr)) return -ENOEXEC;
+        uint64_t previous_end=0;
+        unsigned executable=0;
+        for (unsigned i=0;i<header.e_shnum;++i) {
+            Elf64_Shdr sh;
+            memcpy(&sh,raw+header.e_shoff+(size_t)i*sizeof(sh),sizeof(sh));
+            if (sh.sh_type!=SHT_NOBITS &&
+                (sh.sh_offset>length || sh.sh_size>length-sh.sh_offset)) return -ENOEXEC;
+            if (!(sh.sh_flags&SHF_EXECINSTR) || !sh.sh_size) continue;
+            if (!(sh.sh_flags&SHF_ALLOC) || sh.sh_type!=SHT_PROGBITS ||
+                sh.sh_offset<previous_end) return -ENOEXEC;
+            int contained=0;
+            for (unsigned j=0;j<header.e_phnum;++j) {
+                Elf64_Phdr ph;
+                memcpy(&ph,raw+header.e_phoff+(size_t)j*sizeof(ph),sizeof(ph));
+                if (ph.p_type==PT_LOAD && (ph.p_flags&PF_X) &&
+                    sh.sh_offset>=ph.p_offset && sh.sh_offset-ph.p_offset<=ph.p_filesz &&
+                    sh.sh_size<=ph.p_filesz-(sh.sh_offset-ph.p_offset) &&
+                    sh.sh_addr>=ph.p_vaddr &&
+                    sh.sh_addr-ph.p_vaddr==sh.sh_offset-ph.p_offset) contained=1;
+            }
+            if (!contained) return -ENOEXEC;
+            previous_end=sh.sh_offset+sh.sh_size;
+            ++executable;
+        }
+        if (!executable) return -ENOEXEC;
+        /* Parse immutable headers throughout: a patched byte must never become
+         * an unchecked offset for a later section. The caller only publishes
+         * a completed manifest, so any subsequent decode error is atomic. */
+        for (unsigned i=0;i<header.e_shnum;++i) {
+            Elf64_Shdr sh;
+            memcpy(&sh,raw+header.e_shoff+(size_t)i*sizeof(sh),sizeof(sh));
+            if ((sh.sh_flags&SHF_EXECINSTR) && sh.sh_size &&
+                patch_exec_section(raw+sh.sh_offset,patched+sh.sh_offset,
+                    sh.sh_size)) return -EIO;
+        }
+        return 0;
+    }
+    for (unsigned i=0;i<header.e_phnum;++i) {
+        Elf64_Phdr ph;
+        memcpy(&ph,raw+header.e_phoff+(size_t)i*sizeof(ph),sizeof(ph));
+        if (ph.p_type!=PT_LOAD || !(ph.p_flags&PF_X) || !ph.p_filesz) continue;
+        if (lpr_patch_scan_syscalls(patched+ph.p_offset,ph.p_filesz,0,&scan))
+            return -EIO;
+    }
+    return 0;
+}
+
 int filed_rx_manifest_build(const uint8_t *raw,size_t length,
     uint64_t file_offset,const uint8_t root_uuid[16],
     const uint8_t identity[KB2_FILESYSTEM_SNAPSHOT_STAT_SIZE],
@@ -78,9 +205,9 @@ int filed_rx_manifest_build(const uint8_t *raw,size_t length,
     for (uint64_t i=0;i<m.page_count;++i)
         page_digest(raw,length,i,m.page_hashes+i*FILED_RX_HASH_BYTES);
     memcpy(patched,raw,length);
-    lpr_patch_scan_result_t scan;
-    if (lpr_patch_scan_syscalls(patched,length,0,&scan)) {
-        free(patched);filed_rx_manifest_free(&m);return -EIO;
+    const int patch_status=patch_snapshot(raw,patched,length,file_offset,identity);
+    if (patch_status) {
+        free(patched);filed_rx_manifest_free(&m);return patch_status;
     }
     for (size_t i=0;i<length;++i) m.patch_count+=patched[i]!=raw[i];
     if (m.patch_count>SIZE_MAX/sizeof(*m.patches)) {

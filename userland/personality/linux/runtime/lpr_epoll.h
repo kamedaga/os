@@ -6,6 +6,7 @@
 #include <stdint.h>
 
 int lpr_linux_epoll_fd_active(uint64_t fd);
+int64_t lpr_linux_epoll_create(uint64_t size);
 int64_t lpr_linux_epoll_create1(uint64_t flags);
 int64_t lpr_linux_epoll_ctl(uint64_t epfd, uint64_t op, uint64_t fd, uint64_t event);
 int64_t lpr_linux_epoll_wait(uint64_t epfd, uint64_t events, uint64_t maxevents, uint64_t timeout, unsigned *wait_not_ready __attribute__((unused)));

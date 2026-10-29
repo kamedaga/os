@@ -66,7 +66,25 @@ payload_tree="$work/payload-tree"
 mkdir -p "$payload_tree/etc"
 printf 'installed-through-runner\n' > "$payload_tree/etc/pacha-test"
 tar -C "$payload_tree" -cf "$work/ROOTFS.TAR" .
-printf 'ordinary-bootfs-fixture\n' > "$work/SYSTEM.BOOTFS"
+python3 - "$work/SYSTEM.BOOTFS" <<'PY_BOOTFS'
+import struct,sys
+# Valid ordinary BOOTFS containing one root identity, not a magic-only stub.
+name=b'/etc/pacha/root-uuid';data=bytes.fromhex('11112222333344445555666677778888')
+offset=(104+48+len(name)+1+15)&~15
+image=bytearray(offset+16)
+struct.pack_into('<IIQIIQQQQQ',image,0,0x53465442,104,len(image),1,48,104,152,len(name)+1,offset,16)
+struct.pack_into('<IHBBQQI',image,104,0,len(name),1,0,offset,16,0o644)
+image[152:152+len(name)]=name;image[offset:]=data
+open(sys.argv[1],'wb').write(image)
+PY_BOOTFS
+cat > "$work/progress-wrapper" <<EOF_PROGRESS
+#!/bin/sh
+if [ "\$1" = --root-uuid ]; then
+    exec "$repo_root/.artifacts/installer-tools/sbin/pacha-install-progress" "\$@"
+fi
+exit 0
+EOF_PROGRESS
+chmod 755 "$work/progress-wrapper"
 printf '/PachaOS installed\n    protocol: limine\n    path: boot():/KERNEL.ELF\n' > "$work/SYSTEM.CONF"
 printf 'kernel\n' > "$work/KERNEL.ELF"
 printf 'init\n' > "$work/INITAPP.ELF"
@@ -95,6 +113,7 @@ for item in ROOTFS.TAR ROOTFS.SHA SYSTEM.BOOTFS SYSTEM.SHA SYSTEM.CONF INSTALL.M
 done
 truncate -s 512M "$runner_target"
 truncate -s 512M "$runner_root"
+run_runner() {
 PATH="$tools/sbin:$tools/usr/bin:$PATH" \
 LD_LIBRARY_PATH="$tools/usr/lib" \
 PACHA_INSTALL_TARGET="$runner_target" \
@@ -103,10 +122,17 @@ PACHA_INSTALL_ROOT="$runner_root" \
 PACHA_INSTALL_STAGE="$work/runner-stage" \
 PACHA_INSTALL_TREE="$work/runner-tree" \
 PACHA_INSTALL_LOG="$work/installer.log" \
-PACHA_INSTALL_PROGRESS=/bin/true \
+PACHA_INSTALL_PROGRESS="$work/progress-wrapper" \
+PACHA_INSTALL_VERIFY="${PACHA_INSTALL_VERIFY:-0}" \
 busybox ash "$repo_root/pack/installer-bootfs/pacha-install-runner" \
-    3 $((1024 * 1024)) $((512 * 1024 * 1024)) $((512 * 1024 * 1024)) \
+    "$1" $((1024 * 1024)) $((512 * 1024 * 1024)) $((512 * 1024 * 1024)) \
     0 "$media_data" > "$work/runner.log" 2>&1
+}
+for runner_flags in 8 3; do run_runner "$runner_flags"; done
+# One preparation serves both processes; normal install never hashes ROOTFS.
+test "$(grep -c '^installer: phase=copy-SYSTEM.BOOTFS$' "$work/installer.log")" = 1
+! grep -q '^installer: phase=verify-rootfs$' "$work/installer.log"
+grep -q 'reusing prepared boot payload' "$work/installer.log"
 # The live runner must never retain a second rootfs archive in tmpfs.  Large
 # production payloads otherwise fail before filesystem creation with ENOMEM.
 test ! -e "$work/runner-stage/ROOTFS.TAR"
@@ -124,4 +150,24 @@ grep -qxF 'PachaOS fixed-disk boot registration pending' \
 env -u LD_LIBRARY_PATH debugfs -R 'cat /etc/pacha-test' "$runner_root" \
     > "$work/installed-pacha-test" 2> "$work/installed-debugfs.log"
 cmp "$payload_tree/etc/pacha-test" "$work/installed-pacha-test"
+env -u LD_LIBRARY_PATH dumpe2fs -h "$runner_root" 2>/dev/null |
+    grep -q 'Filesystem UUID:.*11112222-3333-4444-5555-666677778888'
+# A malformed/zero-UUID boot archive must be rejected before format authority.
+printf bad > "$work/bad.bootfs"
+if "$repo_root/.artifacts/installer-tools/sbin/pacha-install-progress" --root-uuid "$work/bad.bootfs"; then
+    echo 'Malformed root identity was accepted' >&2; exit 1
+fi
+# Explicit diagnostics still detect corruption; a failed preparation must
+# revoke its staging receipt so deployment cannot reuse stale boot files.
+PACHA_INSTALL_VERIFY=1 run_runner 8
+grep -q '^installer: phase=verify-rootfs$' "$work/installer.log"
+printf '%064d  ROOTFS.TAR\n' 0 > "$work/bad-rootfs.sha"
+mcopy -o -i "$media@@$media_data" "$work/bad-rootfs.sha" ::/ROOTFS.SHA
+if PACHA_INSTALL_VERIFY=1 run_runner 8; then
+    echo 'Explicit verification accepted a bad archive hash' >&2; exit 1
+fi
+test ! -e "$work/runner-stage/prepared"
+if run_runner 3; then
+    echo 'Deployment accepted a missing preparation receipt' >&2; exit 1
+fi
 echo 'PASS: pinned tools and the bounded live runner created/populated/verified FAT32 and ext4'

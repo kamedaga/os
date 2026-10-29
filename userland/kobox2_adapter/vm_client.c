@@ -1,7 +1,9 @@
 /* SPDX-License-Identifier: MIT */
 /* Native access client. Linux lives only in the owning sandbox process. */
 #include "vm_client_control.h"
+#if PH_VM_CLIENT_FIXTURES
 #include "vm_fixture.h"
+#endif
 #include <pacha/ipc.h>
 #include <pacha/syscall.h>
 #include "lpr_linux_syscall.h"
@@ -30,6 +32,28 @@ static _Noreturn void client_fail(unsigned line) {
     } \
 } while (0)
 
+#ifdef PH_VM_CLIENT_TRACE
+#define TRACE(text) ((void)pacha_syscall2(1, (uintptr_t)text, sizeof(text) - 1))
+#else
+#define TRACE(text) ((void)0)
+#endif
+
+long ph_vm_client_set_segment_base(uint64_t operation, uint64_t value) {
+    /* These scalar setters have no committed effect when native STOP denies
+     * admission. Other errors, including an invalid base, must remain fatal.
+     * Do not apply this retry policy to arbitrary or byte-count syscalls. */
+    if (operation != PACHA_THREAD_SYSCALL_SET_FS_BASE &&
+        operation != PACHA_THREAD_SYSCALL_SET_GS_BASE) return PACHA_SYSCALL_ERR_INVALID;
+    for (unsigned attempt = 0; attempt < 1024; ++attempt) {
+        long result = pacha_syscall1(operation, value);
+        if (result != PACHA_SYSCALL_ERR_NOT_READY) return result;
+        long yielded = pacha_syscall0(PACHA_RUNTIME_SYSCALL_YIELD);
+        if (yielded && yielded != PACHA_SYSCALL_ERR_NOT_READY) return yielded;
+    }
+    return PACHA_SYSCALL_ERR_NOT_READY;
+}
+
+
 static void publish_event(enum ph_vm_client_event kind) {
     const uint64_t one = 1;
 
@@ -38,8 +62,16 @@ static void publish_event(enum ph_vm_client_event kind) {
     }
     control->event = kind;
     atomic_store_explicit(&control->event_sequence, execution_sequence, memory_order_release);
-    CLIENT_CHECK(pacha_syscall3(PACHA_FD_SYSCALL_WRITE, PH_VM_CLIENT_EVENT_FD,
-        (uintptr_t)&one, sizeof(one)) == sizeof(one));
+    /* The native lifecycle gate can return signed NOT_READY before any
+     * write is committed while a concurrent stop is retiring. */
+    for (unsigned attempt = 0; ; ++attempt) {
+        long written = pacha_syscall3(PACHA_FD_SYSCALL_WRITE, PH_VM_CLIENT_EVENT_FD,
+            (uintptr_t)&one, sizeof(one));
+        if (written == sizeof(one)) break;
+        CLIENT_CHECK(written == PACHA_ERR_NOT_READY && attempt < 1024);
+        long yielded = pacha_syscall0(PACHA_RUNTIME_SYSCALL_YIELD);
+        CLIENT_CHECK(!yielded || yielded == PACHA_SYSCALL_ERR_NOT_READY);
+    }
 }
 
 static uint64_t await_command(void) {
@@ -58,8 +90,23 @@ static uint64_t await_command(void) {
             continue;
         }
         CLIENT_CHECK(ready == 1 && event.revents == PACHA_FD_EVENT_READABLE);
-        CLIENT_CHECK(pacha_syscall3(PACHA_FD_SYSCALL_READ, PH_VM_CLIENT_KICK_FD,
-            (uintptr_t)&count, sizeof(count)) == sizeof(count));
+        long consumed = pacha_syscall3(PACHA_FD_SYSCALL_READ, PH_VM_CLIENT_KICK_FD,
+            (uintptr_t)&count, sizeof(count));
+        /* Readiness does not reserve a counter value. A native control or
+         * notification race can leave READ temporarily not ready; wait for
+         * the command instead of treating that as bootstrap corruption. */
+        if (consumed == PACHA_ERR_NOT_READY || consumed == PACHA_SYSCALL_ERR_NOT_READY)
+            continue;
+        if (consumed != sizeof(count)) {
+            control->result = (uint64_t)consumed;
+#ifdef PH_VM_CLIENT_TRACE
+            char message[] = "VM kick read=0000000000000000\n";
+            for (unsigned i = 0; i < 16; ++i)
+                message[13 + i] = "0123456789abcdef"[((uint64_t)consumed >> ((15 - i) * 4)) & 15];
+            (void)pacha_syscall2(1, (uintptr_t)message, sizeof(message) - 1);
+#endif
+        }
+        CLIENT_CHECK(consumed == sizeof(count));
         CLIENT_CHECK(count == 1);
         uint64_t sequence = atomic_load_explicit(&control->command_sequence, memory_order_acquire);
 
@@ -127,10 +174,29 @@ void ph_vm_client_fault(struct pacha_native_fault_frame *frame) {
     /* FXSAVE supplied by the fixed core replaces x87/SSE only. Mark those
      * XSAVE components present without discarding the interrupted AVX bank. */
     saved->xstate[512] |= 3;
-    CLIENT_CHECK(pacha_syscall1(PACHA_THREAD_SYSCALL_SET_FS_BASE, registers->fs_base) == 0);
-    CLIENT_CHECK(pacha_syscall1(PACHA_THREAD_SYSCALL_SET_GS_BASE, registers->gs_base) == 0);
+    CLIENT_CHECK(ph_vm_client_set_segment_base(PACHA_THREAD_SYSCALL_SET_FS_BASE, registers->fs_base) == 0);
+    CLIENT_CHECK(ph_vm_client_set_segment_base(PACHA_THREAD_SYSCALL_SET_GS_BASE, registers->gs_base) == 0);
     control->linux_fs_base = registers->fs_base;
     control->linux_gs_base = registers->gs_base;
+}
+
+_Noreturn void ph_vm_client_fault_return(struct pacha_native_fault_frame *frame) {
+    /* Remote STOP may close syscall admission after RESUME was consumed.
+     * NOT_READY leaves this frame owned by the handler; keep it intact and
+     * yield until CONTINUE admits the return. Success restores user context
+     * and never returns here. INVALID is never a retryable frame error. */
+    for (unsigned attempt = 0; attempt < 1024; ++attempt) {
+        long result = pacha_syscall2(PACHA_PROCESS_SYSCALL_SIGNAL_CTL,
+            PACHA_PROCESS_SIGNAL_CTL_RETURN, (uintptr_t)frame);
+        if (result != PACHA_SYSCALL_ERR_NOT_READY) {
+            control->result = (uint64_t)result;
+            client_fail(__LINE__);
+        }
+        long yielded = pacha_syscall0(PACHA_RUNTIME_SYSCALL_YIELD);
+        CLIENT_CHECK(!yielded || yielded == PACHA_SYSCALL_ERR_NOT_READY);
+    }
+    control->result = PACHA_SYSCALL_ERR_NOT_READY;
+    client_fail(__LINE__);
 }
 
 int64_t lpr_dispatch_syscall_frame(struct lpr_linux_user_frame *frame,
@@ -180,8 +246,8 @@ int64_t lpr_dispatch_syscall_frame(struct lpr_linux_user_frame *frame,
     frame->rsp = registers->rsp;
     frame->rflags = registers->rflags;
     ph_vm_client_return_ip = registers->rip;
-    CLIENT_CHECK(pacha_syscall1(PACHA_THREAD_SYSCALL_SET_FS_BASE, registers->fs_base) == 0);
-    CLIENT_CHECK(pacha_syscall1(PACHA_THREAD_SYSCALL_SET_GS_BASE, registers->gs_base) == 0);
+    CLIENT_CHECK(ph_vm_client_set_segment_base(PACHA_THREAD_SYSCALL_SET_FS_BASE, registers->fs_base) == 0);
+    CLIENT_CHECK(ph_vm_client_set_segment_base(PACHA_THREAD_SYSCALL_SET_GS_BASE, registers->gs_base) == 0);
     control->linux_fs_base = registers->fs_base;
     control->linux_gs_base = registers->gs_base;
     __asm__ volatile("fxrstor64 %0" : : "m"(control->fp) : "memory");
@@ -189,11 +255,13 @@ int64_t lpr_dispatch_syscall_frame(struct lpr_linux_user_frame *frame,
 }
 
 _Noreturn void ph_vm_client_main(void) {
+    TRACE("VM client entered\n");
     CLIENT_CHECK(pacha_syscall4(PACHA_PROCESS_SYSCALL_SIGNAL_CTL,
         PACHA_PROCESS_SIGNAL_CTL_REGISTER_FAULT, (uintptr_t)ph_vm_client_fault_entry,
         (uintptr_t)fault_stack, sizeof(fault_stack)) == 0);
     control->pid = pacha_syscall0(PACHA_RUNTIME_SYSCALL_GETPID);
     control->syscall_entry = (uintptr_t)ph_vm_client_syscall_entry;
+    TRACE("VM client reporting ready\n");
     publish_event(PH_VM_CLIENT_READY);
 
     for (;;) {
@@ -209,6 +277,7 @@ _Noreturn void ph_vm_client_main(void) {
             }
             continue;
         }
+#if PH_VM_CLIENT_FIXTURES
         if (command == PH_VM_CLIENT_PROTECT) {
             control->result = pacha_syscall3(PACHA_VM_SYSCALL_MPROTECT,
                 control->address, 4096, control->value);
@@ -252,5 +321,9 @@ _Noreturn void ph_vm_client_main(void) {
         }
         control->result = *address;
         publish_event(PH_VM_CLIENT_DONE);
+#else
+        /* Production bootstraps provide capture/restore and PARK only. */
+        CLIENT_CHECK(0);
+#endif
     }
 }

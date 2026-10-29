@@ -1132,6 +1132,9 @@ pub fn setVmaProtRange(self: anytype, owner: PrincipalId, start_va: u64, size_by
 
 pub fn releaseFdTableForProcessIndex(self: anytype, index: usize) void {
     const table = self.fdTableForProcessIndex(index) orelse return;
+    // Withdraw weak observers before any source FD or object can be recycled,
+    // including table-release callers outside the ordinary exit sequence.
+    @import("persistent_wait.zig").clearOwner(self, processPrincipalFromIndex(index).?);
     defer self.reclaimFdCapabilities();
     var fd: usize = 0;
     while (fd < table.capacity) : (fd += 1) {
@@ -1152,6 +1155,7 @@ pub fn releaseFdTableForProcessIndexWithFreeList(
     free_list: *FreePageList,
 ) void {
     const table = self.fdTableForProcessIndex(index) orelse return;
+    @import("persistent_wait.zig").clearOwner(self, processPrincipalFromIndex(index).?);
     defer self.reclaimFdCapabilities();
     var fd: usize = 0;
     while (fd < table.capacity) : (fd += 1) {
@@ -1818,10 +1822,13 @@ pub fn validateRamAdmission(self: anytype, ref: NativeVmoRef, offset: u64, bytes
     var position = offset;
     while (position < end) : (position += native_page_size) {
         const page: usize = @intCast(position / native_page_size);
-        const pa = self.nativeVmoResolvedPagePaddrOrZero(ref, page) orelse blk: {
+        const pa: u64 = self.nativeVmoResolvedPagePaddrOrZero(ref, page) orelse blk: {
             // An explicit sparse borrowed hole cannot be resolved through its
             // parent or allocated as zero-fill. It carries no cache alias.
             if (self.nativeVmoSparsePageViewHole(ref, page)) break :blk 0;
+            // Pager absence is also alias-free, but remains a file-data fault
+            // after admission. A resident pager PFN still needs cache checks.
+            if (self.nativeVmoUnsuppliedPagerPage(ref, page)) break :blk 0;
             return KernelError.InvalidState;
         };
         if (pa == 0) continue;
@@ -1866,6 +1873,9 @@ test "MMIO overlay RAM VMA admission checks only resolved target PFNs including 
             return null;
         }
         pub fn nativeVmoSparsePageViewHole(_: @This(), _: NativeVmoRef, _: usize) bool {
+            return false;
+        }
+        pub fn nativeVmoUnsuppliedPagerPage(_: @This(), _: NativeVmoRef, _: usize) bool {
             return false;
         }
         pub const checkedEnd = @import("vma.zig").checkedEnd;

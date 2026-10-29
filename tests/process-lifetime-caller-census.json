@@ -71,7 +71,7 @@
       "deliverSignalLocked": "409d1f743370b0b6aca9a534fda24661989818c3a1c0d4e77eb87595233ba6f1",
       "setCurrentSignalBlockedMask": "501c86287c65d80acec5b50277bbd3193ad89b2a84ae48e2884cfc11c1864335",
       "setCurrentThreadSignalPendingHint": "8c90af9db60c7f02f14012b8471e7258a5b42dedb2fa4585791b3f0bcb3cb5e8",
-      "testUninterruptibleWaitFrontendMatrix": "5f174f8a8ff154197397c449f1767b0e953c7be5398e81cb25be2074aaed2557"
+      "testUninterruptibleWaitFrontendMatrix": "8695b5fbd881d0dd3ee4a8cae1fd58c5ec6970b08a6f17cd1400b02753913f6d"
     }
   },
   "kernel/src/state/fd.zig": {
@@ -123,6 +123,13 @@
     "mentions": {
       "fdEntryConst": 4,
       "fdPayloadWithRightsConst": 2
+    },
+    "reviewed_bodies": {}
+  },
+  "kernel/src/state/persistent_wait.zig": {
+    "mentions": {
+      "fdEntryConst": 2,
+      "fdTableForActiveProcessConst": 1
     },
     "reviewed_bodies": {}
   },
@@ -231,8 +238,9 @@
       "discardFixedMmapPrepared": 1,
       "discardMremapPrepared": 1,
       "discardMunmapPrepared": 1,
-      "fdEntryConst": 2,
+      "fdEntryConst": 3,
       "fdPayloadWithRightsConst": 8,
+      "fdTableForActiveProcessConst": 1,
       "getFdTableConst": 2,
       "getVmaTableConst": 1,
       "prepareFixedAnonymousMmap": 1,
@@ -253,7 +261,8 @@
       "mapVmoFd": "6d840652768d7a5d9b91d8b097cacb3a1a11b5d9e7c2f7ba48fdd10748dcaeb5",
       "mremapVmaRange": "5799a7f9d8499dc9db7266c84a423ef33895dd1c1d832c829ada2c13b3520e30",
       "pagerSupply": "9369ebd2828585c4068174d4fd3d43f9a65e246ae35f909958cdc69093c3a3e3",
-      "pollNowNs": "d2eca7bbfc7e631633ed3e3e4080c0e7e28482bf72dcf33f35e8cb1c924c08c0"
+      "pollNowNs": "d2eca7bbfc7e631633ed3e3e4080c0e7e28482bf72dcf33f35e8cb1c924c08c0",
+      "replacePersistentSet": "1e39051f9b1452254aef659f6608e5d89eadd6f1487b31948e8b5ce1d8a7fe33"
     }
   },
   "kernel/src/syscall/native_ipc.zig": {

@@ -10,7 +10,7 @@ mkdir -p "$out"
   "$adapter/vm_client.ld" -o "$out/vm_client.ld"
 "${CAPOS_FREESTANDING_CC:-clang}" -target x86_64-linux-gnu -fuse-ld=lld \
   -nostdlib -static -ffreestanding -fno-builtin -fno-stack-protector \
-  -fPIE -mno-red-zone -mgeneral-regs-only -std=c11 -O2 -g -Wall -Wextra -Werror \
+  -fPIE -mno-red-zone -mgeneral-regs-only -DPH_VM_CLIENT_FIXTURES=1 -std=c11 -O2 -g -Wall -Wextra -Werror \
   -I "$repo_root/userland/libpacha/include" -I "$repo_root/userland/libipc/include" \
   -I "$repo_root/userland/personality/include" \
   -I "$repo_root/userland/personality/linux/runtime" \

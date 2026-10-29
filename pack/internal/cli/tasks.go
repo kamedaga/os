@@ -140,6 +140,8 @@ func buildLiveImageCommand(ctx *context) *cobra.Command {
 			ui.KeyValues("Live image", [][2]string{
 				{"image", ctx.workspace.Rel(result.Image)},
 				{"bootfs", ctx.workspace.Rel(bootfs.Image)},
+				{"kernel", kernelResultState(kernel)},
+				{"diagnostic kernel", kernelResultState(diagnostic)},
 			})
 			return nil
 		},
@@ -289,17 +291,14 @@ func fsckRootfsCommand(ctx *context) *cobra.Command {
 
 func qemuLimineCommand(ctx *context) *cobra.Command {
 	var opts qemu.Options
-	var prepare bool
+	var prepare, requireFresh bool
+	var only []string
 	cmd := &cobra.Command{
 		Use:   "qemu-limine",
 		Short: "Boot QEMU through Limine BIOS",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if prepare {
-				if err := prepareLimineBootImage(ctx, &opts); err != nil {
-					return err
-				}
-			} else if opts.LimineImage == "" {
-				opts.LimineImage = filepath.Join(ctx.workspace.Artifacts, "limine-boot.img")
+			if err := prepareOrCheckBoot(ctx, &opts, prepare, only, requireFresh); err != nil {
+				return err
 			}
 			ui.Task("qemu:limine")
 			opts.Progress = ui.NewProgressReporter()
@@ -325,6 +324,7 @@ func qemuLimineCommand(ctx *context) *cobra.Command {
 		},
 	}
 	cmd.Flags().BoolVar(&prepare, "prepare", false, "build Limine kernel/userland/bootfs image before booting")
+	addFreshnessFlags(cmd, &only, &requireFresh)
 	cmd.Flags().BoolVar(&opts.NoKVM, "no-kvm", false, "run QEMU without KVM")
 	addIOMMUFlags(cmd, &opts.IOMMU)
 	cmd.Flags().BoolVar(&opts.NoNet, "no-net", false, "run QEMU without network")
@@ -342,33 +342,43 @@ func qemuLimineCommand(ctx *context) *cobra.Command {
 	return cmd
 }
 
-func prepareLimineBootImage(ctx *context, opts *qemu.Options) error {
-	ui.Task("build:kernel:limine")
-	kernel, err := buildsys.BuildKernel(ctx.workspace, buildsys.KernelOptions{
-		StepOverride: "limine",
-		Progress:     ui.NewProgressReporter(),
-	})
-	if err != nil {
+func prepareLimineBootImage(ctx *context, opts *qemu.Options, selection prepareSelection) error {
+	kernelOutput := buildsys.KernelOutputPath(ctx.workspace, "limine")
+	if selection.Kernel {
+		ui.Task("build:kernel:limine")
+		kernel, err := buildsys.BuildKernel(ctx.workspace, buildsys.KernelOptions{
+			StepOverride: "limine",
+			Progress:     ui.NewProgressReporter(),
+		})
+		if err != nil {
+			return err
+		}
+		ui.KeyValues("Kernel", [][2]string{
+			{"step", kernel.Step},
+			{"state", kernelResultState(kernel)},
+			{"output", ctx.workspace.Rel(kernel.Output)},
+		})
+	} else if err := requireFile(kernelOutput, "kernel output (add --only kernel)"); err != nil {
 		return err
 	}
-	ui.KeyValues("Kernel", [][2]string{
-		{"step", kernel.Step},
-		{"output", ctx.workspace.Rel(kernel.Output)},
-	})
 
-	ui.Task("build:userland")
-	userland, err := buildsys.BuildUserland(ctx.workspace, buildsys.UserlandOptions{Progress: ui.NewProgressReporter()})
-	if err != nil {
-		return err
+	var userland buildsys.UserlandResult
+	if selection.Userland {
+		ui.Task("build:userland")
+		result, err := buildsys.BuildUserland(ctx.workspace, buildsys.UserlandOptions{AppIDs: selection.Apps, Progress: ui.NewProgressReporter()})
+		if err != nil {
+			return err
+		}
+		printUserland(result)
+		userland = result
 	}
-	printUserland(userland)
 
 	if err := runRootfsSync(ctx, userland, false); err != nil {
 		return err
 	}
 
 	ui.Task("gen:manifests")
-	generated, err := generateOrReuseManifests(ctx, userland.DirectoryArtifactsChanged == 0)
+	generated, err := generateOrReuseManifests(ctx, false)
 	if err != nil {
 		return err
 	}
@@ -379,7 +389,7 @@ func prepareLimineBootImage(ctx *context, opts *qemu.Options) error {
 
 	ui.Task("build:bootfs")
 	bootfsPath := ctx.workspace.Path(ctx.workspace.Artifacts, "BOOTFS.IMG")
-	image, err := bootfs.BuildImageWithOptions(generated.Outputs.Bootfs, bootfsPath, bootfs.Options{Progress: ui.NewProgressReporter(), Storage: &bootfs.StorageOptions{DiskPath: ctx.workspace.Path(ctx.workspace.Disk.Image), RootPartition: ctx.workspace.Disk.Partitions["rootfs"].Index, RAMBytes: ctx.workspace.Storage.SandboxRAMMiB << 20, QueueSize: ctx.workspace.Storage.QueueSize, ArenaBytes: ctx.workspace.Storage.QueueArenaMiB << 20}})
+	image, err := bootfs.BuildImageWithOptions(generated.Outputs.Bootfs, bootfsPath, bootfsOptions(ctx, true))
 	if err != nil {
 		return err
 	}
@@ -396,7 +406,7 @@ func prepareLimineBootImage(ctx *context, opts *qemu.Options) error {
 
 	ui.Task("build:limine-image")
 	limine, err := bootloaderlimine.BuildImageWithOptions(ctx.workspace, bootloaderlimine.Inputs{
-		KernelELF:   kernel.Output,
+		KernelELF:   kernelOutput,
 		InitELF:     ctx.workspace.ArtifactPath(initApp),
 		BootfsImage: image.Path,
 	}, bootloaderlimine.Options{Progress: ui.NewProgressReporter()})
@@ -405,6 +415,7 @@ func prepareLimineBootImage(ctx *context, opts *qemu.Options) error {
 	}
 	opts.LimineImage = limine.Image
 	ui.KeyValues("Limine", [][2]string{
+		{"state", limineImageState(limine)},
 		{"image", ctx.workspace.Rel(limine.Image)},
 		{"config", ctx.workspace.Rel(limine.Config)},
 		{"limine", limine.Limine},
@@ -427,17 +438,15 @@ func taskStub(task string, use string) *cobra.Command {
 
 func qemuCommand(ctx *context) *cobra.Command {
 	var opts qemu.Options
+	var requireFresh bool
+	var only []string
 	cmd := &cobra.Command{
 		Use:     "qemu",
 		Aliases: []string{"run"},
 		Short:   "Boot QEMU through Limine",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if opts.Prepare {
-				if err := prepareLimineBootImage(ctx, &opts); err != nil {
-					return err
-				}
-			} else if opts.LimineImage == "" {
-				opts.LimineImage = filepath.Join(ctx.workspace.Artifacts, "limine-boot.img")
+			if err := prepareOrCheckBoot(ctx, &opts, opts.Prepare, only, requireFresh); err != nil {
+				return err
 			}
 			ui.Task("qemu")
 			var result qemu.Result
@@ -471,6 +480,7 @@ func qemuCommand(ctx *context) *cobra.Command {
 		},
 	}
 	cmd.Flags().BoolVar(&opts.Prepare, "prepare", false, "build and sync boot/root filesystems before booting")
+	addFreshnessFlags(cmd, &only, &requireFresh)
 	cmd.Flags().BoolVar(&opts.NoBuild, "no-build", false, "deprecated no-op; qemu does not build by default")
 	_ = cmd.Flags().MarkHidden("no-build")
 	cmd.Flags().BoolVar(&opts.NewTerminal, "new-terminal", false, "open virtio-console in a new terminal window")
@@ -573,7 +583,7 @@ func runSeed0rootProfile(ctx *context, profile string, marker string, timeout ti
 	}()
 
 	var prepareOpts qemu.Options
-	if err := prepareLimineBootImage(ctx, &prepareOpts); err != nil {
+	if err := prepareLimineBootImage(ctx, &prepareOpts, allStages()); err != nil {
 		return err
 	}
 	scratchDir, scratchImage, scratchDisk, err := createSeed0rootProfileScratch(ctx, prepareOpts.LimineImage)
@@ -807,12 +817,8 @@ func runBootPrepare(ctx *context) error {
 	if err != nil {
 		return err
 	}
-	kernelState := "built"
-	if kernel.Skipped {
-		kernelState = "up-to-date"
-	}
 	ui.KeyValues("Kernel", [][2]string{
-		{"state", kernelState},
+		{"state", kernelResultState(kernel)},
 		{"output", ctx.workspace.Rel(kernel.Output)},
 	})
 
@@ -829,30 +835,24 @@ func runBootPrepare(ctx *context) error {
 }
 
 func buildKernelCommand(ctx *context) *cobra.Command {
-	var force bool
 	cmd := &cobra.Command{
 		Use:   "kernel",
 		Short: "Build kernel EFI artifact",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ui.Task("build:kernel")
-			result, err := buildsys.BuildKernel(ctx.workspace, buildsys.KernelOptions{Force: force, Progress: ui.NewProgressReporter()})
+			result, err := buildsys.BuildKernel(ctx.workspace, buildsys.KernelOptions{Progress: ui.NewProgressReporter()})
 			if err != nil {
 				return err
-			}
-			state := "built"
-			if result.Skipped {
-				state = "up-to-date"
 			}
 			ui.KeyValues("Kernel", [][2]string{
 				{"step", result.Step},
 				{"dir", ctx.workspace.Kernel.Dir},
-				{"state", state},
+				{"state", kernelResultState(result)},
 				{"output", ctx.workspace.Rel(result.Output)},
 			})
 			return nil
 		},
 	}
-	cmd.Flags().BoolVar(&force, "force", false, "force zig build even when kernel output is up to date")
 	return cmd
 }
 
@@ -928,7 +928,7 @@ func syncRootfsCommand(ctx *context) *cobra.Command {
 				printUserland(result)
 				userland = result
 			}
-			return runRootfsSyncWithOptions(ctx, userland, force, noBuild)
+			return runRootfsSyncWithOptions(ctx, userland, force)
 		},
 	}
 	cmd.Flags().BoolVar(&force, "force", false, "force rootfs rewrite even when fingerprint is unchanged")
@@ -973,11 +973,18 @@ func printUserland(result buildsys.UserlandResult) {
 	ui.KeyValues("Userland", rows)
 }
 
-func runRootfsSync(ctx *context, userland buildsys.UserlandResult, force bool) error {
-	return runRootfsSyncWithOptions(ctx, userland, force, false)
+func kernelResultState(result buildsys.KernelResult) string {
+	if result.Changed {
+		return "rebuilt"
+	}
+	return "unchanged"
 }
 
-func runRootfsSyncWithOptions(ctx *context, userland buildsys.UserlandResult, force bool, noBuild bool) error {
+func runRootfsSync(ctx *context, userland buildsys.UserlandResult, force bool) error {
+	return runRootfsSyncWithOptions(ctx, userland, force)
+}
+
+func runRootfsSyncWithOptions(ctx *context, userland buildsys.UserlandResult, force bool) error {
 	ui.Task("init:disk")
 	disk, err := diskimage.EnsureWithOptions(ctx.workspace, diskimage.Options{Progress: ui.NewProgressReporter()})
 	if err != nil {
@@ -1003,8 +1010,7 @@ func runRootfsSyncWithOptions(ctx *context, userland buildsys.UserlandResult, fo
 		return err
 	}
 	rootfsForce := force
-	manifestReuse := !force && !noBuild && userland.DirectoryArtifactsChanged == 0 && !hasDirectoryPath(changedSources)
-	generated, err := generateOrReuseManifests(ctx, manifestReuse)
+	generated, err := generateOrReuseManifests(ctx, force)
 	if err != nil {
 		return err
 	}
@@ -1067,7 +1073,7 @@ func runBootfsSync(ctx *context, force bool) error {
 	})
 
 	ui.Task("gen:manifests")
-	generated, err := generateOrReuseManifests(ctx, !force)
+	generated, err := generateOrReuseManifests(ctx, force)
 	if err != nil {
 		return err
 	}
@@ -1083,7 +1089,7 @@ func runBootfsSync(ctx *context, force bool) error {
 
 	ui.Task("build:bootfs")
 	bootfsPath := ctx.workspace.Path(ctx.workspace.Artifacts, "BOOTFS.IMG")
-	image, err := bootfs.BuildImageWithOptions(generated.Outputs.Bootfs, bootfsPath, bootfs.Options{Progress: ui.NewProgressReporter(), Storage: &bootfs.StorageOptions{DiskPath: ctx.workspace.Path(ctx.workspace.Disk.Image), RootPartition: ctx.workspace.Disk.Partitions["rootfs"].Index, RAMBytes: ctx.workspace.Storage.SandboxRAMMiB << 20, QueueSize: ctx.workspace.Storage.QueueSize, ArenaBytes: ctx.workspace.Storage.QueueArenaMiB << 20}})
+	image, err := bootfs.BuildImageWithOptions(generated.Outputs.Bootfs, bootfsPath, bootfsOptions(ctx, true))
 	if err != nil {
 		return err
 	}
@@ -1106,16 +1112,10 @@ func runBootfsSync(ctx *context, force bool) error {
 }
 
 func syncBootfsToLimineImage(ctx *context, bootfsPath string) error {
-	const limineFatPartitionByte = int64(2 * 1024 * 1024)
 	liminePath := ctx.workspace.Path(ctx.workspace.Artifacts, "limine-boot.img")
-	locks, err := imagelock.Acquire(liminePath)
-	if err != nil {
-		return err
-	}
-	defer locks.Close()
 	if _, err := os.Stat(liminePath); err != nil {
 		if os.IsNotExist(err) {
-			ui.KeyValues("Limine ESP", [][2]string{
+			ui.KeyValues("Limine image", [][2]string{
 				{"state", "skipped"},
 				{"reason", "limine image missing"},
 			})
@@ -1123,73 +1123,35 @@ func syncBootfsToLimineImage(ctx *context, bootfsPath string) error {
 		}
 		return err
 	}
-
 	initApp, ok := bootInitApp(ctx)
 	if !ok {
 		return fmt.Errorf("missing enabled boot app")
 	}
-	kernelStep := ctx.workspace.Kernel.Step
-	if kernelStep == "" {
-		kernelStep = "limine"
-	}
-	kernelPath := filepath.Join(ctx.workspace.Path(ctx.workspace.Kernel.Dir), "zig-out", "bin", kernelStep)
-	if kernelStep == "limine" {
-		kernelPath = filepath.Join(ctx.workspace.Path(ctx.workspace.Kernel.Dir), "zig-out", "bin", "limine", "pacha-kernel.elf")
-	}
-	initPath := ctx.workspace.ArtifactPath(initApp)
-	configPath := ctx.workspace.Path(ctx.workspace.Artifacts, "limine.conf")
-	for _, path := range []string{kernelPath, initPath, bootfsPath, configPath} {
-		if info, err := os.Stat(path); err != nil {
-			return err
-		} else if info.Size() == 0 {
-			return fmt.Errorf("empty limine input: %s", path)
-		}
-	}
-
-	ui.Task("sync:limine-esp")
-	tmpDir, err := os.MkdirTemp(ctx.workspace.Path(ctx.workspace.Artifacts), "limine-esp-")
+	ui.Task("build:limine-image")
+	// Rebuilding through the image builder keeps the staged loose boot files
+	// and the input record consistent with the image; it is skipped when
+	// nothing changed.
+	result, err := bootloaderlimine.BuildImageWithOptions(ctx.workspace, bootloaderlimine.Inputs{
+		KernelELF:   buildsys.KernelOutputPath(ctx.workspace, ctx.workspace.Kernel.Step),
+		InitELF:     ctx.workspace.ArtifactPath(initApp),
+		BootfsImage: bootfsPath,
+	}, bootloaderlimine.Options{ImagePath: liminePath, Progress: ui.NewProgressReporter()})
 	if err != nil {
 		return err
 	}
-	defer os.RemoveAll(tmpDir)
-
-	mtoolsImage := fmt.Sprintf("%s@@%d", liminePath, limineFatPartitionByte)
-	limineBios := filepath.Join(tmpDir, "limine-bios.sys")
-	bootx64 := filepath.Join(tmpDir, "BOOTX64.EFI")
-	if err := runExternal("mcopy", "-o", "-i", mtoolsImage, "::/limine-bios.sys", limineBios); err != nil {
-		return err
-	}
-	if err := runExternal("mcopy", "-o", "-i", mtoolsImage, "::/EFI/BOOT/BOOTX64.EFI", bootx64); err != nil {
-		return err
-	}
-	if err := runExternal("mformat", "-i", mtoolsImage, "-F", "-v", "LIMINEBOOT", "::"); err != nil {
-		return err
-	}
-	if err := runExternal("mmd", "-i", mtoolsImage, "::/EFI"); err != nil {
-		return err
-	}
-	if err := runExternal("mmd", "-i", mtoolsImage, "::/EFI/BOOT"); err != nil {
-		return err
-	}
-	copies := [][2]string{
-		{limineBios, "::/limine-bios.sys"},
-		{bootx64, "::/EFI/BOOT/BOOTX64.EFI"},
-		{kernelPath, "::/KERNEL.ELF"},
-		{initPath, "::/INITAPP.ELF"},
-		{bootfsPath, "::/BOOTFS.IMG"},
-		{configPath, "::/limine.conf"},
-	}
-	for _, item := range copies {
-		if err := runExternal("mcopy", "-o", "-i", mtoolsImage, item[0], item[1]); err != nil {
-			return err
-		}
-	}
-	ui.KeyValues("Limine ESP", [][2]string{
-		{"state", "synced"},
-		{"image", ctx.workspace.Rel(liminePath)},
+	ui.KeyValues("Limine image", [][2]string{
+		{"state", limineImageState(result)},
+		{"image", ctx.workspace.Rel(result.Image)},
 		{"bootfs", ctx.workspace.Rel(bootfsPath)},
 	})
 	return nil
+}
+
+func limineImageState(result bootloaderlimine.Result) string {
+	if result.Skipped {
+		return "up-to-date"
+	}
+	return "built"
 }
 
 func runExternal(name string, args ...string) error {
@@ -1212,8 +1174,8 @@ func bootInitApp(ctx *context) (config.App, bool) {
 	return config.App{}, false
 }
 
-func generateOrReuseManifests(ctx *context, allowReuse bool) (manifests.Result, error) {
-	if allowReuse {
+func generateOrReuseManifests(ctx *context, force bool) (manifests.Result, error) {
+	if !force {
 		if result, ok, err := manifests.ExistingIfFreshWithOptions(ctx.workspace, manifests.Options{Progress: ui.NewProgressReporter()}); err != nil {
 			return manifests.Result{}, err
 		} else if ok {
@@ -1290,16 +1252,6 @@ func clearDirtyArtifacts(ctx *context) error {
 	return err
 }
 
-func hasDirectoryPath(paths []string) bool {
-	for _, path := range paths {
-		info, err := os.Stat(path)
-		if err == nil && info.IsDir() {
-			return true
-		}
-	}
-	return false
-}
-
 func firstNonEmpty(values ...string) string {
 	for _, value := range values {
 		if value != "" {
@@ -1334,4 +1286,9 @@ func containsShellSpecial(value string) bool {
 		}
 	}
 	return false
+}
+
+func addFreshnessFlags(cmd *cobra.Command, only *[]string, requireFresh *bool) {
+	cmd.Flags().StringArrayVar(only, "only", nil, "with --prepare, rebuild only these stages: kernel, userland, userland:<app>[,<app>...] (repeatable); packaging always runs")
+	cmd.Flags().BoolVar(requireFresh, "require-fresh", false, "refuse to boot when any boot input is stale")
 }

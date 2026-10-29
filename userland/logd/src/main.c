@@ -295,6 +295,7 @@ int main(int argc, char **argv)
             status != 0 ? status : ready_status);
         return 4;
     }
+    struct pacha_fd_wait_retained wait_set = {0};
     for (;;) {
         struct pacha_ipc_msg message = {0};
         if (state.kernel_timer_fd >= 16) {
@@ -302,7 +303,8 @@ int main(int argc, char **argv)
                 { .fd = (pacha_fd_t)config.endpoint_fd, .events = PACHA_FD_EVENT_READABLE },
                 { .fd = state.kernel_timer_fd, .events = PACHA_FD_EVENT_READABLE },
             };
-            status = (pacha_fd_t)pacha_fd_wait_many(waits, 2, PACHA_FD_WAIT_FOREVER);
+            status = (pacha_fd_t)pacha_fd_wait_many_retained(&wait_set,
+                waits, 2, PACHA_FD_WAIT_FOREVER);
             if (status < 0) break;
             if (waits[1].revents & PACHA_FD_EVENT_READABLE) {
                 uint64_t expirations = 0;

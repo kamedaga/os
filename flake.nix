@@ -37,7 +37,7 @@
         in
         {
           default = pkgs.mkShell {
-            packages = toolchains.devPackages;
+            packages = toolchains.devPackages ++ [ pkgs.strace ];
             CAPOS_UNWRAPPED_CLANG = "${toolchains.clangFreestanding}/bin/clang";
             CAPOS_FREESTANDING_CC = "${toolchains.clangFreestanding}/bin/clang";
             CAPOS_LINUX_LLVM18_BIN = "${toolchains.linuxLlvm18}/bin";

@@ -49,8 +49,12 @@ done
 if [ "$runtime_stale" = 1 ]; then
   # The dynamic loader contains the native syscall translation itself. A
   # freshly linked service cannot compensate for a stale loader after an ABI
-  # renumbering, even when its own source and link step are current.
-  bash "$repo_root/musl/pachaos/build/build-runtime.sh"
+  # renumbering, even when its own source and link step are current. The
+  # runtime has one builder (pacgo's build_runtime recipe); rebuilding it here
+  # would race that recipe, which replaces the whole runtime directory.
+  echo "build-app-dynamic.sh: $runtime_lib is missing or older than its sources;" \
+    'run musl/pachaos/build/build-runtime.sh (pacgo recipe build_runtime) first' >&2
+  exit 1
 fi
 
 rm -rf "$obj_dir" "$sysroot"

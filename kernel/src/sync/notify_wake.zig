@@ -1,5 +1,9 @@
-//! NOTIFY-only wake edge. Publishers hold K across request/send/failure;
-//! the receiver clears before inspecting its runqueue or returning to idle.
+//! NOTIFY-only wake edge. Publishers hold K across request; the edge is sent
+//! by the same CPU right after that K release (sync/deferred_wake.zig). A
+//! later publisher may see the token still pending before the send and rely on
+//! it, which is safe because the send is unconditional and a failed deferred
+//! send halts the kernel. The receiver clears before inspecting its runqueue
+//! or returning to idle.
 pub const Token = struct {
     pending: u32 = 0,
 
@@ -10,7 +14,8 @@ pub const Token = struct {
         _ = @atomicRmw(u32, &self.pending, .Xchg, 0, .acq_rel);
     }
     pub fn failed(self: *Token) void {
-        // K excludes a second publisher until failure is resolved.
+        // Only a direct send (no K deferral row yet) returns failure to its
+        // caller while K still excludes a second publisher.
         self.received();
     }
 };

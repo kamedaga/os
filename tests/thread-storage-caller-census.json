@@ -1,6 +1,12 @@
 {
   "note": "Syntactic review tripwire, not a lifetime proof; inherited_table callers require semantic audit.",
   "readers": {
+    "claimedWaitOutput": {
+      "exclusion": "table",
+      "calls": {
+        "threadContextLocked": 1
+      }
+    },
     "detachPrincipalIpcBindings": {
       "exclusion": "table",
       "calls": {
@@ -724,7 +730,7 @@
       "currentThreadGeneration": 5
     },
     "kernel/src/syscall/fd.zig": {
-      "currentThreadGeneration": 3
+      "currentThreadGeneration": 4
     },
     "kernel/src/traps.zig": {
       "currentThreadGeneration": 1

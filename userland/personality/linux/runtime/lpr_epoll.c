@@ -72,7 +72,8 @@ typedef struct lpr_epoll_snapshot {
     int32_t fd;
     uint8_t kind;
     uint8_t reserved0;
-    uint16_t reserved1;
+    uint16_t interest_index;
+    uint64_t instance_generation;
     uint32_t target_ofd_index;
     uint32_t registered_fd;
     uint64_t target_generation;
@@ -130,6 +131,16 @@ static void lpr_epoll_remove_interest(lpr_epoll_instance_t *instance, uint32_t i
 int lpr_linux_epoll_fd_active(uint64_t fd)
 {
     return lpr_epoll_backend(fd) != 0;
+}
+
+int64_t lpr_linux_epoll_create(uint64_t size)
+{
+    /* Linux retains the positive int size check but no longer uses the hint.
+     * The legacy call creates a descriptor without close-on-exec. */
+    if ((int32_t)size <= 0) {
+        return -LPR_LINUX_EINVAL;
+    }
+    return lpr_linux_epoll_create1(0);
 }
 
 int64_t lpr_linux_epoll_create1(uint64_t flags)
@@ -312,6 +323,7 @@ int64_t lpr_linux_epoll_ctl(uint64_t epfd_raw, uint64_t op, uint64_t fd_raw, uin
         lpr_ofd_ops_id(target) != LPR_FD_OPS_TTY &&
         lpr_ofd_ops_id(target) != LPR_FD_OPS_DRM &&
         lpr_ofd_ops_id(target) != LPR_FD_OPS_INPUT &&
+        lpr_ofd_ops_id(target) != LPR_FD_OPS_AUDIO &&
         lpr_ofd_ops_id(target) != LPR_FD_OPS_SYNC_FILE &&
         lpr_ofd_ops_id(target) != LPR_FD_OPS_EPOLL)
     {
@@ -411,10 +423,40 @@ static int lpr_epoll_resolve_target_fd_unlocked(const lpr_epoll_interest_t *inte
     return -1;
 }
 
+typedef struct lpr_epoll_snapshot_epoch {
+    uint32_t ofd_index;
+    uint64_t ofd_generation;
+    uint64_t instance_generation;
+} lpr_epoll_snapshot_epoch_t;
+
+/* A watched descriptor may close after graph construction but before native
+ * wait admission. Its native capability can then be gone. Only a changed
+ * interest set on the SAME epoll OFD justifies rebuilding that stale graph;
+ * an unchanged set, closed root or reused root FD must keep its real error. */
+static int lpr_epoll_wait_should_retry(uint32_t epfd,
+    const lpr_epoll_snapshot_epoch_t *epoch, int64_t result)
+{
+    if (result != -LPR_LINUX_EBADF && result != -LPR_LINUX_EINVAL) return 0;
+    int changed = 0;
+    lpr_fd_table_lock(&lpr_control_fd_table);
+    if (epfd < lpr_control_fd_table.entry_count) {
+        const lpr_fd_entry_t *entry = &lpr_control_fd_table.entries[epfd];
+        if (entry->active && entry->ofd_index == epoch->ofd_index &&
+            entry->ofd_generation == epoch->ofd_generation &&
+            entry->ofd_index < lpr_control_fd_table.ofd_count) {
+            lpr_epoll_instance_t *instance = lpr_epoll_instance_for_object(
+                &lpr_control_fd_table.ofds[entry->ofd_index]);
+            changed = instance && instance->generation != epoch->instance_generation;
+        }
+    }
+    lpr_fd_table_unlock(&lpr_control_fd_table);
+    return changed;
+}
+
 static int64_t lpr_epoll_snapshot(
     uint32_t epfd,
     lpr_epoll_snapshot_t *snapshot,
-    uint32_t *out_count)
+    uint32_t *out_count, lpr_epoll_snapshot_epoch_t *epoch)
 {
     *out_count = 0;
     lpr_fd_table_lock(&lpr_control_fd_table);
@@ -435,6 +477,10 @@ static int64_t lpr_epoll_snapshot(
         lpr_fd_table_unlock(&lpr_control_fd_table);
         return object->active ? -LPR_LINUX_EINVAL : -LPR_LINUX_EBADF;
     }
+    if (epoch) *epoch = (lpr_epoll_snapshot_epoch_t){
+        .ofd_index = slot->ofd_index, .ofd_generation = slot->ofd_generation,
+        .instance_generation = instance->generation,
+    };
     for (uint32_t i = 0; i < instance->count; i++) {
         const lpr_epoll_interest_t *interest = &instance->interests[i];
         if ((interest->state & LPR_EPOLL_STATE_ONESHOT_DISABLED) != 0) {
@@ -449,6 +495,8 @@ static int64_t lpr_epoll_snapshot(
         lpr_epoll_snapshot_t *item = &snapshot[*out_count];
         item->fd = target_fd;
         item->kind = lpr_ofd_ops_id(target);
+        item->interest_index = (uint16_t)i;
+        item->instance_generation = instance->generation;
         item->target_ofd_index = interest->target_ofd_index;
         item->registered_fd = interest->target_fd;
         item->target_generation = interest->target_generation;
@@ -526,15 +574,29 @@ static int64_t lpr_epoll_apply_observation(
         lpr_fd_table_unlock(&lpr_control_fd_table);
         return -LPR_LINUX_EINVAL;
     }
-    for (uint32_t i = 0; i < instance->count; ++i) {
-        lpr_epoll_interest_t *interest = &instance->interests[i];
+    /* The query ran outside the table lock. Its temporary logical descriptor
+     * may have been reassigned while a dup still keeps the watched OFD alive.
+     * Discard that result; the next snapshot resolves a surviving alias. */
+    if (item->fd < 0 || (uint32_t)item->fd >= lpr_control_fd_table.entry_count ||
+        !lpr_control_fd_table.entries[item->fd].active ||
+        lpr_control_fd_table.entries[item->fd].ofd_index != item->target_ofd_index ||
+        lpr_control_fd_table.entries[item->fd].ofd_generation != item->target_generation) {
+        lpr_fd_table_unlock(&lpr_control_fd_table);
+        return 0;
+    }
+    /* CTL/close invalidates this slot identity, including DEL+ADD of the same
+     * open file description. Its control doorbell requests a fresh snapshot.
+     * Unchanged sets avoid a second linear search for every observed fd. */
+    if (instance->generation == item->instance_generation && item->interest_index < instance->count) {
+        lpr_epoll_interest_t *interest = &instance->interests[item->interest_index];
         if (!lpr_epoll_interest_matches(
                 interest,
                 item->registered_fd,
                 item->target_ofd_index,
                 item->target_generation))
         {
-            continue;
+            lpr_fd_table_unlock(&lpr_control_fd_table);
+            return 0;
         }
         if (sequence && (interest->events & LPR_EPOLLET)) {
             /* A different process can drain/refill without this epoll ever
@@ -659,7 +721,7 @@ static int64_t lpr_epoll_scan_fd(
 {
     lpr_epoll_snapshot_t snapshot[LPR_EPOLL_MAX_INTERESTS];
     uint32_t count = 0;
-    const int64_t status = lpr_epoll_snapshot(epfd, snapshot, &count);
+    const int64_t status = lpr_epoll_snapshot(epfd, snapshot, &count, NULL);
     if (status != 0) return status;
     return lpr_epoll_scan(
         epfd, snapshot, count, events, maxevents, cached_sockets, consume, wait_not_ready);
@@ -693,7 +755,7 @@ int64_t lpr_epoll_add_wait_graph(
 
         lpr_epoll_snapshot_t snapshot[LPR_EPOLL_MAX_INTERESTS];
         uint32_t count = 0;
-        status = lpr_epoll_snapshot(epfd, snapshot, &count);
+        status = lpr_epoll_snapshot(epfd, snapshot, &count, NULL);
         if (status != 0) return status;
         for (uint32_t i = 0; i < count; ++i) {
             if (snapshot[i].kind == LPR_FD_OPS_UNIX) {
@@ -766,8 +828,9 @@ int64_t lpr_linux_epoll_wait(
     for (;;) {
         lpr_epoll_snapshot_t snapshot[LPR_EPOLL_MAX_INTERESTS];
         uint32_t count = 0;
+        lpr_epoll_snapshot_epoch_t epoch;
         const int64_t snapshot_status =
-            lpr_epoll_snapshot((uint32_t)epfd_raw, snapshot, &count);
+            lpr_epoll_snapshot((uint32_t)epfd_raw, snapshot, &count, &epoch);
         if (snapshot_status != 0) {
             return snapshot_status;
         }
@@ -809,9 +872,15 @@ int64_t lpr_linux_epoll_wait(
         lpr_wait_graph_t graph;
         lpr_wait_graph_init(&graph);
         status = lpr_epoll_add_wait_graph(epfd_raw, &graph);
-        if (status != 0) return status;
+        if (status != 0) {
+            if (lpr_epoll_wait_should_retry((uint32_t)epfd_raw, &epoch, status)) continue;
+            return status;
+        }
         status = lpr_wait_graph_block(&graph, &deadline, wait_not_ready);
-        if (status != 0) return status;
+        if (status != 0) {
+            if (lpr_epoll_wait_should_retry((uint32_t)epfd_raw, &epoch, status)) continue;
+            return status;
+        }
         cached_sockets = 1;
     }
 }

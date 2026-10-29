@@ -25,6 +25,12 @@ kb2_status_t ph_owner_boot_begin(struct ph_owner_boot *boot,
         config->sandbox_config->resource_count != config->resource_count ||
         config->sandbox_config->size != sizeof(*config->sandbox_config))
         return KB2_STATUS_INVALID_CONFIGURATION;
+    /* The config selects the child's logger; transferring the endpoint
+     * alone silently loses its Linux diagnostics. Conversely a selected
+     * logger must never name a descriptor absent from the launch grants. */
+    if (config->sandbox_config->log_endpoint_fd !=
+        (config->log_endpoint_fd >= 16 ? PH_SANDBOX_LOG_FD : 0))
+        return KB2_STATUS_INVALID_CONFIGURATION;
     *boot = (struct ph_owner_boot){.config = *config, .phase = PH_OWNER_BOOT_CHANNEL};
     int error = pacha_ipc_channel_create(config->management,
         PH_IPC_CHANNEL_RIGHTS | PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_TRANSFER, 0);

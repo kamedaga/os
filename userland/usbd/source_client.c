@@ -4,6 +4,7 @@
 #include <pacha/ipc.h>
 #include <errno.h>
 #include <string.h>
+#include <stdio.h>
 
 static int send_page(struct usbd_source_client *source, uint32_t kind,
     const void *payload, uint32_t count, uint64_t sequence,
@@ -22,6 +23,7 @@ static int send_page(struct usbd_source_client *source, uint32_t kind,
         .magic = INPUTD_SOURCE_MAGIC, .source_id = source->source_id,
         .generation = source->generation, .sequence = sequence,
         .overwritten = overwritten, .kind = kind, .count = count,
+        .source_kind = source->source_kind, .platform_id = source->platform_id,
         .pci_segment = source->pci_segment, .pci_bus = source->pci_bus,
         .pci_device = source->pci_device,
         .pci_function = source->pci_function,
@@ -43,6 +45,10 @@ static int send_page(struct usbd_source_client *source, uint32_t kind,
         result = reply.word0 == INPUTD_SOURCE_MAGIC &&
             reply.word3 == correlation && !reply.fd_count ?
             (int)(int64_t)reply.word1 : -EPROTO;
+    if (result)
+        fprintf(stderr, "[usbd] input source=%llu kind=%u count=%u correlation=%llu status=%d\n",
+            (unsigned long long)source->source_id, kind, count,
+            (unsigned long long)correlation, result);
     return result;
 }
 
@@ -63,6 +69,7 @@ int usbd_source_open(struct usbd_source_client *source, pacha_fd_t endpoint_fd,
     *source = (struct usbd_source_client){.endpoint_fd = endpoint_fd,
         .page_fd = fd, .page = mapped,
         .source_id = source_id, .generation = generation,
+        .source_kind = INPUTD_SOURCE_PCI,
         .pci_segment = pci_segment, .pci_bus = pci_bus,
         .pci_device = pci_device, .pci_function = pci_function};
     return 0;

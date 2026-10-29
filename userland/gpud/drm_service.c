@@ -954,12 +954,14 @@ static int ioctl_request(
                         service, request->handle);
                     if (watch && !watch->submit_reported) {
                         watch->submit_reported = 1;
+#if defined(GPUD_DRM_DIAG) && GPUD_DRM_DIAG
                         printf("[gpud] drm submit generation=%llu node=%llu "
                             "handle=%llu session=%llu\n",
                             (unsigned long long)generation,
                             (unsigned long long)watch->device_minor,
                             (unsigned long long)request->handle,
                             (unsigned long long)binding.session_id);
+#endif
                     }
                 }
                 if (!error && request->request == GPUD_DRM_IOCTL_MODE_SETCRTC &&
@@ -1706,8 +1708,18 @@ int gpud_drm_service_reap_hangups(struct gpud_drm_service *service) {
         service, service->pollfds, service->poll_capacity);
     if (!count)
         return 0;
-    long polled = pacha_fd_wait_many_batched(service->pollfds, count, 0);
-    if (polled < 0 && polled != PACHA_ERR_NOT_READY) return service->error = -EIO;
+    /* This is an immediate probe. FD_POLL preserves min_write_bytes and
+     * readiness but never builds a transient waiter group. */
+    for (size_t start = 0; start < count; start += PACHA_FD_WAIT_RETAINED_MAX_FDS) {
+        size_t n = count - start;
+        if (n > PACHA_FD_WAIT_RETAINED_MAX_FDS) n = PACHA_FD_WAIT_RETAINED_MAX_FDS;
+        const long polled = pacha_fd_poll(service->pollfds + start, n);
+        size_t ready = 0;
+        for (size_t i = start; i < start + n; ++i)
+            ready += service->pollfds[i].revents != 0;
+        if (polled < 0 || (size_t)polled != ready)
+            return service->error = -EIO;
+    }
     size_t connection_count = 0;
     for (struct gpud_drm_connection *c = service->connections; c; c = c->next)
         ++connection_count;
@@ -1754,10 +1766,13 @@ int gpud_drm_service_reap_hangups(struct gpud_drm_service *service) {
             error = release_closed_objects(service);
         if (error)
             return service->error = error;
-        if (!transferred && last && !find_file(service, handle))
+        if (!transferred && last && !find_file(service, handle)) {
+#if defined(GPUD_DRM_DIAG) && GPUD_DRM_DIAG
             printf("[gpud] drm client-hangup handle=%llu generation=%llu backend-close=1\n",
                 (unsigned long long)handle,
                 (unsigned long long)service->files.generation);
+#endif
+        }
     }
     for (size_t i = 0; i < GPUD_DRM_OBJECT_LEASES_MAX; ++i) {
         struct gpud_drm_object_lease *lease = &service->object_leases[i];

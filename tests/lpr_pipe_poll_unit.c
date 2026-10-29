@@ -24,6 +24,7 @@ INACTIVE(lpr_linux_signalfd_active)
 INACTIVE(lpr_linux_filed_fd_active)
 INACTIVE(lpr_linux_device_fd_active)
 lpr_event_backend_t *lpr_event_backend(uint64_t fd) { (void)fd; return NULL; }
+lpr_audio_backend_t *lpr_audio_backend(uint64_t fd) { (void)fd; return NULL; }
 #include "../userland/personality/linux/runtime/lpr_wait.c"
 int64_t lpr_pacha_syscall4(uint64_t nr, uint64_t raw, uint64_t count,
     uint64_t timeout, uint64_t flags)
@@ -43,8 +44,13 @@ int64_t lpr_pacha_syscall2(uint64_t nr, uint64_t raw, uint64_t count)
     assert(nr == PACHAOS_SYSCALL_FD_POLL && count == 1);
     struct pacha_pollfd *p = (void *)(uintptr_t)raw;
     assert(p->fd == 40 && p->revents == 0);
-    p->revents = input_events; ++calls;
-    return input_events ? 1 : 0;
+    if (native_error) { ++calls; return PACHA_SYSCALL_ERR_INVALID; }
+    uint64_t ready = input_events;
+    if (space >= p->min_write_bytes && !peer_closed &&
+        (p->events & PACHA_FD_EVENT_WRITABLE)) ready |= PACHA_FD_EVENT_WRITABLE;
+    if (peer_closed) ready |= PACHA_FD_EVENT_ERROR | PACHA_FD_EVENT_HANGUP;
+    p->revents = ready; ++calls;
+    return ready ? 1 : 0;
 }
 int main(void)
 {

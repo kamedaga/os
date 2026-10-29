@@ -77,16 +77,24 @@ try:
         @functools.cache
         def offset(type_name, field):
             return number(child(entries, structure(type_name), field)['data_member_location'])
+        from kernel_lock_profile import Profile
+        reader = Profile.__new__(Profile)
+        reader.elf, reader.qmp, reader.bases, reader.out = Path(args.elf), qmp, bases, args.out
+        reader.symbols = {match[3]: (int(match[1], 16), int(match[2], 16))
+            for match in re.finditer(r'^([0-9a-f]+) ([0-9a-f]+) \S (.+)$',
+                subprocess.check_output(['nm', '-S', args.elf], text=True), re.M)}
+        reader.page_tables = {}
         def read_va(address, size, label):
-            if address >= bases['Virtual']:
-                physical = address - bases['Virtual'] + bases['Physical']
-            elif 0 < address < 16*1024**3 and address + size <= 16*1024**3:
-                physical = address  # Kernel allocKernelSlice uses identity addresses.
-            else:
-                raise ValueError('unsupported kernel data address')
-            path = (args.out / (label + '.bin')).resolve()
-            qmp.execute('pmemsave', dict(val=physical, size=size, filename=str(path)))
-            return path.read_bytes()
+            # Descriptor storage can live outside the ELF mapping. Walk the
+            # actual kernel page tables, including discontiguous allocations.
+            chunks = []
+            while size:
+                count = min(size, 4096 - (address & 4095))
+                chunks.append(reader.read_physical(reader.translate(address), count,
+                    label + '-' + str(len(chunks))))
+                address += count
+                size -= count
+            return b''.join(chunks)
         state_address = int(re.search(r'^([0-9a-f]+) b boot\.entry\.limine_kernel_state_storage$', symbols, re.M)[1], 16)
         state_type, desc_type = 'kernel.KernelState', 'state.types.ProcessDescriptor'
         desc_size = number(entries[structure(desc_type)]['byte_size'])

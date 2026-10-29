@@ -62,6 +62,9 @@ var irq_drain_generation: u64 = 0;
 var irq_drain_ack: []u64 = &.{};
 const NotifyWake = @import("sync/notify_wake.zig").Token;
 var notify_wake: []NotifyWake = &.{};
+// Wake edges recorded by a K owner and sent after its release. Empty until
+// initCpuStorage, which makes every early-boot wake a direct send.
+var deferred_wakes: @import("sync/deferred_wake.zig").Table = .{};
 
 // Captured once during serial CPU startup, immutable once userspace runs.
 // No partially booted or late/unverified topology may admit UC_MINUS aliases.
@@ -99,6 +102,7 @@ pub fn kernelStaticStorageEndAddr() usize {
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(irq_drain_generation), &irq_drain_generation));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(irq_drain_ack), &irq_drain_ack));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(notify_wake), &notify_wake));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(deferred_wakes), &deferred_wakes));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(mmio_cache_snapshots), &mmio_cache_snapshots));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(mmio_cache_matches), &mmio_cache_matches));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(mmio_cache_online_mask), &mmio_cache_online_mask));
@@ -150,6 +154,14 @@ pub fn initCpuStorage(count: usize) !void {
     runtime_lapic_ids = runtime_lapic_id_storage.ptr;
     irq_drain_ack = try runtime.alloc(u64, count);
     notify_wake = try runtime.alloc(NotifyWake, count);
+    const DeferredWakes = @import("sync/deferred_wake.zig").Table;
+    const deferred_words = count * DeferredWakes.wordsPerCpu(count);
+    deferred_wakes = DeferredWakes.init(
+        try runtime.alloc(usize, deferred_words),
+        try runtime.alloc(usize, deferred_words),
+        try runtime.alloc(u8, count),
+        count,
+    );
     mmio_cache_snapshots = try runtime.alloc(mtrr.CacheSnapshot, count);
     mmio_cache_matches = try runtime.alloc(u32, count);
     online_set = CpuSet.init(try runtime.alloc(usize, CpuSet.wordCount(count)), count);
@@ -949,10 +961,43 @@ fn redispatchCurrentAp(timer_expired: bool) noreturn {
     apIdleLoop(cpu_slot);
 }
 
+/// Inside a K critical section the edge is only recorded and is sent when
+/// that section releases K (see sync/deferred_wake.zig); true then means the
+/// edge is committed, not yet delivered.
 pub fn wakeCpu(cpu_slot: usize) bool {
     if (cpu_slot == currentCpuSlot()) return true;
     if (cpu_slot >= cpuCapacity()) return false;
+    if (recordDeferredWake(cpu_slot, false)) return true;
+    return sendWake(cpu_slot);
+}
+
+/// Caller holds K from runnable publication through the token request; the
+/// edge itself leaves at that K release. Only this path uses the token;
+/// general lifecycle/maintenance IPIs remain independent.
+pub fn wakeCpuForNotify(cpu_slot: usize) bool {
+    if (cpu_slot == currentCpuSlot()) return true;
+    if (cpu_slot >= notify_wake.len) return false;
+    if (!notify_wake[cpu_slot].request()) return true;
+    if (recordDeferredWake(cpu_slot, true)) return true;
+    if (sendWake(cpu_slot)) return true;
+    notify_wake[cpu_slot].failed();
+    return false;
+}
+
+fn recordDeferredWake(cpu_slot: usize, notify: bool) bool {
+    // An unknown stack cannot name its owner row; send directly rather than
+    // borrowing the BSP's row as currentCpuSlot() would.
+    if (deferred_wakes.capacity == 0) return false;
+    const owner = currentCpuSlotIfKnown() orelse return false;
+    return deferred_wakes.record(owner, cpu_slot, notify);
+}
+
+fn sendWake(cpu_slot: usize) bool {
     @import("wake_trace.zig").record(.ipi_send, cpu_slot, 0, 0);
+    // Nonzero only if an edge is still sent while this CPU owns K.
+    const profile = @import("lock_profile.zig");
+    const ipi_sample = if (comptime profile.enabled) profile.stageBegin() else {};
+    defer if (comptime profile.enabled) profile.stageEnd(.wake_ipi, ipi_sample);
     // A runnable publication needs its own APIC edge. Coalescing against an
     // earlier vector loses the later publication when the target consumes the
     // first vector immediately before returning to HLT.
@@ -963,15 +1008,28 @@ pub fn wakeCpu(cpu_slot: usize) bool {
     return false;
 }
 
-/// Caller holds K from runnable publication through this return. Only this
-/// path uses the token; general lifecycle/maintenance IPIs remain independent.
-pub fn wakeCpuForNotify(cpu_slot: usize) bool {
-    if (cpu_slot == currentCpuSlot()) return true;
-    if (cpu_slot >= notify_wake.len) return false;
-    if (!notify_wake[cpu_slot].request()) return true;
-    if (wakeCpu(cpu_slot)) return true;
-    notify_wake[cpu_slot].failed();
-    return false;
+fn sendDeferredWake(_: void, cpu_slot: usize) bool {
+    return sendWake(cpu_slot);
+}
+
+/// K was just acquired on this CPU with IF clear. Wakes published until the
+/// matching release are recorded instead of sent.
+pub fn beginKernelStateWakeDeferral() void {
+    if (deferred_wakes.capacity == 0) return;
+    const owner = currentCpuSlotIfKnown() orelse return;
+    deferred_wakes.begin(owner);
+}
+
+/// K's release store has happened on this CPU with IF still clear, so the
+/// owner cannot migrate between the store and these sends.
+pub fn endKernelStateWakeDeferral() void {
+    if (deferred_wakes.capacity == 0) return;
+    const owner = currentCpuSlotIfKnown() orelse return;
+    const failed = deferred_wakes.end(owner, {}, sendDeferredWake) orelse return;
+    // A later NOTIFY publisher may have skipped its edge on the pending
+    // token; continuing would strand its target in HLT.
+    notify_wake[failed].failed();
+    @panic("deferred notify wake IPI failed");
 }
 
 /// Before the handler's ring-0 early return. Idle resumes its queue-check loop;

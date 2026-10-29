@@ -49,11 +49,14 @@ static int load_blob(pacha_fd_t filed_fd, const char *path, const char *name,
     return error;
 }
 
-static int load_manifest(pacha_fd_t filed_fd, struct netd_kobox2_package *package)
+static int load_manifest(pacha_fd_t filed_fd, struct netd_kobox2_package *package,
+    const char *root)
 {
     struct filed_client_module_image image = {0};
+    char path[128];
+    if (snprintf(path, sizeof(path), "%s/manifest.bin", root) >= (int)sizeof(path)) return -7;
     int error = filed_client_load_module_image(filed_fd,
-        "/srv/kobox2/network/manifest.bin", "network-manifest", &image);
+        path, "network-manifest", &image);
     if (error) return error;
     if (!image.size || image.size > sizeof(package->manifest)) {
         filed_client_release_module_image(&image);
@@ -83,6 +86,34 @@ static int load_manifest(pacha_fd_t filed_fd, struct netd_kobox2_package *packag
     return 0;
 }
 
+static int load_wifi_firmware(pacha_fd_t filed_fd, struct netd_kobox2_package *package)
+{
+    struct filed_client_module_image policy = {0};
+    int error = filed_client_load_module_image_limited(filed_fd,
+        "/srv/kobox2/wifi/firmware.sha256", "wifi-firmware-policy", 65, &policy);
+    if (error) return error;
+    if (policy.size != 65 || policy.data[64] != '\n') error = -22;
+    for (size_t i = 0; !error && i < 64; ++i) {
+        unsigned c = policy.data[i];
+        unsigned value = c >= '0' && c <= '9' ? c - '0' :
+            c >= 'a' && c <= 'f' ? c - 'a' + 10 : 16;
+        if (value == 16) { error = -22; break; }
+        if (!(i & 1)) package->firmware_sha256[i / 2] = value << 4;
+        else package->firmware_sha256[i / 2] |= value;
+    }
+    filed_client_release_module_image(&policy);
+    if (error) return error;
+    error = filed_client_load_module_image_limited(filed_fd,
+        "/srv/kobox2/wifi/firmware.bundle", "wifi-firmware", 64u << 20,
+        &package->firmware);
+    if (!error) {
+        uint8_t actual[32];
+        kb2_sha256(package->firmware.data, package->firmware.size, actual);
+        if (memcmp(actual, package->firmware_sha256, sizeof(actual))) error = -74;
+    }
+    return error;
+}
+
 static int safe_module_name(kb2_closure_string_t name)
 {
     if (!name.data || !name.length || name.length > 63) return 0;
@@ -110,11 +141,23 @@ int netd_kobox2_package_open(struct netd_kobox2_package *package,
     package->device_fd = device_fd;
     package->device = (struct ph_device_authority){
         .object_id = 1, .native_device = info.device, .slot_id = 1, .node_id = 1};
-    struct filed_client_module_image sandbox = {0};
-    error = load_manifest(filed_fd, package);
+    /* The granted function, not a caller-supplied device label, selects its
+     * driver closure. Only the supported AX210 may select the Wi-Fi image. */
+    uint32_t identity = 0, class_revision = 0;
+    error = pacha_capsule_pci_config_read(device_fd, 0, 4, &identity);
+    if (!error) error = pacha_capsule_pci_config_read(device_fd, 8, 4, &class_revision);
     if (error) goto fail;
+    package->wireless = (class_revision >> 8) == 0x028000 && identity == 0x27258086;
+    if (!package->wireless && (class_revision >> 8) != 0x020000) { error = -95; goto fail; }
+    const char *root = package->wireless ? "/srv/kobox2/wifi" : "/srv/kobox2/network";
+    struct filed_client_module_image sandbox = {0};
+    error = load_manifest(filed_fd, package, root);
+    if (error) goto fail;
+    char sandbox_path[128];
+    if (snprintf(sandbox_path, sizeof(sandbox_path), "%s/sandbox.elf", root) >=
+        (int)sizeof(sandbox_path)) { error = -7; goto fail; }
     error = filed_client_load_module_image(filed_fd,
-        "/srv/kobox2/network/sandbox.elf", "netd-sandbox", &sandbox);
+        sandbox_path, "netd-sandbox", &sandbox);
     if (error) goto fail;
     package->sandbox = sandbox.data;
     package->sandbox_size = sandbox.size;
@@ -138,8 +181,8 @@ int netd_kobox2_package_open(struct netd_kobox2_package *package,
         memcpy(name, artifact.namespace_name.data, artifact.namespace_name.length);
         name[artifact.namespace_name.length] = '\0';
         int written = i ? snprintf(path, sizeof(path),
-            "/srv/kobox2/network/modules/%s.ko", name) :
-            snprintf(path, sizeof(path), "/srv/kobox2/network/core.so");
+            "%s/modules/%s.ko", root, name) :
+            snprintf(path, sizeof(path), "%s/core.so", root);
         if (written < 0 || (size_t)written >= sizeof(path)) {
             error = -7;
             goto fail;
@@ -155,6 +198,10 @@ int netd_kobox2_package_open(struct netd_kobox2_package *package,
     }
     kb2_sha256(package->manifest, package->manifest_size,
         package->identity.manifest_digest);
+    if (package->wireless) {
+        error = load_wifi_firmware(filed_fd, package);
+        if (error) goto fail;
+    }
     error = make_blob(package->manifest, package->manifest_size, &package->items[0]);
     if (!error) return 0;
 fail:
@@ -281,7 +328,7 @@ int netd_kobox2_package_configure_controller(
     kb2_sha256(channel_contract, sizeof(channel_contract) - 1, channel_digest);
     const uint8_t *const digests[] = {
         package->identity.manifest_digest, capability_digest, channel_digest};
-    const uint64_t limits[] = {256u << 20, 1, 2, 64};
+    const uint64_t limits[] = {package->wireless ? (512u << 20) : (256u << 20), 1, 2, 64};
     for (unsigned kind = KB2_DIGEST_PROFILE; kind <= KB2_DIGEST_CHANNEL_SET; ++kind)
         if (kb2_controller_set_digest(controller, kind,
                 digests[kind - KB2_DIGEST_PROFILE], 32) != KB2_STATUS_OK)
@@ -306,6 +353,7 @@ int netd_kobox2_package_close(struct netd_kobox2_package *package)
     }
     if (!first) {
         free(package->sandbox_storage);
+        filed_client_release_module_image(&package->firmware);
         memset(package, 0, sizeof(*package));
     }
     return first;

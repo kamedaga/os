@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"capabilityos/pack/internal/buildsys"
 	"capabilityos/pack/internal/config"
 	"capabilityos/pack/internal/ui"
 	"github.com/spf13/cobra"
@@ -55,6 +56,10 @@ packaging, image sync, QEMU, and test tasks.`,
 			if err != nil {
 				return err
 			}
+			if err := buildsys.CleanupLegacyState(workspace); err != nil {
+				return err
+			}
+			buildsys.BeginRun(workspace)
 			ctx.root = root
 			ctx.workspace = workspace
 			return nil
@@ -74,6 +79,7 @@ packaging, image sync, QEMU, and test tasks.`,
 	cmd.AddCommand(profileSmokeCommand(ctx))
 	cmd.AddCommand(profileBenchCommand(ctx))
 	cmd.AddCommand(runnerCommand(ctx))
+	cmd.AddCommand(stateCommand(ctx))
 	cmd.AddCommand(stubCommand(ctx, "image", "Create or update disk image"))
 	cmd.AddCommand(qemuCommand(ctx))
 	cmd.AddCommand(qemuLimineCommand(ctx))

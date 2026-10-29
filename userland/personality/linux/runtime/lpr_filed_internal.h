@@ -5,6 +5,7 @@
 #include "lpr_epoll.h"
 #include "lpr_wait.h"
 #include "lpr_fd/table.h"
+#include "lpr_fd/event.h"
 #include "lpr_fd/memfd.h"
 #include "lpr_filed.h"
 #include "lpr_vfs/rpc.h"
@@ -92,7 +93,9 @@ int lpr_user_range_plausible(uint64_t ptr, uint64_t bytes);
 #define LPR_LINUX_TCSETS 0x5402ull
 #define LPR_LINUX_TCSETSW 0x5403ull
 #define LPR_LINUX_TCSETSF 0x5404ull
-#define LPR_LINUX_TERMIOS_BYTES 60u
+/* Linux x86_64 TCGETS/TCSETS use 4 flags + line + NCCS=19: 36 bytes.
+ * libc struct termios (NCCS=32 and speeds) is a different userspace type. */
+#define LPR_LINUX_KERNEL_TERMIOS_BYTES 36u
 #define LPR_LINUX_TIOCSCTTY 0x540eull
 #define LPR_LINUX_TIOCGPGRP 0x540full
 #define LPR_LINUX_TIOCSPGRP 0x5410ull
@@ -336,8 +339,8 @@ typedef struct lpr_fd_storage_state {
 
 typedef struct lpr_thread_record {
     struct lpr_thread_record *next;
-    uint64_t start_function;
-    uint64_t start_argument;
+    uint64_t allocation;
+    struct lpr_linux_user_frame *return_frame;
     uint64_t clone_flags;
     volatile uint32_t *parent_tid;
     volatile uint32_t *child_tid;
@@ -347,6 +350,10 @@ typedef struct lpr_thread_record {
     pacha_fd_t signal_fd;
     uint64_t signal_mask;
     struct lpr_unix_context unix_context;
+    /* Thread-owned native subscriptions contain no borrowed logical FD pins.
+     * Fork/restart changes process_token; native source close invalidates the
+     * kernel set. The bytes here are only an immutable topology comparison. */
+    struct lpr_native_wait_cache *native_wait_set;
 } lpr_thread_record_t;
 
 typedef struct lpr_thread_state {
@@ -393,6 +400,7 @@ typedef struct lpr_signal_thread_state {
     uint32_t native_pending_hint_active;
     uint64_t fault_stack;
     uint32_t fault_registered;
+    uint32_t async_registered;
     uint64_t mask;
     uint64_t pending_mask;
     uint64_t wait_restore_mask;
@@ -533,6 +541,7 @@ void lpr_signal_thread_state_prepare_current(void);
 void lpr_linux_signal_hint_reset_for_fork_child(void);
 void lpr_signal_thread_state_release_current(void);
 void lpr_linux_register_thread_signal_hint(lpr_signal_thread_state_t *state);
+int64_t lpr_linux_register_thread_signal_runtime(lpr_signal_thread_state_t *state, int process_owner);
 void lpr_signal_thread_state_after_fork_child(void);
 #define lpr_control_fd_table (lpr_state.fd_table)
 #define lpr_control_entries_initial (lpr_state.fd_storage.entries_initial)
@@ -602,6 +611,10 @@ int lpr_filed_adopt(uint64_t *handle, pacha_fd_t lease_fd);
 
 int64_t lpr_filed_session_drop(void);
 void lpr_zero_bytes(void *ptr, uint64_t len);
+/* One native persistent set belongs to the current LPR thread. All LPR
+ * callers share its cache so alternating wait lists force REPLACE. */
+int64_t lpr_wait_native_retained_fds(struct pacha_pollfd *leaves,
+    uint32_t count, uint64_t timeout, uint64_t native_flags);
 void lpr_fd_arrays_init(void);
 int lpr_fd_table_ensure_capacity(uint64_t required_capacity);
 int lpr_fd_table_ensure_fd(uint64_t fd);
@@ -659,6 +672,7 @@ void lpr_fd_after_fork_child(void);
 void lpr_cwd_init(void);
 int64_t lpr_filed_close_handle(uint64_t handle);
 int64_t lpr_filed_dup_handle(uint64_t handle, uint64_t fd_flags, uint64_t *out_handle);
+/* Success consumes the supplied server lease endpoint; failure retains it. */
 int64_t lpr_filed_transfer_dup_handle(
     uint64_t handle, uint64_t fd_flags, pacha_fd_t lease_fd, uint64_t *out_handle);
 int64_t lpr_netd_dup_handle(uint64_t handle);
@@ -679,6 +693,7 @@ int lpr_install_manifest_fds(const lpr_manifest_t *manifest);
 uint64_t lpr_page_align_up(uint64_t value);
 uint64_t lpr_scatter_iov(const lpr_linux_iovec_t *iov, uint64_t iov_count, const unsigned char *src, uint64_t src_len);
 int64_t lpr_linux_readlinkat_to_buffer(uint64_t dirfd, uint64_t path_raw, char *target, uint64_t capacity);
+int64_t lpr_linux_readlinkat(uint64_t dirfd, uint64_t path, uint64_t buf, uint64_t bufsiz);
 int lpr_resolve_final_symlink_path(const char *path, const char *target, char *out, uint64_t capacity);
 
 /* Prototypes for split runtime translation units. */
@@ -721,6 +736,8 @@ int lpr_fd_table_segment_bytes(uint64_t capacity, uint64_t element_size, uint64_
 lpr_event_backend_t *lpr_event_backend(uint64_t fd);
 lpr_drm_backend_t *lpr_drm_backend(uint64_t fd);
 lpr_input_backend_t *lpr_input_backend(uint64_t fd);
+lpr_audio_backend_t *lpr_audio_backend(uint64_t fd);
+#include "lpr_audio/client.h"
 lpr_filed_backend_t *lpr_filed_backend(uint64_t fd);
 lpr_pipe_backend_t *lpr_pipe_backend(uint64_t fd);
 lpr_socket_backend_t *lpr_socket_backend(uint64_t fd);
@@ -895,6 +912,7 @@ int64_t lpr_linux_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg);
 int64_t lpr_linux_file_vmo(uint64_t fd, uint64_t file_offset, uint64_t length, int executable, uint64_t *out_loaded, uint64_t *out_vmo_offset, int *out_pager);
 int64_t lpr_linux_shared_file_vmo(uint64_t fd, uint64_t file_offset, uint64_t length, int writable, int executable, uint32_t initial_prot, uint64_t *out_file_size);
 int64_t lpr_linux_flock(uint64_t fd, uint64_t operation);
+int64_t lpr_filed_close_posix_locks(const lpr_fd_pin_t *pin);
 int64_t lpr_linux_fork(void);
 int64_t lpr_linux_fstat(uint64_t fd, uint64_t statbuf, unsigned *wait_not_ready __attribute__((unused)));
 int64_t lpr_linux_statfs(uint64_t path, uint64_t statfsbuf);
@@ -925,8 +943,10 @@ int64_t lpr_linux_newfstatat(uint64_t dirfd, uint64_t path_raw, uint64_t statbuf
 int64_t lpr_linux_now(lpr_linux_timespec_t *out);
 int64_t lpr_linux_open_metadata(uint64_t dirfd, uint64_t path_raw, uint64_t flags, unsigned *wait_not_ready __attribute__((unused)));
 int64_t lpr_linux_openat(uint64_t dirfd, uint64_t path_raw, uint64_t flags, uint64_t mode, unsigned *wait_not_ready __attribute__((unused)));
+int lpr_linux_proc_snapshot_access(const char *path, uint64_t mode, uint64_t flags, int64_t *status);
 int64_t lpr_linux_proc_snapshot_open(const char *path, uint64_t flags, unsigned *wait_not_ready __attribute__((unused)));
 int lpr_linux_proc_readlink(const char *path, char *target, uint64_t capacity, int64_t *out_status);
+int lpr_linux_proc_pid_directory(const char *path, uint64_t *out_pid, int64_t *out_status);
 int64_t lpr_linux_openat_once(uint64_t dirfd, uint64_t path_raw, uint64_t flags, uint64_t mode, uint64_t *out_kind, unsigned *wait_not_ready __attribute__((unused)));
 int64_t lpr_linux_pipe2(uint64_t fds_raw, uint64_t flags);
 int64_t lpr_linux_pread64(uint64_t fd, uint64_t buf, uint64_t count, uint64_t offset);
@@ -1053,9 +1073,9 @@ void lpr_state_unlock(volatile uint32_t *word);
 uint64_t lpr_next_request_id(volatile uint64_t *counter);
 void lpr_linux_exit_thread(uint64_t code) __attribute__((noreturn));
 void lpr_linux_exit_group(uint64_t code) __attribute__((noreturn));
-void lpr_linux_unmapself_exit(uint64_t base, uint64_t size) __attribute__((noreturn));
+int64_t lpr_linux_unmapself_exit(uint64_t base, uint64_t size);
 void lpr_clone_thread_entry(void) __attribute__((noreturn));
-void lpr_clone_thread_bootstrap(lpr_thread_record_t *record) __attribute__((noreturn));
+const struct lpr_linux_user_frame *lpr_clone_thread_bootstrap(lpr_thread_record_t *record);
 int lpr_thread_current_record(lpr_thread_record_t **out);
 void lpr_filed_control_advance_offset(uint64_t fd, uint64_t old_offset, uint64_t amount);
 void lpr_filed_control_set_offset(uint64_t fd, uint64_t offset);

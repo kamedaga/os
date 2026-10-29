@@ -84,6 +84,19 @@ pub fn Ring(comptime capacity: usize) type {
             result.overrun = @intFromBool(cursor < oldest);
             return true;
         }
+
+        /// Fatal diagnostics may interrupt a ring owner. Never wait for it,
+        /// and release the ring before the caller touches the GOP aperture.
+        pub fn trySnapshotTail(self: *Self, out: []u8) ?usize {
+            if (!self.tryLock(.try_once)) return null;
+            defer self.unlock();
+            const count: usize = @intCast(@min(self.next, @min(capacity, out.len)));
+            const start = self.next - count;
+            for (out[0..count], 0..) |*byte, index| {
+                byte.* = self.bytes[@intCast((start + index) % capacity)];
+            }
+            return count;
+        }
     };
 }
 
@@ -92,6 +105,10 @@ var debug_ring: if (ring_enabled) Ring(64 * 1024) else void =
 
 pub fn readDebug(cursor: u64, out: []u8, result: *log_abi.Read) bool {
     return if (comptime ring_enabled) debug_ring.snapshot(cursor, out, result) else false;
+}
+
+pub fn tryReadDebugTail(out: []u8) ?usize {
+    return if (comptime ring_enabled) debug_ring.trySnapshotTail(out) else null;
 }
 
 pub var boot_log_buffer: [boot_log_max_bytes]u8 = [_]u8{0} ** boot_log_max_bytes;
@@ -204,6 +221,33 @@ test "debug ring reports a dropped contended fragment" {
     try std.testing.expect(ring.snapshot(0, &out, &result));
     try std.testing.expectEqual(@as(u64, 0), result.written);
     try std.testing.expectEqual(@as(u64, 1), result.dropped);
+}
+
+test "fatal ring snapshot keeps the newest bytes across wrap" {
+    var ring = Ring(8){};
+    var out: [4]u8 = undefined;
+    try std.testing.expectEqual(@as(?usize, 0), ring.trySnapshotTail(&out));
+    ring.append("abcdef");
+    try std.testing.expectEqual(@as(?usize, 4), ring.trySnapshotTail(&out));
+    try std.testing.expectEqualStrings("cdef", &out);
+    ring.append("ghijk");
+    try std.testing.expectEqual(@as(?usize, 4), ring.trySnapshotTail(&out));
+    try std.testing.expectEqualStrings("hijk", &out);
+    var all: [16]u8 = undefined;
+    const count = ring.trySnapshotTail(&all).?;
+    try std.testing.expectEqualStrings("defghijk", all[0..count]);
+    try std.testing.expectEqual(@as(?usize, 0), ring.trySnapshotTail(out[0..0]));
+}
+
+test "fatal ring snapshot does not wait or change output when busy" {
+    var ring = Ring(8){};
+    ring.append("latest");
+    ring.lock_word = 1;
+    var out = [_]u8{0xa5} ** 4;
+    try std.testing.expectEqual(@as(?usize, null), ring.trySnapshotTail(&out));
+    try std.testing.expectEqualSlices(u8, &([_]u8{0xa5} ** 4), &out);
+    try std.testing.expectEqual(@as(u8, 1), ring.lock_word);
+    try std.testing.expectEqual(@as(u64, 6), ring.next);
 }
 
 test "default kernel does not expose the ring" {

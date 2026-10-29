@@ -462,6 +462,7 @@ static void pager_worker(void *context)
                 fprintf(stderr,"[filed-pager] supply failed key=%llu offset=%llu\n",
                     (unsigned long long)event.key,
                     (unsigned long long)event.page_offset);
+#if defined(FILED_PERF_DIAG) && FILED_PERF_DIAG
             if ((pager->faults&127)==0)
                 fprintf(stderr,"[filed-pager] STATS faults=%llu supplies=%llu supplied=%llu pread=%llu w4=%llu w64=%llu w128=%llu w256=%llu w512=%llu\n",
                     (unsigned long long)pager->faults,
@@ -473,6 +474,7 @@ static void pager_worker(void *context)
                     (unsigned long long)pager->windows[2],
                     (unsigned long long)pager->windows[3],
                     (unsigned long long)pager->windows[4]);
+#endif
         }
     }
 }

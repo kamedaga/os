@@ -150,7 +150,15 @@ int64_t lpr_linux_eventfd2(uint64_t initval, uint64_t flags)
         .reserved1 = (flags & LPR_LINUX_EFD_SEMAPHORE) ? LPR_LINUX_EFD_SEMAPHORE : 0,
         .flags = (uint32_t)(flags & ~((uint64_t)LPR_LINUX_EFD_SEMAPHORE)),
         .counter = initval, .wait_fd.raw = wait_fd, .notify_fd.raw = notify_fd,
+        .counter_fd.raw = -1,
     };
+    const int counter_status = lpr_event_counter_create(event, initval);
+    if (counter_status != 0) {
+        (void)lpr_backend_state_free(event, sizeof(*event));
+        (void)lpr_close_native_fd_if_open((uint64_t)wait_fd);
+        (void)lpr_close_native_fd_if_open((uint64_t)notify_fd);
+        return counter_status;
+    }
     const lpr_fd_install_t install = {
         .ops_id = LPR_FD_OPS_EVENT,
         .fd_flags = (flags & LPR_LINUX_O_CLOEXEC) ? LPR_FD_ENTRY_CLOEXEC : 0,
@@ -161,6 +169,7 @@ int64_t lpr_linux_eventfd2(uint64_t initval, uint64_t flags)
     };
     const int fd = lpr_fd_alloc_initialized(&install);
     if (fd < 0) {
+        (void)lpr_event_counter_close(event);
         (void)lpr_backend_state_free(event, sizeof(*event));
         (void)lpr_close_native_fd_if_open((uint64_t)wait_fd);
         (void)lpr_close_native_fd_if_open((uint64_t)notify_fd);
@@ -176,7 +185,7 @@ void lpr_event_backend_notify(lpr_event_backend_t *event)
         lpr_glycin_diag_event(
             "event.notify.send.enter",
             (uint64_t)(uintptr_t)event,
-            __atomic_load_n(&event->counter, __ATOMIC_ACQUIRE),
+            __atomic_load_n(lpr_event_counter(event), __ATOMIC_ACQUIRE),
             __atomic_load_n(&event->notify_pending, __ATOMIC_ACQUIRE),
             event->notify_fd.raw);
     }
@@ -189,7 +198,7 @@ void lpr_event_backend_notify(lpr_event_backend_t *event)
         lpr_glycin_diag_event(
             "event.notify.send.exit",
             (uint64_t)(uintptr_t)event,
-            __atomic_load_n(&event->counter, __ATOMIC_ACQUIRE),
+            __atomic_load_n(lpr_event_counter(event), __ATOMIC_ACQUIRE),
             __atomic_load_n(&event->notify_pending, __ATOMIC_ACQUIRE),
             status);
     }
@@ -211,7 +220,7 @@ void lpr_eventfd_drain_wait(uint64_t fd)
         lpr_glycin_diag_event(
             "event.drain.enter",
             fd,
-            __atomic_load_n(&event->counter, __ATOMIC_ACQUIRE),
+            __atomic_load_n(lpr_event_counter(event), __ATOMIC_ACQUIRE),
             __atomic_load_n(&event->notify_pending, __ATOMIC_ACQUIRE),
             event->wait_fd.raw);
     }
@@ -230,7 +239,7 @@ void lpr_eventfd_drain_wait(uint64_t fd)
         lpr_glycin_diag_event(
             "event.drain.exit",
             fd,
-            __atomic_load_n(&event->counter, __ATOMIC_ACQUIRE),
+            __atomic_load_n(lpr_event_counter(event), __ATOMIC_ACQUIRE),
             __atomic_load_n(&event->notify_pending, __ATOMIC_ACQUIRE),
             event->wait_fd.raw);
     }
@@ -277,9 +286,16 @@ int64_t lpr_linux_dup_into(uint64_t fd, int target_fd, uint64_t min_fd, uint64_t
     }
     const int64_t prepared = lpr_fd_prepare_dup(fd);
     if (prepared) return prepared;
+    lpr_fd_pin_t replaced;
+    const int had_replaced=!lpr_fd_table_pin(&lpr_control_fd_table,(uint32_t)new_fd,&replaced);
     lpr_fd_drop_t drop;
-    if (lpr_fd_table_dup_replace(&lpr_control_fd_table, (uint32_t)fd,
-            (uint32_t)new_fd, cloexec ? LPR_FD_ENTRY_CLOEXEC : 0, &drop))
+    const int status=lpr_fd_table_dup_replace(&lpr_control_fd_table, (uint32_t)fd,
+            (uint32_t)new_fd, cloexec ? LPR_FD_ENTRY_CLOEXEC : 0, &drop);
+    if (had_replaced) {
+        if (!status) (void)lpr_filed_close_posix_locks(&replaced);
+        lpr_fd_unpin(&replaced);
+    }
+    if (status)
         return -LPR_LINUX_EBADF;
     if (drop.ready) (void)lpr_backend_finish_drop(&drop);
     return (int64_t)new_fd;

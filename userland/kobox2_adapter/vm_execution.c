@@ -20,6 +20,12 @@ static int control_error(struct ph_vm_space *space, long result) {
      * native resource draining still belongs to close_space. */
     if (!waited) {
         PH_CHECK(status[0] == 2 || status[0] == 3);
+#ifdef PH_USER_PROCESS_SMOKE
+        ph_number("USER_PROCESS_CONTROL_ERROR", result);
+        ph_number("USER_PROCESS_CONTROL_EXIT_KIND", status[0]);
+        ph_number("USER_PROCESS_CONTROL_EXIT_CODE", status[1]);
+        ph_number("USER_PROCESS_CONTROL_DETAIL", space->control->result);
+#endif
         return -ESRCH;
     }
     PH_CHECK(waited == PACHA_SYSCALL_ERR_NOT_READY);
@@ -148,11 +154,11 @@ int ph_vm_capture_running(struct ph_vm_space *space) {
         if (now - started >= UINT64_C(5000000000)) {
             return -ETIMEDOUT;
         }
-        /* Let a transient bootstrap instruction retire before stopping it
-         * again. This is native scheduling, never a hosted Linux task wait. */
-        const uint64_t delay[2] = {0, 1000};
-
-        PH_OK(pacha_syscall2(PACHA_RUNTIME_SYSCALL_NANOSLEEP, (uintptr_t)delay, 0));
+        /* Snapshot may run inside a native notification handler, where
+         * blocking nanosleep is unavailable. Yield lets the trampoline
+         * retire without sleeping in that handler or dropping our lock.
+         * The monotonic deadline above bounds these retries. */
+        PH_OK(pacha_syscall0(PACHA_RUNTIME_SYSCALL_YIELD));
     }
 }
 

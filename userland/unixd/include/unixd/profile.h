@@ -3,7 +3,7 @@
 
 /* Measurement-only build. Elapsed TSC ticks include descheduling/waits;
  * nested rows are inclusive and must not be summed with their parents. */
-enum unix_profile_group { UP_IO, UP_RPC, UP_CONTROL, UP_GROUPS };
+enum unix_profile_group { UP_IO, UP_RPC, UP_CONTROL, UP_FD_TRANSFER, UP_GROUPS };
 enum unix_profile_stage {
     UP_TOTAL, UP_SETUP, UP_RESERVE, UP_COPY, UP_COMMIT, UP_NOTIFY,
     UP_WATCH, UP_WAIT, UP_CLEANUP, UP_ROUTE, UP_MAP,
@@ -19,6 +19,7 @@ static inline uint64_t unix_profile_clock(void)
 }
 void unix_profile_end(struct unix_profile_scope *scope);
 void unix_profile_dump(void);
+void unix_profile_fd_inventory(unsigned phase);
 #define UP_BEGIN(name, g, k, s) \
     struct unix_profile_scope name __attribute__((cleanup(unix_profile_end))) = \
         { unix_profile_clock(), (g), (k), (s) }
@@ -27,4 +28,5 @@ void unix_profile_dump(void);
 #define UP_BEGIN(name, g, k, s) ((void)0)
 #define UP_END(name) ((void)0)
 static inline void unix_profile_dump(void) {}
+static inline void unix_profile_fd_inventory(unsigned phase) { (void)phase; }
 #endif

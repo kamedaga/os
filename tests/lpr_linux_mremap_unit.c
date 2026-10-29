@@ -21,6 +21,10 @@ static unsigned int syscall_count;
 static unsigned int remap_notifications;
 static uint64_t remap_args[4];
 static int failures;
+int64_t lpr_mlock_vm_begin(void) { return 0; }
+void lpr_mlock_vm_end(void) {}
+int lpr_mlock_overlaps(uint64_t address,uint64_t length)
+{ (void)address;(void)length;return 0; }
 
 void lpr_drm_mapping_remapped(uint64_t old_address, uint64_t old_size,
     uint64_t new_address, uint64_t new_size)

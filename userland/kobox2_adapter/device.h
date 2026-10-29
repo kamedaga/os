@@ -9,9 +9,14 @@
 #include <pacha/abi.h>
 
 #define PH_DEVICE_MMIO_MAPPINGS 64u
-/* Each live mapping owns a native FD; inventory must not impose a lower limit. */
-/* Adapter admission inventory; unrelated to the kernel FD number range. */
+/* AX210 alone retains 4095 RX buffers, allocator spares and coherent rings
+ * before TX starts. Keep its bounded service inventory above that baseline;
+ * this is userland admission policy, not a kernel FD-number limit. */
+#if defined(PH_SANDBOX_WIFI) && PH_SANDBOX_WIFI
+#define PH_DEVICE_DMA_MAPPINGS 8192u
+#else
 #define PH_DEVICE_DMA_MAPPINGS 4096u
+#endif
 
 struct ph_image;
 

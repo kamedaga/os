@@ -295,8 +295,8 @@ AMDGPUの合格判定は実AMD GPUで行い、VirGLの合格で代用しない�
 - `kobox/boot/firmware_files.c`は、受け取った各データのSHA-256をLinux側で照合し、
   private rootfsの`/lib/firmware`へ排他的に配置する。module lifecycle終了時に逆順回収。
   `filp_close`の遅延fputではLinux loaderが`ETXTBSY`を返したため、ここだけ同期fputを使う。
-- `pack/scripts/build_amdgpu_package.sh`は通常liveと別の`.artifacts`に、core、19 module、
-  AMDGPU専用sandbox、Kobox2 manifest、固定SHAのfirmware候補15件と読み取り専用
+- `pack/scripts/build_amdgpu_package.sh`と`build_amdgpu_sandbox.sh`は通常liveと別の
+  `.artifacts`に、core、19 module、AMDGPU専用sandbox（後者）、Kobox2 manifest、固定SHAのfirmware候補15件と読み取り専用
   `firmware.bundle`を出力する。bundle全体のSHAと各fileのSHA、名前、範囲、重複を
   sandbox側で検査してからLinuxに渡す。正常・改ざん・`..`・範囲重複は
   `pack/scripts/test_amdgpu_firmware_bundle.sh`で単体試験した。

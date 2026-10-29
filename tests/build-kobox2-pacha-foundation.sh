@@ -99,6 +99,9 @@ case "${1:-}" in
       "$adapter/vm_memory.c" "$adapter/vm_clone.c"
       "$repo_root/userland/personality/linux/runtime/lpr_zpoline.c" "$adapter/vm_gate.c")
     bash "$repo_root/tests/build-kobox2-pacha-vm-client.sh"
+    bash "$repo_root/pack/scripts/build_kobox_userspace_support.sh"
+    extra_flags+=(-DPH_VM_VERIFY_NATIVE_RIGHTS=1)
+    extra_sources+=("$repo_root/.artifacts/kobox2-userspace-support/guardian_image.S")
     ;;
   *) echo "Unknown argument: $1" >&2; exit 2 ;;
 esac

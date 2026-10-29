@@ -211,7 +211,21 @@ pub fn SlotTable(comptime T: type) type {
         pub const MarkIterator = struct {
             base: Iterator,
             mask: u8,
+            next_index: u64 = 0,
             pub fn next(self: *MarkIterator) ?u32 {
+                if (self.mask == 1) {
+                    while (self.next_index <= std.math.maxInt(u32)) {
+                        const index = self.base.table.firstMarkedAtOrAfter(@intCast(self.next_index)) orelse return null;
+                        // Advance before returning: clearing this mark cannot repeat it.
+                        // A mark added at or after next_index is seen on a later call;
+                        // one added behind it is outside this forward-only pass.
+                        self.next_index = @as(u64, index) + 1;
+                        // The old iterator skipped unused entries. A stale or
+                        // premature mark must not expose a body without ownership.
+                        if (self.base.table.get(index) != null) return index;
+                    }
+                    return null;
+                }
                 while (self.base.next()) |item| if (self.base.table.isMarked(item.ref.index, self.mask)) return item.ref.index;
                 return null;
             }
@@ -675,6 +689,38 @@ fn testAllocate(table: anytype, backend: *TestBackend) !@TypeOf(table.*).Allocat
         },
         else => return err,
     };
+}
+
+test "bit-one marked iterator visits sparse marks and advances across mutation" {
+    var backend = TestBackend{};
+    defer backend.deinit();
+    var table = SlotTable(u64){};
+    defer table.deinit();
+    for (0..4096) |_| _ = try testAllocate(&table, &backend);
+    table.mark(100, 1, true);
+    table.mark(3000, 1, true);
+    test_mark_search_nodes = 0;
+    var marks = table.marked(1);
+    try std.testing.expectEqual(@as(?u32, 100), marks.next());
+    table.mark(100, 1, false);
+    table.mark(50, 1, true); // Behind the cursor: never revisit it.
+    table.mark(2000, 1, true); // Ahead of the cursor: seen next.
+    try std.testing.expectEqual(@as(?u32, 2000), marks.next());
+    table.mark(3000, 1, false); // Clearing the next mark removes it.
+    try std.testing.expectEqual(@as(?u32, null), marks.next());
+    try std.testing.expect(test_mark_search_nodes <= 3 * (SlotTable(u64).levels + 2));
+    try table.release(.{ .index = 3800, .generation = 1 });
+    table.mark(3800, 1, true); // Unused marked metadata is not a live body.
+    var live_only = table.marked(1);
+    try std.testing.expectEqual(@as(?u32, 50), live_only.next());
+    try std.testing.expectEqual(@as(?u32, 2000), live_only.next());
+    try std.testing.expectEqual(@as(?u32, null), live_only.next());
+    // Masks without an exact summary retain their union semantics.
+    table.mark(3500, 2, true);
+    var other = table.marked(3);
+    try std.testing.expectEqual(@as(?u32, 50), other.next());
+    try std.testing.expectEqual(@as(?u32, 2000), other.next());
+    try std.testing.expectEqual(@as(?u32, 3500), other.next());
 }
 
 test "slot table exceeds former VMO limit with stable bodies bounded grants and stale rejection" {

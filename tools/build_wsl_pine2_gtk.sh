@@ -2,6 +2,7 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+source "$repo_root/pack/scripts/lib/jobs.sh"
 project_dir="${repo_root}/third_party/pine2-gtk"
 out="${1:-.artifacts/userland-fixtures/pine2-gtk-root}"
 case "${out}" in
@@ -68,17 +69,21 @@ if [[ ! -f "${toolchain}/.ready" ]]; then
   rm -rf "${cmark_source}" "${cmark_build}"
   mkdir -p "${cmark_source}" "${cmark_build}"
   tar -xzf "${archive}" --strip-components=1 -C "${cmark_source}"
+  pacgo_reserve_jobs "${PACGO_BUILD_JOBS:-2}" >/dev/null
+  inner_jobs="$PACGO_RESERVED_JOBS"
   bwrap --unshare-user --uid 0 --gid 0 --bind "${toolchain}" / \
     --ro-bind "${cmark_source}" /source --bind "${cmark_build}" /build \
     --dev /dev --proc /proc --tmpfs /tmp --chdir /build \
-    --clearenv --setenv PATH /usr/bin:/bin --setenv LC_ALL C \
+    --clearenv \
+    --setenv PATH /usr/bin:/bin --setenv LC_ALL C \
     /bin/sh -eu -c '
       cmake -S /source -B /build -G Ninja \
         -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr \
         -DCMARK_SHARED=OFF -DCMARK_STATIC=ON -DCMARK_TESTS=OFF
-      cmake --build /build --parallel
+      cmake --build /build --parallel "$1"
       cmake --install /build
-    '
+    ' sh "$inner_jobs"
+  pacgo_release_jobs
   touch "${toolchain}/.ready"
 fi
 
@@ -86,15 +91,19 @@ build_key="$(sha256sum "${lock}" "${dockerfile}" "${project_dir}/meson.build" \
   "${project_dir}"/src/*.c "${project_dir}"/src/*.h 2>/dev/null | sha256sum | cut -c1-24)"
 build_dir="${repo_root}/.artifacts/build/pine2-gtk-${build_key}"
 mkdir -p "${build_dir}"
+pacgo_reserve_jobs "${PACGO_BUILD_JOBS:-2}" >/dev/null
+inner_jobs="$PACGO_RESERVED_JOBS"
 bwrap --unshare-user --uid 0 --gid 0 --ro-bind "${toolchain}" / \
   --ro-bind "${project_dir}" /source --bind "${build_dir}" /build \
   --dev /dev --proc /proc --tmpfs /tmp --chdir /build \
-  --clearenv --setenv HOME /tmp --setenv PATH /usr/bin:/bin --setenv LC_ALL C \
+  --clearenv \
+  --setenv HOME /tmp --setenv PATH /usr/bin:/bin --setenv LC_ALL C \
   /bin/sh -eu -c '
     meson setup /build /source --wipe --buildtype=release --wrap-mode=nofallback
-    meson compile -C /build
+    meson compile -C /build -j "$1"
     strip --strip-unneeded /build/pine2-gtk
-  '
+  ' sh "$inner_jobs"
+pacgo_release_jobs
 binary="${build_dir}/pine2-gtk"
 [[ -x "${binary}" ]] || { echo "Pine2 GTK musl build did not produce ${binary}" >&2; exit 1; }
 

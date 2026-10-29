@@ -3,6 +3,7 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "$0")/../.." && pwd)"
+source "$repo_root/pack/scripts/lib/jobs.sh"
 # The kobox2 core is pinned to nix's LLVM 18.1.8, and kbuild host tools
 # (fixdep, objtool) must link against nix's glibc and libelf. Only this build
 # enters nix; pacgo and every other build stay outside it.
@@ -57,8 +58,8 @@ fi
     echo 'block canonical config differs from pinned profiles' >&2
     exit 1
 }
-make -C "$source_tree" O="$canonical" ARCH=x86 LLVM=-18 \
-    KBUILD_KCONFIG="$kbuild_kconfig" -j"$jobs" vmlinux modules
+pacgo_make "$jobs" -C "$source_tree" O="$canonical" ARCH=x86 LLVM=-18 \
+    KBUILD_KCONFIG="$kbuild_kconfig" vmlinux modules
 
 # The provider builder pins all three canonical inputs, not just .config.
 # A rebuild with the same config can produce different objects; give that
@@ -69,11 +70,9 @@ provider_identity="$(sha256sum "$canonical/.config" "$canonical/vmlinux" \
 for profile in usb-storage-xhci nvme; do
     case "$profile" in
         usb-storage-xhci)
-            manifest="$usb_profile"; runtime_profile=usb-storage
-            sandbox_flag=--usb-storage ;;
+            manifest="$usb_profile"; runtime_profile=usb-storage ;;
         nvme)
-            manifest="$nvme_profile"; runtime_profile=nvme
-            sandbox_flag=--nvme ;;
+            manifest="$nvme_profile"; runtime_profile=nvme ;;
     esac
     output="$repo_root/.artifacts/kobox2-$profile-production"
     provider="$repo_root/.artifacts/kobox2-$profile-providers/$expected_digest-$provider_identity"
@@ -86,6 +85,7 @@ for profile in usb-storage-xhci nvme; do
         --source-tree "$source_tree" --build-dir "$canonical" \
         --profile "$manifest" --nm llvm-nm-18 \
         --output "$output/closure-inventory.json"
+    pacgo_reserve_jobs "$jobs" >/dev/null
     python3 "$source_tree/kobox/boot/build_boot_runtime.py" \
         --source-tree "$source_tree" --canonical-build-dir "$canonical" \
         --provider-build-dir "$provider" --output-dir "$output/runtime" \
@@ -93,9 +93,9 @@ for profile in usb-storage-xhci nvme; do
         --llvm=-18 --ar llvm-ar-18 --nm llvm-nm-18 \
         --objdump llvm-objdump-18 --objcopy llvm-objcopy-18 \
         --module-inventory "$output/closure-inventory.json" \
-        --link --jobs "$jobs"
-    bash "$repo_root/userland/kobox2_adapter/build-sandbox.sh" \
-        "$output/sandbox.elf" "$sandbox_flag"
+        --link --jobs "$PACGO_RESERVED_JOBS"
+    pacgo_release_jobs
+    printf '%s\n' "${provider#"$repo_root/"}" > "$output/provider-kbuild-dir"
     python3 "$source_tree/kobox/manifest/build_pci_package.py" \
         --inventory "$output/closure-inventory.json" \
         --runtime-dir "$output/runtime" --output-dir "$output" \

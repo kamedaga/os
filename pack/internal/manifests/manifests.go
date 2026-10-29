@@ -1,13 +1,16 @@
 package manifests
 
 import (
+	"bytes"
+	"crypto/sha256"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
-	"time"
+	"sync"
 
 	"capabilityos/pack/internal/config"
 	"capabilityos/pack/internal/progress"
@@ -37,6 +40,23 @@ type entry struct {
 	Dir        bool
 }
 
+type directoryManifestEntry struct {
+	Relative string
+	Type     os.FileMode
+}
+
+type directoryManifestSnapshot struct {
+	SourceRoot string
+	Entries    []directoryManifestEntry
+}
+
+var (
+	runningExecutableIdentityOnce   sync.Once
+	runningExecutableIdentityDigest []byte
+	runningExecutableIdentityErr    error
+	manifestExecutableIdentity      = runningExecutableIdentity
+)
+
 type startupNode struct {
 	AppID    string
 	Action   string
@@ -58,7 +78,7 @@ func Generate(workspace *config.Workspace) (Result, error) {
 }
 
 func GenerateWithOptions(workspace *config.Workspace, opts Options) (Result, error) {
-	return generate(workspace, false, opts.Progress)
+	return generate(workspace, opts.Progress)
 }
 
 func ExistingIfFresh(workspace *config.Workspace) (Result, bool, error) {
@@ -69,8 +89,8 @@ func ExistingIfFreshWithOptions(workspace *config.Workspace, opts Options) (Resu
 	span := progress.Use(opts.Progress).Start("manifests cache", 3)
 	defer span.Close()
 	outputs := manifestOutputs(workspace)
-	span.Set(1, "checking generated manifest timestamps")
-	fresh, err := outputsFresh(workspace.ConfigPath, outputs)
+	span.Set(1, "checking manifest content key")
+	fresh, err := outputsFresh(workspace, outputs)
 	if err != nil || !fresh {
 		if err != nil {
 			span.Fail("manifest cache check failed")
@@ -107,11 +127,20 @@ func ExistingIfFreshWithOptions(workspace *config.Workspace, opts Options) (Resu
 	}, true, nil
 }
 
-func generate(workspace *config.Workspace, cached bool, reporter progress.Reporter) (Result, error) {
+func generate(workspace *config.Workspace, reporter progress.Reporter) (Result, error) {
 	span := progress.Use(reporter).Start("manifests", 4)
 	defer span.Close()
 	apps := manifestApps(workspace)
 	outputs := manifestOutputs(workspace)
+	snapshots, key, err := manifestInputSnapshot(workspace, apps)
+	if err != nil {
+		span.Fail("manifest inputs failed")
+		return Result{}, err
+	}
+	if err := removeManifestKey(workspace); err != nil {
+		span.Fail("manifest key invalidation failed")
+		return Result{}, err
+	}
 	span.Set(1, "rendering startup manifest")
 	startupContents, startupCount, err := renderStartup(workspace, apps)
 	if err != nil {
@@ -123,7 +152,7 @@ func generate(workspace *config.Workspace, cached bool, reporter progress.Report
 		return Result{}, err
 	}
 	span.Set(2, "rendering bootfs manifest")
-	bootfsContents, bootfsCount, err := renderFS(workspace, "bootfs", apps, outputs.Bootfs, outputs.Startup, span)
+	bootfsContents, bootfsCount, err := renderFS(workspace, "bootfs", apps, snapshots, outputs.Bootfs, outputs.Startup, span)
 	if err != nil {
 		span.Fail("bootfs manifest failed")
 		return Result{}, err
@@ -133,13 +162,17 @@ func generate(workspace *config.Workspace, cached bool, reporter progress.Report
 		return Result{}, err
 	}
 	span.Set(3, "rendering rootfs manifest")
-	rootfsContents, rootfsCount, err := renderFS(workspace, "rootfs", apps, outputs.Rootfs, outputs.Startup, span)
+	rootfsContents, rootfsCount, err := renderFS(workspace, "rootfs", apps, snapshots, outputs.Rootfs, outputs.Startup, span)
 	if err != nil {
 		span.Fail("rootfs manifest failed")
 		return Result{}, err
 	}
 	if err := writeIfChanged(outputs.Rootfs, rootfsContents); err != nil {
 		span.Fail("rootfs manifest write failed")
+		return Result{}, err
+	}
+	if err := writeManifestKey(workspace, key); err != nil {
+		span.Fail("manifest key write failed")
 		return Result{}, err
 	}
 	span.Set(4, "manifest files written")
@@ -149,7 +182,7 @@ func generate(workspace *config.Workspace, cached bool, reporter progress.Report
 		Bootfs:  bootfsCount,
 		Rootfs:  rootfsCount,
 		Startup: startupCount,
-		Cached:  cached,
+		Cached:  false,
 	}, nil
 }
 
@@ -172,7 +205,7 @@ func manifestApps(workspace *config.Workspace) []config.App {
 	return apps
 }
 
-func renderFS(workspace *config.Workspace, fsName string, apps []config.App, manifestPath string, startupPath string, span progress.Span) (string, int, error) {
+func renderFS(workspace *config.Workspace, fsName string, apps []config.App, snapshots map[string]directoryManifestSnapshot, manifestPath string, startupPath string, span progress.Span) (string, int, error) {
 	var entries []entry
 	if fsName == "rootfs" {
 		for _, dir := range workspace.RootfsDirs {
@@ -182,12 +215,12 @@ func renderFS(workspace *config.Workspace, fsName string, apps []config.App, man
 	for _, app := range apps {
 		artifact := workspace.ArtifactPath(app)
 		for _, publish := range app.Publishes(fsName) {
-			if isDir(artifact) {
+			if snapshot, ok := snapshots[artifact]; ok {
 				count := 0
 				if span != nil {
 					span.Message(fmt.Sprintf("%s %s: scanning %s", fsName, app.ID, publish.Path))
 				}
-				if err := appendDirectoryEntries(&entries, cleanImagePath(publish.Path), artifact, manifestPath, func(path string) {
+				if err := appendDirectoryEntries(&entries, cleanImagePath(publish.Path), snapshot, manifestPath, func(path string) {
 					count++
 					if span != nil && count%64 == 0 {
 						span.Message(fmt.Sprintf("%s %s: %d files", fsName, app.ID, count))
@@ -236,37 +269,25 @@ func renderFS(workspace *config.Workspace, fsName string, apps []config.App, man
 	return out.String(), len(entries), nil
 }
 
-func appendDirectoryEntries(entries *[]entry, imageRoot string, sourceRoot string, manifestPath string, onFile func(path string)) error {
-	if resolved, err := filepath.EvalSymlinks(sourceRoot); err == nil {
-		sourceRoot = resolved
-	}
-	return filepath.WalkDir(sourceRoot, func(path string, dirEntry fs.DirEntry, err error) error {
-		if err != nil {
-			return err
+func appendDirectoryEntries(entries *[]entry, imageRoot string, snapshot directoryManifestSnapshot, manifestPath string, onFile func(path string)) error {
+	for _, item := range snapshot.Entries {
+		if item.Relative == "." || item.Type != 0 {
+			continue
 		}
-		if path == sourceRoot || dirEntry.IsDir() {
-			return nil
-		}
-		if dirEntry.Type()&os.ModeType != 0 {
-			return nil
-		}
-		rel, err := filepath.Rel(sourceRoot, path)
-		if err != nil {
-			return err
-		}
+		path := filepath.Join(snapshot.SourceRoot, filepath.FromSlash(item.Relative))
 		sourcePath, err := sourcePathForManifest(manifestPath, path)
 		if err != nil {
 			return err
 		}
 		*entries = append(*entries, entry{
-			ImagePath:  joinImagePath(imageRoot, filepath.ToSlash(rel)),
+			ImagePath:  joinImagePath(imageRoot, item.Relative),
 			SourcePath: sourcePath,
 		})
 		if onFile != nil {
 			onFile(path)
 		}
-		return nil
-	})
+	}
+	return nil
 }
 
 func renderStartup(workspace *config.Workspace, apps []config.App) (string, int, error) {
@@ -431,8 +452,6 @@ func ensureNoDuplicates(fsName string, entries []entry) error {
 
 func writeIfChanged(path string, contents string) error {
 	if existing, err := os.ReadFile(path); err == nil && string(existing) == contents {
-		now := time.Now()
-		_ = os.Chtimes(path, now, now)
 		return nil
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
@@ -441,24 +460,176 @@ func writeIfChanged(path string, contents string) error {
 	return os.WriteFile(path, []byte(contents), 0o644)
 }
 
-func outputsFresh(configPath string, outputs Outputs) (bool, error) {
-	configInfo, err := os.Stat(configPath)
-	if err != nil {
-		return false, err
-	}
+func outputsFresh(workspace *config.Workspace, outputs Outputs) (bool, error) {
 	for _, path := range []string{outputs.Bootfs, outputs.Rootfs, outputs.Startup} {
-		info, err := os.Stat(path)
+		_, err := os.Stat(path)
 		if os.IsNotExist(err) {
 			return false, nil
 		}
 		if err != nil {
 			return false, err
 		}
-		if info.ModTime().Before(configInfo.ModTime()) {
-			return false, nil
+	}
+	stored, err := os.ReadFile(manifestKeyPath(workspace))
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	_, current, err := manifestInputSnapshot(workspace, manifestApps(workspace))
+	if err != nil {
+		return false, err
+	}
+	return bytes.Equal(bytes.TrimSpace(stored), []byte(fmt.Sprintf("%x", current))), nil
+}
+
+func manifestInputSnapshot(workspace *config.Workspace, apps []config.App) (map[string]directoryManifestSnapshot, []byte, error) {
+	configBytes, err := os.ReadFile(workspace.ConfigPath)
+	if err != nil {
+		return nil, nil, err
+	}
+	executableIdentity, err := manifestExecutableIdentity()
+	if err != nil {
+		return nil, nil, err
+	}
+	hash := sha256.New()
+	writeHashString(hash, "pacgo-manifests\n")
+	writeHashBytes(hash, executableIdentity)
+	writeHashBytes(hash, configBytes)
+	snapshots := make(map[string]directoryManifestSnapshot)
+	for _, app := range apps {
+		if len(app.Publishes("bootfs")) == 0 && len(app.Publishes("rootfs")) == 0 {
+			continue
+		}
+		artifact := workspace.ArtifactPath(app)
+		writeHashString(hash, "artifact\x00")
+		writeHashField(hash, app.ID)
+		writeHashField(hash, filepath.ToSlash(artifact))
+		info, err := os.Stat(artifact)
+		if os.IsNotExist(err) {
+			writeHashField(hash, "missing")
+			continue
+		}
+		if err != nil {
+			return nil, nil, err
+		}
+		if !info.IsDir() {
+			writeHashField(hash, "regular-file")
+			continue
+		}
+		writeHashField(hash, "directory")
+		snapshot, err := snapshotDirectory(artifact)
+		if err != nil {
+			return nil, nil, err
+		}
+		snapshots[artifact] = snapshot
+		writeHashField(hash, filepath.ToSlash(snapshot.SourceRoot))
+		for _, entry := range snapshot.Entries {
+			writeHashField(hash, entry.Relative)
+			writeHashString(hash, fmt.Sprintf("%d\x00", entry.Type))
 		}
 	}
-	return true, nil
+	return snapshots, hash.Sum(nil), nil
+}
+
+func runningExecutableIdentity() ([]byte, error) {
+	runningExecutableIdentityOnce.Do(func() {
+		path, err := os.Executable()
+		if err != nil {
+			runningExecutableIdentityErr = fmt.Errorf("locate pacgo executable: %w", err)
+			return
+		}
+		path, err = filepath.EvalSymlinks(path)
+		if err != nil {
+			runningExecutableIdentityErr = fmt.Errorf("resolve pacgo executable: %w", err)
+			return
+		}
+		file, err := os.Open(path)
+		if err != nil {
+			runningExecutableIdentityErr = fmt.Errorf("open pacgo executable: %w", err)
+			return
+		}
+		defer file.Close()
+		hash := sha256.New()
+		if _, err := io.Copy(hash, file); err != nil {
+			runningExecutableIdentityErr = fmt.Errorf("hash pacgo executable: %w", err)
+			return
+		}
+		runningExecutableIdentityDigest = hash.Sum(nil)
+	})
+	return runningExecutableIdentityDigest, runningExecutableIdentityErr
+}
+
+func snapshotDirectory(path string) (directoryManifestSnapshot, error) {
+	root, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return directoryManifestSnapshot{}, err
+	}
+	root, err = filepath.Abs(root)
+	if err != nil {
+		return directoryManifestSnapshot{}, err
+	}
+	snapshot := directoryManifestSnapshot{SourceRoot: root}
+	err = filepath.WalkDir(root, func(item string, dirEntry fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		info, err := os.Lstat(item)
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(root, item)
+		if err != nil {
+			return err
+		}
+		snapshot.Entries = append(snapshot.Entries, directoryManifestEntry{
+			Relative: filepath.ToSlash(rel),
+			Type:     info.Mode().Type(),
+		})
+		return nil
+	})
+	if err != nil {
+		return directoryManifestSnapshot{}, err
+	}
+	sort.Slice(snapshot.Entries, func(i, j int) bool {
+		return snapshot.Entries[i].Relative < snapshot.Entries[j].Relative
+	})
+	return snapshot, nil
+}
+
+func manifestKeyPath(workspace *config.Workspace) string {
+	return workspace.Path(workspace.State, "manifests.key")
+}
+
+func writeManifestKey(workspace *config.Workspace, key []byte) error {
+	path := manifestKeyPath(workspace)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(path, []byte(fmt.Sprintf("%x\n", key)), 0o644)
+}
+
+func removeManifestKey(workspace *config.Workspace) error {
+	err := os.Remove(manifestKeyPath(workspace))
+	if os.IsNotExist(err) {
+		return nil
+	}
+	return err
+}
+
+func writeHashString(hash io.Writer, value string) {
+	_, _ = io.WriteString(hash, value)
+}
+
+func writeHashBytes(hash io.Writer, value []byte) {
+	writeHashString(hash, fmt.Sprintf("%d:", len(value)))
+	_, _ = hash.Write(value)
+	writeHashString(hash, "\x00")
+}
+
+func writeHashField(hash io.Writer, value string) {
+	writeHashBytes(hash, []byte(value))
 }
 
 func countEntries(path string) (int, error) {
@@ -502,11 +673,6 @@ func joinImagePath(root string, relative string) string {
 		return root
 	}
 	return root + "/" + relative
-}
-
-func isDir(path string) bool {
-	info, err := os.Stat(path)
-	return err == nil && info.IsDir()
 }
 
 func includes(values []string, needle string) bool {

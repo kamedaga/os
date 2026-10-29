@@ -60,9 +60,23 @@ var limine_user_spaces_storage: [boot_static.user_process_count]boot_static.User
 
 var boot_init_principal: ?kernel.PrincipalId = null;
 var boot_rsdp_paddr: u64 = 0;
+
+/// E is before IOMMU ownership changes and userland. Linux inspected later
+/// has already replaced this firmware state, so the isolated ELF reads it here.
+pub fn diagnosticSnapshotVtd() noreturn {
+    @import("../vtd.zig").diagnosticSnapshot(boot_rsdp_paddr);
+    boot_diag.logFramebufferSnapshot();
+    halt.haltWithMessage("VT-D READ-ONLY SNAPSHOT COMPLETE - BEFORE INITIALIZATION");
+}
 const unrouted_device_interrupt_vector: u8 = 0x41;
-const device_interrupt_vector: u8 = pci.interrupt_vector_base;
-const device_interrupt_vector_count: u8 = pci.interrupt_vector_count;
+const platform_device = @import("../platform_device.zig");
+const device_interrupt_vector: u8 = platform_device.interrupt_vector;
+const device_interrupt_vector_count: u8 = pci.interrupt_vector_end_exclusive - device_interrupt_vector;
+comptime {
+    @import("std").debug.assert(x86_platform.deviceInterruptLayoutValid(device_interrupt_vector, device_interrupt_vector_count,
+        boot_static.lapic_timer_vector, boot_static.scheduler_wake_ipi_vector, unrouted_device_interrupt_vector));
+    @import("std").debug.assert(platform_device.interrupt_vector < pci.interrupt_vector_base);
+}
 
 fn staticStorageEnd(comptime T: type, ptr: *T) usize {
     // Zero-sized storage has only a compiler sentinel, no reservable bytes.
@@ -107,6 +121,7 @@ fn kernelStaticStorageStartAddr() usize {
     start = minStaticStart(start, staticStorageStart(@TypeOf(boot_rsdp_paddr), &boot_rsdp_paddr));
     start = minStaticStart(start, iommu.kernelStaticStorageStartAddr());
     start = minStaticStart(start, acpi_power.staticStart());
+    start = minStaticStart(start, platform_device.staticStart());
     start = minStaticStart(start, x86_platform.kernelStaticStorageStartAddr());
     return start;
 }
@@ -128,6 +143,7 @@ fn kernelStaticStorageEndAddr() usize {
     end = maxStaticEnd(end, iommu.kernelStaticStorageEndAddr());
     end = maxStaticEnd(end, acpi_power.staticEnd());
     end = maxStaticEnd(end, pci.kernelStaticStorageEndAddr());
+    end = maxStaticEnd(end, platform_device.staticEnd());
     end = maxStaticEnd(end, user_copy.kernelStaticStorageEndAddr());
     end = maxStaticEnd(end, user_vm.kernelStaticStorageEndAddr());
     end = maxStaticEnd(end, page_fault_log.kernelStaticStorageEndAddr());
@@ -235,6 +251,7 @@ fn initKernelRuntimeOrHalt() void {
         kernel_log.write(if (pku_enabled) "enabled\n" else "unavailable\n");
         x86_platform.hardenKernelMappingsSupervisorOnly();
         pci.initEcam(boot_rsdp_paddr);
+        platform_device.prepareBootMmio(boot_rsdp_paddr);
         if (!iommu.prepareBootMmio(boot_rsdp_paddr)) {
             halt.haltWithMessage("IOMMU boot MMIO mapping failed");
         }
@@ -269,6 +286,7 @@ fn initMemoryModules() void {
 
     user_vm.init(.{
         .retire_user_tlb_for_principal = user_copy.retireUserTlbForPrincipal,
+        .before_pte_retirement = retainRetiredPageViewWrites,
         .pt_allocator = @import("../memory/identity_allocator.zig").allocatorFor(kernel_runtime.global_free_list, .pt_storage),
         .user_spaces = &user_space_table,
         .four_gib = boot_static.four_gib,
@@ -955,6 +973,10 @@ fn wireRuntimeSubsystems(state: *kernel.KernelState, memory_stats: boot_static.M
         .copy_bytes_to_user_va = user_copy.copyBytesToUserVa,
         .probe_user_range = user_copy.probeUserRange,
         .resident_read_user_u32 = user_copy.readUserU32Resident,
+        .futex_lock_address_space = user_vm.lockAddressSpace,
+        .futex_unlock_address_space = user_vm.unlockAddressSpace,
+        .resident_read_user_u32_with_address_space_locked = user_copy.readUserU32ResidentWithAddressSpaceLocked,
+        .resident_atomic_user_u32_with_address_space_locked = user_copy.atomicUserU32ResidentWithAddressSpaceLocked,
         .wake_waiting_thread_for_principal = scheduler.wakeMailboxWaiter,
         .thread_wake_target_is_live = scheduler.threadWakeTargetIsLive,
         .wake_waiting_thread_generation = scheduler.wakeIfWaitingGeneration,
@@ -1041,6 +1063,7 @@ pub fn bootWithResources(resources: PreparedBootResources, comptime checkpoint: 
     }
     checkpoint('E');
     iommu.init(boot_rsdp_paddr, kernel_runtime.global_free_list, checkpoint);
+    platform_device.initialize();
     x86_platform.sealKernelMmioWindow();
     checkpoint('F');
     kernel_log.write("boot: construct processes\n");
@@ -1070,3 +1093,10 @@ pub fn installPmmBootAccess(offset: u64) void {
 
 // BSP-only initialization before APs can read the immutable copy policy.
 extern fn kernel_memory_init() callconv(.c) void;
+
+// The caller retains AS, hence every matching VMA's VMO lifetime. Retaining
+// evidence is atomic and never enters K/shared-VM beneath the AS lock.
+fn retainRetiredPageViewWrites(principal: kernel.PrincipalId, start: u64, bytes: u64) void {
+    if (!@atomicLoad(bool, &kernel_runtime.kernel_state_ready, .acquire)) return;
+    @import("../state/page_view_dirty.zig").markRetiredAliases(kernel_runtime.kernel_state_global, principal, start, bytes);
+}

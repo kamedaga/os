@@ -39,6 +39,8 @@ int main(void)
         lpr_unix_diag(8, 1, 0, 0, 0);
         lpr_unix_diag(8, 1, (uint64_t)-115, 0, 0);
         lpr_unix_diag(8, 1, (uint64_t)-114, 0, 0);
+        lpr_unix_diag(8, 1, (uint64_t)-2, 0, 0);
+        lpr_unix_diag('W', 1, (uint64_t)-32, 0, 0);
     }
     assert(!logs);
     lpr_unix_diag('R', 1, (uint64_t)-5, 0, 0);

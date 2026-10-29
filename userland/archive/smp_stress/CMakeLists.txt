@@ -1,36 +1,17 @@
 cmake_minimum_required(VERSION 3.16)
-
-set(CMAKE_SYSTEM_NAME Generic)
-set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
-
+if(NOT DEFINED CMAKE_TOOLCHAIN_FILE)
+  set(CMAKE_TOOLCHAIN_FILE "${CMAKE_CURRENT_SOURCE_DIR}/../../cmake/pachaos-native.toolchain.cmake")
+endif()
 project(smp_stress C ASM)
 
-set(REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../..")
-include("${CMAKE_CURRENT_LIST_DIR}/../../cmake/pachaos_native_dependencies.cmake")
-set(SMP_STRESS_ELF "${CMAKE_BINARY_DIR}/smp_stress.elf")
+set(REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../..")
+include("${REPO_ROOT}/userland/cmake/pachaos_native.cmake")
 
-set(SMP_STRESS_RUNTIME_SOURCES
-  ${REPO_ROOT}/userland/libipc/src/ipc.c
-  ${REPO_ROOT}/userland/libpacha/src/syscall.c
-)
-
-string(REPLACE ";" " " SMP_STRESS_RUNTIME_SOURCES_ENV "${SMP_STRESS_RUNTIME_SOURCES}")
-
-add_custom_command(
-  OUTPUT "${SMP_STRESS_ELF}"
-  COMMAND
-    ${CMAKE_COMMAND} -E env
-      "PACHAOS_MUSL_APP_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/src/main.c"
-      "PACHAOS_MUSL_EXTRA_SOURCES=${SMP_STRESS_RUNTIME_SOURCES_ENV}"
-      "PACHAOS_MUSL_EXTRA_INCLUDE_DIRS=${REPO_ROOT}/userland/libipc/include ${REPO_ROOT}/userland/libpacha/include"
-      bash "${REPO_ROOT}/musl/pachaos/build/build-smokes.sh" "${SMP_STRESS_ELF}"
-  DEPENDS ${PACHAOS_NATIVE_DEPENDENCIES}
+pachaos_native_executable(smp_stress
+  SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/src/main.c"
     "${REPO_ROOT}/userland/libipc/src/ipc.c"
     "${REPO_ROOT}/userland/libpacha/src/syscall.c"
-    "${REPO_ROOT}/musl/pachaos/build/build-smokes.sh"
-  WORKING_DIRECTORY "${REPO_ROOT}"
-  VERBATIM
-)
-
-add_custom_target(smp_stress ALL DEPENDS "${SMP_STRESS_ELF}")
+  INCLUDE_DIRECTORIES
+    "${REPO_ROOT}/userland/libipc/include"
+    "${REPO_ROOT}/userland/libpacha/include")

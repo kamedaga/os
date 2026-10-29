@@ -214,7 +214,7 @@ int64_t lpr_tty_ioctl(uint64_t fd, uint64_t request, uint64_t arg)
             lpr_destroy_tty_wire_page(page_fd, page);
             return -LPR_LINUX_EFAULT;
         }
-        lpr_memcpy(ioctl_req->data, (const void *)(uintptr_t)arg, LPR_LINUX_TERMIOS_BYTES);
+        lpr_memcpy(ioctl_req->data, (const void *)(uintptr_t)arg, LPR_LINUX_KERNEL_TERMIOS_BYTES);
         break;
     case LPR_LINUX_TIOCSWINSZ:
         if (arg == 0) {
@@ -248,7 +248,7 @@ int64_t lpr_tty_ioctl(uint64_t fd, uint64_t request, uint64_t arg)
                 lpr_destroy_tty_wire_page(page_fd, page);
                 return -LPR_LINUX_EFAULT;
             }
-            lpr_memcpy((void *)(uintptr_t)arg, ioctl_req->data, LPR_LINUX_TERMIOS_BYTES);
+            lpr_memcpy((void *)(uintptr_t)arg, ioctl_req->data, LPR_LINUX_KERNEL_TERMIOS_BYTES);
             break;
         case LPR_LINUX_TIOCGWINSZ:
             if (arg == 0) {
@@ -483,7 +483,7 @@ uint32_t lpr_linux_eventfd_poll_events(uint64_t fd, uint32_t events, unsigned *w
     }
     const lpr_event_backend_t *event = lpr_event_backend(fd);
     const uint64_t counter = __atomic_load_n(
-        &event->counter, __ATOMIC_ACQUIRE);
+        lpr_event_counter(event), __ATOMIC_ACQUIRE);
     uint32_t revents = 0;
     if ((events & 0x0001u) != 0 && counter != 0) {
         revents |= 0x0001u;

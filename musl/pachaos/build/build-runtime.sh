@@ -3,6 +3,7 @@ set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "${script_dir}/../../.." && pwd)"
+source "${repo_root}/pack/scripts/lib/jobs.sh"
 
 artifact_dir="$(realpath -m "${PACHAOS_MUSL_RUNTIME_DIR:-${repo_root}/.artifacts/musl-pachaos-runtime}")"
 # ABI comparisons need independent runtimes without overwriting a verified
@@ -16,14 +17,13 @@ install_dir="${artifact_dir}/install"
 # Never deploy the native syscall ABI over Alpine's Linux /lib interpreter.
 rootfs_lib_dir="${artifact_dir}/rootfs/usr/lib/pachaos"
 build_log="${artifact_dir}/build.log"
-jobs="${PACHAOS_MUSL_JOBS:-$(nproc)}"
-builtins_archive="${PACHAOS_MUSL_LIBCC:-}"
-
-if [ -z "${builtins_archive}" ]; then
-  builtins_archive="$(find /usr/lib/llvm-* /usr/lib/clang -path '*libclang_rt.builtins-x86_64.a' 2>/dev/null | sort -V | tail -n 1 || true)"
-fi
-if [ -z "${builtins_archive}" ] || [ ! -f "${builtins_archive}" ]; then
-  builtins_archive=""
+jobs="${PACHAOS_MUSL_JOBS:-${PACGO_BUILD_JOBS:-$(nproc)}}"
+# The compiler's own compiler-rt builtins, so libc.so links the runtime
+# helpers of the clang that compiled it.
+builtins_archive="${PACHAOS_MUSL_LIBCC:-$(clang --rtlib=compiler-rt -print-libgcc-file-name)}"
+if [ ! -f "${builtins_archive}" ]; then
+  echo "build-runtime.sh: compiler-rt builtins not found: ${builtins_archive}" >&2
+  exit 1
 fi
 
 rm -rf "${artifact_dir}"
@@ -43,7 +43,7 @@ make_common=(
   "LDFLAGS=-fuse-ld=lld"
 )
 
-if ! make -C "${build_dir}" -j"${jobs}" "${make_common[@]}" \
+if ! pacgo_make "${jobs}" -C "${build_dir}" "${make_common[@]}" \
   lib/libc.so lib/libc.a lib/crt1.o lib/crti.o lib/crtn.o lib/Scrt1.o lib/rcrt1.o >"${build_log}" 2>&1; then
   tail -n 80 "${build_log}" >&2
   exit 1

@@ -10,6 +10,7 @@
 #include "kobox2_nic.h"
 #include "socket_service.h"
 #include "upper.h"
+#include "wifi_control.h"
 #include "pacha/capsule.h"
 #include "pacha/ipc.h"
 #include "pacha/log.h"
@@ -20,6 +21,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 static int validate_boot_config(const struct netd_boot_config *cfg)
 {
@@ -115,50 +117,23 @@ static int netd_wait_set_failure(
 /* A live RAM root starts without site policy. Looking for this ordinary file
  * after NIC startup lets ash supply policy later, without baking a test LAN
  * address into the reusable image or keeping the driver offline meanwhile. */
-static int netd_try_ipv4_policy(struct netd_runtime *runtime, int *state)
+static int netd_activate_ipv4(struct netd_runtime *runtime, int *state,
+    const struct netd_ipv4_boot_config *selected)
 {
-    static int last_policy_error;
-    if (!runtime || !runtime->cfg || !state || *state != 0) return 0;
+    if (!runtime || !runtime->cfg || !state || !selected) return -EINVAL;
     const struct netd_boot_config *cfg = runtime->cfg;
-    struct netd_ipv4_boot_config ipv4 = cfg->ipv4;
-    if (!ipv4.address[0] && !ipv4.address[1] &&
-        !ipv4.address[2] && !ipv4.address[3]) {
-        char text[512];
-        size_t text_size = 0;
-        int error = netd_policy_file_read((pacha_fd_t)cfg->filed_endpoint_fd,
-            text, sizeof(text), &text_size);
-        if (error) {
-            if (error != -ENOENT && error != last_policy_error)
-                fprintf(stderr, "[netd] IPv4 policy read failed status=%d; link remains active\n", error);
-            last_policy_error = error;
-            return 0;
-        }
-        if (netd_network_config_parse_text(text, &ipv4) != 0) {
-            if (last_policy_error != -EINVAL) {
-                fprintf(stderr,
-                    "[netd] IPv4 policy malformed size=%zu text=\"%s\"; link remains active\n",
-                    text_size, text);
-                netd_status_file_note(cfg,
-                    "IPv4 policy parse failed; inspect /run/pacha/network.conf");
-            }
-            last_policy_error = -EINVAL;
-            return 0;
-        }
-    }
+    const struct netd_ipv4_boot_config ipv4 = *selected;
     if (netd_network_config_init(&ipv4) != 0) {
-        if (last_policy_error != -EINVAL)
-            fprintf(stderr, "[netd] IPv4 policy invalid; link remains active\n");
-        last_policy_error = -EINVAL;
-        return 0;
+        return -EINVAL;
     }
-    last_policy_error = 0;
     int status = netd_upper_start(runtime);
     if (!status && (cfg->flags & NETD_BOOT_FLAG_SMOKE) != 0)
         status = netd_packet_io_smoke_after_ipv4();
     if (status != 0) {
         fprintf(stderr, "[netd] IPv4 stack failed status=%d; NIC remains active\n", status);
         *state = -1;
-        return status;
+        netd_wifi_control_ipv4_ready(0, status < 0 ? status : -EIO);
+        return status < 0 ? status : -EIO;
     }
     *state = 1;
     printf("[netd] IPv4 policy applied after NIC startup\n");
@@ -185,8 +160,62 @@ static int netd_try_ipv4_policy(struct netd_runtime *runtime, int *state)
         ipv4.address[0], ipv4.address[1], ipv4.address[2], ipv4.address[3],
         ipv4.gateway[0], ipv4.gateway[1], ipv4.gateway[2], ipv4.gateway[3]);
     netd_status_file_note(cfg, phase);
+    netd_wifi_control_ipv4_ready(1, 0);
     fflush(stdout);
     return 0;
+}
+
+static int netd_try_ipv4_policy(struct netd_runtime *runtime, int *state)
+{
+    static int last_policy_error;
+    if (!runtime || !runtime->cfg || !state || *state != 0) return 0;
+    const struct netd_boot_config *cfg = runtime->cfg;
+    struct netd_ipv4_boot_config ipv4 = cfg->ipv4;
+    if (!(ipv4.address[0] | ipv4.address[1] | ipv4.address[2] | ipv4.address[3])) {
+        char text[512];
+        size_t length;
+        int error = netd_policy_file_read((pacha_fd_t)cfg->filed_endpoint_fd,
+            text, sizeof(text), &length);
+        if (error) {
+            if (error != -ENOENT && error != last_policy_error)
+                fprintf(stderr, "[netd] IPv4 policy read failed status=%d\n", error);
+            last_policy_error = error;
+            return 0;
+        }
+        /* A cached DHCP file does not prove this LAN still leased that IP.
+         * Fresh ACKs are applied directly; only manual files override DHCP. */
+        if (netd_policy_file_is_generated(text)) return 0;
+        if (netd_network_config_parse_text(text, &ipv4)) {
+            if (last_policy_error != -EINVAL)
+                netd_status_file_note(cfg, "IPv4 policy parse failed; inspect /run/pacha/network.conf");
+            last_policy_error = -EINVAL;
+            return 0;
+        }
+    }
+    last_policy_error = 0;
+    return netd_activate_ipv4(runtime, state, &ipv4);
+}
+
+static int netd_wifi_policy_transition(struct netd_runtime *runtime, unsigned action,
+    int *state, int *dhcp_mode, int *hold, unsigned *attempted_ack)
+{
+    if (!action) return 0;
+    netd_libuinet_ipv4_suspend();
+    netd_packet_io_discard_rx();
+    netd_wifi_control_ipv4_ready(0, 0);
+    netd_packet_io_dhcp_disable();
+    *state = 0;
+    *attempted_ack = 0;
+    *hold = !(action & NETD_WIFI_NETWORK_CONNECT);
+    if (*hold) return 0;
+    int error = netd_try_ipv4_policy(runtime, state);
+    if (!error && *state == 1) { *dhcp_mode = 0; return 0; }
+    if (!error) {
+        *dhcp_mode = 1;
+        error = netd_packet_io_dhcp_restart(runtime);
+    }
+    if (error) netd_wifi_control_ipv4_ready(0, error < 0 ? error : -EIO);
+    return error;
 }
 
 int main(int argc, char **argv)
@@ -219,6 +248,12 @@ int main(int argc, char **argv)
         (void)report_link_status(cfg, status, NETD_BOOT_STAGE_NIC);
         return status;
     }
+    int wifi_backend = 0;
+    if (netd_kobox2_wifi_generation()) {
+        int error = netd_wifi_control_start(&runtime);
+        if (!error) wifi_backend = 1;
+        else fprintf(stderr, "[netd] Wi-Fi control initialization failed status=%d\n", error);
+    }
     netd_status_file_publish(cfg, "initializing", NETD_BOOT_STAGE_SOCKET, 0);
     status = netd_socket_service_start(&runtime);
     if (status != 0) {
@@ -228,6 +263,7 @@ int main(int argc, char **argv)
     int ipv4_state = 0;
     (void)netd_try_ipv4_policy(&runtime, &ipv4_state);
     int dhcp_owned = 0;
+    int dhcp_mode = ipv4_state == 0, wifi_hold = 0;
     if (ipv4_state == 0) {
         status = netd_packet_io_dhcp_start(&runtime);
         if (status != 0) {
@@ -261,6 +297,7 @@ int main(int argc, char **argv)
     (void)report_link_status(cfg, 0, NETD_BOOT_STAGE_READY);
 
     uint64_t policy_ticks = 0;
+    uint64_t wifi_ticks = 0;
     unsigned policy_attempted_ack = 0;
     int last_reported_carrier = netd_link_current() ?
         (int)netd_link_current()->carrier : -1;
@@ -271,19 +308,44 @@ int main(int argc, char **argv)
             (timer_event.revents & PACHA_FD_EVENT_READABLE)) {
             uint64_t expirations = 0;
             (void)pacha_fd_read(timer_fd, &expirations, sizeof(expirations));
-            if (ipv4_state == 0) {
+            wifi_ticks += expirations;
+            if (wifi_ticks >= 100) {
+                wifi_ticks %= 100;
+                if (!wifi_backend && netd_kobox2_wifi_generation())
+                    wifi_backend = netd_wifi_control_start(&runtime) == 0;
+                struct timespec now;
+                if (wifi_backend && !clock_gettime(CLOCK_MONOTONIC, &now) &&
+                    now.tv_sec >= 0 && now.tv_nsec >= 0) {
+                    unsigned action = netd_wifi_control_poll(&runtime,
+                        (uint64_t)now.tv_sec * 1000 + (uint64_t)now.tv_nsec / 1000000);
+                    if (action) {
+                        (void)netd_wifi_policy_transition(&runtime, action, &ipv4_state,
+                            &dhcp_mode, &wifi_hold, &policy_attempted_ack);
+                        policy_ticks = 0;
+                    }
+                }
+            }
+            if (ipv4_state == 0 && !wifi_hold) {
                 policy_ticks += expirations;
                 if (policy_ticks >= 100) {
                     policy_ticks %= 100;
                     (void)netd_try_ipv4_policy(&runtime, &ipv4_state);
-                    if (ipv4_state == 1 && !dhcp_owned)
+                    if (ipv4_state == 1 && !dhcp_owned) {
                         netd_packet_io_dhcp_disable();
+                        dhcp_mode = 0;
+                    }
                 }
             }
         }
         netd_packet_io_pump_once();
+        unsigned link_action = netd_wifi_control_take_link_transition();
+        if (link_action) {
+            (void)netd_wifi_policy_transition(&runtime, link_action, &ipv4_state,
+                &dhcp_mode, &wifi_hold, &policy_attempted_ack);
+            policy_ticks = 0;
+        }
         const struct netd_dhcp_client *dhcp = netd_packet_io_dhcp_status();
-        if (ipv4_state == 0 && dhcp != NULL &&
+        if (dhcp_mode && !wifi_hold && dhcp != NULL &&
             dhcp->state == NETD_DHCP_BOUND &&
             policy_attempted_ack != dhcp->acks) {
             policy_attempted_ack = dhcp->acks;
@@ -291,6 +353,12 @@ int main(int argc, char **argv)
                 (pacha_fd_t)cfg->filed_endpoint_fd, &dhcp->lease);
             if (policy_status == 0) {
                 dhcp_owned = 1;
+                struct netd_ipv4_boot_config leased = {0};
+                memcpy(leased.address, dhcp->lease.address, 4);
+                memcpy(leased.netmask, dhcp->lease.netmask, 4);
+                memcpy(leased.gateway, dhcp->lease.gateway, 4);
+                memcpy(leased.dns, dhcp->lease.dns, 4);
+                (void)netd_activate_ipv4(&runtime, &ipv4_state, &leased);
                 netd_status_file_note(cfg,
                     "DHCP lease committed to /run/pacha/network.conf");
             } else if (policy_status != -EEXIST) {
@@ -298,10 +366,26 @@ int main(int argc, char **argv)
                 (void)snprintf(phase, sizeof(phase),
                     "DHCP policy write failed status=%d", policy_status);
                 netd_status_file_note(cfg, phase);
+                netd_wifi_control_ipv4_ready(0, policy_status);
             }
-            (void)netd_try_ipv4_policy(&runtime, &ipv4_state);
-            if (ipv4_state == 1 && !dhcp_owned)
+            if (policy_status == -EEXIST) {
+                dhcp_owned = 0;
+                ipv4_state = 0;
+                netd_libuinet_ipv4_suspend();
+                netd_wifi_control_ipv4_ready(0, 0);
+                (void)netd_try_ipv4_policy(&runtime, &ipv4_state);
+            }
+            if (ipv4_state == 1 && !dhcp_owned) {
                 netd_packet_io_dhcp_disable();
+                dhcp_mode = 0;
+            }
+        }
+        if (dhcp_mode && ipv4_state == 1 && dhcp &&
+            dhcp->state != NETD_DHCP_BOUND && dhcp->state != NETD_DHCP_RENEWING &&
+            dhcp->state != NETD_DHCP_REBINDING) {
+            netd_libuinet_ipv4_suspend();
+            netd_wifi_control_ipv4_ready(0, 0);
+            ipv4_state = 0;
         }
         const struct netd_link_info *link = netd_link_current();
         if (link && (int)link->carrier != last_reported_carrier &&
@@ -309,6 +393,7 @@ int main(int argc, char **argv)
             last_reported_carrier = link->carrier;
         const int busy = netd_socket_service_poll();
         static struct pacha_service_wait_set wait_set;
+        static struct pacha_fd_wait_retained retained_wait;
         status = pacha_service_wait_init(
             &wait_set, (pacha_fd_t)cfg->socket_endpoint_fd);
         if (status != 0)
@@ -337,7 +422,7 @@ int main(int argc, char **argv)
         /* A continuously readable endpoint or a backed-up notification must
          * not starve lease/HANGUP reclamation. Poll once after every bounded
          * drain, and block only when there is no work left to pump. */
-        (void)pacha_service_wait(&wait_set, busy ? 0 : PACHA_FD_WAIT_FOREVER);
+        (void)pacha_service_wait_retained(&wait_set, &retained_wait, busy ? 0 : PACHA_FD_WAIT_FOREVER);
         netd_socket_service_reap_hangups(&wait_set);
         netd_netlink_socket_reap_hangups(&wait_set);
         netd_libuinet_socket_reap_hangups(&wait_set);

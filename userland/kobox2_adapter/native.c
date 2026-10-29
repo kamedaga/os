@@ -133,9 +133,17 @@ void ph_thread_setup(struct ph_task *task) {
 #endif
     PH_CHECK(atomic_is_lock_free(&task->notification_mask) &&
         atomic_is_lock_free(&task->notification_deferred));
-    PH_OK(pacha_syscall6(PACHA_PROCESS_SYSCALL_SIGNAL_CTL,
-        PACHA_PROCESS_SIGNAL_CTL_REGISTER, (uintptr_t)ph_notification_entry,
-        (uintptr_t)__start_ph_trampoline, (uintptr_t)__stop_ph_trampoline, 0, 0));
+    PH_OK(pacha_syscall6(PACHA_PROCESS_SYSCALL_SIGNAL_CTL, PACHA_PROCESS_SIGNAL_CTL_REGISTER,
+        (uintptr_t)&(struct pacha_signal_registration){
+            .entry = (uintptr_t)ph_notification_entry,
+            .inhibit_start = (uintptr_t)__start_ph_trampoline,
+            .inhibit_end = (uintptr_t)__stop_ph_trampoline,
+            .inhibit_secondary_start = 0,
+            .inhibit_secondary_end = 0,
+            .scratch_base = 0,
+            .scratch_size = 0,
+            .flags = PACHA_SIGNAL_REGISTRATION_PROCESS_OWNER,
+        }, 0, 0, 0, 0));
     PH_OK(pacha_syscall4(PACHA_PROCESS_SYSCALL_SIGNAL_CTL,
         PACHA_PROCESS_SIGNAL_CTL_REGISTER_FAULT, (uintptr_t)ph_notification_entry,
         (uintptr_t)task->fault_stack, PH_THREAD_STACK_SIZE));

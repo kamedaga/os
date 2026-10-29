@@ -2,6 +2,8 @@
 set -euo pipefail
 
 repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
+source "$repo_root/pack/scripts/lib/jobs.sh"
+jobs="${JOBS:-${PACGO_BUILD_JOBS:-2}}"
 prefix="${1:-${repo_root}/.artifacts/tools}"
 downloads="${repo_root}/.artifacts/downloads"
 build_root="${repo_root}/.artifacts/tool-build"
@@ -28,7 +30,7 @@ if [ ! -x "${prefix}/bin/bison" ]; then
     (
         cd "${build_root}/bison-${bison_version}"
         ./configure --prefix="${prefix}" --disable-nls
-        make -j"${JOBS:-2}"
+        pacgo_make "$jobs"
         make install
     )
 fi
@@ -41,7 +43,7 @@ if [ ! -x "${prefix}/bin/flex" ]; then
     (
         cd "${build_root}/flex-${flex_version}"
         PATH="${prefix}/bin:${PATH}" ./configure --prefix="${prefix}" --disable-shared
-        PATH="${prefix}/bin:${PATH}" make -j"${JOBS:-2}"
+        PATH="${prefix}/bin:${PATH}" pacgo_make "$jobs"
         PATH="${prefix}/bin:${PATH}" make install
     )
 fi
@@ -61,8 +63,8 @@ if [ ! -f "${prefix}/include/libelf.h" ] || [ ! -f "${prefix}/lib/libelf.a" ]; t
             --without-bzlib \
             --without-lzma \
             --without-zstd
-        make -j"${JOBS:-2}" -C lib
-        make -j"${JOBS:-2}" -C libelf
+        pacgo_make "$jobs" -C lib
+        pacgo_make "$jobs" -C libelf
         make -C lib install
         make -C libelf install
     )

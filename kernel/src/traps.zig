@@ -26,8 +26,9 @@ const TrapFrame = interrupts.TrapFrame;
 const ExceptionTrapFrame = interrupts.ExceptionTrapFrame;
 
 const debug_skip_kernel_fx_state = false;
-const device_interrupt_vector: u8 = pci.interrupt_vector_base;
-const device_interrupt_vector_count: u8 = pci.interrupt_vector_count;
+const platform_device = @import("platform_device.zig");
+const device_interrupt_vector: u8 = platform_device.interrupt_vector;
+const device_interrupt_vector_count: u8 = pci.interrupt_vector_end_exclusive - device_interrupt_vector;
 const trap_frame_qword_count = @sizeOf(TrapFrame) / @sizeOf(u64);
 const exception_trap_frame_qword_count = @sizeOf(ExceptionTrapFrame) / @sizeOf(u64);
 const user_return_gpr_qword_count = @offsetOf(TrapFrame, "rip") / @sizeOf(u64);
@@ -830,10 +831,18 @@ pub export fn pageFaultDispatch(frame: *ExceptionTrapFrame) callconv(.winapi) u6
         const checked = kernel_runtime.kernel_state_global.pendingPagerFaultPage(principal, fault_page_va, write_access, instruction_fetch);
         const same = if (checked) |now|
             now.vmo.index == candidate.?.vmo.index and now.vmo.generation == candidate.?.vmo.generation and now.index == candidate.?.index
-        else false;
+        else
+            false;
         const access: u32 = if (instruction_fetch) @import("kernel_abi_root").pager_abi.access_execute else if (write_access) @import("kernel_abi_root").pager_abi.access_write else @import("kernel_abi_root").pager_abi.access_read;
         const outcome = if (same) kernel_runtime.kernel_state_global.requestPagerFault(
-            candidate.?.vmo, candidate.?.index, access, principal, scheduler.currentThread(), generation, token, frame.rax,
+            candidate.?.vmo,
+            candidate.?.index,
+            access,
+            principal,
+            scheduler.currentThread(),
+            generation,
+            token,
+            frame.rax,
         ) catch {
             // Allocation failure is terminal for this fault. Retrying the
             // instruction would spin forever without a request or waiter.
@@ -1016,14 +1025,11 @@ pub fn stagePendingSignalForUserReturn(frame: *TrapFrame) void {
     // image before signal copy; after a switch this helper is deliberately a
     // no-op, because hardware still holds the outgoing thread's registers.
     if (!@import("builtin").is_test) @import("xstate_runtime.zig").saveIpcLiveIfNeeded();
-    const stack_cost = process_abi.signal_red_zone_size +
-        process_abi.signal_frame_size + process_abi.signal_runtime_stack_size;
-    if (frame.rsp <= stack_cost) {
+    const destination = @import("signal_stack.zig").layout(claimed.scratch_base, claimed.scratch_size, frame.rsp) orelse {
         scheduler.restoreClaimedSignal(claimed);
         return;
-    }
-    const signal_frame_va = (frame.rsp - process_abi.signal_red_zone_size -
-        process_abi.signal_frame_size) & ~@as(u64, 63);
+    };
+    const signal_frame_va = destination.frame_va;
     var signal_frame = NativeSignalFrame{
         .magic = process_abi.signal_frame_magic,
         .size = process_abi.signal_frame_size,
@@ -1046,7 +1052,7 @@ pub fn stagePendingSignalForUserReturn(frame: *TrapFrame) void {
     }
     frame.rdi = signal_frame_va;
     frame.rip = claimed.entry;
-    frame.rsp = signal_frame_va - process_abi.signal_runtime_stack_size;
+    frame.rsp = destination.runtime_rsp;
 }
 
 fn stageFaultForUserReturn(vector: u64, error_code: u64, address: u64, frame: *TrapFrame) bool {
@@ -1171,14 +1177,16 @@ pub export fn deviceInterruptDispatch(frame: *TrapFrame) callconv(.winapi) void 
     };
     lapic.eoi();
     if (!kernel_runtime.kernel_state_ready) return;
-    const route = pci.interruptRouteForVector(active_vector) orelse return;
     var ignored_wake_owners: [16]kernel.PrincipalId = undefined;
-    _ = kernel_runtime.kernel_state_global.recordDeviceInterruptEvent(
-        route.device,
-        route.entry,
-        ignored_wake_owners[0..],
-    );
-    syscalls.completePendingIrqFdWaitersFromInterrupt((frame.cs & 3) == 3 and (frame.ss & 3) == 3);
+    if (active_vector == platform_device.interrupt_vector) {
+        const source = platform_device.interruptSource() orelse return;
+        _ = kernel_runtime.kernel_state_global.recordInterruptEvent(.{ .platform = source },
+            @intCast(platform_device.interruptGsi()), ignored_wake_owners[0..]);
+    } else {
+        const route = pci.interruptRouteForVector(active_vector) orelse return;
+        _ = kernel_runtime.kernel_state_global.recordDeviceInterruptEvent(route.device, route.entry, ignored_wake_owners[0..]);
+    }
+    syscalls.completeDeviceIrqFdWaitersFromInterrupt((frame.cs & 3) == 3 and (frame.ss & 3) == 3);
 }
 
 pub export fn schedulerMaintenanceIpiDispatch(frame: *TrapFrame) callconv(.winapi) void {

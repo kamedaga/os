@@ -1,0 +1,35 @@
+#!/bin/sh
+# Explicit local desktop launch; GPU probing is never an automatic boot action.
+set -eu
+log=/run/pacha/service.log
+if [ ! -f /run/pacha/physical-gpu-ready ]; then
+    /bin/busybox grep -q 'PCI DRM inspection armed' "$log" || {
+        echo 'GPU service is not armed. Check service/kernel logs and SSH readiness.' >&2
+        exit 1
+    }
+    if [ ! -e /run/pacha/gpu-control ]; then
+        printf 'probe\n' >/run/pacha/gpu-control
+    fi
+    count=0
+    until /bin/busybox grep -q 'PCI DRM probe ready status=0' "$log"; do
+        if /bin/busybox grep -q 'PCI DRM probe stopped\|sandbox startup failed' "$log" || [ "$count" -ge 90 ]; then
+            echo 'GPU initialization did not complete; see /run/pacha/service.log.' >&2
+            exit 1
+        fi
+        sleep 1
+        count=$((count+1))
+    done
+    /bin/busybox touch /run/pacha/physical-gpu-ready
+fi
+export HOME=/root USER=root LOGNAME=root DISPLAY=:0 XDG_RUNTIME_DIR=/run/user/0
+export LD_LIBRARY_PATH=/usr/lib:/lib
+# Desktop Mesa uses its compiled-in paths. Do not pass musl driver paths
+# to Java/Prism, whose glibc wrappers select their own driver directory.
+unset GALLIUM_DRIVER MESA_LOADER_DRIVER_OVERRIDE LIBGL_ALWAYS_SOFTWARE \
+    LIBGL_DRIVERS_PATH GBM_BACKENDS_PATH
+# Diagnostics may retain the server log on the installed NVMe across reboot.
+# Defer hardware cursor updates to the main loop so synchronous GPU calls
+# do not hold up the input thread on high-rate mice.
+exec /usr/bin/startx /root/.xinitrc -- :0 -nosilk -nolisten tcp \
+    -logfile "${PACHA_XORG_LOG:-/run/pacha/Xorg.0.log}" \
+    -verbose "${PACHA_XORG_VERBOSE:-0}"

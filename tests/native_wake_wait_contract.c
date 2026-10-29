@@ -289,9 +289,16 @@ int native_wake_wait_contract(void) {
         PACHA_FD_RIGHT_PROCESS_SIGNAL | PACHA_FD_RIGHT_CLOSE, 0);
     CHECK(self >= 16);
     CHECK(!pacha_syscall6(PACHA_PROCESS_SYSCALL_SIGNAL_CTL, PACHA_PROCESS_SIGNAL_CTL_REGISTER,
-        (uintptr_t)ww_signal_entry, (uintptr_t)__start_ww_handlers,
-        (uintptr_t)__stop_ww_handlers, (uintptr_t)ww_pending_begin,
-        (uintptr_t)ww_pending_resume));
+        (uintptr_t)&(struct pacha_signal_registration){
+            .entry = (uintptr_t)ww_signal_entry,
+            .inhibit_start = (uintptr_t)__start_ww_handlers,
+            .inhibit_end = (uintptr_t)__stop_ww_handlers,
+            .inhibit_secondary_start = (uintptr_t)ww_pending_begin,
+            .inhibit_secondary_end = (uintptr_t)ww_pending_resume,
+            .scratch_base = 0,
+            .scratch_size = 0,
+            .flags = PACHA_SIGNAL_REGISTRATION_PROCESS_OWNER,
+        }, 0, 0, 0, 0));
     CHECK(!pacha_syscall2(PACHA_PROCESS_SYSCALL_SIGNAL_CTL,
         PACHA_PROCESS_SIGNAL_CTL_SET_MASK, 0));
     uint64_t observed[2] __attribute__((aligned(16)));
@@ -302,8 +309,16 @@ int native_wake_wait_contract(void) {
     CHECK(signal_count == count && signal_rip == (uintptr_t)ww_pending_resume);
     CHECK(observed[0] == fp_pattern[0] && observed[1] == fp_pattern[1]);
     CHECK(!pacha_syscall6(PACHA_PROCESS_SYSCALL_SIGNAL_CTL, PACHA_PROCESS_SIGNAL_CTL_REGISTER,
-        (uintptr_t)notification_entry, (uintptr_t)__start_native_handlers,
-        (uintptr_t)__stop_native_handlers, 0, 0));
+        (uintptr_t)&(struct pacha_signal_registration){
+            .entry = (uintptr_t)notification_entry,
+            .inhibit_start = (uintptr_t)__start_native_handlers,
+            .inhibit_end = (uintptr_t)__stop_native_handlers,
+            .inhibit_secondary_start = 0,
+            .inhibit_secondary_end = 0,
+            .scratch_base = 0,
+            .scratch_size = 0,
+            .flags = PACHA_SIGNAL_REGISTRATION_PROCESS_OWNER,
+        }, 0, 0, 0, 0));
     CHECK(!pacha_syscall2(PACHA_PROCESS_SYSCALL_SIGNAL_CTL,
         PACHA_PROCESS_SIGNAL_CTL_SET_MASK, 1ull << 11));
     CHECK(!pacha_syscall1(PACHA_FD_SYSCALL_CLOSE, self));

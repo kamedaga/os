@@ -10,9 +10,13 @@
 enum {
     PH_NET_FRAME_ATTACH = 0x300,
     PH_NET_FRAME_INFO = 0x301,
-    PH_NET_FRAME_READ = 0x302,
-    PH_NET_FRAME_WRITE = 0x303,
+    PH_NET_WIFI_REQUEST = 0x302,
+    PH_NET_WIFI_CONFIG = 0x303,
+    PH_NET_WIFI_EVENTS = 0x304,
+    PH_NET_FRAME_READ = 0x305,
+    PH_NET_FRAME_WRITE = 0x306,
     PH_NET_FRAME_BATCH = 16,
+    PH_NET_WIFI_BYTES = 8192,
     PH_NET_FRAME_SHARED_BYTES = 64 * 1024,
 };
 
@@ -29,6 +33,9 @@ struct ph_net_frame_shared {
     uint32_t count;
     struct kobox_linux_net_info info;
     struct kobox_linux_net_frame frames[PH_NET_FRAME_BATCH];
+    uint32_t wifi_length;
+    uint32_t wifi_events;
+    uint8_t wifi_bytes[PH_NET_WIFI_BYTES];
 };
 
 _Static_assert(sizeof(struct ph_net_frame_shared) <= PH_NET_FRAME_SHARED_BYTES,

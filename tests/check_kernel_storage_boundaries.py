@@ -898,7 +898,11 @@ def fd_storage_boundary(files):
         if other not in (path, 'kernel/src/state/memory.zig', 'kernel/src/state/fd_capability.zig', 'kernel/src/kernel.zig') and re.search(r'\.\s*fd_tables(?:_extra)?\b', body):
             errors.append(other + ': FD raw directory bypass')
     policy = function_body(production_source(files['kernel/src/syscall/lock_policy.zig']), 'needsKernelStateLock')
-    expected_policy = '''if (nr == runtime_abi.syscall_nanosleep) return false;
+    expected_policy = '''if (nr == runtime_abi.syscall_getpid or nr == runtime_abi.syscall_gettid or
+        nr == runtime_abi.syscall_clock_getres or nr == runtime_abi.syscall_yield or
+        nr == runtime_abi.syscall_nanosleep or nr == runtime_abi.syscall_futex_wait or
+        nr == runtime_abi.syscall_futex_wake or nr == runtime_abi.syscall_futex_wake_wait or
+        nr == runtime_abi.syscall_futex_requeue) return false;
         if (nr == fd_abi.syscall_vmo_revoke) return true;
         return process_abi.isProcessSyscall(nr) or
         (nr >= pager_abi.syscall_pager_port_create and nr <= pager_abi.syscall_pager_fail) or
@@ -1039,6 +1043,25 @@ def pt_lifecycle_census(files):
             if (counts := Counter(re.findall(r'\b(' + '|'.join(names) + r')\b', production_source(raw))))}
 
 
+def without_profile_stages(code):
+    """Drop comptime-gated lock_profile stage statements from whitespace-free
+    code, then unwrap the bare blocks that only scoped their samples. Braces
+    owned by if/while/defer/else are kept because they follow a token."""
+    code = re.sub(r'const\w+=if\(comptimelock_profile\.enabled\)lock_profile\.stageBegin\(\)else\{\};', '', code)
+    code = re.sub(r'if\(comptimelock_profile\.enabled\)lock_profile\.stageEnd\([^;]*\);', '', code)
+    index = 0
+    while index < len(code):
+        if code[index] == '{' and index > 0 and code[index - 1] in ';{}':
+            depth, end = 1, index + 1
+            while depth and end < len(code):
+                depth += (code[end] == '{') - (code[end] == '}')
+                end += 1
+            code = code[:index] + code[index + 1:end - 1] + code[end:]
+            continue
+        index += 1
+    return code
+
+
 def pending_data_return_boundary(files):
     """Pin this retirement protocol; not a proof of all VM writer locks."""
     errors = []
@@ -1089,9 +1112,10 @@ def pending_data_return_boundary(files):
     if '@atomicLoad(usize,&self.pending_data_returns,.acquire)!=0' not in compact('hasPendingDataReturns'):
         errors.append('pending hint: acquire check missing')
     runtime = ('if(lock_held){constretire_sample=if(comptimelock_profile.enabled)lock_profile.stageBegin()else{};@import().retryRetiredAddressSpaces();state.retryInvocationStorage();state.retryReferenceStorage();native_ipc_syscalls.drainCancellations(h,state);capsule_syscalls.drainDeviceMemoryRetirements(state);'
-               'ram_cache_syscalls.drain(state,h.free_list);if(state.hasPendingDataReturns()){'
+               'ram_cache_syscalls.drain(state,h.free_list);completeDeferredIrqFdWaitersLocked(h);fd_syscalls.completePersistentWaiters(h,state);if(state.hasPendingDataReturns()){'
                '@import().lockAllVmTransactions();state.drainPendingDataReturns();'
-               '@import().unlockAllVmTransactions();}if(comptimelock_profile.enabled)lock_profile.stageEnd(.retire,retire_sample);kernel_state_lock.unlock();}')
+               '@import().unlockAllVmTransactions();}if(comptimelock_profile.enabled)lock_profile.stageEnd(.retire,retire_sample);kernel_state_lock.unlock();'
+               'handOffIrqFdWaitersAfterRelease();}')
     # The migration oracle executes after handler defers under the same K
     # interval. Admit exactly its all-AS comparison envelope; do not let it
     # hide an unlock or a second pending-return call from the guard.
@@ -1109,6 +1133,11 @@ def pending_data_return_boundary(files):
         if min(positions) < 0 or positions != sorted(positions) or any(oracle.count(token) != 1 for token in sequence) or 'kernel_state_lock.' in oracle or 'drainPendingDataReturns' in oracle:
             errors.append('reference oracle: outer K/all-AS comparison boundary bypassed')
         dispatch = dispatch[:start] + dispatch[end:]
+    # Lock-profile stages compile out of production and only time the reviewed
+    # calls, so compare the interval without them; every call, its order, and
+    # every conditional scope remain exact.
+    runtime = without_profile_stages(runtime)
+    dispatch = without_profile_stages(dispatch)
     if runtime not in dispatch or not dispatch.index('defer{') < dispatch.index(runtime):
         errors.append('pending drain: outer KernelState/all-AS/sharedVM boundary bypassed')
     calls = sum(production_source(raw).count('.drainPendingDataReturns(') for raw in files.values())
@@ -1329,7 +1358,9 @@ def main():
         # Lifecycle/timer/K-drop and IPC idle-drain fixtures each own fresh heap state.
         'kernel/src/syscalls.zig': Counter(initFromDetectedRegionsInPlace=5),
         'kernel/src/syscall/process.zig': Counter(initFromDetectedRegionsInPlace=1),
-        'kernel/src/syscall/fd.zig': Counter(initFromDetectedRegionsInPlace=1),
+        # Snapshot, retained-set rollback, HUP, and parked-token fixtures each
+        # allocate and destroy their own state, including source observers.
+        'kernel/src/syscall/fd.zig': Counter(initFromDetectedRegionsInPlace=4),
         # withdrawal contract owner-cleanup and FD-alias tests each allocate a fresh KernelState
         # and destroy it at fixture end; neither resets a live owner. Include
         # the pre-existing VT-d failed-close fixture in its exact call census.
@@ -1507,7 +1538,7 @@ def main():
             ('kernel/src/state/types.zig', 'self.entries.allocate(allocator, leaf,', 'skip_preparation('),
             ('kernel/src/state/types.zig', '@atomicStore(usize, &self.capacity, target, .release);', 'self.capacity = minimum;'),
             ('kernel/src/state/process.zig', 'self.fd_tables_extra.reclaim()', 'skip_reclaim()'),
-            ('kernel/src/syscall/lock_policy.zig', 'if (nr == runtime_abi.syscall_nanosleep)', 'if (nr == fd_abi.syscall_fd_close) return false; if (nr == runtime_abi.syscall_nanosleep)')):
+            ('kernel/src/syscall/lock_policy.zig', 'if (nr == runtime_abi.syscall_getpid', 'if (nr == fd_abi.syscall_fd_close or nr == runtime_abi.syscall_getpid')):
         changed = dict(files)
         assert old in changed[path], old
         changed[path] = changed[path].replace(old, new, 1)

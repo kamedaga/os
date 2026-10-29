@@ -233,6 +233,9 @@ pub const ThreadContext = struct {
     resume_after_stop: bool = false,
     pending_signal_mask: u64 = 0,
     signal_entry: u64 = 0,
+    signal_scratch_base: u64 = 0,
+    signal_scratch_size: u64 = 0,
+    signal_delivery_ready: bool = false,
     signal_blocked_mask: u64 = 0,
     signal_inhibit_start: u64 = 0,
     signal_inhibit_end: u64 = 0,
@@ -1906,7 +1909,7 @@ fn tryIpcDirectSwitchLocked(comptime Registers: type, frame: *TrapFrame, uninter
         source.cpu_slot != cpu or source.active_wait_token != token or !source.wait_mailbox or
         source.wait_completion_claimed or source.wait_completion_publish_pending or source.wake_tick != 0 or
         principalLifecycleBlocksAdmission(source.owner_process) or
-        (!uninterruptible and firstUnblockedPendingSignal(source) != 0 and source.signal_entry != 0)) return false;
+        (!uninterruptible and firstUnblockedPendingSignal(source) != 0 and source.signal_entry != 0 and source.signal_delivery_ready)) return false;
     if (!peer.allocated or peer.generation != hint.thread_generation or peer.owner_process != hint.owner or
         peer.cpu_slot != cpu or !peer.ready or peer.stopped or peer.wait_mailbox or
         peer.wait_completion_claimed or peer.wait_completion_publish_pending or
@@ -2055,7 +2058,7 @@ pub fn parkApThreadForBlockPreferred(
         // next blocking syscall.  Refuse the block while holding the same lock
         // used by deliverSignal(), so no waiter can become stale between the
         // pending-signal check and ready=false.
-        if (firstUnblockedPendingSignal(ctx) != 0 and ctx.signal_entry != 0 and
+        if (firstUnblockedPendingSignal(ctx) != 0 and ctx.signal_entry != 0 and ctx.signal_delivery_ready and
             !wait_uninterruptible)
         {
             if (wait_token != 0) {
@@ -3801,6 +3804,9 @@ fn initializeThreadContextLocked(
     ctx.resume_after_stop = false;
     ctx.pending_signal_mask = 0;
     ctx.signal_entry = 0;
+    ctx.signal_scratch_base = 0;
+    ctx.signal_scratch_size = 0;
+    ctx.signal_delivery_ready = false;
     ctx.signal_blocked_mask = 0;
     ctx.signal_inhibit_start = 0;
     ctx.signal_inhibit_end = 0;
@@ -3821,6 +3827,9 @@ fn initializeThreadContextLocked(
         const source = threadContextLocked(inherit_index) orelse continue;
         if (!source.allocated or source.owner_process != owner_process or source.signal_entry == 0) continue;
         ctx.signal_entry = source.signal_entry;
+        // A scratch belongs to one native thread. Defer delivery until the
+        // child registers its own region; never fall back to its caller stack.
+        ctx.signal_delivery_ready = source.signal_delivery_ready and source.signal_scratch_size == 0;
         ctx.signal_blocked_mask = source.signal_blocked_mask;
         ctx.signal_inhibit_start = source.signal_inhibit_start;
         ctx.signal_inhibit_end = source.signal_inhibit_end;
@@ -4237,7 +4246,8 @@ pub fn prepareDirectHandoff(owner: kernel.PrincipalId, frame: *const TrapFrame, 
     // Diagnostic precedence attributes structural E-owned blockers before
     // scheduler gates, without changing admission or reading outside E.
     if (comptime metric.enabled) {
-        if (resolved.list.poll_head != null) {
+        if (resolved.list.dataPollAfter(null)) |node| {
+            metric.pollBlocker(node, .direct);
             metric.entryReason(.poll);
             return false;
         }
@@ -4246,7 +4256,7 @@ pub fn prepareDirectHandoff(owner: kernel.PrincipalId, frame: *const TrapFrame, 
             return false;
         }
     }
-    if (!directSysretFrame(frame) or !resolved.queue.isEmpty() or resolved.list.poll_head != null or !verifiedCoreReady()) return false;
+    if (!directSysretFrame(frame) or !resolved.queue.isEmpty() or resolved.list.dataPollAfter(null) != null or !verifiedCoreReady()) return false;
     scheduler_state.thread_table.lock();
     var admitted = false;
     defer if (!admitted) scheduler_state.thread_table.unlock();
@@ -4454,8 +4464,15 @@ pub fn prepareDirectNotify(owner: kernel.PrincipalId, frame: *const TrapFrame, c
     const b8_start = @import("ipc_metric.zig").timestamp();
     defer @import("notify_metric.zig").segment(1, b8_start);
     channel.exclusion.assertHeld();
-    if (!verifiedCoreReady() or !directSysretFrame(frame) or channel.ref_count <= 1 or
-        channel.waiters[side].poll_head != null or channel.waiters[1 - side].poll_head != null) return false;
+    if (!verifiedCoreReady() or !directSysretFrame(frame) or channel.ref_count <= 1) return false;
+    if (channel.waiters[side].dataPollAfter(null)) |node| {
+        @import("ipc_metric.zig").pollBlocker(node, .notify);
+        return false;
+    }
+    if (channel.waiters[1 - side].dataPollAfter(null)) |node| {
+        @import("ipc_metric.zig").pollBlocker(node, .notify);
+        return false;
+    }
     scheduler_state.thread_table.lock();
     var admitted = false;
     defer if (!admitted) scheduler_state.thread_table.unlock();
@@ -5826,6 +5843,9 @@ pub fn installExecContextForCurrentThread(
         // Keep pending signals across exec, but require the new runtime to
         // register its own address-bound delivery configuration.
         ctx.signal_entry = 0;
+        ctx.signal_scratch_base = 0;
+        ctx.signal_scratch_size = 0;
+        ctx.signal_delivery_ready = false;
         _ = kernel_runtime.kernel_state_global.clearProcessSignalPendingHintVa(owner_process);
         ctx.signal_inhibit_start = 0;
         ctx.signal_inhibit_end = 0;
@@ -7103,7 +7123,7 @@ fn tryWakeWaitTransferLocked(comptime Registers: type, comptime install: anytype
         source_ctx.cpu_slot != cpu or !source_ctx.ready or source_ctx.stopped or
         !source_ctx.wait_mailbox or source_ctx.active_wait_token != request.caller_token or
         source_ctx.wait_completion_claimed or source_ctx.wait_completion_publish_pending) return null;
-    if (firstUnblockedPendingSignal(source_ctx) != 0 and source_ctx.signal_entry != 0 and
+    if (firstUnblockedPendingSignal(source_ctx) != 0 and source_ctx.signal_entry != 0 and source_ctx.signal_delivery_ready and
         !request.wait_uninterruptible) return null;
     if (!peer.allocated or peer.owner_process != request.owner or peer.generation != request.peer_generation or
         peer.active_wait_token != request.peer_token or peer.wait_completion_claimed or
@@ -7912,6 +7932,7 @@ test "futex wake wait transfers directly without runnable sender and captures ba
         // Signal-frame staging runs before common user return and must not
         // recapture the receiver from the still-live source hardware bases.
         initial_thread_contexts[5].signal_entry = 0x7777;
+        initial_thread_contexts[5].signal_delivery_ready = true;
         initial_thread_contexts[5].pending_signal_mask = signalBit(12).?;
         const signal = claimCurrentSignalForUserReturn(frame.rip) orelse return error.SignalNotClaimed;
         try std.testing.expectEqual(@as(usize, 5), signal.thread_index);
@@ -7952,6 +7973,7 @@ test "futex wake wait rejects early completion signals competitors stale identit
             4 => {
                 source.pending_signal_mask = 4;
                 source.signal_entry = 0x1234;
+                source.signal_delivery_ready = true;
             },
             5 => source.stopped = true,
             6 => source.owner_process = kernel.processPrincipalFromIndex(1).?,
@@ -8600,7 +8622,10 @@ fn deliverSignalLocked(state: *kernel.KernelState, process_generation: ?u32, pri
         return null;
     }
     const newly_pending = (ctx.pending_signal_mask & signal_bit) == 0;
-    const should_interrupt = newly_pending and (ctx.signal_blocked_mask & signal_bit) == 0;
+    // A child that inherited a scratch trampoline must finish registering
+    // before a signal can interrupt its bootstrap wait. Threads with no
+    // trampoline retain native wait-interruption semantics.
+    const should_interrupt = newly_pending and (ctx.signal_entry == 0 or ctx.signal_delivery_ready) and (ctx.signal_blocked_mask & signal_bit) == 0;
     const was_blocked = should_interrupt and !ctx.ready and !ctx.wait_uninterruptible and
         (ctx.wait_mailbox or ctx.wake_tick != 0) and
         !ctx.wait_completion_claimed;
@@ -8672,6 +8697,8 @@ pub const ClaimedSignal = struct {
     thread_index: usize,
     signo: u32,
     entry: u64,
+    scratch_base: u64,
+    scratch_size: u64,
 };
 
 pub fn configureCurrentSignalDelivery(
@@ -8680,21 +8707,36 @@ pub fn configureCurrentSignalDelivery(
     inhibit_end: u64,
     inhibit_secondary_start: u64,
     inhibit_secondary_end: u64,
+    scratch_base: u64,
+    scratch_size: u64,
+    process_owner: bool,
 ) bool {
     scheduler_state.thread_table.lock();
     defer scheduler_state.thread_table.unlock();
     const ctx = threadContextLocked(currentThread()) orelse return false;
     if (!ctx.allocated) return false;
     ctx.signal_entry = entry;
+    ctx.signal_scratch_base = scratch_base;
+    ctx.signal_scratch_size = scratch_size;
+    ctx.signal_delivery_ready = true;
     ctx.signal_inhibit_start = inhibit_start;
     ctx.signal_inhibit_end = inhibit_end;
     ctx.signal_inhibit_secondary_start = inhibit_secondary_start;
     ctx.signal_inhibit_secondary_end = inhibit_secondary_end;
-    // The thread that registers the runtime signal trampoline is the process's
-    // signal owner (the main/event-loop thread).  Process-directed signals are
-    // delivered here so teardown runs on the loop that can service them.
-    ctx.signal_owner = true;
+    // Per-thread scratch registration must not make every worker the process
+    // signal owner. Only the runtime's designated main/event-loop opts in.
+    ctx.signal_owner = process_owner;
     return true;
+}
+
+// Only this thread can replace its registration. Snapshot under T, then
+// probe/copy without T: user memory faults may acquire address-space locks.
+pub fn currentSignalStack() ?struct { base: u64, size: u64 } {
+    scheduler_state.thread_table.lock();
+    defer scheduler_state.thread_table.unlock();
+    const ctx = threadContextLocked(currentThread()) orelse return null;
+    if (!ctx.allocated or !ctx.signal_delivery_ready) return null;
+    return .{ .base = ctx.signal_scratch_base, .size = ctx.signal_scratch_size };
 }
 
 pub fn setCurrentSignalBlockedMask(blocked_mask: u64) bool {
@@ -8772,6 +8814,9 @@ pub fn copyCurrentThreadStateToGeneration(target_thread: usize, generation: u32,
     const target = matchingThreadLocked(target_thread, generation, owner) orelse return false;
     if (threadSlotReferencedByCpu(target_thread)) return false;
     target.signal_entry = source.signal_entry;
+    target.signal_scratch_base = 0;
+    target.signal_scratch_size = 0;
+    target.signal_delivery_ready = source.signal_delivery_ready and source.signal_scratch_size == 0;
     target.signal_blocked_mask = source.signal_blocked_mask;
     target.signal_inhibit_start = source.signal_inhibit_start;
     target.signal_inhibit_end = source.signal_inhibit_end;
@@ -8794,7 +8839,7 @@ pub fn claimCurrentSignalForUserReturn(rip: u64) ?ClaimedSignal {
         return null;
     };
     const signo = firstUnblockedPendingSignal(ctx);
-    if (!ctx.allocated or signo == 0 or ctx.signal_entry == 0 or ctx.active_fault_frame != 0) {
+    if (!ctx.allocated or signo == 0 or ctx.signal_entry == 0 or !ctx.signal_delivery_ready or ctx.active_fault_frame != 0) {
         scheduler_state.thread_table.unlock();
         return null;
     }
@@ -8814,6 +8859,8 @@ pub fn claimCurrentSignalForUserReturn(rip: u64) ?ClaimedSignal {
         .thread_index = thread_index,
         .signo = signo,
         .entry = ctx.signal_entry,
+        .scratch_base = ctx.signal_scratch_base,
+        .scratch_size = ctx.signal_scratch_size,
     };
     ctx.pending_signal_mask &= ~signalBit(signo).?;
     setThreadHotPendingSignalMask(thread_index, ctx.pending_signal_mask);
@@ -9108,7 +9155,7 @@ pub fn blockCurrentThreadPreferred(
     // respect to each other.  The syscall caller will remove any waiter it
     // registered and return NOT_READY/EAGAIN, allowing delivery at a safe
     // user-frame boundary instead of leaving a completion waiter behind.
-    if (firstUnblockedPendingSignal(ctx) != 0 and ctx.signal_entry != 0 and
+    if (firstUnblockedPendingSignal(ctx) != 0 and ctx.signal_entry != 0 and ctx.signal_delivery_ready and
         !wait_uninterruptible)
     {
         if (wait_token != 0) {
@@ -9203,6 +9250,7 @@ test "thread storage generational operations reject reused identity and wrong ow
     const source_ctx = threadContextMutable(source.index).?;
     installCurrentContextLocked(&scheduler_state.cpus[0], source.index, source_ctx);
     source_ctx.signal_entry = 0x4000;
+    source_ctx.signal_delivery_ready = true;
     try std.testing.expect(setCurrentThreadSignalPendingHint(0x5678));
     try std.testing.expectEqual(@as(u64, 0x5678), source_ctx.signal_pending_hint_va);
     source_ctx.x_state[160] = 0x73;
@@ -9361,6 +9409,7 @@ test "uninterruptible wait real BSP AP admission matrix and wait attribute lifet
                     WaitAdmissionTest.stopped_at_block = false;
                     const ctx = &initial_thread_contexts[4];
                     ctx.signal_entry = 0x4000;
+                    ctx.signal_delivery_ready = true;
                     ctx.pending_signal_mask = if (pending == 0) 0 else 1;
                     ctx.signal_blocked_mask = if (pending == 2) 1 else 0;
                     const token = if (kind == 5) 0 else reserveCurrentWaitToken(1).?;
@@ -9399,6 +9448,7 @@ test "uninterruptible wait direct handoff pending matrix rejects before outbound
             request.wait_uninterruptible = uninterruptible;
             const ctx = &initial_thread_contexts[4];
             ctx.signal_entry = 0x4000;
+            ctx.signal_delivery_ready = true;
             ctx.pending_signal_mask = if (pending == 0) 0 else 1;
             ctx.signal_blocked_mask = if (pending == 2) 1 else 0;
             var frame = std.mem.zeroes(TrapFrame);
@@ -9440,6 +9490,7 @@ test "uninterruptible wait signal defers U wait but interrupts ordinary wait and
         const owner: kernel.PrincipalId = @enumFromInt(std.math.maxInt(u32));
         ctx.owner_process = owner;
         ctx.signal_entry = 0x4000;
+        ctx.signal_delivery_ready = true;
         const token = reserveCurrentWaitToken(1).?;
         var frame = std.mem.zeroes(TrapFrame);
         try std.testing.expect(blockCurrentThread(&frame, true, uninterruptible, token, 10, 5, null));
@@ -9543,6 +9594,8 @@ pub fn testUninterruptibleWaitFrontendMatrix() !void {
     const ipc = @import("syscall/native_ipc.zig");
     const runtime = @import("syscall/runtime.zig");
     const sc = @import("syscall/numbers.zig");
+    // Bits 2..4 select retained FD waits; use an unknown bit for every frontend.
+    const invalid_flags: u64 = 1 << 5;
     const storage = try std.testing.allocator.alignedAlloc(u8, .fromByteUnits(4096), kernel.runtimeStorageBytes());
     defer std.testing.allocator.free(storage);
     try std.testing.expect(kernel.initRuntimeStorage(storage));
@@ -9553,7 +9606,7 @@ pub fn testUninterruptibleWaitFrontendMatrix() !void {
     }
     for (0..2) |path| {
         for (0..5) |kind| {
-            for ([_]u64{ 0, 2, 4 }) |flags| {
+            for ([_]u64{ 0, 2, invalid_flags }) |flags| {
                 for (0..3) |pending| {
                     // Each row owns fresh heap storage; no live owner is reset.
                     const state = try std.testing.allocator.create(kernel.KernelState);
@@ -9573,6 +9626,7 @@ pub fn testUninterruptibleWaitFrontendMatrix() !void {
                     WaitFrontendFixture.bad_lock_interval = false;
                     const ctx = &initial_thread_contexts[4];
                     ctx.signal_entry = 0x4000;
+                    ctx.signal_delivery_ready = true;
                     ctx.pending_signal_mask = if (pending == 0) 0 else 1;
                     ctx.signal_blocked_mask = if (pending == 2) 1 else 0;
                     const pair = try state.createIpcChannelPairFds(default_process_principal, .{ .send = true, .recv = true, .wait = true, .poll = true, .close = true }, .{}, 16);
@@ -9613,16 +9667,16 @@ pub fn testUninterruptibleWaitFrontendMatrix() !void {
                             break :blk runtime.WaitTestSupport.wakeWait(WaitFrontendFixture.hooks(), default_process_principal, &frame);
                         },
                     };
-                    const admitted = flags != 4 and (flags == 2 or pending != 1);
+                    const admitted = flags != invalid_flags and (flags == 2 or pending != 1);
                     try std.testing.expectEqual(admitted, WaitAdmissionTest.stopped_at_block);
                     try std.testing.expect(!WaitFrontendFixture.bad_lock_interval);
-                    try std.testing.expectEqual(flags != 4, @as(bool, WaitFrontendFixture.block_calls == 1));
+                    try std.testing.expectEqual(flags != invalid_flags, @as(bool, WaitFrontendFixture.block_calls == 1));
                     try std.testing.expectEqual(admitted and flags == 2, ctx.wait_uninterruptible);
-                    if (flags == 4) {
+                    if (flags == invalid_flags) {
                         try std.testing.expectEqual(sc.syscall_err_invalid, status);
                         try std.testing.expectEqual(@as(usize, 0), WaitFrontendFixture.copies);
                     } else if (!admitted) try std.testing.expectEqual(sc.syscall_err_not_ready, status);
-                    if (kind == 4) try std.testing.expectEqual(if (flags == 4) std.math.maxInt(u64) else @as(u64, 0), frame.rdx);
+                    if (kind == 4) try std.testing.expectEqual(if (flags == invalid_flags) std.math.maxInt(u64) else @as(u64, 0), frame.rdx);
                     if (admitted) {
                         if (flags == 2) {
                             scheduler_state.thread_table.lock();
@@ -10699,7 +10753,7 @@ test "AP block preferred caller preserves competing EEVDF choice and saved commi
 /// K owns delivery; T validates the claimed generation/token before staging.
 /// Publication (including a stop or delayed runqueue admission) carries words
 /// with the status. A completion before block is consumed by both park paths.
-// K retains group identity; T validates the same terminal claim as publication.
+// K owns group/subscription delivery; T validates the terminal publication claim.
 pub fn stagePollResult(target: kernel.ThreadWakeTarget, index: u64, revents: u64) bool {
     scheduler_state.thread_table.lock();
     defer scheduler_state.thread_table.unlock();
@@ -10723,6 +10777,19 @@ pub fn stageIpcResult(target: kernel.ThreadWakeTarget, words: [4]u64, fd_count: 
     ctx.wait_ipc_words = words;
     ctx.wait_ipc_fd_count = fd_count;
     return true;
+}
+
+/// Retained subscriptions never store user pointers. Only a terminal claim
+/// lends the blocked invocation's output VA; timeout/signal/exit end that loan
+/// without walking the independent, persistent observer nodes.
+pub fn claimedWaitOutput(target: kernel.ThreadWakeTarget) ?u64 {
+    scheduler_state.thread_table.lock();
+    defer scheduler_state.thread_table.unlock();
+    const ctx = threadContextLocked(target.thread_index) orelse return null;
+    if (!ctx.allocated or ctx.owner_process != target.owner or
+        ctx.generation != target.thread_generation or ctx.active_wait_token != target.wait_token or
+        !ctx.wait_completion_claimed) return null;
+    return ctx.frame.rdi;
 }
 
 test "thread storage IPC register codec words extensions capacity and faults" {
@@ -10851,6 +10918,7 @@ test "thread storage poll register completion before BSP AP and fast block" {
 // lifetime boundary that made ThreadContext-embedded nodes unsafe.
 test "thread storage IPC stable block fast call reply receive and unchanged fallback" {
     const abi = @import("kernel_abi_root").ipc_abi;
+    const runtime_abi = @import("kernel_abi_root").runtime_abi;
     const ipc = @import("syscall/native_ipc.zig").WaitTestSupport;
     const saved = try std.testing.allocator.dupe(ThreadContext, &initial_thread_contexts);
     defer {
@@ -10876,6 +10944,14 @@ test "thread storage IPC stable block fast call reply receive and unchanged fall
         // The atomic queue hint alone must not suppress its final drain.
         try std.testing.expect(!hasPendingIpcCancellations());
         state.ipc_cancel_writable_pending = true;
+        // K-free runtime calls fall through the ordinary IPC probe. It must
+        // leave K-owned cancellation work for the next K owner.
+        for ([_]u64{ runtime_abi.syscall_getpid, runtime_abi.syscall_nanosleep, runtime_abi.syscall_futex_wait, runtime_abi.syscall_futex_wake, runtime_abi.syscall_futex_wake_wait, runtime_abi.syscall_futex_requeue, runtime_abi.syscall_futex_wake_op }) |nr| {
+            var probe = std.mem.zeroes(TrapFrame);
+            probe.rax = nr;
+            try std.testing.expect(@import("syscall/native_ipc.zig").dispatchAfterScalarMiss(h, state, owner, &probe) == null);
+            try std.testing.expect(state.ipc_cancel_writable_pending);
+        }
         @import("syscall/native_ipc.zig").drainCancellations(h, state);
         try std.testing.expect(!state.ipc_cancel_writable_pending);
 
@@ -11261,6 +11337,7 @@ test "thread storage IPC stable receive lifetime exit exec slot reuse and close"
             detachPrincipalIpcBindings(owner);
         } else if (action == 4) {
             initial_thread_contexts[4].signal_entry = 0x400000;
+            initial_thread_contexts[4].signal_delivery_ready = true;
             scheduler_state.thread_table.lock();
             try std.testing.expect(deliverSignalLocked(state, state.processDescriptor(owner).?.generation, owner, 4, &initial_thread_contexts[4], 2, 3) != null);
             try std.testing.expect(block.receive.state == .pending);
@@ -11449,6 +11526,7 @@ test "thread storage IPC EEVDF refusal preserves frame token tree and service" {
             1 => timeout = 1,
             2 => {
                 initial_thread_contexts[4].signal_entry = 1;
+                initial_thread_contexts[4].signal_delivery_ready = true;
                 initial_thread_contexts[4].pending_signal_mask = 1;
             },
             3 => initial_thread_contexts[5].stopped = true,
@@ -12204,7 +12282,7 @@ test "IPC notify direct admission is read-only and commits latch token and hando
     const memory = try std.testing.allocator.alignedAlloc(u8, .fromByteUnits(4096), kernel.runtimeStorageBytes());
     defer std.testing.allocator.free(memory);
     try std.testing.expect(kernel.initRuntimeStorage(memory));
-    for (0..25) |scenario| {
+    for (0..29) |scenario| {
         const state = try std.testing.allocator.create(kernel.KernelState);
         defer std.testing.allocator.destroy(state);
         try state.initFromDetectedRegionsInPlace(1);
@@ -12277,6 +12355,10 @@ test "IPC notify direct admission is read-only and commits latch token and hando
                 scheduler_state.cpus[0].runqueue_lock.unlock();
             }
         }
+        var poll_observer: kernel.IpcWaiter = .{ .active = true };
+        var persistent_set: kernel.persistent_wait.Set = .{};
+        var persistent_observer: kernel.persistent_wait.Item = .{ .set = &persistent_set };
+        defer found.channel.waiters[found.side].poll_head = null;
         switch (scenario) {
             2, 4 => found.channel.notify_pending[found.side] = true,
             3 => found.channel.notify_waiters[1 - found.side] = .{},
@@ -12288,7 +12370,16 @@ test "IPC notify direct admission is read-only and commits latch token and hando
             11 => initial_thread_contexts[4].pending_signal_mask = 1,
             12 => RuntimeAccountingTest.now_ns = null,
             13 => target.stopped = true,
-            16 => found.channel.waiters[found.side].poll_head = @ptrFromInt(4096),
+            16 => {
+                found.channel.waiters[found.side].poll_head = &poll_observer;
+            },
+            25...28 => {
+                poll_observer.binding.persistent = &persistent_observer;
+                poll_observer.events = if (scenario >= 26) @import("kernel_abi_root").fd_abi.event_readable else 0;
+                persistent_observer.queued = scenario >= 27;
+                if (scenario == 28) persistent_set.invocation = .{ .token = 1 };
+                found.channel.waiters[found.side].poll_head = &poll_observer;
+            },
             17 => found.channel.ref_count = 1,
             23 => found.channel.ref_count = 3,
             18 => {
@@ -12307,7 +12398,7 @@ test "IPC notify direct admission is read-only and commits latch token and hando
         const before_waiters = found.channel.notify_waiters;
         var plan: DirectNotifyPlan = undefined;
         const accepted = prepareDirectNotify(owner, &frame, found.channel, found.side, wait, send, null, &plan);
-        if (scenario >= 6 and scenario != 14 and scenario != 15 and scenario != 19 and scenario != 23 and scenario != 24) {
+        if (scenario >= 6 and scenario != 14 and scenario != 15 and scenario != 19 and scenario != 23 and scenario != 24 and scenario != 25 and scenario != 27) {
             try std.testing.expect(!accepted);
             // Tree links form cycles; compare fields and pointer identities,
             // then the pointed-to nodes and tree separately, never recurse.
@@ -12337,7 +12428,7 @@ test "IPC notify direct admission is read-only and commits latch token and hando
             pair.end();
             continue;
         }
-        if (scenario <= 2 or scenario == 19 or scenario == 23 or scenario == 24) {
+        if (scenario <= 2 or scenario == 19 or scenario == 23 or scenario == 24 or scenario == 25 or scenario == 27) {
             try std.testing.expectEqual(@as(usize, 5), currentThread());
             try std.testing.expectEqual(@as(u64, if (scenario == 19 or scenario == 24) before_target.frame.rax else 0), frame.rax);
             if (scenario == 19 or scenario == 24) try std.testing.expectEqualDeep(before_target.frame, frame);
@@ -12405,4 +12496,74 @@ test "IPC notify saved continuation origin ends at activation and ordinary captu
     try std.testing.expectEqual(@as(u64, 0x5678), source.frame.r13);
     try std.testing.expect(!initial_thread_contexts[5].entry_state.notify_sysret_continuation);
     try std.testing.expect(source.entry_state.notify_sysret_continuation);
+}
+
+test "native signal scratch is independent after clone and pending survives until registration" {
+    const saved_contexts = initial_thread_contexts[4..6].*;
+    const saved_hot = initial_thread_hot_states[4..6].*;
+    defer {
+        initial_thread_contexts[4..6].* = saved_contexts;
+        initial_thread_hot_states[4..6].* = saved_hot;
+        initializeStaticStorage();
+    }
+    try initializeDirectBlockTest(false);
+    const owner = initial_thread_contexts[4].owner_process;
+    try std.testing.expect(configureCurrentSignalDelivery(0x4000, 0x4000, 0x5000, 0, 0, 0x10000, 8192, true));
+    try std.testing.expect(copyCurrentThreadStateToGeneration(5, 17, owner));
+    const child = &initial_thread_contexts[5];
+    try std.testing.expectEqual(@as(u64, 0), child.signal_scratch_base);
+    try std.testing.expectEqual(@as(u64, 0), child.signal_scratch_size);
+    try std.testing.expect(!child.signal_delivery_ready and !child.signal_owner);
+    setTestCurrentThread(&scheduler_state.cpus[0], 5);
+    child.pending_signal_mask = 1;
+    try std.testing.expect(currentSignalStack() == null);
+    try std.testing.expect(claimCurrentSignalForUserReturn(0x9000) == null);
+    try std.testing.expectEqual(@as(u64, 1), child.pending_signal_mask);
+    try std.testing.expect(configureCurrentSignalDelivery(0x4000, 0x4000, 0x5000, 0, 0, 0x20000, 8192, false));
+    try std.testing.expect(claimCurrentSignalForUserReturn(0x4001) == null);
+    const claimed = claimCurrentSignalForUserReturn(0x9000).?;
+    try std.testing.expectEqual(@as(u64, 0x20000), claimed.scratch_base);
+    try std.testing.expectEqual(@as(u64, 0x10000), initial_thread_contexts[4].signal_scratch_base);
+    try std.testing.expectEqual(@as(u64, 0), child.pending_signal_mask);
+    // Delivery copy failure restores the claimed signal through this API.
+    child.owner_process = @enumFromInt(std.math.maxInt(u32));
+    restoreClaimedSignal(claimed);
+    try std.testing.expectEqual(@as(u64, 1), child.pending_signal_mask);
+    _ = claimCurrentSignalForUserReturn(0x9000).?;
+    try std.testing.expectEqual(@as(u64, 0), child.pending_signal_mask);
+    _ = @import("signal_stack.zig").layout(0x20000, 8192, 1).?;
+}
+
+test "native signal unregistered child can block with pending and cannot be interrupted before registration" {
+    const saved_contexts = initial_thread_contexts[4..6].*;
+    const saved_hot = initial_thread_hot_states[4..6].*;
+    defer {
+        WaitAdmissionTest.stop_after_block = false;
+        initial_thread_contexts[4..6].* = saved_contexts;
+        initial_thread_hot_states[4..6].* = saved_hot;
+        initializeStaticStorage();
+    }
+    for ([_]bool{ false, true }) |registered| {
+        try initializeDirectBlockTest(false);
+        WaitAdmissionTest.stop_after_block = true;
+        const ctx = &initial_thread_contexts[4];
+        const owner: kernel.PrincipalId = @enumFromInt(std.math.maxInt(u32));
+        ctx.owner_process = owner;
+        ctx.signal_entry = 0x4000;
+        ctx.signal_delivery_ready = registered;
+        ctx.pending_signal_mask = 1;
+        const token = reserveCurrentWaitToken(1).?;
+        var frame = std.mem.zeroes(TrapFrame);
+        try std.testing.expectEqual(!registered, blockCurrentThread(&frame, true, false, token, 0, 2, null));
+        try std.testing.expectEqual(@as(u64, 1), ctx.pending_signal_mask);
+        if (!registered) {
+            const state = try std.testing.allocator.create(kernel.KernelState);
+            defer std.testing.allocator.destroy(state);
+            scheduler_state.thread_table.lock();
+            const delivery = deliverSignalLocked(state, null, owner, 4, ctx, 2, 2).?;
+            try std.testing.expect(!delivery.was_blocked and !delivery.should_interrupt);
+            try std.testing.expect(!ctx.ready and ctx.wait_mailbox);
+            try std.testing.expectEqual(@as(u64, 3), ctx.pending_signal_mask);
+        }
+    }
 }

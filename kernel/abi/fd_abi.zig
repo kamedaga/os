@@ -1,5 +1,15 @@
 /// Internal waits finish before signal delivery; teardown is never deferred.
 pub const wait_uninterruptible: u64 = 1 << 1;
+// A thread-generation-owned subscription set, separate from each wait token.
+// REPLACE snapshots and atomically replaces the set; REUSE only supplies this
+// invocation's output array (same count); CLEAR requires zero array/count/time.
+// No output VA is retained in idle subscriptions. Source descriptor mutation
+// invalidates the set; callers must REPLACE before reuse. One-shot waits do not
+// alter it. Thread/process teardown and CLEAR release all observer storage.
+pub const wait_set_replace: u64 = 1 << 2;
+pub const wait_set_reuse: u64 = 1 << 3;
+pub const wait_set_clear: u64 = 1 << 4;
+pub const wait_set_invalidated: u64 = 0 -% @as(u64, 7);
 
 pub const fd_table_entries: u32 = 256;
 // FD_TABLE(minimum_capacity): zero queries, otherwise grow without shrinking.
@@ -11,42 +21,48 @@ pub const first_dynamic_fd: u32 = 16;
 // current generation, including the initial thread created by PROCESS_CLONE.
 pub const thread_self_fd: u32 = 0xffff_fffe;
 
-pub const syscall_fd_first: u64 = 41;
-pub const syscall_fd_table: u64 = 41;
-pub const syscall_fd_close: u64 = 42;
-pub const syscall_fd_dup: u64 = 43;
-pub const syscall_fd_get_info: u64 = 44;
-pub const syscall_fd_set_flags: u64 = 45;
-pub const syscall_fd_read: u64 = 46;
-pub const syscall_fd_write: u64 = 47;
-pub const syscall_fd_readv: u64 = 48;
-pub const syscall_fd_writev: u64 = 49;
-pub const syscall_fd_fcntl: u64 = 50;
-pub const syscall_fd_poll: u64 = 51;
-pub const syscall_fd_wait_many: u64 = 52;
-pub const syscall_fd_ioctl: u64 = 53;
-pub const syscall_fd_stat: u64 = 54;
-pub const syscall_eventfd_create: u64 = 55;
-pub const syscall_pipe_create: u64 = 56;
-pub const syscall_timerfd_create: u64 = 57;
-pub const syscall_timerfd_settime: u64 = 58;
-pub const syscall_timerfd_gettime: u64 = 59;
-pub const syscall_vmo_create: u64 = 60;
+pub const syscall_fd_first: u64 = 42;
+pub const syscall_fd_table: u64 = 42;
+pub const syscall_fd_close: u64 = 43;
+pub const syscall_fd_dup: u64 = 44;
+pub const syscall_fd_get_info: u64 = 45;
+pub const syscall_fd_set_flags: u64 = 46;
+pub const syscall_fd_read: u64 = 47;
+pub const syscall_fd_write: u64 = 48;
+pub const syscall_fd_readv: u64 = 49;
+pub const syscall_fd_writev: u64 = 50;
+pub const syscall_fd_fcntl: u64 = 51;
+pub const syscall_fd_poll: u64 = 52;
+pub const syscall_fd_wait_many: u64 = 53;
+pub const syscall_fd_ioctl: u64 = 54;
+pub const syscall_fd_stat: u64 = 55;
+pub const syscall_eventfd_create: u64 = 56;
+pub const syscall_pipe_create: u64 = 57;
+pub const syscall_timerfd_create: u64 = 58;
+pub const syscall_timerfd_settime: u64 = 59;
+pub const syscall_timerfd_gettime: u64 = 60;
+pub const syscall_vmo_create: u64 = 61;
 // VMO_GROW(fd, page-aligned capacity): append zeroed backing without replacing
 // live aliases. Requires RESIZE; shrinking and page-view growth are rejected.
-pub const syscall_vmo_grow: u64 = 61;
+pub const syscall_vmo_grow: u64 = 62;
 // Changes the physical cache type of populated canonical RAM, including
 // aliases held by other processes. Requires an explicit cache-policy right.
-pub const syscall_vmo_cache_policy: u64 = 62;
+pub const syscall_vmo_cache_policy: u64 = 63;
 pub const vmo_cache_wb: u64 = 0;
 pub const vmo_cache_uc_minus: u64 = 1;
 pub const vmo_cache_uc: u64 = 2;
 pub const vmo_cache_wc: u64 = 3;
-pub const syscall_vmo_create_page_view: u64 = 63;
+pub const syscall_vmo_create_page_view: u64 = 64;
 // Fixed-length borrowed backing replacement; requires both the revocation
 // capability and the same parent's SHARE + original maximum MAP authority.
-pub const syscall_vmo_refresh_page_view: u64 = 64;
-pub const syscall_vmo_revoke: u64 = 65;
+pub const syscall_vmo_refresh_page_view: u64 = 65;
+// VMO_COLLECT_DIRTY(view_fd, bitmap, word_count, flags=0). REVOKE controls
+// destructive acknowledgement of CPU-write evidence. Bits use logical view
+// page indices. Exact word count required; failed copyout retains all bits.
+// Output must not physically alias any page of the collected view. DMA writes
+// are outside this CPU-only contract; the DMA owner keeps its own protocol.
+pub const syscall_vmo_collect_dirty: u64 = 66;
+pub const syscall_vmo_revoke: u64 = 67;
 pub const syscall_fd_last: u64 = syscall_vmo_revoke;
 pub const syscall_fd_count: u64 = syscall_fd_last - syscall_fd_first + 1;
 
@@ -79,9 +95,10 @@ pub const right_close: u64 = 1 << 6;
 pub const right_process_signal: u64 = 1 << 27;
 pub const thread_self_rights_mask: u64 =
     right_inspect | right_wait | right_poll | right_transfer | right_close | right_process_signal;
-pub const right_read: u64 = 1 << 43;
-pub const right_write: u64 = 1 << 44;
-pub const right_revoke: u64 = 1 << 45;
+pub const right_controller_write: u64 = 1 << 31;
+pub const right_read: u64 = 1 << 44;
+pub const right_write: u64 = 1 << 45;
+pub const right_revoke: u64 = 1 << 46;
 pub const right_map_read: u64 = 1 << 13;
 pub const right_map_write: u64 = 1 << 14;
 pub const right_map_exec: u64 = 1 << 15;
@@ -138,14 +155,15 @@ pub const fd_kind_endpoint: u64 = 5;
 pub const fd_kind_channel: u64 = 6;
 pub const fd_kind_reply: u64 = 7;
 pub const fd_kind_device: u64 = 8;
-pub const fd_kind_mmio_region: u64 = 9;
-pub const fd_kind_dma_buffer: u64 = 10;
-pub const fd_kind_dma_mapping: u64 = 11;
-pub const fd_kind_irq: u64 = 12;
-pub const fd_kind_timer: u64 = 13;
-pub const fd_kind_serial: u64 = 14;
-pub const fd_kind_pipe: u64 = 15;
-pub const fd_kind_pager_port: u64 = 16;
+pub const fd_kind_platform_device: u64 = 9;
+pub const fd_kind_mmio_region: u64 = 10;
+pub const fd_kind_dma_buffer: u64 = 11;
+pub const fd_kind_dma_mapping: u64 = 12;
+pub const fd_kind_irq: u64 = 13;
+pub const fd_kind_timer: u64 = 14;
+pub const fd_kind_serial: u64 = 15;
+pub const fd_kind_pipe: u64 = 16;
+pub const fd_kind_pager_port: u64 = 17;
 
 pub const fd_info_kind_offset: u64 = 0;
 pub const fd_info_rights_offset: u64 = 8;

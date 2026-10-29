@@ -1,6 +1,7 @@
 #include "../lpr_filed_internal.h"
 #include "../support/browser_diag.h"
 #include "device.h"
+#include <unixd/profile.h>
 #include "../lpr_common/boot_diagnostic.h"
 
 #define LPR_LINUX_EMSGSIZE 90
@@ -73,7 +74,7 @@ static int64_t lpr_ops_pipe_close(void *state)
 
 static int64_t lpr_ops_event_close(void *state)
 {
-    const lpr_event_backend_t *event = state;
+    lpr_event_backend_t *event = state;
     const int was_signalfd =
         event->subtype == LPR_EVENT_BACKEND_SIGNALFD;
     const int was_inotify =
@@ -81,9 +82,13 @@ static int64_t lpr_ops_event_close(void *state)
     const uint64_t inotify_mapping = event->counter;
     const uint64_t inotify_mapping_bytes = event->deadline_ns;
     int64_t status = 0;
-    if (event->wait_fd.raw >= 16)
-        status = lpr_close_native_fd_if_open(
+    if (event->subtype == LPR_EVENT_BACKEND_EVENTFD)
+        status = lpr_event_counter_close(event);
+    if (event->wait_fd.raw >= 16) {
+        const int64_t wait_status = lpr_close_native_fd_if_open(
             (uint64_t)event->wait_fd.raw);
+        if (status == 0) status = wait_status;
+    }
     if (event->notify_fd.raw >= 16) {
         const int64_t notify_status = lpr_close_native_fd_if_open(
             (uint64_t)event->notify_fd.raw);
@@ -166,6 +171,7 @@ static int64_t lpr_fd_close_backend(uint8_t ops_id, void *state)
     case LPR_FD_OPS_TTY: return lpr_ops_tty_close(state);
     case LPR_FD_OPS_DRM: return lpr_ops_drm_close(state);
     case LPR_FD_OPS_INPUT: return lpr_ops_input_close(state);
+    case LPR_FD_OPS_AUDIO: return lpr_close_native_fd_if_open((uint64_t)((lpr_audio_backend_t *)state)->native.raw);
     case LPR_FD_OPS_PIPE: return lpr_ops_pipe_close(state);
     case LPR_FD_OPS_EVENT: return lpr_ops_event_close(state);
     case LPR_FD_OPS_SOCKET: return lpr_socket_close_backend(state);
@@ -241,6 +247,8 @@ int lpr_fd_transfer_prepare(
         return 0; /* unixd retains the authenticated OFD, not local VMO numbers. */
     }
     if (pin->ops_id == LPR_FD_OPS_FILED) {
+        unix_profile_fd_inventory(0);
+        UP_BEGIN(export_total, UP_FD_TRANSFER, LPR_FD_OPS_FILED, UP_TOTAL);
         const lpr_filed_backend_t *filed = pin->state;
         const int64_t binding_status = lpr_filed_endpoint_ready();
         if (binding_status) return binding_status;
@@ -253,11 +261,15 @@ int lpr_fd_transfer_prepare(
             return -LPR_LINUX_EMSGSIZE;
         pacha_fd_t lease_fd = -1;
         pacha_fd_t remote_lease_fd = -1;
+        UP_BEGIN(pair_time, UP_FD_TRANSFER, LPR_FD_OPS_FILED, UP_SETUP);
         const int pair_status = lpr_filed_lease_pair(&lease_fd, &remote_lease_fd);
+        UP_END(pair_time);
         if (pair_status != 0) return pair_status;
         uint64_t ticket = 0;
+        UP_BEGIN(dup_time, UP_FD_TRANSFER, LPR_FD_OPS_FILED, UP_CALL);
         const int64_t status = lpr_filed_transfer_dup_handle(
             filed->handle, 0, remote_lease_fd, &ticket);
+        UP_END(dup_time);
         if (status != 0) {
             (void)lpr_close_native_fd_if_open((uint64_t)lease_fd);
             (void)lpr_close_native_fd_if_open((uint64_t)remote_lease_fd);
@@ -737,6 +749,8 @@ static int lpr_fd_io_supported(uint8_t ops_id, uint32_t operation)
         return operation <= 5;
     case LPR_FD_OPS_UNIX:
         return operation <= 5;
+    case LPR_FD_OPS_AUDIO:
+        return operation == 1 || operation == 3 || operation == 4 || operation == 5;
     case LPR_FD_OPS_DRM:
     case LPR_FD_OPS_INPUT:
         return operation == 0 || operation == 2 || operation == 4 || operation == 5;

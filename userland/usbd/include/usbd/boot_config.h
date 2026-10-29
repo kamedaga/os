@@ -9,6 +9,7 @@ enum {
     USBD_BOOT_READY_MAGIC = 0x3159445244425355ull,
     USBD_KIND_USB_XHCI = 1,
     USBD_KIND_NVME = 2,
+    USBD_KIND_PS2 = 3,
 };
 
 /* Private seed0root -> usbd startup data. Resource rights are still carried

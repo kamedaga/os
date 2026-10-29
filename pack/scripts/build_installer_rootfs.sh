@@ -136,6 +136,8 @@ install_kobox_package "$repo_root/.artifacts/kobox2-usb-storage-xhci-production"
     /srv/kobox2/usb-storage
 install_kobox_package "$repo_root/.artifacts/kobox2-nvme-production" \
     /srv/kobox2/nvme
+install_kobox_package "$repo_root/.artifacts/kobox2-ps2-production/package" \
+    /srv/kobox2/ps2
 
 mkdir -p "$stage/dev/dri" "$stage/dev/input" "$stage/dev/shm" \
     "$stage/proc" "$stage/run" "$stage/sys" "$stage/tmp"

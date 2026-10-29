@@ -53,7 +53,7 @@ static void log_runtime_event(const struct gpud_boot_config *config,
  * to select a PCI function or bypass package/firmware verification. */
 static int manual_control(pacha_fd_t filed_fd) {
     struct filed_client_module_image image = {0};
-    int error = filed_client_load_module_image_limited(filed_fd,
+    int error = filed_client_load_optional_module_image_limited(filed_fd,
         GPUD_INSPECT_CONTROL_PATH, "gpu-control", 16, &image);
     if (error)
         return error == -ENOENT || error == -7 ? 0 : error;
@@ -129,7 +129,7 @@ static int request_display_release(const struct gpud_boot_config *config) {
  * derived from the uploaded file. This keeps Kobox2 rebuilds off the USB. */
 static int refresh_inspection_policy(struct gpud_boot_config *config) {
     struct filed_client_module_image image = {0};
-    int error = filed_client_load_module_image_limited(
+    int error = filed_client_load_optional_module_image_limited(
         (pacha_fd_t)config->filed_endpoint_fd, GPUD_INSPECT_POLICY_PATH,
         "gpu-probe-policy", 384, &image);
     if (error == -ENOENT) return 0;
@@ -231,7 +231,8 @@ static int wait_readable(pacha_fd_t fd, pacha_fd_t process_fd, uint64_t deadline
 
 static int wait_service(
     struct gpud_drm_service *service, pacha_fd_t endpoint_fd,
-    pacha_fd_t process_fd, pacha_fd_t control_fd, uint64_t timeout_ticks) {
+    pacha_fd_t process_fd, pacha_fd_t control_fd, uint64_t timeout_ticks,
+    struct pacha_fd_wait_retained *retained) {
     int error = gpud_drm_service_reserve_pollfds(service, 4);
     if (error) return error;
     struct pacha_pollfd *events = service->pollfds;
@@ -256,8 +257,8 @@ static int wait_service(
     }
     size_t source_count = gpud_drm_service_pollfds(
         service, events + event_count, service->poll_capacity - event_count);
-    long result = pacha_fd_wait_many_batched(
-        events, event_count + source_count, timeout_ticks);
+    long result = pacha_fd_wait_many_retained(
+        retained, events, event_count + source_count, timeout_ticks);
     if (events[1].revents)
         return -EPIPE;
     if (result == PACHA_ERR_NOT_READY || result == 0)
@@ -388,6 +389,8 @@ struct gpud_generation {
     unsigned char *gpu_mapping;
     struct gpud_gpu_channel gpu_channel;
     struct gpud_drm_service service;
+    /* serve_generation is the sole waiting thread for this generation. */
+    struct pacha_fd_wait_retained wait_set;
 };
 
 static int retire_drm_generation(
@@ -780,7 +783,7 @@ static int start_generation(const struct gpud_boot_config *config,
 
 static int serve_generation(
     struct gpud_generation *current, pacha_fd_t filed_fd, pacha_fd_t *control_fd, int inspect,
-    int *forced, int *stop_requested) {
+    int *forced, int *stop_requested, const struct gpud_boot_config *config) {
     *forced = 0;
     *stop_requested = 0;
     struct gpud_control_poll command_poll = {0};
@@ -794,6 +797,7 @@ static int serve_generation(
             if (gpud_control_poll_due(&command_poll, now_ms)) {
                 int command = manual_control(filed_fd);
                 if (command == 2) {
+                    log_runtime_event(config, "stop requested by manual control", 0);
                     *stop_requested = 1;
                     return 0;
                 }
@@ -804,6 +808,8 @@ static int serve_generation(
         int control = receive_control(*control_fd, current->id);
         if (control == GPUD_CONTROL_STOP ||
             (inspect && control == GPUD_CONTROL_PEER_CLOSED)) {
+            log_runtime_event(config, control == GPUD_CONTROL_STOP ?
+                "stop requested by owner" : "owner control peer closed", 0);
             *stop_requested = 1;
             return 0;
         }
@@ -844,7 +850,7 @@ static int serve_generation(
         }
         error = wait_service(&current->service, current->service.endpoint_fd,
             current->launch.process.fd, *control_fd,
-            timeout);
+            timeout, &current->wait_set);
         if (inspect && error == -EAGAIN)
             continue;
         if (error)
@@ -1005,7 +1011,7 @@ static int run(const struct gpud_boot_config *config) {
         const int restart_error = serve_generation(
             &current, (pacha_fd_t)config->filed_endpoint_fd, &control_fd,
             config->backend == GPUD_BACKEND_PCI_DRM_INSPECT,
-            &forced, &stop_requested);
+            &forced, &stop_requested, config);
         int discovery_error = gpud_discovery_remove(&discovery,
             (pacha_fd_t)config->filed_endpoint_fd);
         if (discovery_error)

@@ -3,6 +3,22 @@
 #include "../support/browser_diag.h"
 #include "../support/mmap_profile.h"
 
+/* Conservative per-process fast path: once record locks are used, every
+ * descriptor close must release that inode's POSIX locks, including dup aliases. */
+static volatile uint32_t lpr_posix_locks_used;
+
+int64_t lpr_filed_close_posix_locks(const lpr_fd_pin_t *pin)
+{
+    if (!__atomic_load_n(&lpr_posix_locks_used,__ATOMIC_ACQUIRE) ||
+        pin->ops_id!=LPR_FD_OPS_FILED) return 0;
+    const lpr_filed_backend_t *file=pin->state;
+    if (!file || !file->handle || (file->flags&010000000u)) return 0; /* O_PATH */
+    kb2_fs_request_t request={.opcode=KB2_FILESYSTEM_OP_FCNTL,
+        .handle=file->handle,.flags=LPR_LINUX_F_SETLK,.mode=2}; /* F_UNLCK, whole inode */
+    kb2_fs_response_t response;
+    return lpr_fs_call(&request,0,0,0,0,0,0,&response,-1,0);
+}
+
 static int64_t lpr_linux_file_vmo_call(uint32_t op, uint64_t flags,
     uint64_t fd, uint64_t file_offset, uint64_t length, uint32_t prot, uint64_t *out_loaded, uint64_t *out_vmo_offset, int *out_pager)
 {
@@ -66,6 +82,7 @@ int64_t lpr_linux_shared_file_vmo(
 
 int64_t lpr_backend_write(uint64_t fd, uint64_t buf, uint64_t count, unsigned *wait_not_ready __attribute__((unused)))
 {
+    if (lpr_audio_backend(fd)) return lpr_audio_write(fd, buf, count);
     if (lpr_block_backend(fd)) {
         const uint64_t offset = lpr_filed_control_offset(fd);
         const int64_t n = lpr_block_io(fd, buf, count, offset, 1);
@@ -101,10 +118,10 @@ int64_t lpr_backend_write(uint64_t fd, uint64_t buf, uint64_t count, unsigned *w
 #endif
         for (;;) {
             uint64_t counter = __atomic_load_n(
-                &event->counter, __ATOMIC_ACQUIRE);
+                lpr_event_counter(event), __ATOMIC_ACQUIRE);
             while (counter <= (UINT64_MAX - 1u) - value) {
                 if (__atomic_compare_exchange_n(
-                        &event->counter,
+                        lpr_event_counter(event),
                         &counter,
                         counter + value,
                         0,
@@ -120,7 +137,7 @@ int64_t lpr_backend_write(uint64_t fd, uint64_t buf, uint64_t count, unsigned *w
                         lpr_glycin_diag_event(
                             "event.write.exit", fd,
                             __atomic_load_n(
-                                &event->counter, __ATOMIC_ACQUIRE),
+                                lpr_event_counter(event), __ATOMIC_ACQUIRE),
                             __atomic_load_n(
                                 &event->notify_pending, __ATOMIC_ACQUIRE),
                             (int64_t)value);
@@ -195,6 +212,7 @@ int64_t lpr_backend_writev(uint64_t fd, uint64_t iov_raw, uint64_t iov_count, un
     if (iov_raw == 0 && iov_count != 0) {
         return -LPR_LINUX_EFAULT;
     }
+    if (lpr_audio_backend(fd)) return lpr_iov_scalar_io(fd, iov_raw, iov_count, 1, wait_not_ready);
     if (lpr_block_backend(fd))
         return lpr_iov_scalar_io(fd, iov_raw, iov_count, 1, wait_not_ready);
     if (lpr_linux_device_fd_active(fd)) {
@@ -483,6 +501,26 @@ int64_t lpr_linux_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg)
             return -LPR_LINUX_EINVAL;
         }
     }
+    if (lpr_audio_backend(fd) != 0) {
+        switch (cmd) {
+        case LPR_LINUX_F_GETFD:
+            return lpr_control_get_fd_flags(fd);
+        case LPR_LINUX_F_SETFD:
+            return lpr_control_set_fd_flags(fd, arg);
+        case LPR_LINUX_F_GETFL:
+            return lpr_audio_status_flags(fd, UINT64_MAX);
+        case LPR_LINUX_F_SETFL:
+        {
+            int64_t changed = lpr_audio_status_flags(fd, arg);
+            return changed < 0 ? changed : lpr_control_set_status_flags(fd, arg);
+        }
+        case LPR_LINUX_F_DUPFD:
+        case LPR_LINUX_F_DUPFD_CLOEXEC:
+            return lpr_linux_dup(fd, arg, cmd == LPR_LINUX_F_DUPFD_CLOEXEC);
+        default:
+            return -LPR_LINUX_EINVAL;
+        }
+    }
     if (lpr_linux_input_fd_active(fd)) {
         switch (cmd) {
         case LPR_LINUX_F_GETFD:
@@ -569,6 +607,46 @@ int64_t lpr_linux_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg)
     if (!lpr_fd_is_filed(fd)) {
         return -LPR_LINUX_EBADF;
     }
+    if (cmd==LPR_LINUX_F_SETLK || cmd==LPR_LINUX_F_SETLKW) {
+        /* Linux x86_64 flock is a userspace record, never a sandbox pointer.
+         * Resolve relative ranges once before an interruptible blocking wait. */
+        struct { int16_t type,whence;int32_t pad;int64_t start,length;int32_t pid,tail; } range;
+        if (arg<4096 || arg>UINT64_MAX-sizeof(range)) return -LPR_LINUX_EFAULT;
+        lpr_memcpy(&range,(const void *)(uintptr_t)arg,sizeof(range));
+        int64_t base=0;
+        if (range.whence==1) {
+            base=lpr_linux_lseek(fd,0,1);
+            if (base<0) return base;
+        } else if (range.whence==2) {
+            lpr_linux_stat_t stat;
+            int64_t status=lpr_linux_fstat(fd,(uint64_t)(uintptr_t)&stat,0);
+            if (status) return status;
+            base=stat.st_size;
+        } else if (range.whence) return -LPR_LINUX_EINVAL;
+        if (__builtin_add_overflow(base,range.start,&range.start)) return -LPR_LINUX_EOVERFLOW;
+        if (range.start<0) return -LPR_LINUX_EINVAL;
+        __atomic_store_n(&lpr_posix_locks_used,1,__ATOMIC_RELEASE);
+        for (;;) {
+            const int64_t binding_status=lpr_filed_fd_binding(fd);
+            if (binding_status) return binding_status;
+            const lpr_filed_backend_t *file=lpr_filed_backend(fd);
+            if (!file) return -LPR_LINUX_EBADF;
+            kb2_fs_request_t request={.opcode=KB2_FILESYSTEM_OP_FCNTL,
+                .handle=file->handle,.flags=LPR_LINUX_F_SETLK,.mode=(uint16_t)range.type,
+                .offset=range.start,.length=(uint64_t)range.length};
+            kb2_fs_response_t response;
+            int64_t status=lpr_fs_call(&request,0,0,0,0,0,0,&response,-1,0);
+            if (cmd!=LPR_LINUX_F_SETLKW || status!=-LPR_LINUX_EAGAIN)
+                return status;
+            /* Keep a potentially long client wait out of storage workers.
+             * Each attempt releases its request before sleeping, so process
+             * death cannot leave a queued request acquiring an orphan lock. */
+            const struct pachaos_timespec delay={.tv_sec=0,.tv_nsec=1000000};
+            unsigned wait_not_ready=0;
+            status=lpr_linux_nanosleep((uint64_t)(uintptr_t)&delay,0,&wait_not_ready);
+            if (status) return status;
+        }
+    }
     switch (cmd) {
     case LPR_LINUX_F_GETFD: return lpr_control_get_fd_flags(fd);
     case LPR_LINUX_F_SETFD: return lpr_control_set_fd_flags(fd, arg);
@@ -620,12 +698,28 @@ int64_t lpr_backend_ioctl(uint64_t fd, uint64_t request, uint64_t arg, unsigned 
             : (uint64_t)current & ~LPR_LINUX_O_NONBLOCK;
         return lpr_linux_fcntl(fd, LPR_LINUX_F_SETFL, flags);
     }
+    if (request == LPR_LINUX_FIONREAD) {
+        const lpr_pipe_backend_t *pipe = lpr_pipe_backend(fd);
+        if (pipe != 0) {
+            if (arg == 0 || !lpr_user_range_plausible(arg, sizeof(int)))
+                return -LPR_LINUX_EFAULT;
+            struct pacha_fd_info info = {0};
+            if (!lpr_native_fd_info((uint64_t)pipe->native.raw, &info) ||
+                info.kind != PACHA_FD_KIND_PIPE)
+                return -LPR_LINUX_EBADF;
+            /* The native pipe snapshot exposes its queued byte count.
+             * Inspect it without consuming data, including on the write end. */
+            *(int *)(uintptr_t)arg = info.size > INT32_MAX ? INT32_MAX : (int)info.size;
+            return 0;
+        }
+    }
     if (lpr_linux_dmabuf_fd_active(fd)) {
         return lpr_dmabuf_ioctl(fd, request, arg);
     }
     if (lpr_block_backend(fd)) {
         return lpr_block_ioctl(fd, request, arg);
     }
+    if (lpr_audio_backend(fd)) return lpr_audio_ioctl(fd, request, arg);
     if (lpr_linux_input_fd_active(fd)) {
         return lpr_input_ioctl(fd, request, arg);
     }
@@ -784,6 +878,14 @@ int64_t lpr_backend_fstat(uint64_t fd, uint64_t statbuf)
         st->st_blksize = 4096;
         return 0;
     }
+    if (lpr_audio_backend(fd)) {
+        lpr_linux_stat_t *st = (void *)(uintptr_t)statbuf;
+        lpr_memset(st, 0, sizeof(*st));
+        st->st_ino = 0x617564696full; st->st_nlink = 1;
+        st->st_mode = LPR_LINUX_S_IFCHR | 0660u;
+        st->st_rdev = (14ull << 8) | 3u; st->st_blksize = 4096;
+        return 0;
+    }
     if (lpr_linux_input_fd_active(fd)) {
         const lpr_input_backend_t *input = lpr_input_backend(fd);
         lpr_linux_stat_t *st = (lpr_linux_stat_t *)(uintptr_t)statbuf;
@@ -889,6 +991,63 @@ int64_t lpr_linux_newfstatat(uint64_t dirfd, uint64_t path_raw, uint64_t statbuf
         return lpr_linux_fstat(dirfd, statbuf, wait_not_ready);
     }
     if (path[0] == '\0') return -LPR_LINUX_ENOENT;
+    uint64_t proc_pid = 0;
+    int64_t proc_status = 0;
+    if (lpr_linux_proc_pid_directory(path, &proc_pid, &proc_status)) {
+        if (proc_status) return proc_status;
+        /* PID entries are synthesized by LPR, while FileD owns /proc's
+         * namespace metadata. Preserve that ownership and device identity;
+         * do not attempt to open a nonexistent backing PID directory. */
+        uint64_t handle = 0;
+        int64_t status = lpr_dir_handle_for(dirfd, "/proc", &handle);
+        if (status) return status;
+        uint8_t wire[KB2_FILESYSTEM_STATX_SIZE];
+        status = fs_stat(handle, "/proc", 0, 0x7ffu, wire);
+        if (status) return status;
+        lpr_linux_stat_t *out = (void *)(uintptr_t)statbuf;
+        lpr_write_linux_stat(out, wire);
+        out->st_ino = UINT64_C(0x7000000000000000) + proc_pid;
+        out->st_mode = LPR_LINUX_S_IFDIR | 0555u;
+        out->st_nlink = 2;
+        out->st_size = 0;
+        out->st_blocks = 0;
+        if ((flags & LPR_LINUX_AT_SYMLINK_NOFOLLOW) &&
+            lpr_strcmp(path, "/proc/self") == 0) {
+            out->st_mode = LPR_LINUX_S_IFLNK | 0777u;
+            out->st_nlink = 1;
+            char target[24];
+            if (lpr_linux_proc_readlink(path, target, sizeof(target), &proc_status) &&
+                proc_status >= 0) out->st_size = proc_status;
+        }
+        return 0;
+    }
+    char proc_target[LPR_LINUX_SYMLINK_MAX];
+    if (lpr_linux_proc_readlink(path, proc_target, sizeof(proc_target) - 1,
+            &proc_status)) {
+        if (proc_status < 0) return proc_status;
+        proc_target[proc_status] = '\0';
+        if (!(flags & LPR_LINUX_AT_SYMLINK_NOFOLLOW)) {
+            return lpr_linux_newfstatat((uint64_t)(int64_t)LPR_LINUX_AT_FDCWD,
+                (uint64_t)(uintptr_t)proc_target, statbuf, flags, wait_not_ready);
+        }
+        uint64_t handle = 0;
+        int64_t status = lpr_dir_handle_for(dirfd, "/proc", &handle);
+        if (status) return status;
+        uint8_t wire[KB2_FILESYSTEM_STATX_SIZE];
+        status = fs_stat(handle, "/proc", 0, 0x7ffu, wire);
+        if (status) return status;
+        lpr_linux_stat_t *out = (void *)(uintptr_t)statbuf;
+        lpr_write_linux_stat(out, wire);
+        uint64_t inode = UINT64_C(14695981039346656037);
+        for (const unsigned char *p = (const unsigned char *)path; *p; ++p)
+            inode = (inode ^ *p) * UINT64_C(1099511628211);
+        out->st_ino = inode;
+        out->st_mode = LPR_LINUX_S_IFLNK | 0777u;
+        out->st_nlink = 1;
+        out->st_size = proc_status;
+        out->st_blocks = 0;
+        return 0;
+    }
     const int64_t drm_stat = lpr_drm_stat_path(path, statbuf);
     if (drm_stat != -LPR_LINUX_ENOENT) return drm_stat;
     if (!lpr_strcmp(path, "/dev/pacha/install-target")) {
@@ -903,14 +1062,18 @@ int64_t lpr_linux_newfstatat(uint64_t dirfd, uint64_t path_raw, uint64_t statbuf
     const int virtual_path =
         (lpr_strncmp(path, "/proc", 5) == 0 && (path[5] == '/' || path[5] == '\0')) ||
         (lpr_strncmp(path, "/dev", 4) == 0 && (path[4] == '/' || path[4] == '\0'));
-    if (!virtual_path) {
+    const int device_path = lpr_strncmp(path, "/dev", 4) == 0 &&
+        (path[4] == '/' || !path[4]);
+    if (!virtual_path || device_path) {
         uint64_t dir_handle = 0;
         int64_t status = lpr_dir_handle_for(dirfd, path, &dir_handle);
         if (status != 0) return status;
         uint8_t wire[KB2_FILESYSTEM_STATX_SIZE];
         status = fs_stat(dir_handle, path, flags, 0x7ffu, wire);
         if (!status) lpr_write_linux_stat((void *)(uintptr_t)statbuf, wire);
-        return status;
+        /* A real device inode has metadata without opening its driver.
+         * Only absent legacy virtual aliases need LPR's descriptor fallback. */
+        if (!device_path || status != -LPR_LINUX_ENOENT) return status;
     }
     /* stat() must not acquire a controlling terminal when its virtual-device
      * fallback temporarily opens /dev/pts/N.  A plain O_RDONLY open let the
@@ -988,10 +1151,14 @@ int64_t lpr_linux_statx(
     mask &= ~UINT64_C(0x40000000);
     const char *path = (const char *)(uintptr_t)path_raw;
     if (!path) return -LPR_LINUX_EFAULT;
-    const int virtual_path = (lpr_strncmp(path, "/proc", 5) == 0 &&
+    const int native_descriptor = (flags & LPR_LINUX_AT_EMPTY_PATH) && !path[0] &&
+        !lpr_fd_is_filed(dirfd);
+    const int virtual_path = native_descriptor || (lpr_strncmp(path, "/proc", 5) == 0 &&
         (path[5] == '/' || !path[5])) || (lpr_strncmp(path, "/dev", 4) == 0 &&
         (path[4] == '/' || !path[4]));
-    if (!virtual_path) {
+    const int device_path = lpr_strncmp(path, "/dev", 4) == 0 &&
+        (path[4] == '/' || !path[4]);
+    if (!virtual_path || device_path) {
         uint64_t handle;
         int64_t status = (flags & LPR_LINUX_AT_EMPTY_PATH) && !path[0] ?
             0 : lpr_dir_handle_for(dirfd, path, &handle);
@@ -1003,7 +1170,7 @@ int64_t lpr_linux_statx(
         uint8_t wire[KB2_FILESYSTEM_STATX_SIZE];
         status = fs_stat(handle, path, flags, mask, wire);
         if (!status) lpr_memcpy((void *)(uintptr_t)statxbuf, wire, sizeof(wire));
-        return status;
+        if (!device_path || status != -LPR_LINUX_ENOENT) return status;
     }
     lpr_linux_stat_t st;
     lpr_memset(&st, 0, sizeof(st));
@@ -1060,6 +1227,9 @@ int64_t lpr_linux_access(uint64_t path, uint64_t mode)
 int64_t lpr_linux_faccessat(uint64_t dirfd, uint64_t path_raw, uint64_t mode, uint64_t flags)
 {
     const char *path = (const char *)(uintptr_t)path_raw;
+    int64_t proc_status;
+    if (lpr_linux_proc_snapshot_access(path, mode, flags, &proc_status))
+        return proc_status;
     uint64_t handle;
     int64_t status = lpr_dir_handle_for(dirfd, path, &handle);
     if (status) return status;
@@ -1182,6 +1352,12 @@ int64_t lpr_linux_utimensat(uint64_t dirfd, uint64_t path_raw, uint64_t times, u
 
 int64_t lpr_linux_readlink(uint64_t path, uint64_t buf, uint64_t bufsiz)
 {
+    return lpr_linux_readlinkat((uint64_t)(int64_t)LPR_LINUX_AT_FDCWD,
+        path, buf, bufsiz);
+}
+
+int64_t lpr_linux_readlinkat(uint64_t dirfd, uint64_t path, uint64_t buf, uint64_t bufsiz)
+{
     if (bufsiz == 0) return -LPR_LINUX_EINVAL;
     if (buf == 0 && bufsiz != 0) {
         return -LPR_LINUX_EFAULT;
@@ -1199,7 +1375,7 @@ int64_t lpr_linux_readlink(uint64_t path, uint64_t buf, uint64_t bufsiz)
     char target[LPR_LINUX_SYMLINK_MAX];
     lpr_memset(target, 0, sizeof(target));
     const int64_t status = lpr_linux_readlinkat_to_buffer(
-        (uint64_t)(int64_t)LPR_LINUX_AT_FDCWD,
+        dirfd,
         path,
         target,
         sizeof(target));

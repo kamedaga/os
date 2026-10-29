@@ -1,0 +1,26 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+set -Eeuo pipefail
+media=/run/archiso/bootmnt
+install -d -m 700 /root/.ssh
+install -m 600 "$media/pacha/authorized_keys" /root/.ssh/authorized_keys
+install -m 755 "$media/pacha/pacha-install" /usr/local/sbin/pacha-install
+install -d /etc/ssh/sshd_config.d
+cat > /etc/ssh/sshd_config.d/00-pacha-live.conf <<'EOF'
+PermitRootLogin prohibit-password
+PubkeyAuthentication yes
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+EOF
+ssh-keygen -A
+sshd -t
+systemctl restart sshd
+cat > /etc/profile.d/pacha-installer.sh <<'EOF'
+printf '\nPachaOS installer on Linux. Start: pacha-install\n'
+printf 'Log: /run/pacha-install/install.log\n\n'
+EOF
+echo 'PachaOS coexistence installer ready. Preview: pacha-install --plan'
+echo 'Only existing unallocated space is used; Windows is not resized.'
+echo 'To replace Windows and ALL partitions: pacha-install --erase-disk --plan'
+echo 'SSH: public key authentication only; root login.'
+ip -br address

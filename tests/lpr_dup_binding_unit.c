@@ -9,6 +9,17 @@ static lpr_backend_record_t backends[16];
 static lpr_filed_backend_t source, target;
 static int64_t binding_result;
 static unsigned prepared, dropped, bindings;
+int64_t lpr_filed_close_posix_locks(const lpr_fd_pin_t *pin)
+{
+    assert(pin->state==&target && entries[4].ofd_index==entries[3].ofd_index);
+    return 0;
+}
+void lpr_fd_unpin(const lpr_fd_pin_t *pin)
+{
+    lpr_fd_drop_t drop;
+    assert(!lpr_fd_table_unpin(&lpr_control_fd_table,pin,&drop));
+    if (drop.ready) (void)lpr_backend_finish_drop(&drop);
+}
 
 int lpr_control_require_fd(uint64_t fd)
 {

@@ -22,6 +22,12 @@ void ph_boot_log_map_failure(unsigned long window, unsigned long offset,
 void ph_boot_log_scatter_failure(unsigned long window, unsigned long offset,
     unsigned long first_page, unsigned long pages, unsigned long protection,
     unsigned long step, unsigned long result);
+/* DMA publication can fail before Linux publishes its net_device. Preserve
+ * the native operation and resource snapshot through the SEND-only RAM log. */
+void ph_boot_log_dma_failure(unsigned long stage, long native_status,
+    unsigned long iova, unsigned long bytes, unsigned long mappings,
+    unsigned long mapping_bytes, long fd_status, unsigned long fd_capacity,
+    unsigned long fd_free);
 /* Preserve the failing native IRQ operation in the RAM log before rollback. */
 void ph_boot_log_irq_failure(unsigned long mode, unsigned long index,
     unsigned long count, unsigned long cpu, unsigned long step,

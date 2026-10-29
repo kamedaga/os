@@ -12,6 +12,8 @@ struct usbd_source_client {
     struct inputd_source_page *page;
     uint64_t source_id, generation, correlation;
     uint64_t next_sequence, overwritten;
+    uint64_t platform_id;
+    uint32_t source_kind;
     uint16_t pci_segment;
     uint8_t pci_bus, pci_device, pci_function;
 };

@@ -14,6 +14,12 @@ static lpr_filed_backend_t old_file, replacement;
 static int64_t binding_result;
 static unsigned binds, leases, closes, drops, reuse, epolls;
 static uint64_t closed_handle;
+int64_t lpr_filed_close_posix_locks(const lpr_fd_pin_t *pin)
+{
+    assert(pin->state==&old_file && !entries[pin->fd].active);
+    assert(!binding_result && old_file.handle==511);
+    return 0;
+}
 
 void lpr_fd_arrays_init(void) {}
 void lpr_cwd_init(void) {}

@@ -95,8 +95,11 @@ class Profile:
         if len(self.labels)!=self.kinds+self.stages:raise ValueError('ELF labels do not match layout')
         if not self.dynamic and self.symbols['lock_profile_histograms'][1]!=self.cpus*self.series*self.stride:raise ValueError('ELF extent mismatch')
         self.shapes={'lock_profile_free_floor':self.cpus*8,'lock_profile_histograms':self.cpus*self.series*self.stride,'lock_profile_stages':self.cpus*self.kinds*self.stages*3*8,'lock_profile_events':self.cpus*self.kinds*4*8}
+        if 'lock_profile_wait_callers' in self.symbols:
+            self.shapes['lock_profile_wait_callers'] = 512 * 88
+            self.shapes['lock_profile_wait_caller_overflow'] = 16
         for key,size in self.shapes.items():
-            if self.symbols[key][1]!=(16 if self.dynamic else size):raise ValueError('ELF aggregation extent mismatch')
+            if self.symbols[key][1]!=(16 if self.dynamic and key not in ('lock_profile_wait_callers','lock_profile_wait_caller_overflow') else size):raise ValueError('ELF aggregation extent mismatch')
         if 'pmm_profile_counts' in self.symbols:
             if self.symbols['pmm_profile_counts'][1] != 160: raise ValueError('PMM profile extent mismatch')
             self.shapes['pmm_profile_counts'] = 160
@@ -145,7 +148,7 @@ class Profile:
             table=entry&0x000ffffffffff000
         raise AssertionError('page walk')
     def segments(self,key):
-        is_slice=key in ('user_copy_detail','storage_profile_detail','pmm_profile_detail','lock_profile_histograms','lock_profile_stages','lock_profile_events','lock_profile_free_floor','lock_profile_writers','smp_perf_counters','munmap_perf_counters','vmo_perf_counters','ipc_perf_counters','ipc_syscall_counts','timer_scan_perf_counters','runtime_path_perf_counters','pt_retire_perf_counters','wake_wait_handoff_perf_counters')
+        is_slice=key in ('user_copy_detail','storage_profile_detail','pmm_profile_detail','lock_profile_histograms','lock_profile_stages','lock_profile_events','lock_profile_free_floor','lock_profile_writers','smp_perf_counters','munmap_perf_counters','vmo_perf_counters','ipc_perf_counters','ipc_syscall_counts','notify_fast_counts','timer_scan_perf_counters','runtime_path_perf_counters','pt_retire_perf_counters','wake_wait_handoff_perf_counters')
         if not getattr(self,'dynamic',False) or not is_slice:
             return [(self.physical(key),self.symbols[key][1])]
         descriptor=self.read_physical(self.physical(key),16,'descriptor-'+key)
@@ -221,6 +224,19 @@ class Profile:
         floor=struct.unpack('<'+str(self.cpus)+'Q',raw.get('lock_profile_free_floor',bytes(self.cpus*8)))
         minimum=min((2**64-1-v for v in floor if v),default=None)
         result = dict(histograms=records,stages=totals,events=events,minimum_free_pages=minimum)
+        if 'lock_profile_wait_callers' in raw:
+            data=raw['lock_profile_wait_callers']
+            callers=[]
+            for offset in range(0,len(data),88):
+                principal,=struct.unpack_from('<Q',data,offset)
+                if not principal:continue
+                label=data[offset+8:offset+40].split(b'\0',1)[0].decode(errors='replace')
+                values=struct.unpack_from('<6Q',data,offset+40)
+                callers.append(dict(principal=principal-1,label=label,
+                    transient=dict(calls=values[0],items=values[2],hold_cycles=values[4]),
+                    replace=dict(calls=values[1],items=values[3],hold_cycles=values[5])))
+            result['wait_callers']=callers
+            result['wait_caller_overflow']=struct.unpack('<2Q',raw['lock_profile_wait_caller_overflow'])
         if 'pmm_profile_counts' in raw:
             result['pmm'] = list(struct.unpack('<20Q',raw['pmm_profile_counts']))
         if 'storage_profile_detail' in raw:

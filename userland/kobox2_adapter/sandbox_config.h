@@ -4,6 +4,7 @@
 
 #include "bootstrap.h"
 #include "device_authority.h"
+#include "platform_authority.h"
 
 /* Private launch policy copied read-only before starting the native thread;
  * never accept expected package/device identity from the data channel. */
@@ -12,6 +13,7 @@
 #define PH_SANDBOX_STORAGE_DEVICES_ADDRESS UINT64_C(0x49000000)
 #define PH_SANDBOX_CHANNEL_FD 16
 #define PH_SANDBOX_LOG_FD 17
+enum { PH_FS_ROOT_EXT4 = 0, PH_FS_ROOT_TMPFS = 1 };
 struct ph_sandbox_config {
     /* Development builds must agree on the exact launch record extent.
      * This is a bounds check, not an ABI generation or compatibility promise. */
@@ -20,6 +22,7 @@ struct ph_sandbox_config {
     uint64_t artifact_count, resource_count;
     uint64_t client_id, gpu_channel_id;
     struct ph_device_authority device;
+    struct ph_platform_authority platform;
     /* Optional read-only launch mapping outside the closure transport. Its
      * whole-image digest is authenticated by the owner; the sandbox verifies
      * it and each file before Linux can request firmware. */
@@ -31,7 +34,7 @@ struct ph_sandbox_config {
      * budgets are resources, never pathname/file-size limits. */
     uint8_t root_uuid[16];
     uint64_t fs_channel_id, fs_owner_channel_id, fs_arena_bytes, ram_bytes;
-    uint32_t fs_queue_size, storage_reserved;
+    uint32_t fs_queue_size, fs_root_kind;
     /* ph_device_authority[] lives in a separately authenticated read-only
      * launch blob; storage does not infer additional authority from PCI IDs. */
     uint64_t storage_devices_address, storage_device_count;

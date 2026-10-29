@@ -6,6 +6,7 @@
 #include <filed_client/module_image.h>
 #include <kobox2/closure.h>
 #include <kobox2/pci_function_layout.h>
+#include <kobox2/platform_device_layout.h>
 #include <kobox2/resource_grant.h>
 #include <kobox2/sha256.h>
 #include <pacha/capsule.h>
@@ -19,10 +20,18 @@
 static const char *package_root(uint32_t kind) {
     if (kind == USBD_KIND_USB_XHCI) return "/srv/kobox2/usb-storage";
     if (kind == USBD_KIND_NVME) return "/srv/kobox2/nvme";
+    if (kind == USBD_KIND_PS2) return "/srv/kobox2/ps2";
     return NULL;
 }
 
 static const uint8_t device_schema[32] = KB2_PCI_FUNCTION_SCHEMA_SHA256_BYTES;
+static const uint8_t platform_schema[32] = KB2_PLATFORM_DEVICE_SCHEMA_SHA256_BYTES;
+static const uint8_t *package_schema(const struct usbd_package *package) {
+    return package->kind == USBD_KIND_PS2 ? platform_schema : device_schema;
+}
+static uint64_t package_native_rights(const struct usbd_package *package) {
+    return package->kind == USBD_KIND_PS2 ? PH_PLATFORM_CONTROLLER_RIGHTS : PH_DEVICE_FUNCTION_RIGHTS;
+}
 
 static int make_blob(const void *bytes, size_t size, struct ph_bootstrap_item *item) {
     if (!bytes || !size || size > UINT64_MAX - 4095)
@@ -97,7 +106,7 @@ static int load_manifest(pacha_fd_t filed_fd, struct usbd_package *package,
         resource.maximum_rights != KB2_PCI_FUNCTION_REQUIRED_RIGHTS ||
         resource.flags != (KB2_CLOSURE_RESOURCE_FLAG_REQUIRED |
                            KB2_CLOSURE_RESOURCE_FLAG_SHARED) ||
-        memcmp(resource.interface_schema_digest, device_schema, 32))
+        memcmp(resource.interface_schema_digest, package_schema(package), 32))
         return -22;
     return 0;
 }
@@ -114,20 +123,31 @@ static int safe_module_name(kb2_closure_string_t name) {
 
 int usbd_package_open(struct usbd_package *package, pacha_fd_t filed_fd, pacha_fd_t device_fd,
     uint32_t kind) {
-    const char *root = package_root(kind);
+    if (!package || package->device_fd) return -22;
+    package->kind = kind;
+    return usbd_package_open_root(package, filed_fd, device_fd, package_root(kind));
+}
+
+int usbd_package_open_root(struct usbd_package *package, pacha_fd_t filed_fd,
+    pacha_fd_t device_fd, const char *root) {
     if (!package || !root || package->device_fd || filed_fd < 16 || device_fd < 16)
         return -22;
     struct pacha_capsule_info info = {0};
     int error = pacha_capsule_query(device_fd, &info);
-    const uint64_t device_rights = PH_DEVICE_FUNCTION_RIGHTS | PACHA_FD_RIGHT_TRANSFER;
-    if (error || info.kind != PACHA_CAPSULE_KIND_DEVICE ||
+    const int platform = package->kind == USBD_KIND_PS2;
+    const uint64_t device_rights = package_native_rights(package) | PACHA_FD_RIGHT_TRANSFER;
+    if (error || info.kind != (platform ? PACHA_CAPSULE_KIND_PLATFORM_DEVICE : PACHA_CAPSULE_KIND_DEVICE) ||
         (info.rights & device_rights) != device_rights || !info.device ||
-        !(info.flags & PACHA_CAPSULE_DMA_TRANSLATED) ||
-        (info.flags & PACHA_CAPSULE_DMA_QUARANTINED))
+        (!platform && (!(info.flags & PACHA_CAPSULE_DMA_TRANSLATED) ||
+        (info.flags & PACHA_CAPSULE_DMA_QUARANTINED))))
         return error ? error : -13;
     package->device_fd = device_fd;
-    package->device = (struct ph_device_authority){
-        .object_id = 1, .native_device = info.device, .slot_id = 1, .node_id = 1};
+    if (platform)
+        package->platform = (struct ph_platform_authority){
+            .object_id = 1, .platform_id = info.device, .slot_id = 1, .node_id = 1};
+    else
+        package->device = (struct ph_device_authority){
+            .object_id = 1, .native_device = info.device, .slot_id = 1, .node_id = 1};
     struct filed_client_module_image sandbox = {0};
     error = load_manifest(filed_fd, package, root);
     if (error) goto fail;
@@ -183,10 +203,11 @@ int usbd_package_bind(struct usbd_package *package, uint64_t generation) {
         return -22;
     package->identity.generation = generation;
     package->device.generation = generation;
+    package->platform.generation = generation;
     kb2_resource_grant_slot_source_t slot = {.slot_id = 1,
         .resource_type = KB2_CLOSURE_RESOURCE_DEVICE,
         .state = KB2_RESOURCE_GRANT_SLOT_PRESENT};
-    memcpy(slot.interface_schema_digest, device_schema, sizeof(device_schema));
+    memcpy(slot.interface_schema_digest, package_schema(package), 32);
     kb2_resource_grant_object_source_t object = {.slot_id = 1, .object_id = 1,
         .granted_rights = KB2_PCI_FUNCTION_REQUIRED_RIGHTS};
     kb2_resource_grant_handle_binding_t handle = {.object_id = 1,
@@ -204,7 +225,7 @@ int usbd_package_bind(struct usbd_package *package, uint64_t generation) {
         return error;
     package->items[package->artifact_count + 2] = (struct ph_bootstrap_item){
         .capability = {.fd = (uint64_t)package->device_fd,
-            .rights = PH_DEVICE_FUNCTION_RIGHTS, .flags = PACHA_FD_FLAG_CLOEXEC}};
+            .rights = package_native_rights(package), .flags = PACHA_FD_FLAG_CLOEXEC}};
     return 0;
 }
 
@@ -221,6 +242,7 @@ int usbd_package_unbind(struct usbd_package *package, uint64_t generation) {
     }
     package->identity.generation = 0;
     package->device.generation = 0;
+    package->platform.generation = 0;
     package->grant_size = 0;
     memset(package->identity.grant_digest, 0, sizeof(package->identity.grant_digest));
     return 0;
@@ -275,7 +297,7 @@ int usbd_package_configure_controller(
     }
     if (status == KB2_STATUS_OK)
         status = kb2_closure_builder_add_resource(builder, 1, KB2_RESOURCE_DEVICE,
-            device_schema, sizeof(device_schema), 1, 1,
+            package_schema(package), 32, 1, 1,
             KB2_PCI_FUNCTION_REQUIRED_RIGHTS, KB2_PCI_FUNCTION_REQUIRED_RIGHTS,
             KB2_RESOURCE_REQUIRED | KB2_RESOURCE_SHARED);
     for (size_t i = 0; i < package->artifact_count && status == KB2_STATUS_OK; ++i) {
@@ -296,7 +318,7 @@ int usbd_package_configure_controller(
         return -22;
     uint8_t capability_digest[32], channel_digest[32];
     static const char channel_contract[] = PH_OWNER_CHANNEL_CONTRACT;
-    kb2_sha256(device_schema, sizeof(device_schema), capability_digest);
+    kb2_sha256(package_schema(package), 32, capability_digest);
     kb2_sha256(channel_contract, sizeof(channel_contract) - 1, channel_digest);
     const uint8_t *const digests[] = {
         package->identity.manifest_digest, capability_digest, channel_digest,

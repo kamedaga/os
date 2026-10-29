@@ -56,6 +56,7 @@ type Result struct {
 	Limine     string
 	Config     string
 	FilesBytes int64
+	Skipped    bool
 }
 
 func BuildImageWithOptions(workspace *config.Workspace, inputs Inputs, opts Options) (Result, error) {
@@ -111,6 +112,39 @@ func BuildImageWithOptions(workspace *config.Workspace, inputs Inputs, opts Opti
 		return Result{}, err
 	}
 	defer locks.Close()
+	// Installer images embed payloads that are not part of the record; they
+	// are always rebuilt.
+	var digests map[string]string
+	if opts.InstallerPayload == "" {
+		digests, err = imageInputDigests(workspace, inputs, limine, dataDir)
+		if err != nil {
+			span.Fail("limine input digest failed")
+			return Result{}, err
+		}
+		if !opts.Force {
+			fresh, err := imageMatchesRecord(workspace, imagePath, digests)
+			if err != nil {
+				span.Fail("limine image check failed")
+				return Result{}, err
+			}
+			if fresh {
+				if _, err := stageBootInputs(filepath.Dir(imagePath), inputs); err != nil {
+					span.Fail("limine input staging failed")
+					return Result{}, err
+				}
+				if err := writeConfig(configPath, inputs.DiagnosticELF != ""); err != nil {
+					span.Fail("limine config write failed")
+					return Result{}, err
+				}
+				span.Done("limine boot image up-to-date")
+				return Result{Image: imagePath, Limine: limine, Config: configPath, FilesBytes: total, Skipped: true}, nil
+			}
+		}
+	}
+	if err := removeImageRecord(imagePath); err != nil {
+		span.Fail("limine image record invalidation failed")
+		return Result{}, err
+	}
 	span.Set(3, "creating disk image")
 	if err := os.MkdirAll(filepath.Dir(imagePath), 0o755); err != nil {
 		span.Fail("limine image directory failed")
@@ -265,6 +299,12 @@ func BuildImageWithOptions(workspace *config.Workspace, inputs Inputs, opts Opti
 			return Result{}, err
 		}
 		return Result{}, fmt.Errorf("empty limine image: %s", imagePath)
+	}
+	if digests != nil {
+		if err := writeImageRecord(workspace, imagePath, digests); err != nil {
+			span.Fail("limine image record failed")
+			return Result{}, err
+		}
 	}
 	span.Done("limine boot image ready")
 	return Result{Image: imagePath, Limine: limine, Config: configPath, FilesBytes: total}, nil
@@ -493,8 +533,17 @@ func copyBootInput(source, destination string) error {
 	if err != nil {
 		return err
 	}
-	if destinationInfo, err := os.Stat(destination); err == nil && os.SameFile(sourceInfo, destinationInfo) {
-		return nil
+	if destinationInfo, err := os.Stat(destination); err == nil {
+		if os.SameFile(sourceInfo, destinationInfo) {
+			return nil
+		}
+		same, err := sameContents(source, destination, sourceInfo.Size(), destinationInfo.Size())
+		if err != nil {
+			return err
+		}
+		if same {
+			return nil
+		}
 	}
 	out, err := os.CreateTemp(filepath.Dir(destination), ".boot-input-*")
 	if err != nil {
@@ -645,6 +694,17 @@ func verifyFATFile(image string, offset int64, name, source string) error {
 }
 
 func writeConfig(path string, diagnostic bool) error {
+	content := configContent(diagnostic)
+	if existing, err := os.ReadFile(path); err == nil && bytes.Equal(existing, []byte(content)) {
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(path, []byte(content), 0o644)
+}
+
+func configContent(diagnostic bool) string {
 	content := "" +
 		"timeout: 0\n" +
 		"serial: yes\n" +
@@ -673,13 +733,12 @@ func writeConfig(path string, diagnostic bool) error {
 			"    path: boot():/DIAGBOOT.ELF\n" +
 			"    resolution: 640x480x32\n"
 	}
-	if existing, err := os.ReadFile(path); err == nil && bytes.Equal(existing, []byte(content)) {
-		return nil
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return err
-	}
-	return os.WriteFile(path, []byte(content), 0o644)
+	return content
+}
+
+func sha256Bytes(data []byte) []byte {
+	sum := sha256.Sum256(data)
+	return sum[:]
 }
 
 func run(name string, args ...string) error {
@@ -691,4 +750,28 @@ func run(name string, args ...string) error {
 		return fmt.Errorf("%s %s failed: %w\n%s", name, strings.Join(args, " "), err, combined.String())
 	}
 	return nil
+}
+
+func sameContents(lhs, rhs string, lhsSize, rhsSize int64) (bool, error) {
+	if lhsSize != rhsSize {
+		return false, nil
+	}
+	var sums [2][]byte
+	for index, path := range []string{lhs, rhs} {
+		file, err := os.Open(path)
+		if err != nil {
+			return false, err
+		}
+		hash := sha256.New()
+		_, err = io.Copy(hash, file)
+		closeErr := file.Close()
+		if err != nil {
+			return false, err
+		}
+		if closeErr != nil {
+			return false, closeErr
+		}
+		sums[index] = hash.Sum(nil)
+	}
+	return bytes.Equal(sums[0], sums[1]), nil
 }

@@ -22,9 +22,11 @@ typedef struct lpr_linux_capability_data {
 
 int64_t lpr_linux_capget(uint64_t header_raw,
                          uint64_t data_raw,
-                         int64_t current_pid);
+                         int64_t current_pid,
+                         int64_t current_tid);
 int64_t lpr_linux_capset(uint64_t header_raw,
                          uint64_t data_raw,
-                         int64_t current_pid);
+                         int64_t current_pid,
+                         int64_t current_tid);
 
 #endif

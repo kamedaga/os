@@ -68,6 +68,7 @@ struct filed_storage_owner {
     uint64_t shared_expected;
     struct ph_ipc_packet shared_attachment;
     int started, failed;
+    unsigned ram_root;
 };
 
 static int receive_shared(struct filed_storage_owner *owner, struct ph_ipc_packet *packet)
@@ -121,24 +122,28 @@ static int make_blob(const void *bytes, size_t size, struct ph_bootstrap_item *i
 
 static int load_artifacts(struct filed_storage_owner *owner)
 {
-    int error = ph_bootfs_find(&owner->archive, "/srv/kobox2/storage/sandbox.elf",
-        &owner->sandbox, &owner->sandbox_size);
+    const char *root = owner->ram_root ? "/srv/kobox2/ramfs" : "/srv/kobox2/storage";
+    char path[96];
+    snprintf(path, sizeof(path), "%s/sandbox.elf", root);
+    int error = ph_bootfs_find(&owner->archive, path, &owner->sandbox, &owner->sandbox_size);
+    snprintf(path, sizeof(path), "%s/manifest.bin", root);
     if (!error) error = ph_bootfs_find(&owner->archive,
-        "/srv/kobox2/storage/manifest.bin", &owner->manifest, &owner->manifest_size);
+        path, &owner->manifest, &owner->manifest_size);
     if (error) return error;
     if (!owner->sandbox_size || kb2_closure_manifest_decode(owner->manifest,
             owner->manifest_size, &owner->decoded)) return -EBADMSG;
     owner->artifact_count = kb2_closure_manifest_artifact_count(&owner->decoded);
     if (!owner->artifact_count || owner->artifact_count > (SIZE_MAX / sizeof(*owner->items)) - 3 ||
-        kb2_closure_manifest_resource_count(&owner->decoded) != 1) return -EBADMSG;
+        kb2_closure_manifest_resource_count(&owner->decoded) != (owner->ram_root ? 0u : 1u) ||
+        (owner->ram_root && kb2_closure_manifest_binding_count(&owner->decoded))) return -EBADMSG;
     kb2_closure_manifest_resource_t resource;
-    if (kb2_closure_manifest_resource(&owner->decoded, 0, &resource) ||
+    if (!owner->ram_root && (kb2_closure_manifest_resource(&owner->decoded, 0, &resource) ||
         resource.slot_id != 1 || resource.type != KB2_CLOSURE_RESOURCE_DEVICE ||
         resource.minimum_count != 1 || resource.maximum_count != 1 ||
         resource.required_rights != KB2_PCI_FUNCTION_REQUIRED_RIGHTS ||
         resource.maximum_rights != KB2_PCI_FUNCTION_REQUIRED_RIGHTS ||
         resource.flags != (KB2_CLOSURE_RESOURCE_FLAG_REQUIRED | KB2_CLOSURE_RESOURCE_FLAG_SHARED) ||
-        memcmp(resource.interface_schema_digest, device_schema, 32)) return -EBADMSG;
+        memcmp(resource.interface_schema_digest, device_schema, 32))) return -EBADMSG;
     owner->items = calloc(owner->artifact_count + 3, sizeof(*owner->items));
     if (!owner->items) return -ENOMEM;
     for (size_t i = 0; i < owner->artifact_count; ++i) {
@@ -152,12 +157,12 @@ static int load_artifacts(struct filed_storage_owner *owner)
                 (c >= '0' && c <= '9') || c == '_' || c == '-')) return -EBADMSG;
         }
         if (!i && (name.length != 4 || memcmp(name.data, "core", 4))) return -EBADMSG;
-        size_t path_size = (size_t)name.length + sizeof("/srv/kobox2/storage/modules/.ko");
+        size_t path_size = (size_t)name.length + strlen(root) + sizeof("/modules/.ko");
         char *path = malloc(path_size);
         if (!path) return -ENOMEM;
-        if (i) snprintf(path, path_size, "/srv/kobox2/storage/modules/%.*s.ko",
-            (int)name.length, name.data);
-        else strcpy(path, "/srv/kobox2/storage/core.so");
+        if (i) snprintf(path, path_size, "%s/modules/%.*s.ko",
+            root, (int)name.length, name.data);
+        else snprintf(path, path_size, "%s/core.so", root);
         const unsigned char *bytes;
         size_t size;
         error = ph_bootfs_find(&owner->archive, path, &bytes, &size);
@@ -202,7 +207,7 @@ static int configure_controller(struct filed_storage_owner *owner)
         }
         status = kb2_closure_builder_add_dependency(builder, edge.consumer_node_id, edge.provider_node_id);
     }
-    if (status == KB2_STATUS_OK)
+    if (status == KB2_STATUS_OK && !owner->ram_root)
         status = kb2_closure_builder_add_resource(builder, 1, KB2_RESOURCE_DEVICE,
             device_schema, 32, 1, 1, KB2_PCI_FUNCTION_REQUIRED_RIGHTS,
             KB2_PCI_FUNCTION_REQUIRED_RIGHTS, KB2_RESOURCE_REQUIRED | KB2_RESOURCE_SHARED);
@@ -221,7 +226,7 @@ static int configure_controller(struct filed_storage_owner *owner)
     if (status != KB2_STATUS_OK) return -EINVAL;
     uint8_t capability_digest[32], channel_digest[32];
     static const char channel_contract[] = PH_OWNER_CHANNEL_CONTRACT;
-    kb2_sha256(device_schema, 32, capability_digest);
+    kb2_sha256(device_schema, owner->ram_root ? 0 : 32, capability_digest);
     kb2_sha256(channel_contract, sizeof(channel_contract) - 1, channel_digest);
     const uint8_t *const digests[] = {owner->identity.manifest_digest, capability_digest, channel_digest};
     /* Queue depth bounds outstanding requests; the service RAM budget can
@@ -241,7 +246,7 @@ static int bind_resources(struct filed_storage_owner *owner)
 {
     uint64_t generation = kb2_controller_generation(owner->controller);
     owner->identity.generation = generation;
-    owner->device.generation = generation;
+    if (!owner->ram_root) owner->device.generation = generation;
     kb2_resource_grant_slot_source_t slot = {.slot_id = 1,
         .resource_type = KB2_CLOSURE_RESOURCE_DEVICE, .state = KB2_RESOURCE_GRANT_SLOT_PRESENT};
     memcpy(slot.interface_schema_digest, device_schema, 32);
@@ -251,6 +256,11 @@ static int bind_resources(struct filed_storage_owner *owner)
         .role = KB2_PCI_FUNCTION_NATIVE_HANDLE_ROLE_DEVICE, .transfer_handle_index = 0};
     kb2_resource_grant_source_t source = {.generation = generation, .slots = &slot, .slot_count = 1,
         .objects = &object, .object_count = 1, .handle_bindings = &handle, .handle_binding_count = 1};
+    if (owner->ram_root) {
+        source.slots = NULL; source.slot_count = 0;
+        source.objects = NULL; source.object_count = 0;
+        source.handle_bindings = NULL; source.handle_binding_count = 0;
+    }
     memcpy(source.closure_manifest_digest, owner->identity.manifest_digest, 32);
     size_t capacity, used;
     if (kb2_resource_grant_encoded_size(&source, &capacity)) return -EINVAL;
@@ -263,7 +273,7 @@ static int bind_resources(struct filed_storage_owner *owner)
     }
     free(grant);
     if (error) return error;
-    owner->items[owner->artifact_count + 2] = (struct ph_bootstrap_item){
+    if (!owner->ram_root) owner->items[owner->artifact_count + 2] = (struct ph_bootstrap_item){
         .capability = {.fd = owner->config.device_fd, .rights = PH_DEVICE_FUNCTION_RIGHTS,
             .flags = PACHA_FD_FLAG_CLOEXEC}};
     const kb2_action_t *action = kb2_controller_pending_action(owner->controller);
@@ -559,25 +569,29 @@ static int queue_wait(void *context, uint32_t notification)
     }
 }
 
-int filed_storage_owner_create(pacha_fd_t bootfs_fd, uint64_t bootfs_size,
-    const storage_filed_bootstrap_t *bootstrap, struct filed_storage_owner **out)
+static int create_owner(pacha_fd_t bootfs_fd, uint64_t bootfs_size,
+    const storage_filed_bootstrap_t *bootstrap, unsigned ram_root,
+    struct filed_storage_owner **out)
 {
-    if (!out || !bootstrap || bootfs_fd < 16 || bootstrap->device_fd < 16 ||
-        !storage_root_uuid_valid(bootstrap->root_uuid) || !bootstrap->sandbox_ram_bytes ||
+    if (!out || !bootstrap || bootfs_fd < 16 ||
+        (ram_root ? (bootstrap->device_fd || storage_root_uuid_valid(bootstrap->root_uuid)) :
+         (bootstrap->device_fd < 16 || !storage_root_uuid_valid(bootstrap->root_uuid))) ||
+        !bootstrap->sandbox_ram_bytes ||
         bootstrap->queue_size > UINT32_MAX || !bootstrap->queue_arena_bytes) return -EINVAL;
     *out = NULL;
     struct filed_storage_owner *owner = calloc(1, sizeof(*owner));
     if (!owner) return -ENOMEM;
     owner->config = *bootstrap;
+    owner->ram_root = ram_root;
     owner->next_exchange = 2;
     owner->management = (struct pacha_ipc_channel_pair){.a = -1, .b = -1};
     struct pacha_capsule_info info = {0};
-    int error = pacha_capsule_query((pacha_fd_t)bootstrap->device_fd, &info);
+    int error = ram_root ? 0 : pacha_capsule_query((pacha_fd_t)bootstrap->device_fd, &info);
     uint64_t required = PH_DEVICE_FUNCTION_RIGHTS | PACHA_FD_RIGHT_TRANSFER;
-    if (!error && (info.kind != PACHA_CAPSULE_KIND_DEVICE || !info.device ||
+    if (!ram_root && !error && (info.kind != PACHA_CAPSULE_KIND_DEVICE || !info.device ||
             (info.rights & required) != required || !(info.flags & PACHA_CAPSULE_DMA_TRANSLATED) ||
             (info.flags & PACHA_CAPSULE_DMA_QUARANTINED))) error = -EACCES;
-    owner->device = (struct ph_device_authority){.object_id = 1,
+    if (!ram_root) owner->device = (struct ph_device_authority){.object_id = 1,
         .native_device = info.device, .slot_id = 1, .node_id = 1};
     if (!error) error = ph_bootfs_open(&owner->archive, bootfs_fd, bootfs_size);
     if (!error) error = load_artifacts(owner);
@@ -587,6 +601,23 @@ int filed_storage_owner_create(pacha_fd_t bootfs_fd, uint64_t bootfs_size,
     if (error) { (void)filed_storage_owner_destroy(owner); return error; }
     *out = owner;
     return 0;
+}
+
+int filed_storage_owner_create(pacha_fd_t fd, uint64_t size,
+    const storage_filed_bootstrap_t *bootstrap, struct filed_storage_owner **out)
+{
+    return create_owner(fd, size, bootstrap, 0, out);
+}
+int filed_storage_owner_create_ram(pacha_fd_t fd, uint64_t size,
+    uint64_t ram_bytes, struct filed_storage_owner **out)
+{
+    const storage_filed_bootstrap_t policy = {
+        .sandbox_ram_bytes = ram_bytes, .queue_size = 64, .queue_arena_bytes = 16u << 20};
+    return create_owner(fd, size, &policy, 1, out);
+}
+const struct ph_bootfs *filed_storage_owner_archive(const struct filed_storage_owner *owner)
+{
+    return owner ? &owner->archive : NULL;
 }
 
 int filed_storage_owner_start(struct filed_storage_owner *owner)
@@ -603,9 +634,10 @@ int filed_storage_owner_start(struct filed_storage_owner *owner)
     }
     struct ph_sandbox_config sandbox = {.size = sizeof(struct ph_sandbox_config),
         .identity = owner->identity, .artifact_count = owner->artifact_count,
-        .resource_count = 1, .device = owner->device,
-        .storage_devices_address = PH_SANDBOX_STORAGE_DEVICES_ADDRESS,
-        .storage_device_count = 1,
+        .resource_count = owner->ram_root ? 0 : 1, .device = owner->device,
+        .storage_devices_address = owner->ram_root ? 0 : PH_SANDBOX_STORAGE_DEVICES_ADDRESS,
+        .storage_device_count = owner->ram_root ? 0 : 1,
+        .fs_root_kind = owner->ram_root ? PH_FS_ROOT_TMPFS : PH_FS_ROOT_EXT4,
         .fs_channel_id = 1, .fs_owner_channel_id = 2,
         .fs_arena_bytes = owner->config.queue_arena_bytes,
         .ram_bytes = owner->config.sandbox_ram_bytes,
@@ -618,9 +650,9 @@ int filed_storage_owner_start(struct filed_storage_owner *owner)
         .watch = &owner->watch, .lifecycle = &owner->lifecycle,
         .resource_set_id = 1, .sandbox_id = 1, .sandbox_config = &sandbox,
         .image = owner->sandbox, .image_size = owner->sandbox_size, .items = owner->items,
-        .artifact_count = owner->artifact_count, .resource_count = 1, .log_endpoint_fd = -1};
-    start.extra_blobs = &storage_devices;
-    start.extra_blob_count = 1;
+        .artifact_count = owner->artifact_count, .resource_count = owner->ram_root ? 0 : 1, .log_endpoint_fd = -1};
+    start.extra_blobs = owner->ram_root ? NULL : &storage_devices;
+    start.extra_blob_count = owner->ram_root ? 0 : 1;
     if (!error) {
         kb2_status_t status = ph_owner_boot_begin(&owner->boot, &start);
         if (status != KB2_STATUS_OK) {
@@ -901,7 +933,7 @@ static int retire_owner(struct filed_storage_owner *owner)
             continue;
         }
         if (type == KB2_ACTION_REVOKE_RESOURCES) {
-            int error = pacha_capsule_dma_set_enabled((pacha_fd_t)owner->config.device_fd, 0);
+            int error = owner->ram_root ? 0 : pacha_capsule_dma_set_enabled((pacha_fd_t)owner->config.device_fd, 0);
             if (error) return error;
             if (owner->data.channel.identity.generation)
                 kb2_vq_channel_fault(&owner->data.channel.channel);

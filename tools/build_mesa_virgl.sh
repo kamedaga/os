@@ -3,6 +3,7 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+source "$repo_root/pack/scripts/lib/jobs.sh"
 runtime="$(realpath "${1:?Alpine Mesa staging root required}")"
 version=25.1.9
 library="libgallium-${version}.so"
@@ -68,13 +69,32 @@ if [[ ! -f "${toolchain}/.ready" ]]; then
 fi
 mkdir -p "${toolchain}/source" "${toolchain}/build"
 
-# Changing the patch, recipe or installed toolchain invalidates the build cache.
-key="$(sha256sum "${patch_file}" "${BASH_SOURCE[0]}" "${toolchain}/lib/apk/db/installed" |
-  sha256sum | cut -c1-32)"
+meson_options=(
+  --prefix=/usr --libdir=lib --buildtype=release --wrap-mode=nofallback
+  -Db_ndebug=true -Db_lto=false -Dauto_features=disabled
+  -Dallow-kcmp=enabled -Dexpat=enabled -Dshader-cache=enabled
+  -Dxlib-lease=enabled -Dxmlconfig=enabled -Dzstd=enabled -Dzlib=enabled
+  -Dbackend_max_links=2 -Ddri-drivers-path=/usr/lib/dri
+  -Dgallium-drivers=r300,r600,radeonsi,nouveau,llvmpipe,virgl,zink,svga,i915,iris,crocus
+  -Dvulkan-drivers=[] -Dplatforms=x11,wayland
+  -Dllvm=enabled -Dshared-llvm=enabled -Dgbm=enabled -Dglx=dri
+  -Dopengl=true -Dosmesa=false -Dgles1=enabled -Dgles2=enabled -Degl=enabled
+  -Dgallium-extra-hud=true -Dgallium-nine=true -Dgallium-xa=enabled
+  -Dgallium-va=enabled -Dgallium-vdpau=enabled -Dvideo-codecs=all)
+
+# The build cache is keyed by what determines the library: source, patch,
+# installed toolchain and Meson configuration. Edits to this script that leave
+# them alone (job control, messages) keep the cache.
+key="$({
+  printf '%s\n' "${version}" "${source_sha}" "${library}" "${meson_options[@]}"
+  sha256sum <"${patch_file}"
+  sha256sum <"${toolchain}/lib/apk/db/installed"
+} | sha256sum | cut -c1-32)"
 build_root="${work}/${key}"
 source_dir="${build_root}/source"
 build_dir="${build_root}/build"
-built_library="${build_dir}/src/gallium/targets/dri/${library}"
+library_path="build/src/gallium/targets/dri/${library}"
+built_library="${build_root}/${library_path}"
 mkdir -p "${source_dir}" "${build_dir}"
 if [[ ! -f "${build_root}/source-prepared" ]]; then
   tar -xJf "${cache}/mesa-${version}.tar.xz" --strip-components=1 -C "${source_dir}"
@@ -84,31 +104,27 @@ if [[ ! -f "${build_root}/source-prepared" ]]; then
   touch "${build_root}/source-prepared"
 fi
 
+# library.sha256 names the library relative to build_root.
 if [[ ! -f "${build_root}/library.sha256" ]] ||
-   ! sha256sum -c --status "${build_root}/library.sha256"; then
+   ! (cd "${build_root}" && sha256sum -c --status library.sha256); then
+  pacgo_reserve_jobs "$jobs" >/dev/null
+  inner_jobs="$PACGO_RESERVED_JOBS"
   # Upstream source is read-only during compilation; outputs go to /build.
   bwrap --unshare-user --uid 0 --gid 0 --ro-bind "${toolchain}" / \
     --ro-bind "${source_dir}" /source --bind "${build_dir}" /build \
     --dev /dev --proc /proc --tmpfs /tmp --chdir /build \
-    --clearenv --setenv PATH /usr/lib/llvm20/bin:/usr/bin:/bin \
+    --clearenv \
+    --setenv PATH /usr/lib/llvm20/bin:/usr/bin:/bin \
     --setenv LC_ALL C /bin/sh -eu -c '
+      jobs="$1" target="$2"
+      shift 2
       if [ ! -f build.ninja ]; then
-        meson setup /build /source \
-          --prefix=/usr --libdir=lib --buildtype=release --wrap-mode=nofallback \
-          -Db_ndebug=true -Db_lto=false -Dauto_features=disabled \
-          -Dallow-kcmp=enabled -Dexpat=enabled -Dshader-cache=enabled \
-          -Dxlib-lease=enabled -Dxmlconfig=enabled -Dzstd=enabled -Dzlib=enabled \
-          -Dbackend_max_links=2 -Ddri-drivers-path=/usr/lib/dri \
-          -Dgallium-drivers=r300,r600,radeonsi,nouveau,llvmpipe,virgl,zink,svga,i915,iris,crocus \
-          -Dvulkan-drivers=[] -Dplatforms=x11,wayland \
-          -Dllvm=enabled -Dshared-llvm=enabled -Dgbm=enabled -Dglx=dri \
-          -Dopengl=true -Dosmesa=false -Dgles1=enabled -Dgles2=enabled -Degl=enabled \
-          -Dgallium-extra-hud=true -Dgallium-nine=true -Dgallium-xa=enabled \
-          -Dgallium-va=enabled -Dgallium-vdpau=enabled -Dvideo-codecs=all
+        meson setup /build /source "$@"
       fi
-      ninja -C /build -j "$1" "src/gallium/targets/dri/$2"
-    ' sh "${jobs}" "${library}"
-  sha256sum "${built_library}" >"${build_root}/library.sha256"
+      ninja -C /build -j "${jobs}" "src/gallium/targets/dri/${target}"
+    ' sh "${inner_jobs}" "${library}" "${meson_options[@]}"
+  pacgo_release_jobs
+  (cd "${build_root}" && sha256sum "${library_path}") >"${build_root}/library.sha256"
 else
   echo "using verified Mesa build cache: ${key}"
 fi
@@ -118,7 +134,7 @@ install -m 0755 "${built_library}" "${runtime}/usr/lib/${library}"
 mkdir -p "${runtime}/usr/share/pacha"
 {
   printf 'Mesa %s; VirGL render-target/sampler-view cache eligibility only\n' "${version}"
-  printf 'source-sha256 %s\nbuild-key %s\n' "${source_sha}" "${key}"
+  printf 'source-sha256 %s\nbuild-key %s\ntoolchain-key %s\n' "${source_sha}" "${key}" "${toolchain_key}"
   sha256sum "${patch_file}" "${built_library}"
 } >"${runtime}/usr/share/pacha/mesa-virgl-build.txt"
 echo "installed patched ${library} into ${runtime}"

@@ -4,6 +4,8 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "$0")/../.." && pwd)"
+source "$repo_root/pack/scripts/lib/jobs.sh"
+jobs="${JOBS:-${PACGO_BUILD_JOBS:-8}}"
 # The kobox2 core is pinned to nix's LLVM 18.1.8, and kbuild host tools
 # (fixdep, objtool) must link against nix's glibc and libelf. Only this build
 # enters nix; pacgo and every other build stay outside it.
@@ -36,13 +38,15 @@ fi
 
 identity="$(sha256sum "$canonical/.config" "$canonical/vmlinux" \
     "$canonical/vmlinux.a" | sha256sum | cut -d' ' -f1)"
+pacgo_reserve_jobs "$jobs" >/dev/null
 python3 "$source_tree/kobox/boot/build_boot_runtime.py" \
     --source-tree "$source_tree" --canonical-build-dir "$canonical" \
     --provider-build-dir "$repo_root/.artifacts/kobox2-amdgpu-providers/$identity" \
     --output-dir "$hosted" --device-profile amdgpu --cc clang-18 \
     --ld ld.lld-18 --llvm=-18 --ar llvm-ar-18 --nm llvm-nm-18 \
     --objdump llvm-objdump-18 --objcopy llvm-objcopy-18 \
-    --module-inventory "$inventory" --with-gates --link --jobs "${JOBS:-8}"
+    --module-inventory "$inventory" --with-gates --link --jobs "$PACGO_RESERVED_JOBS"
+pacgo_release_jobs
 
 if [[ ! -d "$firmware_dir" ]]; then
     echo 'Fetch the pinned AMDGPU firmware before the no-device test' >&2
@@ -54,8 +58,8 @@ if [[ ! -f "$mapping_file" ]]; then
 fi
 (cd "$firmware_dir" && sha256sum -c "$firmware_manifest")
 mkdir -p "$probe_output"
-make -C "$source_tree" O="$canonical" ARCH=x86 LLVM=-18 \
-    M="$probe_source" MO="$probe_output" -j"${JOBS:-8}" modules
+pacgo_make "$jobs" -C "$source_tree" O="$canonical" ARCH=x86 LLVM=-18 \
+    M="$probe_source" MO="$probe_output" modules
 
 # The pinned libelf path is for Kbuild's host tools only. It may also contain
 # a foreign libc; never let the native CMake smoke-test linker search it.
@@ -65,7 +69,7 @@ cmake -S "$repo_root/kobox2" -B "$cmake_dir" -DBUILD_TESTING=ON \
     -DKB2_OS_BACKEND=linux -DKB2_CPU_ARCH=x86_64 -DCMAKE_BUILD_TYPE= \
     -DKOBOX_LINUX_TASK_BUILD_DIR="$canonical" \
     -DKOBOX_LINUX_BOOT_RUNTIME_CORE="$hosted/linux-boot-runtime.so"
-cmake --build "$cmake_dir" --target kobox_linux_module_smoke_test -j"${JOBS:-8}"
+pacgo_cmake_build "$jobs" "$cmake_dir" --target kobox_linux_module_smoke_test
 
 mapfile -t module_paths < <(python3 -c \
     'import json,sys; print("\n".join(json.load(open(sys.argv[1]))["load_order"]))' \

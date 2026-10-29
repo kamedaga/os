@@ -1,16 +1,20 @@
 cmake_minimum_required(VERSION 3.16)
-set(CMAKE_SYSTEM_NAME Generic)
-set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
+if(NOT DEFINED CMAKE_TOOLCHAIN_FILE)
+  set(CMAKE_TOOLCHAIN_FILE "${CMAKE_CURRENT_SOURCE_DIR}/../cmake/pachaos-native.toolchain.cmake")
+endif()
+# Depfile paths are rewritten relative to the build tree for Ninja.
+cmake_policy(SET CMP0116 NEW)
 project(filed C ASM)
 set(REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../..")
-include("${REPO_ROOT}/userland/cmake/pachaos_native_dependencies.cmake")
+include("${REPO_ROOT}/userland/cmake/pachaos_native.cmake")
 set(PROTOCOL "${REPO_ROOT}/kobox2/protocol")
-set(FILED_ELF "${CMAKE_BINARY_DIR}/filed.elf")
 set(FILED_SANDBOX_ELF "${CMAKE_BINARY_DIR}/sandbox.elf")
-set(ZYDIS_SOURCE "${REPO_ROOT}/.artifacts/third_party/zydis-v4.1.1/source")
-set(FILED_PROFILE_CFLAGS "$ENV{PACHAOS_FILED_EXTRA_CFLAGS}")
+# Written by pack/scripts/download_zydis.sh (the zydis_source pacgo recipe).
+set(ZYDIS_SOURCE "${REPO_ROOT}/.artifacts/third_party/zydis-v4.1.1/tree")
+separate_arguments(FILED_PROFILE_CFLAGS UNIX_COMMAND "$ENV{PACHAOS_FILED_EXTRA_CFLAGS}")
 set(FILED_EXTRA_SOURCES
   "${CMAKE_CURRENT_SOURCE_DIR}/src/runtime.c"
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/live_root.c"
   "${CMAKE_CURRENT_SOURCE_DIR}/src/storage.c"
   "${CMAKE_CURRENT_SOURCE_DIR}/src/storage_owner.c"
   "${CMAKE_CURRENT_SOURCE_DIR}/src/relay.c"
@@ -61,35 +65,46 @@ set(FILED_EXTRA_SOURCES
   "${ZYDIS_SOURCE}/src/Decoder.c"
   "${ZYDIS_SOURCE}/src/DecoderData.c"
   "${ZYDIS_SOURCE}/src/SharedData.c")
-string(REPLACE ";" " " FILED_EXTRA_SOURCES_ENV "${FILED_EXTRA_SOURCES}")
-file(GLOB_RECURSE FILED_HEADERS CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/include/*.h"
-  "${CMAKE_CURRENT_SOURCE_DIR}/src/exec/*.h")
-add_custom_command(OUTPUT "${FILED_ELF}"
-  COMMAND bash "${REPO_ROOT}/pack/scripts/download_zydis.sh"
-  COMMAND ${CMAKE_COMMAND} -E env
-    "PACHAOS_MUSL_APP_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/src/main.c"
-    "PACHAOS_MUSL_EXTRA_SOURCES=${FILED_EXTRA_SOURCES_ENV}"
-    "PACHAOS_MUSL_EXTRA_INCLUDE_DIRS=${CMAKE_CURRENT_SOURCE_DIR}/include ${REPO_ROOT}/musl/upstream/src/internal ${REPO_ROOT}/musl/upstream/src/include ${REPO_ROOT}/musl/upstream/arch/pachaos ${REPO_ROOT}/userland/storage/include ${REPO_ROOT}/userland/libipc/include ${REPO_ROOT}/userland/libcapsule/include ${REPO_ROOT}/userland/libpacha/include ${REPO_ROOT}/userland/personality/include ${REPO_ROOT}/userland/personality/linux/decoder ${REPO_ROOT}/userland/gpud ${REPO_ROOT}/kobox2/include ${PROTOCOL}/include ${PROTOCOL}/generated/include ${ZYDIS_SOURCE}/include ${ZYDIS_SOURCE}/src ${ZYDIS_SOURCE}/dependencies/zycore/include"
-    "PACHAOS_MUSL_EXTRA_CFLAGS=-std=c11 -D__pachaos__ -DZYDIS_STATIC_BUILD -DZYDIS_MINIMAL_MODE -DZYDIS_DISABLE_ENCODER -DZYDIS_DISABLE_FORMATTER -DZYDIS_DISABLE_SEGMENT -DZYAN_NO_LIBC -Wno-unused-parameter -Wno-deprecated-non-prototype ${FILED_PROFILE_CFLAGS}"
-    bash "${REPO_ROOT}/musl/pachaos/build/build-smokes.sh" "${FILED_ELF}"
-  DEPENDS ${PACHAOS_NATIVE_DEPENDENCIES} "${CMAKE_CURRENT_SOURCE_DIR}/src/main.c" ${FILED_EXTRA_SOURCES} ${FILED_HEADERS}
-    "${CMAKE_CURRENT_SOURCE_DIR}/tests/internal_microbench.inc"
-    "${CMAKE_CURRENT_SOURCE_DIR}/tests/internal_microbench_clock.h"
-    "${REPO_ROOT}/musl/pachaos/build/build-smokes.sh"
-    "${REPO_ROOT}/pack/scripts/download_zydis.sh"
-  WORKING_DIRECTORY "${REPO_ROOT}" VERBATIM)
-file(GLOB_RECURSE FILED_SANDBOX_INPUTS CONFIGURE_DEPENDS
-  "${REPO_ROOT}/userland/kobox2_adapter/*.c"
-  "${REPO_ROOT}/userland/kobox2_adapter/*.h"
-  "${REPO_ROOT}/userland/kobox2_owner/*.c"
-  "${REPO_ROOT}/userland/kobox2_owner/*.h"
-  "${REPO_ROOT}/kobox2/linux-sandbox/kobox/*.c"
-  "${REPO_ROOT}/kobox2/linux-sandbox/kobox/*.h"
-  "${PROTOCOL}/*.c" "${PROTOCOL}/*.h")
+pachaos_native_executable(filed
+  SOURCES
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/main.c"
+    ${FILED_EXTRA_SOURCES}
+  INCLUDE_DIRECTORIES
+    "${CMAKE_CURRENT_SOURCE_DIR}/include"
+    "${REPO_ROOT}/musl/upstream/src/internal"
+    "${REPO_ROOT}/musl/upstream/src/include"
+    "${REPO_ROOT}/musl/upstream/arch/pachaos"
+    "${REPO_ROOT}/userland/storage/include"
+    "${REPO_ROOT}/userland/libipc/include"
+    "${REPO_ROOT}/userland/libcapsule/include"
+    "${REPO_ROOT}/userland/libpacha/include"
+    "${REPO_ROOT}/userland/personality/include"
+    "${REPO_ROOT}/userland/personality/linux/decoder"
+    "${REPO_ROOT}/userland/gpud"
+    "${REPO_ROOT}/kobox2/include"
+    "${PROTOCOL}/include"
+    "${PROTOCOL}/generated/include"
+    "${ZYDIS_SOURCE}/include"
+    "${ZYDIS_SOURCE}/src"
+    "${ZYDIS_SOURCE}/dependencies/zycore/include"
+  COMPILE_OPTIONS
+    -std=c11
+    -D__pachaos__
+    -DZYDIS_STATIC_BUILD
+    -DZYDIS_MINIMAL_MODE
+    -DZYDIS_DISABLE_ENCODER
+    -DZYDIS_DISABLE_FORMATTER
+    -DZYDIS_DISABLE_SEGMENT
+    -DZYAN_NO_LIBC
+    -Wno-unused-parameter
+    -Wno-deprecated-non-prototype
+    ${FILED_PROFILE_CFLAGS})
 add_custom_command(OUTPUT "${FILED_SANDBOX_ELF}"
+  DEPFILE "${FILED_SANDBOX_ELF}.d"
   COMMAND bash "${REPO_ROOT}/userland/kobox2_adapter/build-sandbox.sh"
     "${FILED_SANDBOX_ELF}" --storage
-  DEPENDS ${FILED_SANDBOX_INPUTS}
-    "${REPO_ROOT}/userland/kobox2_adapter/build-sandbox.sh"
+  DEPENDS "${REPO_ROOT}/userland/kobox2_adapter/build-sandbox.sh"
   WORKING_DIRECTORY "${REPO_ROOT}" VERBATIM)
-add_custom_target(filed ALL DEPENDS "${FILED_ELF}" "${FILED_SANDBOX_ELF}")
+add_custom_target(filed_sandbox ALL DEPENDS "${FILED_SANDBOX_ELF}")
+# Building the filed target delivers both ELFs.
+add_dependencies(filed filed_sandbox)

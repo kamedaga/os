@@ -12,6 +12,7 @@ pub const DirectIpc = struct {
 pub const FullIpc = struct {
     queue: *types.IpcQueue,
     list: *types.IpcWaitList,
+    opposite: ?*types.IpcWaitList,
     registration: types.FdWaitRegistrationRef,
     hint: *const types.IpcReceiverHint,
     payload: types.KernelObjectPayload,
@@ -46,6 +47,7 @@ fn resolveIpcUnderK(comptime full: bool, self: anytype, owner: types.PrincipalId
             result.list = &body.waiters;
             result.registration = .{ .kind = .endpoint, .index = queue.reference_identity.owner, .generation = body.generation };
             if (full) {
+                result.opposite = null;
                 result.hint = &body.receiver_hint;
                 result.payload = .{ .endpoint = .{ .index = queue.reference_identity.owner, .generation = body.generation } };
             }
@@ -62,6 +64,9 @@ fn resolveIpcUnderK(comptime full: bool, self: anytype, owner: types.PrincipalId
             result.list = &body.waiters[destination];
             result.registration = .{ .kind = .channel, .index = local.reference_identity.owner, .generation = body.generation, .side = @intCast(destination) };
             if (full) {
+                // Both directions share E. Lend the already validated peer
+                // list under the same K interval instead of resolving again.
+                result.opposite = &body.waiters[1 - destination];
                 result.hint = &body.receiver_hints[destination];
                 result.payload = .{ .channel = .{ .channel = .{ .index = local.reference_identity.owner, .generation = body.generation }, .side = @intCast(side) } };
             }
@@ -221,10 +226,13 @@ test "FD capability direct cache preserves size directions rights and independen
             const full = ipcUnderK(state, owner, fd, if (outbound) .{ .call = true } else .{ .recv = true, .wait = true }, outbound).?;
             try std.testing.expectEqual(small.queue, full.queue);
             try std.testing.expectEqual(small.list, full.list);
+            try std.testing.expect(full.opposite.? != full.list);
+            try std.testing.expectEqual(full.list.exclusion, full.opposite.?.exclusion);
             try std.testing.expectEqualDeep(small.registration, full.registration);
             try std.testing.expectEqual(full.payload.channel.side ^ @as(u1, if (outbound) 1 else 0), full.registration.side);
             const body = state.ipcChannelSlot(full.payload.channel.channel).?;
             try std.testing.expectEqual(&body.receiver_hints[full.registration.side], full.hint);
+            try std.testing.expectEqual(&body.waiters[1 - full.registration.side], full.opposite.?);
         }
     }
     const weak = try state.dupFd(owner, pair.a, 16, .{ .recv = true, .wait = true, .close = true }, .{});
@@ -240,6 +248,7 @@ test "FD capability direct cache preserves size directions rights and independen
     const endpoint = try state.createIpcEndpointFd(owner, rights, .{}, pair.a);
     try std.testing.expectEqual(pair.a, endpoint);
     const ep = directIpcUnderK(state, owner, endpoint, false).?;
+    try std.testing.expect(ipcUnderK(state, owner, endpoint, .{ .recv = true, .wait = true }, false).?.opposite == null);
     try std.testing.expectEqual(ep.queue, directIpcUnderK(state, owner, endpoint, true).?.queue);
     try std.testing.expectEqual(@TypeOf(ep.registration.kind).endpoint, ep.registration.kind);
     try state.closeFd(owner, endpoint);

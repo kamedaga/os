@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: MIT */
 #include "device_dma.h"
 #include "host.h"
+#include "boot.h"
 #include <pacha/capsule.h>
 #include <errno.h>
 
@@ -83,6 +84,9 @@ static void dma_failure_record(struct ph_dma *dma, enum dma_failure_stage stage,
     buffer[length++] = '\n';
     buffer[length] = '\0';
     ph_log(buffer);
+    ph_boot_log_dma_failure(stage, native_status, iova, bytes, mappings,
+        mapping_bytes, fd_status, fd_status ? 0 : info.capacity,
+        fd_status ? 0 : info.free_slots);
 }
 
 static int dma_native_status(long result) {
@@ -104,6 +108,36 @@ static void dma_lock(struct ph_dma *dma) {
 
 static void dma_unlock(struct ph_dma *dma) {
     atomic_store_explicit(&dma->lock, 0, memory_order_release);
+}
+
+static int dma_query(const struct ph_dma_config *config, struct pacha_capsule_info *info);
+
+/* FD_TABLE grows a shared process table; it does not reserve slots for DMA.
+ * IRQs and task creation can consume the initial headroom. Only retry a native
+ * allocation failure when the table is demonstrably full and can be grown.
+ * No Linux allocator/reentry is used, and one operation gets at most one retry.
+ * A failed native derive has already rolled back its unpublished translation. */
+static int dma_restore_fd_headroom(struct ph_dma *dma) {
+    struct pacha_fd_table_info info = {0};
+    if (pacha_syscall2(PACHA_FD_SYSCALL_TABLE, 0, (uintptr_t)&info) ||
+        info.maximum > PACHA_THREAD_SELF_FD || info.capacity > info.maximum ||
+        info.free_slots > info.capacity || info.free_slots)
+        return 0;
+    struct pacha_capsule_info device = {0};
+    if (dma_query(&dma->config, &device)) return 0;
+    size_t active = 0;
+    for (size_t i = 0; i < dma->config.mapping_capacity; ++i)
+        active += dma->config.mappings[i].length != 0;
+    uint64_t extra = dma->config.mapping_capacity - active + 1u;
+    if (extra > info.maximum - info.capacity)
+        extra = info.maximum - info.capacity;
+    if (!extra) return 0;
+    const uint64_t requested = info.capacity + extra;
+    if (pacha_syscall2(PACHA_FD_SYSCALL_TABLE, requested, (uintptr_t)&info))
+        return 0;
+    return info.capacity >= requested && info.capacity <= info.maximum &&
+        info.maximum <= PACHA_THREAD_SELF_FD && info.free_slots &&
+        info.free_slots <= info.capacity;
 }
 
 static struct ph_dma_mapping *dma_free_slot(struct ph_dma *dma,
@@ -188,6 +222,9 @@ static int dma_map(void *context, uint64_t iova, uint64_t ram_offset,
     }
     long fd = pacha_syscall6(PACHA_CAPSULE_SYSCALL_DERIVE_DMA_MAPPING, config->device_fd,
         (uintptr_t)config->ram + ram_offset, iova, length, direction, 0);
+    if (fd == PACHA_SYSCALL_ERR_ALLOC && dma_restore_fd_headroom(dma))
+        fd = pacha_syscall6(PACHA_CAPSULE_SYSCALL_DERIVE_DMA_MAPPING, config->device_fd,
+            (uintptr_t)config->ram + ram_offset, iova, length, direction, 0);
     if (fd < 16 || fd >= PACHA_THREAD_SELF_FD) {
         struct pacha_capsule_info info = {0};
         int query_result;
@@ -276,6 +313,10 @@ static int dma_map_page_list(void *context, uint64_t iova,
     long view_fd = pacha_syscall5(PACHA_FD_SYSCALL_VMO_CREATE_PAGE_VIEW,
         (uint64_t)config->ram_fd, (uintptr_t)ram_pages,
         page_count, rights, PACHA_FD_FLAG_CLOEXEC);
+    if (view_fd == PACHA_SYSCALL_ERR_ALLOC && dma_restore_fd_headroom(dma))
+        view_fd = pacha_syscall5(PACHA_FD_SYSCALL_VMO_CREATE_PAGE_VIEW,
+            (uint64_t)config->ram_fd, (uintptr_t)ram_pages,
+            page_count, rights, PACHA_FD_FLAG_CLOEXEC);
     if (view_fd < 16 || view_fd >= PACHA_THREAD_SELF_FD) {
         dma_failure_record(dma, DMA_FAILURE_VIEW, view_fd, iova, length);
         result = view_fd ? dma_native_status(view_fd) : -EPROTO;
@@ -305,6 +346,9 @@ static int dma_map_page_list(void *context, uint64_t iova,
     }
     long fd = pacha_syscall6(PACHA_CAPSULE_SYSCALL_DERIVE_DMA_MAPPING,
         config->device_fd, (uintptr_t)view, iova, length, direction, 0);
+    if (fd == PACHA_SYSCALL_ERR_ALLOC && dma_restore_fd_headroom(dma))
+        fd = pacha_syscall6(PACHA_CAPSULE_SYSCALL_DERIVE_DMA_MAPPING,
+            config->device_fd, (uintptr_t)view, iova, length, direction, 0);
     if (fd < 16 || fd >= PACHA_THREAD_SELF_FD) {
         struct pacha_capsule_info info = {0};
         dma_failure_record(dma, DMA_FAILURE_SCATTERED, fd, iova, length);

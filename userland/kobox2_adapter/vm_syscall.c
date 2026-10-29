@@ -14,6 +14,9 @@ void ph_vm_capture_syscall(struct ph_vm_space *space) {
     memcpy(space->captured_fp.fxsave, control->fp, sizeof(control->fp));
     memcpy(&space->fp_mxcsr_mask, control->fp + 28, sizeof(space->fp_mxcsr_mask));
     space->syscall_stopped = true;
+#ifdef PH_USER_PROCESS_SMOKE
+    ph_number("USER_PROCESS_SYSCALL", control->registers.rax);
+#endif
     space->syscall_returned = false;
     space->event.kind = KOBOX_VM_EVENT_SYSCALL;
     space->event.user = space->captured_registers;

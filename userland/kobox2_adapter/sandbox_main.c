@@ -13,8 +13,17 @@
 #include "block_service.h"
 #include "usb_storage_service.h"
 #include "firmware_bundle.h"
+#include "entropy.h"
+#include "wifi_host.h"
 #include "fs_queue.h"
+#include "audio_service.h"
 #include <kobox2/module_progress.h>
+#ifndef PH_SANDBOX_PS2
+#define PH_SANDBOX_PS2 0
+#endif
+#if PH_SANDBOX_PS2
+#include "ps2_native.h"
+#endif
 
 #ifndef PH_SANDBOX_DEVICE
 #define PH_SANDBOX_DEVICE 1
@@ -25,18 +34,24 @@
 #ifndef PH_SANDBOX_NET
 #define PH_SANDBOX_NET 0
 #endif
+#ifndef PH_SANDBOX_WIFI
+#define PH_SANDBOX_WIFI 0
+#endif
 #ifndef PH_SANDBOX_AMDGPU
 #define PH_SANDBOX_AMDGPU 0
 #endif
 #ifndef PH_SANDBOX_BLOCK
 #define PH_SANDBOX_BLOCK 0
 #endif
+#ifndef PH_SANDBOX_AUDIO
+#define PH_SANDBOX_AUDIO 0
+#endif
 #ifndef PH_SANDBOX_FS
 #define PH_SANDBOX_FS 0
 #endif
 #define PH_SANDBOX_VIRTIO_GPU \
     (PH_SANDBOX_DEVICE && !PH_SANDBOX_USB_HID && !PH_SANDBOX_NET && \
-     !PH_SANDBOX_AMDGPU && !PH_SANDBOX_BLOCK && !PH_SANDBOX_FS)
+     !PH_SANDBOX_AMDGPU && !PH_SANDBOX_BLOCK && !PH_SANDBOX_FS && !PH_SANDBOX_AUDIO)
 #define PH_SANDBOX_GPU (PH_SANDBOX_VIRTIO_GPU || PH_SANDBOX_AMDGPU)
 #if PH_SANDBOX_DEVICE
 #include "device.h"
@@ -55,16 +70,19 @@ static struct ph_bootstrap_receiver bundle;
 static struct ph_package package;
 static struct ph_module_package modules;
 static struct ph_lifecycle lifecycle;
-#if PH_SANDBOX_AMDGPU
+#if PH_SANDBOX_AMDGPU || PH_SANDBOX_WIFI
 static struct kobox_linux_firmware_file firmware_files[KOBOX_FIRMWARE_MAX_FILES];
 static size_t firmware_count;
 #endif
-#if PH_SANDBOX_USB_HID
+#if PH_SANDBOX_USB_HID || PH_SANDBOX_PS2
 #if PH_SANDBOX_BLOCK
 static struct ph_usb_storage_service usb_storage;
 #else
 static struct ph_usb_input_service usb_input;
 #endif
+#endif
+#if PH_SANDBOX_AUDIO
+static struct ph_audio_service audio_service;
 #endif
 #if PH_SANDBOX_NET
 static struct ph_net_frame_service net_frames;
@@ -84,7 +102,7 @@ static struct kobox_linux_device_port_config *storage_ports;
 static size_t storage_device_count;
 #endif
 
-#if PH_SANDBOX_NET || PH_SANDBOX_AMDGPU || PH_SANDBOX_BLOCK || PH_SANDBOX_FS
+#if PH_SANDBOX_NET || PH_SANDBOX_AMDGPU || PH_SANDBOX_BLOCK || PH_SANDBOX_FS || PH_SANDBOX_AUDIO
 
 #if PH_SANDBOX_AMDGPU
 static void report_gpu_irq_ready(void);
@@ -165,7 +183,7 @@ static void report_gpu_irq_ready(void) {
 }
 #endif
 #if PH_SANDBOX_FS
-#elif PH_SANDBOX_USB_HID || PH_SANDBOX_NET || PH_SANDBOX_BLOCK
+#elif PH_SANDBOX_USB_HID || PH_SANDBOX_NET || PH_SANDBOX_BLOCK || PH_SANDBOX_AUDIO
 static struct kobox_linux_device_port_config pci_device_launch;
 #else
 static struct kobox_linux_device_launch device_launch;
@@ -179,6 +197,9 @@ static uint64_t gpu_channel_id;
 
 static void prepare_device(const struct kobox_linux_boot_layout *layout, void *context) {
     (void)context;
+#if PH_SANDBOX_WIFI
+    ph_wifi_host_prepare();
+#endif
 #if PH_SANDBOX_FS
     /* Every native grant has its own DMA/IRQ port and synthetic PCI domain.
      * The domain is transport topology, never a guessed hardware identity. */
@@ -200,14 +221,15 @@ static void prepare_device(const struct kobox_linux_boot_layout *layout, void *c
                                             .memory = layout->task.memory,
                                             .irq_cookie_sequence = &irq_cookie_sequence};
     PH_OK(ph_device_init(&device, &config));
-#if PH_SANDBOX_USB_HID || PH_SANDBOX_NET || PH_SANDBOX_BLOCK || PH_SANDBOX_FS
+#if PH_SANDBOX_USB_HID || PH_SANDBOX_NET || PH_SANDBOX_BLOCK || PH_SANDBOX_AUDIO || PH_SANDBOX_FS
     pci_device_launch = (struct kobox_linux_device_port_config){
         .size = sizeof(pci_device_launch),
         .pci = &device.pci.host,
         .dma = &device.dma.host,
         .irq = &device.irq.host,
         .expected_class = PH_SANDBOX_USB_HID ? 0x0c0330 :
-            PH_SANDBOX_NET ? 0x020000 : 0x010802,
+            PH_SANDBOX_NET ? (PH_SANDBOX_WIFI ? 0x028000 : 0x020000) :
+            PH_SANDBOX_AUDIO ? 0x040100 : 0x010802,
     };
 #else
     device_launch =
@@ -237,7 +259,19 @@ static void cleanup_fatal(void *context, long status) {
 
 static void run_service(void *context) {
     (void)context;
+#if PH_SANDBOX_WIFI
+    PH_OK(ph_seed_linux_entropy());
+#endif
     PH_OK(ph_module_package_open(&modules, &package));
+#if PH_SANDBOX_PS2
+    for (size_t i = 0; i < modules.count; ++i)
+        if (!strcmp(modules.modules[i].name, "i8042"))
+            modules.modules[i].parameters = "noaux=1";
+    struct ph_lifecycle_service ps2_service;
+    PH_OK(ph_usb_input_service_init(&usb_input, &ph_core,
+        bootstrap_ipc.generation, &ps2_service));
+    PH_OK(ph_lifecycle_start_service(&lifecycle, &bootstrap_ipc, &ps2_service));
+#endif
 #if PH_SANDBOX_AMDGPU
     /* Firmware class reports the names requested by the unmodified Linux
      * driver, including failed lookups. The staged-file log alone cannot
@@ -285,11 +319,20 @@ static void run_service(void *context) {
     PH_OK(ph_block_service_init(&block_io, &ph_core,
         bootstrap_ipc.generation, &service));
     PH_OK(ph_lifecycle_start_service(&lifecycle, &bootstrap_ipc, &service));
+#elif PH_SANDBOX_AUDIO
+    struct ph_lifecycle_service service;
+    PH_OK(ph_audio_service_init(&audio_service, &ph_core,
+        bootstrap_ipc.generation, &service));
+    PH_OK(ph_lifecycle_start_service(&lifecycle, &bootstrap_ipc, &service));
 #elif PH_SANDBOX_NET
     struct ph_lifecycle_service service;
     PH_OK(ph_net_frame_service_init(&net_frames, &ph_core,
         bootstrap_ipc.generation, &service));
+#if PH_SANDBOX_WIFI
+    PH_OK(ph_lifecycle_start_monitored_service(&lifecycle, &bootstrap_ipc, &service));
+#else
     PH_OK(ph_lifecycle_start_service(&lifecycle, &bootstrap_ipc, &service));
+#endif
 #elif PH_SANDBOX_AMDGPU
     struct ph_lifecycle_service service;
     PH_OK(ph_gpu_sessions_init(
@@ -309,12 +352,15 @@ static void run_service(void *context) {
     PH_OK(ph_lifecycle_start_service(&lifecycle, &bootstrap_ipc, &service));
 #endif
 #else
-    PH_OK(ph_lifecycle_start(&lifecycle, &bootstrap_ipc));
+    if (!PH_SANDBOX_PS2) PH_OK(ph_lifecycle_start(&lifecycle, &bootstrap_ipc));
 #endif
     struct kobox_linux_module_launch launch = {.size = sizeof(launch),
                                                .modules = modules.modules,
                                                .count = modules.count,
                                                .lifecycle = &lifecycle.port};
+#if PH_SANDBOX_PS2
+    launch.capture_input = 1;
+#endif
 #if PH_SANDBOX_DEVICE
 #if PH_SANDBOX_FS
     launch.pci_devices = storage_ports;
@@ -347,10 +393,20 @@ static void run_service(void *context) {
         .minor = block_write_policy.minor};
     launch.progress = report_device_progress;
     launch.progress_context = &bootstrap_ipc;
+#elif PH_SANDBOX_AUDIO
+    launch.pci_devices = &pci_device_launch;
+    launch.pci_device_count = 1;
+    launch.progress = report_device_progress;
+    launch.progress_context = &bootstrap_ipc;
 #elif PH_SANDBOX_NET
     launch.pci_devices = &pci_device_launch;
     launch.pci_device_count = 1;
     launch.capture_network = 1;
+#if PH_SANDBOX_WIFI
+    launch.firmware = firmware_files;
+    launch.firmware_count = firmware_count;
+    launch.wireless = ph_wifi_host_config();
+#endif
     launch.progress = report_device_progress;
     launch.progress_context = &bootstrap_ipc;
 #elif PH_SANDBOX_AMDGPU
@@ -370,7 +426,7 @@ static void run_service(void *context) {
     memcpy(&run, &symbol, sizeof(run));
     int result = run(&launch, &report);
     ph_lifecycle_finish(&lifecycle);
-#if PH_SANDBOX_NET || PH_SANDBOX_AMDGPU || PH_SANDBOX_BLOCK || PH_SANDBOX_FS
+#if PH_SANDBOX_NET || PH_SANDBOX_AMDGPU || PH_SANDBOX_BLOCK || PH_SANDBOX_FS || PH_SANDBOX_AUDIO
     if (result) {
         /* The native owner has no serial console on a live machine. Report
          * the upstream module-launch errno before fatal process exit. */
@@ -396,11 +452,16 @@ static void run_service(void *context) {
     ph_number("package modules unloaded", report.unloaded);
     ph_number("package module result", report.result);
     ph_number("package module cleanup", report.cleanup_result);
+#if PH_SANDBOX_WIFI
+    /* Failed Linux cleanup retains its binding and executable. Native owner
+     * failure/reaping then retires PCI/DMA authority; never free it early. */
+    if (!report.cleanup_result) ph_wifi_host_finish();
+#endif
     PH_OK(result);
     PH_CHECK(report.loaded == modules.count && report.unloaded == modules.count && !report.result &&
              !report.cleanup_result && lifecycle.token);
 #if PH_SANDBOX_DEVICE
-#if PH_SANDBOX_USB_HID || PH_SANDBOX_NET || PH_SANDBOX_BLOCK || PH_SANDBOX_FS
+#if PH_SANDBOX_USB_HID || PH_SANDBOX_NET || PH_SANDBOX_BLOCK || PH_SANDBOX_AUDIO || PH_SANDBOX_FS
     PH_CHECK(report.pci_bound && report.pci_detached);
 #elif PH_SANDBOX_AMDGPU
     PH_CHECK(report.device.bound && report.device.primary_major &&
@@ -442,6 +503,8 @@ static void run_service(void *context) {
     ph_log("NATIVE_USB_DEVICE_LIFECYCLE=PASS granted-pci bound unload detach\n");
 #elif PH_SANDBOX_BLOCK
     ph_log("NATIVE_BLOCK_DEVICE_LIFECYCLE=PASS granted-pci bound unload detach\n");
+#elif PH_SANDBOX_AUDIO
+    ph_log("NATIVE_AUDIO_LIFECYCLE=PASS verified-closure pcm-close unload detach\n");
 #elif PH_SANDBOX_NET
     ph_log("NATIVE_NET_DEVICE_LIFECYCLE=PASS granted-pci bound unload detach\n");
 #else
@@ -455,6 +518,8 @@ static void run_service(void *context) {
     ph_log("NATIVE_USB_MODULE_LIFECYCLE=PASS verified-closure ready quiesce unload\n");
 #elif PH_SANDBOX_BLOCK
     ph_log("NATIVE_BLOCK_MODULE_LIFECYCLE=PASS verified-closure ready quiesce unload\n");
+#elif PH_SANDBOX_AUDIO
+    ph_log("NATIVE_AUDIO_LIFECYCLE=PASS verified-closure pcm-close unload detach\n");
 #elif PH_SANDBOX_NET
     ph_log("NATIVE_NET_MODULE_LIFECYCLE=PASS verified-closure ready quiesce unload\n");
 #else
@@ -472,17 +537,35 @@ static void service_main(const struct kobox_linux_task_report *report, void *con
 }
 #endif
 
+#if PH_SANDBOX_PS2
+static void prepare_ps2(const struct kobox_linux_boot_layout *layout, void *context) {
+    (void)layout; (void)context;
+    PH_OK(ph_ps2_prepare(&ph_core));
+}
+#endif
+
 void ph_main(void) {
     const struct ph_sandbox_config *config = (void *)PH_SANDBOX_CONFIG_ADDRESS;
     /* Reject a different launch extent before reading storage or device policy. */
     PH_CHECK(config->size == sizeof(*config));
+#if PH_SANDBOX_WIFI
+    PH_CHECK(config->ram_bytes >= (384ul << 20) && config->ram_bytes <= (2ul << 30));
+    ph_core.ram_size = config->ram_bytes;
+#endif
+#if PH_SANDBOX_VIRTIO_GPU
+    /* World geometry needs multiple concurrent 128 MiB GEM buffers. This
+     * budget belongs to the GPU core, independently of guest RAM/JVM heap. */
+    ph_core.ram_size = 1ul << 30;
+    ph_log("virtio-gpu core RAM budget=1024 MiB\n");
+#endif
 #if PH_SANDBOX_FS
     PH_CHECK(config->fs_channel_id && config->fs_owner_channel_id &&
         config->fs_channel_id != config->fs_owner_channel_id &&
-        !config->storage_reserved && config->ram_bytes && config->ram_bytes <= SIZE_MAX);
+        config->fs_root_kind <= PH_FS_ROOT_TMPFS && config->ram_bytes && config->ram_bytes <= SIZE_MAX);
     ph_core.ram_size = (size_t)config->ram_bytes;
     fs_mount_config = (struct kobox_linux_fs_mount_config){
-        .size = sizeof(fs_mount_config), .generation = config->identity.generation};
+        .size = sizeof(fs_mount_config), .generation = config->identity.generation,
+        .root_kind = config->fs_root_kind};
     memcpy(fs_mount_config.root_uuid, config->root_uuid, sizeof(config->root_uuid));
 #endif
 #if PH_SANDBOX_BLOCK
@@ -497,13 +580,13 @@ void ph_main(void) {
     block_write_policy = *policy;
 #endif
     PH_CHECK(((PH_SANDBOX_USB_HID || PH_SANDBOX_NET || PH_SANDBOX_AMDGPU ||
-               PH_SANDBOX_BLOCK || PH_SANDBOX_FS) ?
+               PH_SANDBOX_BLOCK || PH_SANDBOX_FS || PH_SANDBOX_AUDIO || PH_SANDBOX_PS2) ?
               config->artifact_count >= 2 &&
               config->artifact_count <= PH_BOOTSTRAP_MAX_ARTIFACTS :
               config->artifact_count == (PH_SANDBOX_DEVICE ? 13u : 2u)) &&
              config->resource_count == (PH_SANDBOX_FS ? config->storage_device_count :
-                PH_SANDBOX_DEVICE ? 1u : 0u));
-#if PH_SANDBOX_AMDGPU
+                (PH_SANDBOX_DEVICE || PH_SANDBOX_PS2) ? 1u : 0u));
+#if PH_SANDBOX_AMDGPU || PH_SANDBOX_WIFI
     PH_CHECK(config->log_endpoint_fd == 0 ||
              config->log_endpoint_fd == PH_SANDBOX_LOG_FD);
     ph_boot_set_log_fd((pacha_fd_t)config->log_endpoint_fd);
@@ -522,7 +605,7 @@ void ph_main(void) {
              !memcmp(config->firmware_sha256, absent_sha256, 32));
 #endif
     PH_OK(ph_ipc_init(&bootstrap_ipc, PH_SANDBOX_CHANNEL_FD, config->identity.generation));
-#if PH_SANDBOX_NET || PH_SANDBOX_AMDGPU || PH_SANDBOX_BLOCK || PH_SANDBOX_FS
+#if PH_SANDBOX_NET || PH_SANDBOX_AMDGPU || PH_SANDBOX_BLOCK || PH_SANDBOX_FS || PH_SANDBOX_AUDIO
     ph_set_failure_reporter(report_device_fatal);
     ph_set_exception_reporter(report_device_exception);
 #endif
@@ -536,6 +619,10 @@ void ph_main(void) {
     }
     PH_OK(ph_package_open(
         &package, &bundle, &config->identity, kobox_x86_64_elf_matches, cleanup_fatal, NULL));
+#if PH_SANDBOX_PS2
+    PH_OK(ph_ps2_grant_take(&bundle, &package, &config->platform));
+    ph_log("NATIVE_PS2_CONTROLLER_GRANT=PASS platform-PIO IRQ1 no-DMA\n");
+#endif
 #if PH_SANDBOX_DEVICE
 #if PH_SANDBOX_GPU
     client_id = config->client_id;
@@ -545,15 +632,17 @@ void ph_main(void) {
     PH_CHECK(!config->client_id && !config->gpu_channel_id);
 #endif
 #if PH_SANDBOX_FS
-    PH_CHECK(config->storage_devices_address == PH_SANDBOX_STORAGE_DEVICES_ADDRESS &&
-        config->storage_device_count && config->storage_device_count <= UINT16_MAX + UINT64_C(1) &&
+    PH_CHECK((config->fs_root_kind == PH_FS_ROOT_TMPFS ?
+        (!config->storage_devices_address && !config->storage_device_count) :
+        (config->storage_devices_address == PH_SANDBOX_STORAGE_DEVICES_ADDRESS && config->storage_device_count)) &&
+        config->storage_device_count <= UINT16_MAX + UINT64_C(1) &&
         config->storage_device_count <= SIZE_MAX / sizeof(*storage_devices));
     storage_device_count = (size_t)config->storage_device_count;
     const struct ph_device_authority *authorities =
         (const void *)(uintptr_t)config->storage_devices_address;
-    storage_grants = ph_alloc(storage_device_count * sizeof(*storage_grants));
-    storage_devices = ph_alloc(storage_device_count * sizeof(*storage_devices));
-    storage_ports = ph_alloc(storage_device_count * sizeof(*storage_ports));
+    storage_grants = storage_device_count ? ph_alloc(storage_device_count * sizeof(*storage_grants)) : NULL;
+    storage_devices = storage_device_count ? ph_alloc(storage_device_count * sizeof(*storage_devices)) : NULL;
+    storage_ports = storage_device_count ? ph_alloc(storage_device_count * sizeof(*storage_ports)) : NULL;
     /* Validate the complete set before any Linux or bus-master import. The
      * grant codec verifies logical uniqueness; native identities must also
      * be distinct so two ports cannot own one physical function. */
@@ -565,8 +654,9 @@ void ph_main(void) {
 #else
     PH_OK(ph_device_grant_take(&device_grant, &bundle, &package, &config->device));
 #endif
-#if PH_SANDBOX_USB_HID || PH_SANDBOX_NET || PH_SANDBOX_BLOCK || PH_SANDBOX_FS
-    ph_log("NATIVE_PCI_DEVICE_GRANT=PASS native-identity attenuated-rights\n");
+#if PH_SANDBOX_USB_HID || PH_SANDBOX_NET || PH_SANDBOX_BLOCK || PH_SANDBOX_AUDIO || PH_SANDBOX_FS
+    ph_log(config->resource_count ? "NATIVE_PCI_DEVICE_GRANT=PASS native-identity attenuated-rights\n" :
+        "NATIVE_RAM_FS_AUTHORITY=PASS no PCI capability\n");
 #else
     ph_log(
         "NATIVE_GPUD_DEVICE_GRANT=PASS native-identity attenuated-rights private-child-import\n");
@@ -588,6 +678,8 @@ void ph_main(void) {
     ph_boot_run(package.common.artifacts[0].data, package.common.artifacts[0].size,
 #if PH_SANDBOX_DEVICE
         prepare_device,
+#elif PH_SANDBOX_PS2
+        prepare_ps2,
 #else
         NULL,
 #endif

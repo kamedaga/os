@@ -1,0 +1,4 @@
+#!/bin/sh
+ALSOFT_CONF=${ALSOFT_CONF:-/opt/lwjgl/alsoft.conf}
+export ALSOFT_CONF
+exec /usr/local/bin/java -cp '/opt/lwjgl/examples:/opt/lwjgl/lib/*' LwjglSoundDemo "$@"

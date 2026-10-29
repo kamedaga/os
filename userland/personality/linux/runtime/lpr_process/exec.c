@@ -5,7 +5,7 @@
 #include "../lpr_common/boot_diagnostic.h"
 #endif
 
-enum { LPR_EXEC_BACKEND_SNAPSHOT_BYTES = 256u };
+enum { LPR_EXEC_BACKEND_SNAPSHOT_BYTES = 256u, LPR_EXEC_BACKEND_NATIVE_FDS = 3u };
 
 int64_t lpr_linux_wait_process_fd(uint64_t process_fd, uint64_t *out_exit_code, unsigned *wait_not_ready __attribute__((unused)))
 {
@@ -177,6 +177,7 @@ int lpr_exec_local_fd_active(uint64_t fd)
         lpr_linux_tty_fd_active(fd) ||
         lpr_linux_drm_fd_active(fd) ||
         lpr_linux_input_fd_active(fd) ||
+        lpr_audio_backend(fd) != 0 ||
         lpr_linux_dmabuf_fd_active(fd) ||
         lpr_linux_sync_file_fd_active(fd) ||
         lpr_pipe_fd_is_active(fd) ||
@@ -254,6 +255,7 @@ static uint64_t lpr_exec_backend_record_bytes(uint8_t ops_id)
     case LPR_FD_OPS_TTY: return sizeof(lpr_tty_backend_t);
     case LPR_FD_OPS_DRM: return sizeof(lpr_drm_backend_t);
     case LPR_FD_OPS_INPUT: return sizeof(lpr_input_backend_t);
+    case LPR_FD_OPS_AUDIO: return sizeof(lpr_audio_backend_t);
     case LPR_FD_OPS_PIPE: return sizeof(lpr_pipe_backend_t);
     case LPR_FD_OPS_EVENT: return sizeof(lpr_event_backend_t);
     case LPR_FD_OPS_SOCKET: return sizeof(lpr_socket_backend_t);
@@ -273,16 +275,15 @@ static int lpr_transaction_track_lease(
 static uint32_t lpr_exec_backend_native_fds(
     uint8_t ops_id,
     const void *state,
-    pacha_fd_t out_fds[2])
+    pacha_fd_t out_fds[LPR_EXEC_BACKEND_NATIVE_FDS])
 {
     if (out_fds == 0) return 0;
-    out_fds[0] = -1;
-    out_fds[1] = -1;
+    for (unsigned i = 0; i < LPR_EXEC_BACKEND_NATIVE_FDS; ++i) out_fds[i] = -1;
     if (state == 0) return 0;
     uint32_t count = 0;
 #define LPR_EXEC_ADD_NATIVE(value) do { \
     const pacha_fd_t native_fd__ = (value); \
-    if (native_fd__ >= 16 && count < 2) out_fds[count++] = native_fd__; \
+    if (native_fd__ >= 16 && count < LPR_EXEC_BACKEND_NATIVE_FDS) out_fds[count++] = native_fd__; \
 } while (0)
     switch (ops_id) {
     case LPR_FD_OPS_FILED:
@@ -306,12 +307,17 @@ static uint32_t lpr_exec_backend_native_fds(
         LPR_EXEC_ADD_NATIVE(((const lpr_input_backend_t *)state)->wait_fd.raw);
         LPR_EXEC_ADD_NATIVE(((const lpr_input_backend_t *)state)->lease_fd.raw);
         break;
+    case LPR_FD_OPS_AUDIO:
+        LPR_EXEC_ADD_NATIVE(((const lpr_audio_backend_t *)state)->native.raw);
+        break;
     case LPR_FD_OPS_PIPE:
         LPR_EXEC_ADD_NATIVE(((const lpr_pipe_backend_t *)state)->native.raw);
         break;
     case LPR_FD_OPS_EVENT:
         LPR_EXEC_ADD_NATIVE(((const lpr_event_backend_t *)state)->wait_fd.raw);
         LPR_EXEC_ADD_NATIVE(((const lpr_event_backend_t *)state)->notify_fd.raw);
+        if (((const lpr_event_backend_t *)state)->subtype == LPR_EVENT_BACKEND_EVENTFD)
+            LPR_EXEC_ADD_NATIVE(((const lpr_event_backend_t *)state)->counter_fd.raw);
         break;
     case LPR_FD_OPS_EPOLL:
         LPR_EXEC_ADD_NATIVE(((const lpr_epoll_backend_t *)state)->wait_fd.raw);
@@ -339,7 +345,8 @@ static uint32_t lpr_exec_backend_native_fds(
 static void lpr_fork_close_displaced_capabilities(
     uint8_t ops_id, const void *original, const void *prepared)
 {
-    pacha_fd_t old_fds[2], new_fds[2];
+    pacha_fd_t old_fds[LPR_EXEC_BACKEND_NATIVE_FDS];
+    pacha_fd_t new_fds[LPR_EXEC_BACKEND_NATIVE_FDS];
     const uint32_t old_count = lpr_exec_backend_native_fds(ops_id, original, old_fds);
     const uint32_t new_count = lpr_exec_backend_native_fds(ops_id, prepared, new_fds);
     for (uint32_t i = 0; i < old_count; ++i) {
@@ -409,7 +416,7 @@ static uint32_t lpr_exec_manifest_capability_count(uint8_t ops_id, const void *s
     if (ops_id == LPR_FD_OPS_UNIX) return 1;
     if (ops_id == LPR_FD_OPS_FILED)
         return ((const lpr_filed_backend_t *)state)->handle != 0;
-    pacha_fd_t native_fds[2];
+    pacha_fd_t native_fds[LPR_EXEC_BACKEND_NATIVE_FDS];
     uint32_t count = lpr_exec_backend_native_fds(ops_id, state, native_fds);
     if (lpr_backend_needs_transfer_lease(ops_id, state)) {
         /* PRIME exports already have an original-owner lease. Preparing the
@@ -556,6 +563,7 @@ static const char *lpr_manifest_backend_stage(uint8_t ops_id)
     case LPR_FD_OPS_INPUT: return "backend-input";
     case LPR_FD_OPS_SOCKET: return "backend-socket";
     case LPR_FD_OPS_DMABUF: return "backend-dmabuf";
+    case LPR_FD_OPS_AUDIO: return "backend-audio";
     case LPR_FD_OPS_PIPE: return "backend-pipe";
     case LPR_FD_OPS_EVENT: return "backend-event";
     case LPR_FD_OPS_EPOLL: return "backend-epoll";
@@ -618,6 +626,7 @@ static int lpr_prepare_backend_record(
                     0,
                     remote_lease_fd,
                     &handle);
+                if (!status) remote_lease_fd = -1;
 #if defined(LPR_EXEC_DIAG) && LPR_EXEC_DIAG
                 lpr_manifest_filed_diag(
                     status == 0 ? "transfer-ready" : "transfer-failed",
@@ -806,6 +815,12 @@ static int lpr_prepare_backend_record(
                 original->lease_fd.raw, prepared->lease_fd.raw);
         break;
     }
+    case LPR_FD_OPS_AUDIO: {
+        const lpr_audio_backend_t *original = original_state;
+        lpr_audio_backend_t *prepared = prepared_state;
+        LPR_DUP_MANIFEST_FIELD(original->native.raw, prepared->native.raw);
+        break;
+    }
     case LPR_FD_OPS_PIPE: {
         const lpr_pipe_backend_t *original = original_state;
         lpr_pipe_backend_t *prepared = prepared_state;
@@ -817,6 +832,10 @@ static int lpr_prepare_backend_record(
         lpr_event_backend_t *prepared = prepared_state;
         LPR_DUP_MANIFEST_FIELD(original->wait_fd.raw, prepared->wait_fd.raw);
         LPR_DUP_MANIFEST_FIELD(original->notify_fd.raw, prepared->notify_fd.raw);
+        if (original->subtype == LPR_EVENT_BACKEND_EVENTFD) {
+            prepared->counter_map = 0;
+            LPR_DUP_MANIFEST_FIELD(original->counter_fd.raw, prepared->counter_fd.raw);
+        }
         break;
     }
     case LPR_FD_OPS_EPOLL: {
@@ -871,6 +890,7 @@ static int lpr_prepare_manifest_impl(
             0,
             remote_lease_fd,
             &transaction->cwd_handle);
+        if (!dup_status) remote_lease_fd = -1;
         if (dup_status != 0 || transaction->cwd_handle == 0) {
             (void)lpr_close_native_fd_if_open(
                 (uint64_t)transaction->cwd_lease_fd);
@@ -887,7 +907,7 @@ static int lpr_prepare_manifest_impl(
     lpr_manifest_layout_t maximum;
     if (capacity == 0 || capacity > UINT64_MAX / 256u ||
         lpr_manifest_layout(
-            capacity, capacity, capacity * 2u + 1u,
+            capacity, capacity, capacity * 3u + 1u,
             capacity * 256u, &maximum) != 0)
     {
         return -LPR_LINUX_E2BIG;
@@ -895,7 +915,7 @@ static int lpr_prepare_manifest_impl(
     const uint64_t scratch_offset = lpr_align_up_4096(maximum.byte_size);
     const uint64_t scratch_bytes_per_fd =
         sizeof(lpr_manifest_entry_t) + sizeof(lpr_fd_pin_t) +
-        2u * sizeof(lpr_prepared_lease_t) +
+        3u * sizeof(lpr_prepared_lease_t) +
         LPR_EXEC_BACKEND_SNAPSHOT_BYTES;
     if (scratch_offset == 0 || scratch_bytes_per_fd == 0 ||
         capacity > (UINT64_MAX - scratch_offset) /
@@ -933,7 +953,7 @@ static int lpr_prepare_manifest_impl(
     transaction->pins = (lpr_fd_pin_t *)(snapshot_entries + capacity);
     transaction->prepared_leases =
         (lpr_prepared_lease_t *)(transaction->pins + capacity);
-    transaction->prepared_lease_capacity = capacity * 2u;
+    transaction->prepared_lease_capacity = capacity * 3u;
     uint8_t *backend_snapshots = (uint8_t *)(
         transaction->prepared_leases + transaction->prepared_lease_capacity);
 
@@ -1108,7 +1128,7 @@ static int lpr_prepare_manifest_impl(
             lpr_destroy_exec_transaction(transaction);
             return prepare_status;
         }
-        pacha_fd_t native_fds[2];
+        pacha_fd_t native_fds[LPR_EXEC_BACKEND_NATIVE_FDS];
         const uint32_t native_fd_count =
             lpr_exec_backend_native_fds(pin->ops_id, record, native_fds);
         ofds[i].generation = pin->ofd_generation;

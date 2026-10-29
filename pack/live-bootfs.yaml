@@ -49,6 +49,15 @@ files:
   /srv/usbd.elf: usbd
   /srv/netd.elf: netd
   /srv/logd.elf: logd
+  /srv/kobox2/ps2/sandbox.elf: kobox2_ps2_sandbox
+  /srv/kobox2/ps2/core.so: kobox2_ps2_core
+  /srv/kobox2/ps2/manifest.bin: kobox2_ps2_manifest
+  /srv/kobox2/ps2/modules/evdev.ko: kobox2_ps2_evdev
+  /srv/kobox2/ps2/modules/libps2.ko: kobox2_ps2_libps2
+  /srv/kobox2/ps2/modules/serio.ko: kobox2_ps2_serio
+  /srv/kobox2/ps2/modules/i8042.ko: kobox2_ps2_i8042
+  /srv/kobox2/ps2/modules/vivaldi_fmap.ko: kobox2_ps2_vivaldi_fmap
+  /srv/kobox2/ps2/modules/atkbd.ko: kobox2_ps2_atkbd
   /srv/kobox2/usb-storage/sandbox.elf: kobox2_usb_storage_sandbox
   /srv/kobox2/usb-storage/core.so: kobox2_usb_storage_core
   /srv/kobox2/usb-storage/manifest.bin: kobox2_usb_storage_manifest
@@ -84,6 +93,23 @@ files:
   /srv/kobox2/network/modules/failover.ko: kobox2_network_failover
   /srv/kobox2/network/modules/net_failover.ko: kobox2_network_net_failover
   /srv/kobox2/network/modules/virtio_net.ko: kobox2_network_virtio_net
+  /usr/bin/wifi: wifi
+  /srv/kobox2/wifi/sandbox.elf: kobox2_wifi_sandbox
+  /srv/kobox2/wifi/core.so: kobox2_wifi_core
+  /srv/kobox2/wifi/manifest.bin: kobox2_wifi_manifest
+  /srv/kobox2/wifi/firmware.bundle: kobox2_wifi_firmware
+  /srv/kobox2/wifi/firmware.sha256: kobox2_wifi_firmware_hash
+  /srv/kobox2/wifi/modules/firmware_class.ko: kobox2_wifi_firmware_class
+  /srv/kobox2/wifi/modules/crc32.ko: kobox2_wifi_crc32
+  /srv/kobox2/wifi/modules/libarc4.ko: kobox2_wifi_libarc4
+  /srv/kobox2/wifi/modules/rfkill.ko: kobox2_wifi_rfkill
+  /srv/kobox2/wifi/modules/cfg80211.ko: kobox2_wifi_cfg80211
+  /srv/kobox2/wifi/modules/iwlwifi.ko: kobox2_wifi_iwlwifi
+  /srv/kobox2/wifi/modules/mac80211.ko: kobox2_wifi_mac80211
+  /srv/kobox2/wifi/modules/iwlmvm.ko: kobox2_wifi_iwlmvm
+  /usr/share/licenses/pachaos-wifi/iwlwifi.txt: kobox2_wifi_firmware_license
+  /usr/share/licenses/pachaos-wifi/wpa_supplicant.txt: wifi_supplicant_license
+  /usr/share/licenses/pachaos-wifi/openssl.txt: wifi_openssl_license
   # termd currently opens all eight modules, even with its null device backend.
   /usr/lib/kobox/linux_tty_core.ko: kobox_linux_tty_core
   /usr/lib/kobox/linux_tty_n_null.ko: kobox_linux_tty_n_null
@@ -93,3 +119,13 @@ files:
   /usr/lib/kobox/linux_virtio_pci_legacy_dev.ko: kobox_linux_virtio_pci_legacy_dev
   /usr/lib/kobox/linux_virtio_pci.ko: kobox_linux_virtio_pci
   /usr/lib/kobox/linux_virtio_console.ko: kobox_linux_virtio_console
+  # One current filesystem core, sealed without any PCI resource grant.
+  /srv/kobox2/ramfs/sandbox.elf: ramfs_sandbox
+  /srv/kobox2/ramfs/core.so: ramfs_core
+  /srv/kobox2/ramfs/manifest.bin: ramfs_manifest
+  /srv/kobox2/ramfs/modules/crc16.ko: ramfs_crc16
+  /srv/kobox2/ramfs/modules/ext4.ko: ramfs_ext4
+  /srv/kobox2/ramfs/modules/jbd2.ko: ramfs_jbd2
+  /srv/kobox2/ramfs/modules/mbcache.ko: ramfs_mbcache
+  /srv/kobox2/ramfs/modules/nvme.ko: ramfs_nvme
+  /srv/kobox2/ramfs/modules/nvme_core.ko: ramfs_nvme_core

@@ -1,13 +1,11 @@
 cmake_minimum_required(VERSION 3.16)
-
-set(CMAKE_SYSTEM_NAME Generic)
-set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
-
+if(NOT DEFINED CMAKE_TOOLCHAIN_FILE)
+  set(CMAKE_TOOLCHAIN_FILE "${CMAKE_CURRENT_SOURCE_DIR}/../cmake/pachaos-native.toolchain.cmake")
+endif()
 project(pachaos_capsule C ASM)
 
 set(REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../..")
-include("${REPO_ROOT}/userland/cmake/pachaos_native_dependencies.cmake")
-set(PACHAOS_CAPSULE_ELF "${CMAKE_BINARY_DIR}/pachaos_capsule.elf")
+include("${REPO_ROOT}/userland/cmake/pachaos_native.cmake")
 
 set(KOBOX_RUNTIME_SOURCES
   ${REPO_ROOT}/userland/libipc/src/ipc.c
@@ -75,25 +73,23 @@ set(KOBOX_RUNTIME_SOURCES
   ${CMAKE_CURRENT_SOURCE_DIR}/src/fops_smoke_stub.c
 )
 
-string(REPLACE ";" " " KOBOX_RUNTIME_SOURCES_ENV "${KOBOX_RUNTIME_SOURCES}")
-
-add_custom_command(
-  OUTPUT "${PACHAOS_CAPSULE_ELF}"
-  COMMAND
-    ${CMAKE_COMMAND} -E env
-      "PACHAOS_MUSL_APP_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/src/main.c"
-      "PACHAOS_MUSL_EXTRA_SOURCES=${KOBOX_RUNTIME_SOURCES_ENV}"
-      "PACHAOS_MUSL_EXTRA_INCLUDE_DIRS=${CMAKE_CURRENT_SOURCE_DIR}/include ${REPO_ROOT}/userland/libipc/include ${REPO_ROOT}/userland/libcapsule/include ${REPO_ROOT}/userland/libpacha/include ${REPO_ROOT}/_kobox/include ${REPO_ROOT}/_kobox/src"
-      "PACHAOS_MUSL_EXTRA_CFLAGS=-D__pachaos__ -Wno-unused-parameter -Wno-unused-variable -Wno-unused-function -Wno-sign-compare -Wno-pointer-sign -Wno-missing-field-initializers -Wno-deprecated-non-prototype"
-      bash "${REPO_ROOT}/musl/pachaos/build/build-smokes.sh" "${PACHAOS_CAPSULE_ELF}"
-  DEPENDS ${PACHAOS_NATIVE_DEPENDENCIES}
+pachaos_native_executable(pachaos_capsule
+  SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/src/main.c"
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/fops_smoke_stub.c"
-    "${CMAKE_CURRENT_SOURCE_DIR}/include/pachaos_capsule/boot_config.h"
-    "${REPO_ROOT}/musl/pachaos/build/build-smokes.sh"
     ${KOBOX_RUNTIME_SOURCES}
-  WORKING_DIRECTORY "${REPO_ROOT}"
-  VERBATIM
-)
-
-add_custom_target(pachaos_capsule ALL DEPENDS "${PACHAOS_CAPSULE_ELF}")
+  INCLUDE_DIRECTORIES
+    "${CMAKE_CURRENT_SOURCE_DIR}/include"
+    "${REPO_ROOT}/userland/libipc/include"
+    "${REPO_ROOT}/userland/libcapsule/include"
+    "${REPO_ROOT}/userland/libpacha/include"
+    "${REPO_ROOT}/_kobox/include"
+    "${REPO_ROOT}/_kobox/src"
+  COMPILE_OPTIONS
+    -D__pachaos__
+    -Wno-unused-parameter
+    -Wno-unused-variable
+    -Wno-unused-function
+    -Wno-sign-compare
+    -Wno-pointer-sign
+    -Wno-missing-field-initializers
+    -Wno-deprecated-non-prototype)

@@ -202,6 +202,7 @@ if_pachaos_attach(struct uinet_if *uif)
 	ifp->if_flags = IFF_BROADCAST | IFF_SIMPLEX | IFF_MULTICAST;
 	ifp->if_ioctl = if_pachaos_ioctl;
 	ifp->if_transmit = if_pachaos_transmit;
+	ifp->if_qflush = if_qflush;
 
 	IFQ_SET_MAXLEN(&ifp->if_snd, 1024);
 	ifp->if_snd.ifq_drv_maxlen = 1024;

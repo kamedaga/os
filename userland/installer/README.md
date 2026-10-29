@@ -92,3 +92,80 @@ desktop and GPU-smoke extraction order cannot select different builds.
 Alpine's original APK checksums remain intact: `apk audit` can report these
 documented local Mesa replacements rather than pretending they are pristine
 Alpine package files. No complete developer rootfs is copied.
+
+## Physical desktop payload
+
+`pack/scripts/build_minecraft_installer_rootfs.py` composes an explicit payload
+from the official Alpine base, selected locked Xfce/Epiphany packages, the
+verified WebKit overlay, Semeru Java 25, glibc/radeonsi, Prism Launcher and the
+prepared Minecraft 26.1.2/Fabric artifacts. It does not copy the developer
+rootfs, Minecraft accounts, worlds, SSH host keys or host caches. Pass one
+Ed25519 public key with `--ssh-authorized-key-file`.
+
+The `installed-base physical-desktop` profile reuses asynchronous USB/network
+readiness, public-key SSH and the manual GPU/GOP handoff from the live session.
+It initially provides a console. `pacha-desktop` explicitly requests the GPU
+probe and starts upstream Xorg/Xfce after readiness; it never probes at boot.
+The ordinary virtio desktop profile is unchanged. Real GPU rendering and sound
+on an installed physical system still need hardware verification.
+
+The formatter reads the root UUID from the structurally validated `SYSTEM.BOOTFS` using
+`pacha-install-progress --root-uuid` and supplies it to `mke2fs -U`. A randomly
+formatted UUID cannot satisfy storage_boot's exact filesystem selection.
+The formatter transaction test verifies the resulting on-disk UUID as well as
+ESP/root content. Malformed identities fail during preflight.
+
+The live root uses the same current FileD/Kobox filesystem service with an
+explicit tmpfs root configuration. Its separate closure manifest grants no PCI
+resources; the ext4 configuration still requires a device capability and a
+nonzero root UUID. Validated BOOTFS files are imported through the filesystem
+service before live readiness is published. Native and Linux musl interpreters
+retain executable metadata in BOOTFS.
+
+This payload needs at least 8 GiB RAM for installation: the filesystem service
+receives up to 4 GiB and tmpfs limits usage to 75% of that budget. The archive
+streams from USB for verification/extraction; it is never retained in RAM
+alongside its extracted tree. The hosted page metadata reservation covers the
+4 GiB RAM budget and rejects insufficient metadata space before boot.
+
+A disposable NVMe file was installed by the native PachaOS live installer,
+including ext4 consistency checking and ESP readback. The next USB boot verified
+UEFI registration and started the installed NVMe root. Public-key SSH, Java 25,
+login-shell application paths and Java's 24-processor recognition passed with
+24 KVM vCPUs. The final payload explicitly records `.ssh` and Dropbear directory
+permissions as 0700 and authorized_keys as 0600. Desktop startup leaves driver
+paths to each runtime so Java's glibc Mesa cannot inherit musl driver paths.
+These two payload corrections were checked on the installed test system and in
+the final archive; the full installation transaction was not repeated.
+Physical GPU rendering and physical audio still require separate hardware work.
+
+Build the curated media without writing any physical disk:
+
+```sh
+PACGO_NIX_DEVELOP=1 bash pack/scripts/build_minecraft_installer.sh \
+  /path/to/ssh-ed25519-public-key
+```
+
+After installation, reboot once with the USB inserted to register the fixed-disk
+UEFI entry, then remove the USB. The installed console's `pacha-desktop` command
+requests the manual GPU handoff and starts Xfce; `prismlauncher` opens the prepared
+Minecraft/Fabric instance. SSH uses the supplied public key; media contain no
+private keys, saved account authentication or worlds.
+
+## Installer diagnosis and staging
+
+The media writer hashes and reads back the complete image. Normal installation
+therefore prepares the boot payload once before ARM and reuses that RAM staging
+after the NVMe owner restart. It does not stream the root archive for repeated
+hashing. `PACHA_INSTALL_VERIFY=1` explicitly enables source SHA verification in
+the runner's preparation mode. A failed preparation removes its receipt;
+deployment without a completed preparation fails before any formatter runs.
+Lightweight metadata/root-UUID checks and post-format consistency/readback
+checks remain.
+
+Live SSH is polled before/during the installer and while its runner children
+execute. SSH receives no installer disk ports. `/run/pacha/installer.log` records
+each runner phase, so a stopped operation can be inspected from an established
+SSH session. These changes improve diagnosis; they do not establish the cause
+of a physical-machine hang. Processing cancellation is not implemented yet;
+the UI disables terminal signal characters while active.

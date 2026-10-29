@@ -3,13 +3,14 @@ package buildsys
 import (
 	"bytes"
 	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
+	"sort"
 	"strings"
 	"time"
 
@@ -25,7 +26,6 @@ type UserlandOptions struct {
 }
 
 type KernelOptions struct {
-	Force        bool
 	StepOverride string
 	Progress     progress.Reporter
 }
@@ -43,22 +43,32 @@ type UserlandResult struct {
 type KernelResult struct {
 	Step    string
 	Output  string
-	Skipped bool
+	Changed bool
 }
 
-type sourceState struct {
-	Exists  bool
-	IsDir   bool
-	Size    int64
-	ModTime int64
+type fileAppResult struct {
+	Rebuilt         bool
+	ArtifactChanged bool
+	Directory       bool
+	DirectoryDigest []byte
 }
 
-type rebuildCheck struct {
-	Needed      bool
-	Fingerprint []byte
+type fileAppPlan struct {
+	App        config.App
+	Artifact   string
+	Source     config.FileSource
+	SourcePath string
+	RecipeID   string
+}
+
+type recipeRun struct {
+	Before  map[string]recipeOutputState
+	Changed bool
 }
 
 func BuildKernel(workspace *config.Workspace, opts KernelOptions) (KernelResult, error) {
+	hasher := hasherFor(workspace)
+	defer flushHasher(hasher)
 	span := progress.Use(opts.Progress).Start("kernel", 3)
 	defer span.Close()
 	step := workspace.Kernel.Step
@@ -68,28 +78,16 @@ func BuildKernel(workspace *config.Workspace, opts KernelOptions) (KernelResult,
 	if step == "" {
 		step = "limine"
 	}
-	span.Set(1, "checking kernel inputs")
+	span.Set(1, "hashing kernel output")
 	kernelDir := workspace.Path(workspace.Kernel.Dir)
-	output := kernelOutputForStep(kernelDir, step)
-	if !opts.Force {
-		upToDate, err := outputUpToDate(output, []string{
-			filepath.Join(kernelDir, "build.zig"),
-			filepath.Join(kernelDir, "src"),
-			filepath.Join(kernelDir, "abi"),
-			workspace.Path("bootloader", "limine"),
-		})
-		if err != nil {
-			span.Fail("kernel check failed")
-			return KernelResult{}, err
-		}
-		if upToDate {
-			span.Done("kernel up-to-date")
-			return KernelResult{Step: step, Output: output, Skipped: true}, nil
-		}
+	output := KernelOutputPath(workspace, step)
+	before, err := hashIfExists(hasher, output)
+	if err != nil {
+		span.Fail("kernel output check failed")
+		return KernelResult{}, err
 	}
 	span.Set(2, "preparing zig cache")
-	localCache := zigCachePath(workspace, "kernel-local")
-	globalCache := zigCachePath(workspace, "kernel-global")
+	localCache, globalCache := kernelCacheDirs(workspace)
 	if err := os.MkdirAll(localCache, 0o755); err != nil {
 		span.Fail("kernel cache failed")
 		return KernelResult{}, err
@@ -105,11 +103,33 @@ func BuildKernel(workspace *config.Workspace, opts KernelOptions) (KernelResult,
 		span.Fail("kernel build failed")
 		return KernelResult{}, err
 	}
-	span.Done("kernel built")
-	return KernelResult{Step: step, Output: output}, nil
+	hasher.Invalidate(output)
+	after, err := hasher.Hash(output)
+	if err != nil {
+		span.Fail("kernel output hash failed")
+		return KernelResult{}, err
+	}
+	if err := writeKernelInputRecord(workspace, step, output, hasher); err != nil {
+		span.Fail("kernel input record failed")
+		return KernelResult{}, err
+	}
+	changed := !bytes.Equal(before, after)
+	if changed {
+		span.Done("kernel rebuilt")
+	} else {
+		span.Done("kernel unchanged")
+	}
+	return KernelResult{Step: step, Output: output, Changed: changed}, nil
 }
 
-func kernelOutputForStep(kernelDir string, step string) string {
+func KernelOutputPath(workspace *config.Workspace, step string) string {
+	if step == "" {
+		step = workspace.Kernel.Step
+	}
+	if step == "" {
+		step = "limine"
+	}
+	kernelDir := workspace.Path(workspace.Kernel.Dir)
 	if step == "limine" {
 		return filepath.Join(kernelDir, "zig-out", "bin", "limine", "pacha-kernel.elf")
 	}
@@ -121,50 +141,112 @@ func kernelOutputForStep(kernelDir string, step string) string {
 
 func BuildUserland(workspace *config.Workspace, opts UserlandOptions) (UserlandResult, error) {
 	var result UserlandResult
-	rebuilds := map[string]bool{}
+	if err := CleanupLegacyState(workspace); err != nil {
+		return result, err
+	}
+	hasher := hasherFor(workspace)
+	defer flushHasher(hasher)
 	apps, err := selectApps(workspace, opts.AppID, opts.AppIDs)
 	if err != nil {
 		return result, err
 	}
 	span := progress.Use(opts.Progress).Start("userland apps", int64(len(apps)))
 	defer span.Close()
+	var plans []fileAppPlan
+	recipePlans := make(map[string][]int)
+	var recipeRoots []string
 	for _, app := range apps {
-		span.Message(app.ID)
 		if workspace.Skipped(app) {
 			result.SkippedApps++
 			span.Add(1, app.ID+" skipped")
 			continue
 		}
-		artifact := workspace.ArtifactPath(app)
-		switch app.Kind() {
-		case "file":
-			span.Message(app.ID + " file")
-			rebuilt, copied, directoryArtifact, err := buildFileApp(workspace, app, artifact, opts.Force, rebuilds)
-			if err != nil {
-				span.Fail(app.ID + " failed")
-				return result, err
-			}
-			if rebuilt {
-				result.RebuiltSources++
-				result.RebuiltApps = append(result.RebuiltApps, app.ID)
-			}
-			if copied {
-				result.CopiedArtifacts++
-				result.ChangedArtifacts = append(result.ChangedArtifacts, artifact)
-				if directoryArtifact {
-					result.DirectoryArtifactsChanged++
-				}
-			} else {
-				result.ReusedArtifacts++
-			}
-		default:
+		if app.Kind() != "file" {
 			span.Fail(app.ID + " unsupported")
 			return result, fmt.Errorf("app %s has unsupported kind %s", app.ID, app.Kind())
 		}
-		span.Add(1, app.ID)
+		source, err := app.FileSource()
+		if err != nil {
+			span.Fail(app.ID + " failed")
+			return result, err
+		}
+		plan := fileAppPlan{
+			App:        app,
+			Artifact:   workspace.ArtifactPath(app),
+			Source:     source,
+			SourcePath: workspace.Path(source.Path),
+			RecipeID:   source.Recipe,
+		}
+		plans = append(plans, plan)
+		if source.Recipe != "" {
+			if _, exists := recipePlans[source.Recipe]; !exists {
+				recipeRoots = append(recipeRoots, source.Recipe)
+			}
+			recipePlans[source.Recipe] = append(recipePlans[source.Recipe], len(plans)-1)
+		}
+	}
+
+	runs, err := scheduleRecipes(workspace, recipeRoots, opts.Force, hasher, span)
+	if err != nil {
+		span.Fail("recipe build failed")
+		return result, err
+	}
+
+	for index := range plans {
+		plan := &plans[index]
+		span.Message(plan.App.ID + " file")
+		if plan.Source.Recipe == "" && !pathExists(plan.SourcePath) {
+			span.Fail(plan.App.ID + " source missing")
+			return result, fmt.Errorf("missing source for app %s: %s", plan.App.ID, plan.Source.Path)
+		}
+		appResult, err := publishFileApp(workspace, *plan, runs, hasher)
+		if err != nil {
+			span.Fail(plan.App.ID + " failed")
+			return result, err
+		}
+		if appResult.Rebuilt {
+			result.RebuiltSources++
+			result.RebuiltApps = append(result.RebuiltApps, plan.App.ID)
+		}
+		if appResult.ArtifactChanged {
+			result.CopiedArtifacts++
+			result.ChangedArtifacts = append(result.ChangedArtifacts, plan.Artifact)
+			if appResult.Directory {
+				result.DirectoryArtifactsChanged++
+			}
+		} else {
+			result.ReusedArtifacts++
+		}
+		if len(appResult.DirectoryDigest) != 0 {
+			if err := writeDirectoryArtifactDigest(workspace, plan.App.ID, appResult.DirectoryDigest); err != nil {
+				span.Fail(plan.App.ID + " state failed")
+				return result, err
+			}
+		}
+		span.Add(1, plan.App.ID)
 	}
 	span.Done("userland ready")
 	return result, nil
+}
+
+func CleanupLegacyState(workspace *config.Workspace) error {
+	directory := workspace.Path(workspace.State, "build")
+	entries, err := os.ReadDir(directory)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".sha256") || strings.HasSuffix(entry.Name(), ".tree.sha256") {
+			continue
+		}
+		if err := os.Remove(filepath.Join(directory, entry.Name())); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
+	return nil
 }
 
 func selectApps(workspace *config.Workspace, appID string, appIDs []string) ([]config.App, error) {
@@ -197,75 +279,54 @@ func selectApps(workspace *config.Workspace, appID string, appIDs []string) ([]c
 	return workspace.Apps(), nil
 }
 
-func buildFileApp(workspace *config.Workspace, app config.App, artifact string, force bool, rebuilds map[string]bool) (bool, bool, bool, error) {
-	source, err := app.FileSource()
+func publishFileApp(workspace *config.Workspace, plan fileAppPlan, runs map[string]recipeRun, hasher *Hasher) (fileAppResult, error) {
+	sourceInfo, err := os.Stat(plan.SourcePath)
 	if err != nil {
-		return false, false, false, err
+		return fileAppResult{}, err
 	}
-	sourcePath := workspace.Path(source.Path)
-	rebuilt := false
-	check, err := fileSourceNeedsRebuild(workspace, app, source, sourcePath, force)
-	if err != nil {
-		return false, false, false, err
-	}
-	if check.Needed {
-		if len(source.Rebuild) == 0 {
-			return false, false, false, fmt.Errorf("missing source for app %s: %s", app.ID, source.Path)
-		}
-		key := strings.Join(source.Rebuild, "\x00")
-		if !rebuilds[key] {
-			before := statSource(sourcePath)
-			cmd := exec.Command(source.Rebuild[0], source.Rebuild[1:]...)
-			cmd.Dir = workspace.Root
-			if err := run(cmd); err != nil {
-				return false, false, false, err
-			}
-			rebuilds[key] = true
-			rebuilt = !sameSourceState(before, statSource(sourcePath))
-		}
-		if !pathExists(sourcePath) {
-			return rebuilt, false, false, fmt.Errorf("rebuild for app %s did not create %s", app.ID, source.Path)
-		}
-	}
-	if len(check.Fingerprint) > 0 {
-		if err := writeFileSourceFingerprint(workspace, app.ID, check.Fingerprint); err != nil {
-			return rebuilt, false, false, err
-		}
-	}
-	sourceInfo, err := os.Stat(sourcePath)
-	if err != nil {
-		return rebuilt, false, false, err
-	}
+	recipe, recipeRan := runs[plan.RecipeID]
 	if sourceInfo.IsDir() {
-		copied, err := linkDirArtifact(workspace, sourcePath, artifact)
-		return rebuilt, copied || rebuilt, true, err
+		digest, err := treeDigest(plan.SourcePath)
+		if err != nil {
+			return fileAppResult{}, err
+		}
+		previous, exists, err := readDirectoryArtifactDigest(workspace, plan.App.ID)
+		if err != nil {
+			return fileAppResult{}, err
+		}
+		linked, err := linkDirArtifact(workspace, plan.SourcePath, plan.Artifact)
+		if err != nil {
+			return fileAppResult{}, err
+		}
+		changed := linked || !exists || !bytes.Equal(previous, digest)
+		current := recipeOutputState{Path: plan.Source.Path, Kind: "dir", Digest: hex.EncodeToString(digest)}
+		before, existed := recipe.Before[plan.SourcePath]
+		return fileAppResult{
+			Rebuilt:         recipeRan && (!existed || !sameOutputDigest(before, current)),
+			ArtifactChanged: changed,
+			Directory:       true,
+			DirectoryDigest: digest,
+		}, nil
 	}
-	copied, err := copyFileIfChanged(sourcePath, artifact)
-	return rebuilt, copied, false, err
-}
-
-func statSource(path string) sourceState {
-	info, err := os.Stat(path)
+	copied, err := copyFileIfChanged(plan.SourcePath, plan.Artifact, hasher)
 	if err != nil {
-		return sourceState{}
+		return fileAppResult{}, err
 	}
-	return sourceState{
-		Exists:  true,
-		IsDir:   info.IsDir(),
-		Size:    info.Size(),
-		ModTime: info.ModTime().UnixNano(),
+	rebuilt := false
+	if recipeRan {
+		digest, err := hasher.Hash(plan.SourcePath)
+		if err != nil {
+			return fileAppResult{}, err
+		}
+		current := recipeOutputState{Path: plan.Source.Path, Kind: "file", Digest: hex.EncodeToString(digest)}
+		before, existed := recipe.Before[plan.SourcePath]
+		rebuilt = !existed || !sameOutputDigest(before, current)
 	}
+	return fileAppResult{Rebuilt: rebuilt, ArtifactChanged: copied}, nil
 }
 
-func sameSourceState(lhs sourceState, rhs sourceState) bool {
-	return lhs.Exists == rhs.Exists &&
-		lhs.IsDir == rhs.IsDir &&
-		lhs.Size == rhs.Size &&
-		lhs.ModTime == rhs.ModTime
-}
-
-func copyFileIfChanged(source string, dest string) (bool, error) {
-	same, err := sameFileContents(source, dest)
+func copyFileIfChanged(source string, dest string, hasher *Hasher) (bool, error) {
+	same, err := sameFileContents(source, dest, hasher)
 	if err != nil {
 		return false, err
 	}
@@ -298,6 +359,7 @@ func copyFileIfChanged(source string, dest string) (bool, error) {
 		_ = os.Remove(tmp)
 		return false, err
 	}
+	hasher.Invalidate(dest)
 	if info, err := os.Stat(source); err == nil {
 		_ = os.Chtimes(dest, info.ModTime(), info.ModTime())
 	}
@@ -353,185 +415,122 @@ func ensureArtifactTarget(workspace *config.Workspace, path string) error {
 	return nil
 }
 
-func replaceIfChanged(source string, dest string) (bool, error) {
-	same, err := sameFileContents(source, dest)
-	if err != nil {
-		return false, err
-	}
-	if same {
-		if info, err := os.Stat(source); err == nil {
-			_ = os.Chtimes(dest, info.ModTime(), info.ModTime())
-		}
-		return false, nil
-	}
-	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
-		return false, err
-	}
-	return true, os.Rename(source, dest)
+func directoryArtifactDigestPath(workspace *config.Workspace, appID string) string {
+	return filepath.Join(workspace.Path(workspace.State), "build", sanitizeFilename(appID)+".tree.sha256")
 }
 
-func fileSourceNeedsRebuild(workspace *config.Workspace, app config.App, source config.FileSource, sourcePath string, force bool) (rebuildCheck, error) {
-	if len(source.Rebuild) == 0 {
-		return rebuildCheck{Needed: force || !pathExists(sourcePath)}, nil
+func readDirectoryArtifactDigest(workspace *config.Workspace, appID string) ([]byte, bool, error) {
+	data, err := os.ReadFile(directoryArtifactDigestPath(workspace, appID))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, false, nil
 	}
-	fingerprint, err := fileSourceFingerprint(workspace, source)
 	if err != nil {
-		return rebuildCheck{}, err
+		return nil, false, err
 	}
-	if force || !pathExists(sourcePath) {
-		return rebuildCheck{Needed: true, Fingerprint: fingerprint}, nil
-	}
-	existing, err := os.ReadFile(fileSourceFingerprintPath(workspace, app.ID))
+	digest, err := hex.DecodeString(string(bytes.TrimSpace(data)))
 	if err != nil {
-		return rebuildCheck{Needed: true, Fingerprint: fingerprint}, nil
+		return nil, false, fmt.Errorf("read directory artifact digest for %s: %w", appID, err)
 	}
-	if !bytes.Equal(bytes.TrimSpace(existing), []byte(fmt.Sprintf("%x", fingerprint))) {
-		return rebuildCheck{Needed: true, Fingerprint: fingerprint}, nil
+	if len(digest) != sha256.Size {
+		return nil, false, fmt.Errorf("read directory artifact digest for %s: got %d bytes, want %d", appID, len(digest), sha256.Size)
 	}
-	return rebuildCheck{Needed: false, Fingerprint: fingerprint}, nil
+	return digest, true, nil
 }
 
-func fileSourceDependencies(workspace *config.Workspace, source config.FileSource) []string {
-	seen := map[string]bool{}
-	var deps []string
-	add := func(path string) {
-		if path == "" || strings.HasPrefix(path, "-") {
-			return
-		}
-		if !filepath.IsAbs(path) {
-			path = workspace.Path(path)
-		}
-		path = filepath.Clean(path)
-		if seen[path] {
-			return
-		}
-		seen[path] = true
-		deps = append(deps, path)
+func writeDirectoryArtifactDigest(workspace *config.Workspace, appID string, digest []byte) error {
+	path := directoryArtifactDigestPath(workspace, appID)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
 	}
-	for _, arg := range source.Rebuild {
-		// Recipe arguments include output files and CMake build directories.
-		// Hashing them makes a successful build invalidate its own cache.
-		// Generated inputs must instead be declared explicitly in Input.
-		argPath := arg
-		if !filepath.IsAbs(argPath) {
-			argPath = workspace.Path(argPath)
+	return os.WriteFile(path, []byte(fmt.Sprintf("%x\n", digest)), 0o644)
+}
+
+type treeDigestEntry struct {
+	path       string
+	typeBits   os.FileMode
+	permission os.FileMode
+	size       int64
+	mtimeNS    int64
+	linkTarget string
+	content    string
+}
+
+func treeDigest(path string) ([]byte, error) {
+	return treeDigestFor(path, true, nil)
+}
+
+func treeOutputDigest(path string, hasher *Hasher) ([]byte, error) {
+	return treeDigestFor(path, false, hasher)
+}
+
+func treeDigestFor(path string, includeMtime bool, hasher *Hasher) ([]byte, error) {
+	root, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return nil, err
+	}
+	var entries []treeDigestEntry
+	err = filepath.WalkDir(root, func(item string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
 		}
-		rel, err := filepath.Rel(workspace.Path(workspace.Artifacts), argPath)
-		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-			add(arg)
+		info, err := os.Lstat(item)
+		if err != nil {
+			return err
 		}
-		if strings.HasSuffix(arg, ".sh") {
-			for _, dep := range inferScriptDependencies(workspace, arg) {
-				add(dep)
+		rel, err := filepath.Rel(root, item)
+		if err != nil {
+			return err
+		}
+		itemDigest := treeDigestEntry{
+			path:       filepath.ToSlash(rel),
+			typeBits:   info.Mode().Type(),
+			permission: info.Mode().Perm(),
+			size:       info.Size(),
+			mtimeNS:    info.ModTime().UnixNano(),
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			itemDigest.linkTarget, err = os.Readlink(item)
+			if err != nil {
+				return err
 			}
-		}
-	}
-	for _, input := range source.Input {
-		add(input)
-		if filepath.Clean(input) == filepath.Join("userland", "cmake") {
-			// These native producers embed the same musl translation and
-			// codecs. Keep the outer cache aligned with CMake's real inputs.
-			for _, dep := range nativeCMakeDependencies(workspace) {
-				add(dep)
+		} else if info.Mode().IsRegular() {
+			var content []byte
+			var hashErr error
+			if hasher == nil {
+				content, hashErr = hashFileUncached(item)
+			} else {
+				content, hashErr = hasher.Hash(item)
 			}
+			if hashErr != nil {
+				return hashErr
+			}
+			itemDigest.content = hex.EncodeToString(content)
 		}
-	}
-	return deps
-}
-
-func nativeCMakeDependencies(workspace *config.Workspace) []string {
-	path := workspace.Path("userland", "cmake", "pachaos_native_dependencies.cmake")
-	data, err := os.ReadFile(path)
-	if err != nil {
+		entries = append(entries, itemDigest)
 		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
-	deps := []string{path}
-	pattern := regexp.MustCompile(`"\$\{_pachaos_native_root\}/([^"\n]+)"`)
-	for _, match := range pattern.FindAllStringSubmatch(string(data), -1) {
-		deps = append(deps, match[1])
-	}
-	return deps
-}
-
-func fileSourceFingerprint(workspace *config.Workspace, source config.FileSource) ([]byte, error) {
+	sort.Slice(entries, func(i, j int) bool { return entries[i].path < entries[j].path })
 	hash := sha256.New()
-	writeHashString(hash, "pacgo-file-source-v1\n")
-	for _, arg := range source.Rebuild {
-		writeHashString(hash, "arg\x00"+arg+"\n")
-	}
-	for _, input := range source.Input {
-		writeHashString(hash, "input\x00"+input+"\n")
-	}
-	for _, dep := range fileSourceDependencies(workspace, source) {
-		if err := hashPath(hash, dep); err != nil {
-			if os.IsNotExist(err) {
-				continue
-			}
-			return nil, err
+	writeHashString(hash, "pacgo-directory-artifact\n")
+	for _, entry := range entries {
+		writeHashField(hash, entry.path)
+		writeHashString(hash, fmt.Sprintf("%d\x00%d\x00%d\x00", entry.typeBits, entry.permission, entry.size))
+		if includeMtime {
+			writeHashString(hash, fmt.Sprintf("%d\x00", entry.mtimeNS))
 		}
+		writeHashField(hash, entry.linkTarget)
+		writeHashField(hash, entry.content)
 	}
 	return hash.Sum(nil), nil
 }
 
-func hashPath(hash io.Writer, path string) error {
-	info, err := os.Stat(path)
-	if err != nil {
-		return err
-	}
-	path = filepath.Clean(path)
-	if !info.IsDir() {
-		return hashFileWithName(hash, path, path, info)
-	}
-	return filepath.WalkDir(path, func(item string, entry os.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		name := entry.Name()
-		if entry.IsDir() {
-			if name == ".git" || name == ".zig-cache" || name == "zig-out" || name == "CMakeFiles" {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		if entry.Type()&os.ModeType != 0 {
-			return nil
-		}
-		info, err := entry.Info()
-		if err != nil {
-			return err
-		}
-		return hashFileWithName(hash, path, item, info)
-	})
-}
-
-func hashFileWithName(hash io.Writer, root string, path string, info os.FileInfo) error {
-	rel, err := filepath.Rel(root, path)
-	if err != nil {
-		return err
-	}
-	writeHashString(hash, "file\x00"+filepath.ToSlash(path)+"\x00"+filepath.ToSlash(rel)+"\x00")
-	writeHashString(hash, fmt.Sprintf("%d\x00", info.Size()))
-	fileHash, err := fileHash(path)
-	if err != nil {
-		return err
-	}
-	if _, err := hash.Write(fileHash); err != nil {
-		return err
-	}
-	writeHashString(hash, "\n")
-	return nil
-}
-
-func fileSourceFingerprintPath(workspace *config.Workspace, appID string) string {
-	return filepath.Join(workspace.Path(workspace.State), "build", sanitizeFilename(appID)+".sha256")
-}
-
-func writeFileSourceFingerprint(workspace *config.Workspace, appID string, fingerprint []byte) error {
-	path := fileSourceFingerprintPath(workspace, appID)
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return err
-	}
-	return os.WriteFile(path, []byte(fmt.Sprintf("%x\n", fingerprint)), 0o644)
+func writeHashField(hash io.Writer, value string) {
+	writeHashString(hash, fmt.Sprintf("%d:", len(value)))
+	writeHashString(hash, value)
+	writeHashString(hash, "\x00")
 }
 
 func sanitizeFilename(value string) string {
@@ -553,107 +552,7 @@ func writeHashString(hash io.Writer, value string) {
 	_, _ = io.WriteString(hash, value)
 }
 
-func inferScriptDependencies(workspace *config.Workspace, script string) []string {
-	path := script
-	if !filepath.IsAbs(path) {
-		path = workspace.Path(path)
-	}
-	bytes, err := os.ReadFile(path)
-	if err != nil {
-		return nil
-	}
-	text := string(bytes)
-	sourceFlag := regexp.MustCompile(`(?m)-S[ \t]+([^ \t\\]+)`)
-	var deps []string
-	for _, match := range sourceFlag.FindAllStringSubmatch(text, -1) {
-		deps = append(deps, match[1])
-	}
-	freestandingHelper := regexp.MustCompile(`(?m)configure_freestanding_cmake[ \t]+(?:"[^"]+"|'[^']+'|[^ \t]+)[ \t]+(?:"([^"]+)"|'([^']+)'|([^ \t\n]+))`)
-	for _, match := range freestandingHelper.FindAllStringSubmatch(text, -1) {
-		for _, group := range match[1:] {
-			if group != "" {
-				deps = append(deps, group)
-				break
-			}
-		}
-	}
-	return deps
-}
-
-func outputNeedsBuild(output string, inputs []string) (bool, error) {
-	outputInfo, err := os.Stat(output)
-	if errors.Is(err, os.ErrNotExist) {
-		return true, nil
-	}
-	if err != nil {
-		return false, err
-	}
-	for _, input := range inputs {
-		info, err := os.Stat(input)
-		if err != nil {
-			return false, err
-		}
-		if info.ModTime().After(outputInfo.ModTime()) {
-			return true, nil
-		}
-	}
-	return false, nil
-}
-
-func outputUpToDate(output string, inputs []string) (bool, error) {
-	outputInfo, err := os.Stat(output)
-	if errors.Is(err, os.ErrNotExist) {
-		return false, nil
-	}
-	if err != nil {
-		return false, err
-	}
-	for _, input := range inputs {
-		newer, err := pathNewerThan(input, outputInfo.ModTime())
-		if err != nil {
-			return false, err
-		}
-		if newer {
-			return false, nil
-		}
-	}
-	return true, nil
-}
-
-func pathNewerThan(path string, cutoff time.Time) (bool, error) {
-	info, err := os.Stat(path)
-	if err != nil {
-		return false, err
-	}
-	if !info.IsDir() {
-		return info.ModTime().After(cutoff), nil
-	}
-	newer := false
-	err = filepath.WalkDir(path, func(item string, entry os.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		if entry.IsDir() {
-			name := entry.Name()
-			if name == ".zig-cache" || name == "zig-out" {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		info, err := entry.Info()
-		if err != nil {
-			return err
-		}
-		if info.ModTime().After(cutoff) {
-			newer = true
-			return filepath.SkipAll
-		}
-		return nil
-	})
-	return newer, err
-}
-
-func sameFileContents(lhs string, rhs string) (bool, error) {
+func sameFileContents(lhs string, rhs string, hasher *Hasher) (bool, error) {
 	lhsInfo, err := os.Stat(lhs)
 	if err != nil {
 		return false, err
@@ -674,28 +573,15 @@ func sameFileContents(lhs string, rhs string) (bool, error) {
 	if lhsInfo.Size() == 0 {
 		return true, nil
 	}
-	lhsHash, err := fileHash(lhs)
+	lhsHash, err := hasher.Hash(lhs)
 	if err != nil {
 		return false, err
 	}
-	rhsHash, err := fileHash(rhs)
+	rhsHash, err := hasher.Hash(rhs)
 	if err != nil {
 		return false, err
 	}
 	return bytes.Equal(lhsHash, rhsHash), nil
-}
-
-func fileHash(path string) ([]byte, error) {
-	file, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer file.Close()
-	hash := sha256.New()
-	if _, err := io.Copy(hash, file); err != nil {
-		return nil, err
-	}
-	return hash.Sum(nil), nil
 }
 
 func run(cmd *exec.Cmd) error {
@@ -713,8 +599,4 @@ func run(cmd *exec.Cmd) error {
 func pathExists(path string) bool {
 	_, err := os.Stat(path)
 	return err == nil
-}
-
-func zigCachePath(workspace *config.Workspace, name string) string {
-	return filepath.Join(os.TempDir(), "capos-zig-cache", filepath.Base(workspace.Root), name)
 }

@@ -2805,17 +2805,17 @@ test "irq fd records only matching device and MSI-X entry" {
     var s: KernelState = undefined;
     try initFdState(&s);
     const irq_fd = try s.createIrqFd(p0, .{
-        .device = 0x1001,
+        .source = .{ .pci = 0x1001 },
         .kind = .msix,
         .vector = 1,
     }, fdRights(.{ .irq_wait = true, .poll = true, .read = true, .close = true }), .{}, 16);
     const auto_fd = try s.createIrqFd(p0, .{
-        .device = 0x1001,
+        .source = .{ .pci = 0x1001 },
         .kind = .auto,
         .vector = 0,
     }, fdRights(.{ .irq_wait = true, .poll = true, .read = true, .close = true }), .{}, 16);
     const other_device_fd = try s.createIrqFd(p0, .{
-        .device = 0x1002,
+        .source = .{ .pci = 0x1002 },
         .kind = .auto,
         .vector = 0,
     }, fdRights(.{ .irq_wait = true, .poll = true, .read = true, .close = true }), .{}, 16);
@@ -2849,7 +2849,7 @@ test "retired irq aliases report hangup and cannot consume a replacement event" 
     var s: KernelState = undefined;
     try initFdState(&s);
     const rights = fdRights(.{ .irq_wait = true, .poll = true, .read = true, .close = true, .dup = true });
-    const fd = try s.createIrqFd(p0, .{ .device = 0x1001, .kind = .msix, .vector = 1 }, rights, .{}, 16);
+    const fd = try s.createIrqFd(p0, .{ .source = .{ .pci = 0x1001 }, .kind = .msix, .vector = 1 }, rights, .{}, 16);
     const alias = try s.dupFd(p0, fd, 16, rights, .{});
     const original = s.fdEntryConst(p0, fd).?.object;
     const group = try s.beginFdWaitGroup(p0, 7, 11, 1);
@@ -2866,7 +2866,7 @@ test "retired irq aliases report hangup and cannot consume a replacement event" 
     try std.testing.expectEqual(@as(?u64, fd_abi.event_hangup), s.fdPollEvents(p0, alias, 0, 0));
     try std.testing.expect(s.irqEventCountForFd(p0, alias, .{ .read = true }) == null);
     s.cancelFdWaitGroup(group, 1);
-    const replacement = try s.createIrqFd(p0, .{ .device = 0x1001, .kind = .msix, .vector = 1 }, rights, .{}, 16);
+    const replacement = try s.createIrqFd(p0, .{ .source = .{ .pci = 0x1001 }, .kind = .msix, .vector = 1 }, rights, .{}, 16);
     var owners: [4]PrincipalId = undefined;
     try std.testing.expectEqual(@as(usize, 1), s.recordDeviceInterruptEvent(0x1001, 1, &owners));
     try std.testing.expectEqual(@as(?u64, 1), s.irqEventCountForFd(p0, replacement, .{ .read = true }));
@@ -2884,7 +2884,7 @@ test "irq publication retirement drains racing writer before slot reuse" {
     var s: KernelState = undefined;
     try initFdState(&s);
     const fd = try s.createIrqFd(p0, .{
-        .device = 0x1001,
+        .source = .{ .pci = 0x1001 },
         .kind = .msix,
         .vector = 1,
     }, fdRights(.{ .irq_wait = true, .close = true }), .{}, 16);
@@ -2911,7 +2911,7 @@ test "irq publication retirement drains racing writer before slot reuse" {
         try s.closeFd(p0, current_fd);
         try std.testing.expect(s.kernelObjectSlot(current_ref) == null);
         const replacement = try s.createIrqFd(p0, .{
-            .device = 0x1002,
+            .source = .{ .pci = 0x1002 },
             .kind = .msix,
             .vector = 1,
         }, fdRights(.{ .irq_wait = true, .close = true }), .{}, 16);
@@ -2922,7 +2922,7 @@ test "irq publication retirement drains racing writer before slot reuse" {
         try std.testing.expectEqual(@as(?u64, 0), s.irqPublishedEventCount(replacement_ref));
         try s.closeFd(p0, replacement);
         current_fd = try s.createIrqFd(p0, .{
-            .device = 0x1001,
+            .source = .{ .pci = 0x1001 },
             .kind = .msix,
             .vector = 1,
         }, fdRights(.{ .irq_wait = true, .close = true }), .{}, 16);
@@ -2939,7 +2939,7 @@ test "concurrent IRQ producers add each event exactly once" {
     var s: KernelState = undefined;
     try initFdState(&s);
     defer s.deinitPools();
-    const fd = try s.createIrqFd(p0, .{ .device = 0x1001, .kind = .msix, .vector = 1 }, fdRights(.{ .irq_wait = true, .close = true }), .{}, 16);
+    const fd = try s.createIrqFd(p0, .{ .source = .{ .pci = 0x1001 }, .kind = .msix, .vector = 1 }, fdRights(.{ .irq_wait = true, .close = true }), .{}, 16);
     const ref = s.fdEntryConst(p0, fd).?.object;
     const Producer = struct {
         fn run(state: *KernelState) void {
@@ -2963,7 +2963,7 @@ test "irq directory filters live candidates and preserves generation on reuse" {
     defer s.deinitPools();
     var refs: [65]kernel.KernelObjectRef = undefined;
     for (&refs) |*ref| {
-        ref.* = try s.createKernelObject(.irq, .{ .irq = .{ .owner_principal_raw = @intFromEnum(p0), .device = 0x1001, .kind = .msix, .vector = 1 } });
+        ref.* = try s.createKernelObject(.irq, .{ .irq = .{ .owner_principal_raw = @intFromEnum(p0), .source = .{ .pci = 0x1001 }, .kind = .msix, .vector = 1 } });
         s.publishIrqObject(ref.*, s.kernelObjectSlot(ref.*).?.payload.irq);
     }
     var owners: [4]PrincipalId = undefined;
@@ -10426,4 +10426,112 @@ test "pager munmap while pending cannot resurrect a removed VMA" {
     s.releasePrincipalNativeMemory(p1, &free);
     s.releasePrincipalNativeMemory(p0, &free);
     try std.testing.expectEqual(@as(usize, 4), free.pageCount());
+}
+
+test "page view dirty inventory unions pages without accepting private PFNs and masks tail" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    var s: KernelState = undefined;
+    try initFdState(&s);
+    const parent = try s.createNativeVmo(.anonymous, 70 * 4096);
+    try s.retainNativeVmo(parent);
+    var pages: [70]u64 = undefined;
+    for (&pages, 0..) |*page, i| page.* = 0x8400_0000 + i * 4096;
+    try s.installNativeVmoPages(parent, 0, &pages, null);
+    const view = try s.createNativePageView(parent, pages.len);
+    try s.installNativeVmoPages(view, 0, &pages, null);
+    const slot = s.nativeVmoSlot(view).?;
+    kernel.page_view_dirty.record(slot, 1, pages[1]);
+    kernel.page_view_dirty.record(slot, 69, pages[69]);
+    kernel.page_view_dirty.record(slot, 2, 0x8500_2000); // private COW
+    kernel.page_view_dirty.record(slot, 70, pages[0]); // outside view
+    try std.testing.expectEqual(@as(u64, 2), kernel.page_view_dirty.word(slot, 0));
+    try std.testing.expectEqual(@as(u64, 32), kernel.page_view_dirty.word(slot, 1));
+    // Inspecting (or failing to deliver) a snapshot never acknowledges it.
+    try std.testing.expectEqual(@as(u64, 2), kernel.page_view_dirty.word(slot, 0));
+    kernel.page_view_dirty.acknowledge(slot);
+    try std.testing.expectEqual(@as(u64, 0), kernel.page_view_dirty.word(slot, 0));
+    try std.testing.expectEqual(@as(u64, 0), kernel.page_view_dirty.word(slot, 1));
+    @atomicStore(bool, &slot.page_view_dirty_all, true, .release);
+    try std.testing.expectEqual(std.math.maxInt(u64), kernel.page_view_dirty.word(slot, 0));
+    try std.testing.expectEqual(@as(u64, 63), kernel.page_view_dirty.word(slot, 1));
+    try std.testing.expectEqual(@as(u64, 0), kernel.page_view_dirty.word(slot, 2));
+}
+
+test "page view retirement preserves formerly writable aliases and refresh dirty inventory" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    var s: KernelState = undefined;
+    try initFdState(&s);
+    const parent = try s.createNativeVmo(.anonymous, 2 * 4096);
+    try s.retainNativeVmo(parent);
+    try s.installNativeVmoPages(parent, 0, &.{ 0x8400_0000, 0x8400_1000 }, null);
+    const view = try s.createNativePageView(parent, 1);
+    try s.installNativeVmoPages(view, 0, &.{0x8400_0000}, null);
+    const ro = vmaProt(.{ .read = true });
+    const rw = vmaProt(.{ .read = true, .write = true });
+    try s.createVmaWithRetainedVmo(p0, 0x4100_0000, 4096, ro, rw, mmapFlags(.{ .shared = true }), view, 0);
+    try s.createVmaWithRetainedVmo(p1, 0x4200_0000, 4096, rw, rw, mmapFlags(.{ .shared = true }), view, 0);
+    const slot = s.nativeVmoSlot(view).?;
+    kernel.page_view_dirty.markRetiredAliases(&s, p0, 0x4000_0000, 4096);
+    try std.testing.expectEqual(@as(u64, 0), kernel.page_view_dirty.word(slot, 0));
+    kernel.page_view_dirty.markRetiredAliases(&s, p0, 0x4100_0000, 4096);
+    try std.testing.expectEqual(@as(u64, 1), kernel.page_view_dirty.word(slot, 0));
+    kernel.page_view_dirty.acknowledge(slot);
+    kernel.page_view_dirty.markRetiredAliases(&s, p1, 0x4200_0000, 4096);
+    const staged = try s.createNativePageView(parent, 1);
+    try s.installNativeVmoPages(staged, 0, &.{0x8400_1000}, null);
+    const Invalidator = struct {
+        pub fn invalidate(_: @This(), _: PrincipalId, _: u64, _: u64) bool {
+            return true;
+        }
+    };
+    try s.refreshNativePageView(view, staged, Invalidator{});
+    try std.testing.expectEqual(@as(u64, 1), kernel.page_view_dirty.word(slot, 0));
+    try std.testing.expectEqual(@as(?u64, 0x8400_1000), s.nativeVmoResolvedPagePaddr(view, 0));
+    kernel.page_view_dirty.acknowledge(slot);
+    kernel.page_view_dirty.record(slot, 0, 0x8400_0000); // retired backing
+    try std.testing.expectEqual(@as(u64, 0), kernel.page_view_dirty.word(slot, 0));
+    kernel.page_view_dirty.record(slot, 0, 0x8400_1000);
+    try std.testing.expectEqual(@as(u64, 1), kernel.page_view_dirty.word(slot, 0));
+}
+
+test "page view dirty partial copyout failure retains full inventory until successful retry" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    var s: KernelState = undefined;
+    try initFdState(&s);
+    const parent = try s.createNativeVmo(.anonymous, 4096);
+    try s.retainNativeVmo(parent);
+    try s.installNativeVmoPages(parent, 0, &.{0x8400_0000}, null);
+    const view = try s.createNativePageView(parent, 4097);
+    s.nativeVmoSlot(view).?.page_view_sparse = true;
+    try s.installNativeVmoPages(view, 0, &.{0x8400_0000}, null);
+    try s.installNativeVmoPages(view, 4096, &.{0x8400_0000}, null);
+    const slot = s.nativeVmoSlot(view).?;
+    kernel.page_view_dirty.record(slot, 0, 0x8400_0000);
+    kernel.page_view_dirty.record(slot, 4096, 0x8400_0000);
+    const Sink = struct {
+        fail_after_prefix: bool,
+        calls: usize = 0,
+        bitmap: [65]u64 = @splat(0),
+        pub fn write(sink: *@This(), first: usize, values: []const u64) bool {
+            sink.calls += 1;
+            if (sink.fail_after_prefix and first != 0) return false;
+            @memcpy(sink.bitmap[first..][0..values.len], values);
+            return true;
+        }
+    };
+    var failing = Sink{ .fail_after_prefix = true };
+    try std.testing.expect(!kernel.page_view_dirty.deliver(slot, &failing));
+    try std.testing.expectEqual(@as(usize, 2), failing.calls);
+    try std.testing.expectEqual(@as(u64, 1), failing.bitmap[0]);
+    try std.testing.expectEqual(@as(u64, 1), kernel.page_view_dirty.word(slot, 0));
+    try std.testing.expectEqual(@as(u64, 1), kernel.page_view_dirty.word(slot, 64));
+    var retry = Sink{ .fail_after_prefix = false };
+    try std.testing.expect(kernel.page_view_dirty.deliver(slot, &retry));
+    try std.testing.expectEqual(@as(u64, 1), retry.bitmap[0]);
+    try std.testing.expectEqual(@as(u64, 1), retry.bitmap[64]);
+    try std.testing.expectEqual(@as(u64, 0), kernel.page_view_dirty.word(slot, 0));
+    try std.testing.expectEqual(@as(u64, 0), kernel.page_view_dirty.word(slot, 64));
 }

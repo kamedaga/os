@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: MIT */
 #include "kobox2_nic.h"
+#include "wifi_control.h"
 #include "kobox2_frame_client.h"
 #include "kobox2_package.h"
 #include "link.h"
@@ -24,6 +25,7 @@ enum { NETD_RESOURCE_SET_ID = 1, NETD_SANDBOX_ID = 1 };
 
 struct nic_generation {
     uint64_t id;
+    uint64_t association_sequence;
     struct pacha_ipc_channel_pair management;
     struct ph_ipc ipc;
     struct gpud_native_launch launch;
@@ -239,6 +241,17 @@ static int start_generation(void)
         .identity = nic.package.identity,
         .artifact_count = nic.package.artifact_count, .resource_count = 1,
         .device = nic.package.device};
+    struct gpud_launch_blob firmware_blob = {0};
+    if (nic.package.wireless) {
+        sandbox_config.ram_bytes = 512u << 20;
+        sandbox_config.log_endpoint_fd = status_config->log_endpoint_fd >= 16 ?
+            PH_SANDBOX_LOG_FD : 0;
+        sandbox_config.firmware_address = PH_SANDBOX_FIRMWARE_ADDRESS;
+        sandbox_config.firmware_size = nic.package.firmware.size;
+        memcpy(sandbox_config.firmware_sha256, nic.package.firmware_sha256, 32);
+        firmware_blob = (struct gpud_launch_blob){.bytes = nic.package.firmware.data,
+            .size = nic.package.firmware.size, .address = PH_SANDBOX_FIRMWARE_ADDRESS};
+    }
     const struct ph_owner_boot_config start = {.controller = nic.controller,
         .launch = &current->launch, .ipc = &current->ipc,
         .management = &current->management, .watch = &current->watch,
@@ -246,8 +259,12 @@ static int start_generation(void)
         .resource_set_id = NETD_RESOURCE_SET_ID, .sandbox_id = NETD_SANDBOX_ID,
         .sandbox_config = &sandbox_config, .image = nic.package.sandbox,
         .image_size = nic.package.sandbox_size,
+        .extra_blobs = nic.package.wireless ? &firmware_blob : NULL,
+        .extra_blob_count = nic.package.wireless ? 1 : 0,
         .items = nic.package.items, .artifact_count = nic.package.artifact_count,
-        .resource_count = 1, .log_endpoint_fd = -1};
+        .resource_count = 1,
+        .log_endpoint_fd = nic.package.wireless && status_config->log_endpoint_fd >= 16 ?
+            (pacha_fd_t)status_config->log_endpoint_fd : -1};
     struct ph_owner_boot boot = {0};
     nic_progress(NETD_NIC_STEP_SANDBOX_LAUNCH, "start shared sandbox boot sequence");
     kb2_status_t step_status = ph_owner_boot_begin(&boot, &start);
@@ -380,7 +397,8 @@ static int sandbox_exited(pacha_fd_t process_fd)
 {
     struct pacha_pollfd event = {.fd = process_fd,
         .events = PACHA_FD_EVENT_READABLE | PACHA_FD_EVENT_HANGUP};
-    long result = pacha_fd_wait_many(&event, 1, 0);
+    /* An immediate liveness probe needs no registered waiter. */
+    long result = pacha_fd_poll(&event, 1);
     return result > 0 && event.revents;
 }
 
@@ -412,6 +430,10 @@ static void nic_poll(void *context)
         fprintf(stderr, "[netd] NIC identity changed within generation\n");
         return;
     }
+    if (nic.package.wireless && current->association_sequence != info.association_sequence) {
+        current->association_sequence = info.association_sequence;
+        netd_wifi_control_link_changed(info.carrier);
+    }
     (void)netd_link_set_carrier(current->id, info.carrier);
     for (unsigned round = 0; round < 4; ++round) {
         const struct kobox_linux_net_frame *frames = NULL;
@@ -423,6 +445,36 @@ static void nic_poll(void *context)
             (void)netd_link_receive(current->id, frames[i].bytes, frames[i].length);
         if (count < PH_NET_FRAME_BATCH) break;
     }
+}
+
+uint64_t netd_kobox2_wifi_generation(void)
+{
+    return nic.started && !nic.failed && nic.package.wireless ? nic.generation.id : 0;
+}
+
+int netd_kobox2_wifi_command(const void *command, size_t length,
+    void *reply, size_t capacity, size_t *received)
+{
+    if (!netd_kobox2_wifi_generation()) return -EOPNOTSUPP;
+    struct nic_generation *current = &nic.generation;
+    return netd_kobox2_wifi_request(&current->frames, &current->ipc,
+        current->launch.process.fd, command, length, reply, capacity, received);
+}
+
+int netd_kobox2_wifi_configuration(const void *configuration, size_t length)
+{
+    if (!netd_kobox2_wifi_generation()) return -EOPNOTSUPP;
+    struct nic_generation *current = &nic.generation;
+    return netd_kobox2_wifi_configure(&current->frames, &current->ipc,
+        current->launch.process.fd, configuration, length);
+}
+
+int netd_kobox2_wifi_take_events(uint32_t *events)
+{
+    if (!netd_kobox2_wifi_generation()) return -EOPNOTSUPP;
+    struct nic_generation *current = &nic.generation;
+    return netd_kobox2_wifi_events(&current->frames, &current->ipc,
+        current->launch.process.fd, events);
 }
 
 int netd_kobox2_nic_start(struct netd_runtime *runtime)

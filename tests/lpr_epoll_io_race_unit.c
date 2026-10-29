@@ -96,7 +96,7 @@ static uint32_t take_event(void)
     lpr_epoll_snapshot_t snapshot[LPR_EPOLL_MAX_INTERESTS];
     lpr_linux_epoll_event_t event = {0};
     uint32_t count;
-    assert(lpr_epoll_snapshot(4, snapshot, &count) == 0);
+    assert(lpr_epoll_snapshot(4, snapshot, &count, NULL) == 0);
     const int64_t result = lpr_epoll_scan(4, snapshot, count, &event, 1, 1, 1, 0);
     assert(result == 0 || result == 1);
     assert(!result || event.data == 1234);
@@ -160,6 +160,51 @@ int main(void)
     expect(take_event() == LPR_EPOLLIN, "UNIX one-shot initial event");
     unix_sequence.read++;
     expect(take_event() == 0, "remote progress does not rearm ONESHOT");
+
+    setup(LPR_EPOLLIN);
+    lpr_epoll_snapshot_t old[LPR_EPOLL_MAX_INTERESTS];
+    uint32_t count, report;
+    assert(lpr_epoll_snapshot(4, old, &count, NULL) == 0 && count == 1);
+    /* Reuse the descriptor after the unlocked readiness query. The watched
+     * OFD survives through fd 5, so only that new snapshot may report it. */
+    entries[3] = entries[4];
+    assert(lpr_epoll_apply_observation(4, old, LPR_EPOLLIN, 1, &report, NULL) == 0);
+    expect(report == 0, "reassigned query descriptor cannot publish readiness");
+    ready_events = LPR_EPOLLIN;
+    expect(take_event() == LPR_EPOLLIN, "surviving dup resolves on next snapshot");
+
+    setup(LPR_EPOLLIN | LPR_EPOLLONESHOT);
+    assert(lpr_epoll_snapshot(4, old, &count, NULL) == 0 && count == 1);
+    lpr_epoll_instance_t *instance = (void *)&storage;
+    instance->generation++; /* CTL publication, even with the same OFD/slot. */
+    assert(lpr_epoll_apply_observation(4, old, LPR_EPOLLIN, 1, &report, NULL) == 0);
+    expect(report == 0 && !(instance->interests[0].state & LPR_EPOLL_STATE_ONESHOT_DISABLED),
+        "obsolete snapshot cannot consume a rearmed one-shot");
+    ready_events = LPR_EPOLLIN;
+    expect(take_event() == LPR_EPOLLIN, "fresh snapshot consumes the new interest");
+    setup(LPR_EPOLLIN);
+    lpr_epoll_snapshot_epoch_t epoch;
+    assert(lpr_epoll_snapshot(4, old, &count, &epoch) == 0);
+    expect(!lpr_epoll_wait_should_retry(4, &epoch, -LPR_LINUX_EINVAL),
+        "unchanged graph preserves native EINVAL");
+    expect(!lpr_epoll_wait_should_retry(4, &epoch, -LPR_LINUX_EBADF),
+        "unchanged graph preserves EBADF");
+    ((lpr_epoll_instance_t *)&storage)->generation++;
+    expect(lpr_epoll_wait_should_retry(4, &epoch, -LPR_LINUX_EINVAL),
+        "concurrent interest retirement rebuilds native invalid graph");
+    expect(lpr_epoll_wait_should_retry(4, &epoch, -LPR_LINUX_EBADF),
+        "concurrent interest retirement rebuilds closed target graph");
+    expect(!lpr_epoll_wait_should_retry(4, &epoch, -LPR_LINUX_EFAULT),
+        "interest mutation does not hide unrelated failure");
+    expect(!lpr_epoll_wait_should_retry(4, &epoch, LPR_WAIT_RESTART_SYSCALL),
+        "signal restart must unwind and deliver rather than retry here");
+    entries[4].active = 0;
+    expect(!lpr_epoll_wait_should_retry(4, &epoch, -LPR_LINUX_EBADF),
+        "closed root does not retry");
+    entries[4].active = 1;
+    entries[4].ofd_generation++;
+    expect(!lpr_epoll_wait_should_retry(4, &epoch, -LPR_LINUX_EBADF),
+        "reused root descriptor does not retry");
     if (failures) return 1;
     puts("LPR_EPOLL_IO_RACE_UNIT=OK");
     return 0;

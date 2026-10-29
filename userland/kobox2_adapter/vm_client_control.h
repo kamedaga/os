@@ -6,7 +6,7 @@
 #include <stdatomic.h>
 #include "vm_layout.h"
 
-/* Private native test-client bootstrap, not a controller or LPR wire ABI.
+/* Private native user-process bootstrap, not a controller or LPR wire ABI.
  * No core pointer or RAM descriptor crosses this boundary. Addresses below
  * refer only to the child. The manager keeps authoritative bounds privately. */
 #define PH_VM_CLIENT_KICK_FD 16

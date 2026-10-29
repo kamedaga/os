@@ -9,6 +9,7 @@
 #include <string.h>
 
 lpr_state_t lpr_state;
+int lpr_thread_current_record(lpr_thread_record_t **out) { *out=NULL; return -1; }
 static unsigned live, closes, calls, queued, drains, blocks, ready_calls;
 static uint64_t identities[1024];
 static unsigned registered[1024], removals;

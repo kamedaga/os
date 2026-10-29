@@ -8,7 +8,6 @@ const diag = @import("../sync/lock_diagnostics.zig");
 const scheduler = @import("../scheduler.zig").connection;
 const abi = @import("kernel_abi_root").pager_abi;
 const clock = @import("../realtime_clock.zig");
-const kernel_log = @import("../kernel_log.zig");
 
 fn pagerNowNs() u64 {
     if (comptime @import("builtin").is_test) return 0;
@@ -26,36 +25,13 @@ fn waitBucket(us: u64) usize {
     return 159;
 }
 
-fn waitBucketUpperUs(bucket: usize) u64 {
-    if (bucket < 64) return @as(u64, @intCast(bucket + 1)) * 10;
-    var upper: u64 = 640;
-    for (0..bucket - 63) |step|
-        upper += @as(u64, 10) << @as(u6, @intCast(step / 8));
-    return upper;
-}
-
-fn waitQuantileUs(self: anytype, count: u64, percentile: u64) u64 {
-    const target = (count * percentile + 99) / 100;
-    var seen: u64 = 0;
-    for (&self.pager_wait_histogram, 0..) |*bucket, i| {
-        seen += @atomicLoad(u64, bucket, .monotonic);
-        if (seen >= target) return waitBucketUpperUs(i);
-    }
-    return waitBucketUpperUs(self.pager_wait_histogram.len - 1);
-}
-
 fn recordWaitLatency(self: anytype, started_ns: u64) void {
     if (started_ns == 0) return;
     const now = pagerNowNs();
     if (now < started_ns) return;
     const bucket = waitBucket((now - started_ns) / 1000);
     _ = @atomicRmw(u64, &self.pager_wait_histogram[bucket], .Add, 1, .monotonic);
-    const count = @atomicRmw(u64, &self.pager_wait_samples, .Add, 1, .monotonic) + 1;
-    if ((count & 255) == 0) kernel_log.writeFmt(
-        "pager: WAIT_STATS samples={} p50_us={} p90_us={} p99_us={}\n",
-        .{ count, waitQuantileUs(self, count, 50),
-            waitQuantileUs(self, count, 90), waitQuantileUs(self, count, 99) },
-    );
+    _ = @atomicRmw(u64, &self.pager_wait_samples, .Add, 1, .monotonic);
 }
 
 pub const Lock = struct {

@@ -140,7 +140,8 @@ static void run(unsigned failure) {
     struct gpud_lifecycle lifecycle = {0};
     const struct gpud_launch_blob blob = {.bytes = &image, .size = 1, .address = 0x48000000};
     sandbox = (struct ph_sandbox_config){.size = sizeof(struct ph_sandbox_config),
-        .identity = {.generation = 7}, .artifact_count = 1};
+        .identity = {.generation = 7}, .artifact_count = 1,
+        .log_endpoint_fd = log_grant ? PH_SANDBOX_LOG_FD : 0};
     struct ph_owner_boot_config config = {.controller = (kb2_controller_t *)&controller_storage,
         .launch = &launch, .ipc = &ipc, .management = &pair, .watch = &watch,
         .lifecycle = &lifecycle, .resource_set_id = 1, .sandbox_id = 1,
@@ -156,6 +157,12 @@ static void run(unsigned failure) {
         assert(pair.a == -1 && pair.b == -1);
     }
     sandbox.size = sizeof(sandbox);
+    const uint64_t selected_logger = sandbox.log_endpoint_fd;
+    sandbox.log_endpoint_fd = log_grant ? 0 : PH_SANDBOX_LOG_FD;
+    assert(ph_owner_boot_begin(&boot, &config) == KB2_STATUS_INVALID_CONFIGURATION);
+    assert(boot.phase == PH_OWNER_BOOT_EMPTY && !launches && !transfers && !closed);
+    assert(pair.a == -1 && pair.b == -1);
+    sandbox.log_endpoint_fd = selected_logger;
     kb2_status_t status = ph_owner_boot_begin(&boot, &config);
     if (failure == 1 || failure == 2 || failure == 7) {
         assert(status == KB2_STATUS_HOST_FAILURE && !launches);
@@ -189,6 +196,6 @@ int main(void) {
         run(failure);
     extra = log_grant = 1;
     run(0);
-    puts("shared sandbox owner boot: OK (9 scenarios; invalid launch extents rejected)");
+    puts("shared sandbox owner boot: OK (9 scenarios; invalid extents and missing/unselected log grants rejected)");
     return 0;
 }

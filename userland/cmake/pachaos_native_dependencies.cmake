@@ -38,4 +38,17 @@ set(PACHAOS_NATIVE_DEPENDENCIES
   "${_pachaos_native_root}/userland/filed/include/filed/flags.h"
   "${_pachaos_native_root}/userland/filed/include/filed/ipc_protocol.h"
   "${_pachaos_native_root}/userland/libipc/include/pacha/service_abi.h")
+# build-app-dynamic.sh links against the runtime that build-runtime.sh (the
+# build_runtime pacgo recipe) installed; it never rebuilds it. Relink when any
+# of those installed files changes.
+if(DEFINED ENV{PACHAOS_MUSL_RUNTIME_DIR})
+  set(_pachaos_runtime_lib "$ENV{PACHAOS_MUSL_RUNTIME_DIR}/install/usr/lib")
+else()
+  set(_pachaos_runtime_lib "${_pachaos_native_root}/.artifacts/musl-pachaos-runtime/install/usr/lib")
+endif()
+foreach(_pachaos_runtime_file IN ITEMS crt1.o crti.o crtn.o Scrt1.o libc.so)
+  list(APPEND PACHAOS_NATIVE_DEPENDENCIES "${_pachaos_runtime_lib}/${_pachaos_runtime_file}")
+endforeach()
+unset(_pachaos_runtime_file)
+unset(_pachaos_runtime_lib)
 unset(_pachaos_native_root)

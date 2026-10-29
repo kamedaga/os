@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: MIT */
 /* Native VM transport. Linux owns the mappings' policy and page lifetime. */
 #include "vm_internal.h"
+#include "vm_guardian.h"
 #include <errno.h>
 
 uint64_t ph_vm_lock_space(struct ph_vm_space *space) {
@@ -30,9 +31,32 @@ static bool reap_if_terminal(struct ph_vm_space *space, uint64_t status[4]) {
     }
     PH_OK(result);
     PH_CHECK(status[0] == 2 || status[0] == 3);
+#ifdef PH_USER_PROCESS_SMOKE
+    ph_number("USER_PROCESS_NATIVE_EXIT_KIND", status[0]);
+    ph_number("USER_PROCESS_NATIVE_EXIT_CODE", status[1]);
+#endif
     space->reaped = true;
     space->running = false;
     return true;
+}
+
+/* Caller holds space lock. Retry an unaccepted kill; only an accepted one
+ * permits sleeping for termination. WAIT also resolves a racing normal exit.
+ */
+static void terminate_and_reap(struct ph_vm_space *space, uint64_t status[4]) {
+    while (!reap_if_terminal(space, status)) {
+        long killed = pacha_syscall2(PACHA_PROCESS_SYSCALL_KILL, space->process_fd, 0);
+        if (killed) {
+            if (reap_if_terminal(space, status)) return;
+            PH_CHECK(killed == PACHA_SYSCALL_ERR_NOT_READY);
+            PH_OK(pacha_syscall0(PACHA_RUNTIME_SYSCALL_YIELD));
+            continue;
+        }
+        struct pacha_pollfd completion = {
+            .fd = space->process_fd, .events = PACHA_FD_EVENT_READABLE,
+        };
+        PH_CHECK(ph_wait_readable(&completion, 1) == 1);
+    }
 }
 
 static void queue_exit(struct ph_vm_space *space, const uint64_t status[4]) {
@@ -64,16 +88,18 @@ static void queue_client_event(struct ph_vm_space *space) {
         ph_vm_capture_syscall(space);
     } else {
         PH_CHECK(control->event == PH_VM_CLIENT_FAULT && control->fault_vector == 14);
-#ifdef PH_EXEC_GATE
+#if defined(PH_EXEC_GATE) || defined(PH_VM_USER_PROCESS)
         if (ph_exec_capture_syscall_fault(space)) {
             space->running = false;
             space->pending = true;
             return;
         }
+#ifdef PH_EXEC_GATE
         ph_number("exec fault address", control->fault_address);
         ph_number("exec fault IP", control->fault_ip);
         ph_number("exec fault flags", control->fault_flags);
         ph_number("exec fault error", control->fault_error);
+#endif
 #endif
         space->event.kind = KOBOX_VM_EVENT_FAULT;
         space->event.fault = (struct kobox_linux_vm_fault) {
@@ -91,19 +117,26 @@ static void queue_client_event(struct ph_vm_space *space) {
 
 static void *monitor_client(void *opaque) {
     struct ph_vm_space *space = opaque;
-    struct pacha_pollfd descriptors[2] = {
+    struct pacha_pollfd descriptors[3] = {
         {.fd = space->event_fd, .events = PACHA_FD_EVENT_READABLE},
         {.fd = space->process_fd, .events = PACHA_FD_EVENT_READABLE},
+        {.fd = space->guardian_fd, .events = PACHA_FD_EVENT_READABLE},
     };
 
     for (;;) {
-        long ready = ph_wait_readable(descriptors, 2);
+        long ready = ph_wait_readable(descriptors, 3);
 
-        PH_CHECK(ready >= 1 && ready <= 2);
+        PH_CHECK(ready >= 1 && ready <= 3);
         uint64_t memory_mask = ph_vm_lock_memory(space);
         uint64_t mask = ph_vm_lock_space(space);
         uint64_t status[4];
         bool terminal = reap_if_terminal(space, status);
+
+        if (!terminal && descriptors[2].revents) {
+            /* Loss of supervision is fatal, including during native STOP. */
+            terminate_and_reap(space, status);
+            terminal = true;
+        }
 
         if (terminal) {
             queue_exit(space, status);
@@ -123,26 +156,23 @@ static void *monitor_client(void *opaque) {
 
 static int close_space(void *opaque) {
     struct ph_vm_space *space = opaque;
+#ifdef PH_USER_PROCESS_SMOKE
+    ph_log("USER_PROCESS_CLOSE=entry\n");
+#endif
     uint64_t mask = ph_vm_lock_space(space);
 
     if (!space->reaped) {
-        PH_OK(pacha_syscall2(PACHA_PROCESS_SYSCALL_KILL, space->process_fd, 0));
         uint64_t status[4];
-
-        while (!reap_if_terminal(space, status)) {
-            struct pacha_pollfd completion = {
-                .fd = space->process_fd,
-                .events = PACHA_FD_EVENT_READABLE,
-            };
-
-            PH_CHECK(ph_wait_readable(&completion, 1) == 1);
-        }
+        terminate_and_reap(space, status);
         /* The native producer queues the single EXIT and wakes Linux after
          * this lock is released. close itself only guarantees actual reaping. */
     }
     bool drain = !atomic_load_explicit(&space->cleanup_state, memory_order_relaxed);
 
     if (drain) {
+#ifdef PH_USER_PROCESS_SMOKE
+        ph_log("USER_PROCESS_CLOSE=join\n");
+#endif
         atomic_store_explicit(&space->cleanup_state, 1, memory_order_relaxed);
     }
     ph_vm_unlock_space(space, mask);
@@ -151,13 +181,28 @@ static int close_space(void *opaque) {
          * descriptors or its control alias. Keep only the Linux-facing
          * tombstone/MM membership until all core bindings are gone. */
         PH_OK(ph_thread_join(space->monitor));
+#ifdef PH_USER_PROCESS_SMOKE
+        ph_log("USER_PROCESS_CLOSE=monitor_done\n");
+#endif
         space->monitor = NULL;
+        struct pacha_pollfd guardian = {
+            .fd = space->guardian_fd, .events = PACHA_FD_EVENT_READABLE,
+        };
+        PH_CHECK(ph_wait_readable(&guardian, 1) == 1);
+#ifdef PH_USER_PROCESS_SMOKE
+        ph_log("USER_PROCESS_CLOSE=guardian_done\n");
+#endif
         pacha_fd_t *descriptors[] = {&space->thread_fd, &space->process_fd,
-            &space->kick_fd, &space->event_fd, &space->control_fd};
+            &space->kick_fd, &space->event_fd, &space->control_fd,
+            &space->guardian_thread_fd, &space->guardian_fd};
 
         for (unsigned index = 0; index < sizeof(descriptors) / sizeof(descriptors[0]); ++index) {
             PH_OK(pacha_syscall1(PACHA_FD_SYSCALL_CLOSE, *descriptors[index]));
             *descriptors[index] = -1;
+        }
+        if (space->lifeline_fd >= 16) {
+            PH_OK(pacha_syscall1(PACHA_FD_SYSCALL_CLOSE, space->lifeline_fd));
+            space->lifeline_fd = -1;
         }
         for (unsigned protection = 0; protection < 8; ++protection) {
             PH_OK(pacha_syscall1(PACHA_FD_SYSCALL_CLOSE, space->ram_grant_fds[protection]));
@@ -167,6 +212,9 @@ static int close_space(void *opaque) {
         space->control = NULL;
         atomic_store_explicit(&space->cleanup_state, 2, memory_order_release);
         ph_wake(&space->cleanup_state);
+#ifdef PH_USER_PROCESS_SMOKE
+        ph_log("USER_PROCESS_CLOSE=done\n");
+#endif
     } else {
         while (atomic_load_explicit(&space->cleanup_state, memory_order_acquire) != 2) {
             ph_wait(&space->cleanup_state, 1);
@@ -308,6 +356,7 @@ static void create_ram_grants(struct ph_vm_space *space) {
     }
 }
 
+#ifdef PH_VM_VERIFY_NATIVE_RIGHTS
 static void verify_native_protection(struct ph_vm_space *space) {
     struct pacha_pollfd completion = {
         .fd = space->event_fd,
@@ -345,6 +394,45 @@ static void verify_native_protection(struct ph_vm_space *space) {
     PH_OK(ph_vm_reset_pages(space, space->start, PH_PAGE_SIZE));
     ph_log("PACHA_KOBOX_VM_NATIVE_PROTECTION=PASS\n");
 }
+#endif
+
+static void create_guardian(struct ph_vm_space *space, pacha_fd_t peer) {
+    pacha_fd_t ready_fd = create_event_counter();
+    struct pacha_process_fd_grant grants[] = {
+        {.source_fd = peer, .target_fd = PH_GUARDIAN_LIFELINE_FD,
+            .rights = PACHA_FD_RIGHT_WAIT | PACHA_FD_RIGHT_POLL},
+        {.source_fd = space->process_fd, .target_fd = PH_GUARDIAN_CHILD_FD,
+            .rights = PACHA_FD_RIGHT_KILL | PACHA_FD_RIGHT_WAIT | PACHA_FD_RIGHT_POLL},
+        {.source_fd = ready_fd, .target_fd = PH_GUARDIAN_READY_FD,
+            .rights = PACHA_FD_RIGHT_WRITE},
+    };
+    long process = pacha_syscall5(PACHA_PROCESS_SYSCALL_CREATE, 0,
+        PACHA_FD_RIGHT_MAP_INTO | PACHA_FD_RIGHT_SPAWN | PACHA_FD_RIGHT_SET_CONTEXT |
+        PACHA_FD_RIGHT_KILL |
+        PACHA_FD_RIGHT_WAIT | PACHA_FD_RIGHT_POLL | PACHA_FD_RIGHT_CLOSE, 0,
+        (uintptr_t)grants, sizeof(grants) / sizeof(grants[0]));
+    PH_CHECK(process >= 16);
+    space->guardian_fd = (pacha_fd_t)process;
+    PH_OK(pacha_syscall1(PACHA_FD_SYSCALL_CLOSE, peer));
+    uint64_t entry = ph_vm_load_bootstrap(space->guardian_fd,
+        ph_vm_guardian_image_start,
+        (size_t)(ph_vm_guardian_image_end - ph_vm_guardian_image_start));
+    ph_vm_map_anonymous(process, PH_VM_CLIENT_STACK, PH_VM_CLIENT_STACK_SIZE);
+    long thread = pacha_syscall6(PACHA_THREAD_SYSCALL_CREATE, process, entry,
+        PH_VM_CLIENT_STACK + PH_VM_CLIENT_STACK_SIZE, 0, 0,
+        PACHA_FD_RIGHT_START | PACHA_FD_RIGHT_CLOSE);
+    if (thread < 16) ph_fail(__FILE__, __LINE__, thread);
+    space->guardian_thread_fd = (pacha_fd_t)thread;
+    PH_OK(pacha_syscall1(PACHA_THREAD_SYSCALL_START, thread));
+    struct pacha_pollfd ready[] = {
+        {.fd = ready_fd, .events = PACHA_FD_EVENT_READABLE},
+        {.fd = space->guardian_fd, .events = PACHA_FD_EVENT_READABLE},
+    };
+    PH_CHECK(ph_wait_readable(ready, 2) == 1);
+    PH_CHECK(ready[0].revents == PACHA_FD_EVENT_READABLE && !ready[1].revents);
+    ph_vm_event_consume(ready_fd);
+    PH_OK(pacha_syscall1(PACHA_FD_SYSCALL_CLOSE, ready_fd));
+}
 
 struct ph_vm_space *ph_vm_create(const void *file, size_t file_size,
     uint64_t start, uint64_t length) {
@@ -362,6 +450,11 @@ struct ph_vm_space *ph_vm_create(const void *file, size_t file_size,
     create_ram_grants(space);
     space->kick_fd = create_event_counter();
     space->event_fd = create_event_counter();
+    uint64_t lifeline[2] = {0};
+    PH_OK(pacha_syscall3(PACHA_IPC_SYSCALL_CHANNEL_CREATE, (uintptr_t)lifeline,
+        PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_TRANSFER | PACHA_FD_RIGHT_WAIT |
+        PACHA_FD_RIGHT_POLL, 0));
+    space->lifeline_fd = (pacha_fd_t)lifeline[0];
     struct pacha_process_fd_grant grants[] = {
         {.source_fd = space->kick_fd, .target_fd = PH_VM_CLIENT_KICK_FD,
             .rights = PACHA_FD_RIGHT_READ | PACHA_FD_RIGHT_POLL},
@@ -370,12 +463,15 @@ struct ph_vm_space *ph_vm_create(const void *file, size_t file_size,
     };
     uint64_t process_rights = PACHA_FD_RIGHT_MAP_INTO | PACHA_FD_RIGHT_SPAWN |
         PACHA_FD_RIGHT_SET_CONTEXT | PACHA_FD_RIGHT_KILL | PACHA_FD_RIGHT_WAIT |
-        PACHA_FD_RIGHT_POLL | PACHA_FD_RIGHT_CLOSE;
+        PACHA_FD_RIGHT_POLL | PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_TRANSFER;
     long process = pacha_syscall5(PACHA_PROCESS_SYSCALL_CREATE, 0, process_rights, 0,
         (uintptr_t)grants, sizeof(grants) / sizeof(grants[0]));
 
     PH_CHECK(process >= 16);
     space->process_fd = (pacha_fd_t)process;
+#ifdef PH_USER_PROCESS_SMOKE
+    ph_number("VM native process", process);
+#endif
     uint64_t entry = ph_vm_load_bootstrap(space->process_fd, file, file_size);
     uint64_t control_rights = PACHA_FD_RIGHT_MAP_READ | PACHA_FD_RIGHT_MAP_WRITE |
         PACHA_FD_RIGHT_CLOSE;
@@ -402,7 +498,11 @@ struct ph_vm_space *ph_vm_create(const void *file, size_t file_size,
         ph_fail(__FILE__, __LINE__, thread);
     }
     space->thread_fd = (pacha_fd_t)thread;
+    create_guardian(space, (pacha_fd_t)lifeline[1]);
     PH_OK(pacha_syscall1(PACHA_THREAD_SYSCALL_START, thread));
+#ifdef PH_USER_PROCESS_SMOKE
+    ph_log("VM native bootstrap started\n");
+#endif
     struct pacha_pollfd ready[2] = {
         {.fd = space->event_fd, .events = PACHA_FD_EVENT_READABLE},
         {.fd = space->process_fd, .events = PACHA_FD_EVENT_READABLE},
@@ -419,9 +519,17 @@ struct ph_vm_space *ph_vm_create(const void *file, size_t file_size,
     PH_CHECK(atomic_load_explicit(&space->control->event_sequence, memory_order_acquire) == 0);
     PH_CHECK(space->control->event == PH_VM_CLIENT_READY && space->control->pid != 0);
     space->pid = space->control->pid;
+#ifdef PH_USER_PROCESS_SMOKE
+    ph_log("VM native bootstrap ready\n");
+#endif
     ph_vm_install_lpr_entry(space);
+#ifdef PH_VM_VERIFY_NATIVE_RIGHTS
     verify_native_protection(space);
+#endif
     ph_vm_park_bootstrap(space);
+#ifdef PH_USER_PROCESS_SMOKE
+    ph_log("VM native bootstrap parked\n");
+#endif
     space->monitor = ph_thread_create(monitor_client, space);
     return space;
 }

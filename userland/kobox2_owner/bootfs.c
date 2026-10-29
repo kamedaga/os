@@ -123,6 +123,21 @@ int ph_bootfs_find(const struct ph_bootfs *archive, const char *path,
     return -ENOENT;
 }
 
+int ph_bootfs_entry(const struct ph_bootfs *archive, uint32_t index,
+    const unsigned char **path, size_t *path_size,
+    const unsigned char **bytes, size_t *size, uint32_t *mode)
+{
+    if (!archive || !archive->image || index >= archive->entry_count ||
+        !path || !path_size || !bytes || !size || !mode) return -EINVAL;
+    const unsigned char *entry = archive->image + archive->entries + (uint64_t)index * 48;
+    *path = archive->image + archive->strings + rd32(entry);
+    *path_size = rd16(entry + 4);
+    *bytes = archive->image + rd64(entry + 8);
+    *size = (size_t)rd64(entry + 16);
+    *mode = rd32(entry + 24);
+    return 0;
+}
+
 int ph_bootfs_close(struct ph_bootfs *archive)
 {
     if (!archive) return -EINVAL;

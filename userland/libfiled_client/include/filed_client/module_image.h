@@ -27,4 +27,9 @@ int filed_client_load_module_image(
 int filed_client_load_module_image_limited(pacha_fd_t endpoint_fd, const char *path,
     const char *name, size_t max_bytes, struct filed_client_module_image *out);
 
+/* An optional control/policy file may be absent during normal polling.
+ * Return ENOENT without logging it; all other validation/errors are identical. */
+int filed_client_load_optional_module_image_limited(pacha_fd_t endpoint_fd, const char *path,
+    const char *name, size_t max_bytes, struct filed_client_module_image *out);
+
 void filed_client_release_module_image(struct filed_client_module_image *image);

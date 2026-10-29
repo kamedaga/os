@@ -1,19 +1,19 @@
 /// Internal waits finish before signal delivery; teardown is never deferred.
 pub const wait_uninterruptible: u64 = 1 << 1;
 
-pub const syscall_ipc_first: u64 = 76;
-pub const syscall_ipc_endpoint_create: u64 = 76;
-pub const syscall_ipc_channel_create: u64 = 77;
-pub const syscall_ipc_send: u64 = 78;
-pub const syscall_ipc_recv: u64 = 79;
-pub const syscall_ipc_call: u64 = 80;
-pub const syscall_ipc_reply: u64 = 81;
-pub const syscall_ipc_reply_recv: u64 = 82;
-pub const syscall_ipc_reply_extract: u64 = 83;
+pub const syscall_ipc_first: u64 = 78;
+pub const syscall_ipc_endpoint_create: u64 = 78;
+pub const syscall_ipc_channel_create: u64 = 79;
+pub const syscall_ipc_send: u64 = 80;
+pub const syscall_ipc_recv: u64 = 81;
+pub const syscall_ipc_call: u64 = 82;
+pub const syscall_ipc_reply: u64 = 83;
+pub const syscall_ipc_reply_recv: u64 = 84;
+pub const syscall_ipc_reply_extract: u64 = 85;
 pub const implicit_reply: u64 = ~@as(u64, 0);
-pub const syscall_ipc_recv_wait: u64 = 84;
-pub const syscall_ipc_notify: u64 = 85;
-pub const syscall_ipc_notify_wait: u64 = 86;
+pub const syscall_ipc_recv_wait: u64 = 86;
+pub const syscall_ipc_notify: u64 = 87;
+pub const syscall_ipc_notify_wait: u64 = 88;
 pub const syscall_ipc_last: u64 = syscall_ipc_notify_wait;
 pub const syscall_ipc_count: u64 = syscall_ipc_last - syscall_ipc_first + 1;
 

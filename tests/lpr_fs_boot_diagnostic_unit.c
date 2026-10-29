@@ -260,6 +260,12 @@ int64_t lpr_pacha_syscall4(uint64_t nr, uint64_t a, uint64_t b, uint64_t c, uint
 {
     return fixture_finish_request(nr, a, b, c, d);
 }
+int64_t lpr_wait_native_retained_fds(struct pacha_pollfd *leaves,
+    uint32_t count, uint64_t timeout, uint64_t native_flags)
+{
+    return lpr_pacha_syscall4(PACHA_FD_SYSCALL_WAIT_MANY,
+        (uint64_t)(uintptr_t)leaves, count, timeout, native_flags);
+}
 int64_t lpr_ipc_message(uint64_t nr, uint64_t endpoint,
     uint64_t request, uint64_t reply, uint64_t timeout, uint64_t flags, int *sent)
 {

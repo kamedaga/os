@@ -54,6 +54,7 @@ fn ThreadExitPublishContext(comptime Handler: type) type {
 
         fn run(raw_context: *anyopaque) void {
             const context: *@This() = @ptrCast(@alignCast(raw_context));
+            kernel.persistent_wait.clearThread(context.state, context.proc, context.thread_index, context.thread_generation);
             if (context.clear_tid)
                 runtime.clearTidAndWake(context.handler, context.proc, context.user_va);
             context.state.markThreadObjectsExitedBySlot(context.thread_index, context.thread_generation, .exited, context.exit_code);
@@ -595,6 +596,7 @@ fn killThread(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, 
         // In particular, a remote CPU may still be executing this generation.
         // Never release a shared-memory lock based on an uncompleted kill.
         if (!scheduler.releaseThreadGeneration(@intCast(thread.thread_index), thread.thread_generation, @enumFromInt(thread.owner_principal_raw))) return sc.syscall_err_not_ready;
+        kernel.persistent_wait.clearThread(state, @enumFromInt(thread.owner_principal_raw), @intCast(thread.thread_index), thread.thread_generation);
     }
     state.markThreadObjectsExitedBySlot(thread.thread_index, thread.thread_generation, .killed, code);
     _ = wakeTaskFdWaiters(h, state, @enumFromInt(thread.owner_principal_raw));
@@ -798,6 +800,10 @@ fn deliverPendingSignalToUserFrame(
         perf.runtimeAdd(.pending_frame, .invalid, 1);
         return sc.syscall_err_invalid;
     }
+    if (scheduler.currentSignalStack()) |stack| {
+        if (@import("../signal_stack.zig").contains(stack.base, stack.size, frame.rsp))
+            return sc.syscall_err_invalid;
+    }
     const claim_start = perf.runtimeTimestamp(.pending_frame);
     const claim_result = scheduler.claimCurrentSignalForUserReturn(user_frame.rip);
     perf.runtimeAdd(.pending_frame, .claim_calls, 1);
@@ -807,15 +813,12 @@ fn deliverPendingSignalToUserFrame(
         return sc.syscall_ok;
     };
     perf.runtimeAdd(.pending_frame, .claimed, 1);
-    const stack_cost = process_abi.signal_red_zone_size +
-        process_abi.signal_frame_size + process_abi.signal_runtime_stack_size;
-    if (user_frame.rsp <= stack_cost) {
+    const destination = @import("../signal_stack.zig").layout(claimed.scratch_base, claimed.scratch_size, user_frame.rsp) orelse {
         scheduler.restoreClaimedSignal(claimed);
         perf.runtimeAdd(.pending_frame, .invalid, 1);
         return sc.syscall_err_invalid;
-    }
-    const signal_frame_va = (user_frame.rsp - process_abi.signal_red_zone_size -
-        process_abi.signal_frame_size) & ~@as(u64, 63);
+    };
+    const signal_frame_va = destination.frame_va;
     var signal_frame = NativeSignalFrame{
         .magic = process_abi.signal_frame_magic,
         .size = process_abi.signal_frame_size,
@@ -833,7 +836,7 @@ fn deliverPendingSignalToUserFrame(
     }
     frame.rdi = signal_frame_va;
     frame.rip = claimed.entry;
-    frame.rsp = signal_frame_va - process_abi.signal_runtime_stack_size;
+    frame.rsp = destination.runtime_rsp;
     return sc.syscall_ok;
 }
 
@@ -866,11 +869,17 @@ fn signalControl(h: anytype, proc: kernel.PrincipalId, frame: *TrapFrame) u64 {
     const state = h.state;
     switch (frame.rdi) {
         process_abi.signal_ctl_register => {
-            const entry = frame.rsi;
-            const inhibit_start = frame.rdx;
-            const inhibit_end = frame.r10;
-            const inhibit_secondary_start = frame.r8;
-            const inhibit_secondary_end = frame.r9;
+            var registration: process_abi.SignalRegistration = undefined;
+            if (!h.copy_user_bytes_from_va(proc, frame.rsi, std.mem.asBytes(&registration)))
+                return sc.syscall_err_invalid;
+            const entry = registration.entry;
+            const inhibit_start = registration.inhibit_start;
+            const inhibit_end = registration.inhibit_end;
+            const inhibit_secondary_start = registration.inhibit_secondary_start;
+            const inhibit_secondary_end = registration.inhibit_secondary_end;
+            if ((registration.flags & ~process_abi.signal_registration_process_owner) != 0 or
+                !@import("../signal_stack.zig").scratchRegistrationValid(registration.scratch_base, registration.scratch_size, entry, inhibit_start, inhibit_end))
+                return sc.syscall_err_invalid;
             if (!isUserEntryVa(entry) or
                 !isUserSignalInhibitRange(inhibit_start, inhibit_end) or
                 !isUserSignalInhibitRange(inhibit_secondary_start, inhibit_secondary_end) or
@@ -884,6 +893,9 @@ fn signalControl(h: anytype, proc: kernel.PrincipalId, frame: *TrapFrame) u64 {
                 inhibit_end,
                 inhibit_secondary_start,
                 inhibit_secondary_end,
+                registration.scratch_base,
+                registration.scratch_size,
+                (registration.flags & process_abi.signal_registration_process_owner) != 0,
             )) sc.syscall_ok else sc.syscall_err_not_ready;
         },
         process_abi.signal_ctl_set_mask => {

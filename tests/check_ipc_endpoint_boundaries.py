@@ -10,7 +10,7 @@ LOCKED = {
  'state/reference_check.zig': 'queue',
  'state/fd_capability.zig': 'deinit',
  'state/ipc.zig': 'clearIpcQueue clearIpcQueueWithFreeList clearIpcEndpointSlot clearIpcEndpointSlotWithFreeList releaseIpcChannelHandle releaseIpcChannelHandleWithFreeList clearIpcReplySlot clearIpcReplySlotWithFreeList registerIpcDirectReceive cancelIpcDirectReceivers registerIpcPollWaitersForFd registerIpcRecvCompletionWaiterForFd unregisterIpcPollWaitersForFd wakeIpcWaitersForSendFd noteIpcReceiverForFd ipcReceiverHandoffHintForSendFd takeIpcWritableWaitersForRecvFd takeIpcChannelPeerCloseWaiters ipcNotifyPeerForFd settleIpcPeerNotifyForFd consumeIpcNotifyForFd ipcNotifyWaiterForFd registerIpcNotifyWaiterForFd unregisterIpcNotifyWaiterForFd ipcChannelNotifyWaiterSnapshot takeIpcChannelNotifyWaitersAfterClose wakeIpcPollWaitersForSendFd enqueueIpcMessage ipcClaimCallReply ipcFinishCallReply releaseIpcCallAuthority ipcExtractReply ipcTakeDirectReceiver ipcCreateCall ipcCall cancelCall takeIpcCancellationWritableWaiters drainIpcCancellations ipcRecvPendingCall ipcRecv',
- 'state/fd.zig': 'revokeObjectHolders fdIpcReadable fdIpcWritable fdPollEventsWithWriteMin detachFdWaitGroup dmaEnablingQueue',
+ 'state/fd.zig': 'revokeObjectHolders fdIpcReadable fdIpcWritable fdPollEventsWithWriteMin detachFdWaitGroup retirePersistentRegistration makePersistentRegistration dmaEnablingQueue',
  'syscall/native_ipc.zig': 'fastDispatchAfterRegisterAdmission',
 }
 WRITES = re.compile(r'\.(?:receive_(?:head|tail|next|prev|list|target)|poll_(?:head|tail)|receiver_hints?|notify_(?:pending|waiters)|queue_key|sent|lifetime_refs)\b[^;\n]*(?:=(?!=)|\.(?:store|fetchAdd|fetchSub)\()|\.(?:appendReceive|unlinkReceive|removeWaiter|takeReadable|takeReadablePollWaiters|takeEvents|push|pop)\(')
@@ -111,6 +111,29 @@ def check(files, expected):
         production = without_tests(code_only(files[path]))
         assert not re.search(r'fastDispatchKFree|pinIpcFastBlock|tryIpcFastSend|releaseRetainedReply', production)
     types = files['state/types.zig']
+    data_poll = function_body(code_only(types), 'dataPollAfter')
+    assert 'self.assertHeld();' in data_poll
+    for required in ('!node.active', 'node.binding.persistent == null', 'node.recv_memory.active',
+                     'node.events & (abi.event_readable | abi.event_writable) != 0',
+                     '!item.queued or item.set.invocation != null'):
+        assert required in data_poll, 'data admission skipped a required observer'
+    assert not WRITES.search(data_poll), 'data admission must leave close observers linked'
+    # dataPollAfter also reads the K-owned FIFO/invocation. Freeze its borrower
+    # surface and the K admission of the two direct entry callers.
+    users = {}
+    for path, text in files.items():
+        for name, b in functions(text):
+            count = b.count('.dataPollAfter(')
+            if count: users[path + ':' + name] = count
+    assert users == {
+        'scheduler_connection.zig:prepareDirectHandoff': 2,
+        'scheduler_connection.zig:prepareDirectNotify': 2,
+        'syscall/native_ipc.zig:fastDispatchAfterRegisterAdmission': 6,
+    }, 'unreviewed persistent ready FIFO borrower'
+    for entry_name, prepare in (('syscallDirectIpcPrepare', 'scheduler.prepareDirectHandoff('),
+                                ('prepareDirectNotifyEntry', 'scheduler.prepareDirectNotify(')):
+        entry = function_body(code_only(files['syscalls.zig']), entry_name)
+        assert entry.index('kernel_state_lock.tryLock()') < entry.index(prepare)
     assert 'lifetime_refs: std.atomic.Value(usize)' in types
     for name in ('appendReceive', 'unlinkReceive', 'removeWaiter', 'push', 'pop'):
         assert 'self.assertHeld();' in function_body(code_only(types), name)

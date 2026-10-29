@@ -1,16 +1,21 @@
 /* SPDX-License-Identifier: MIT */
 /* Shared syscall capture/return entry. The embedding runtime owns dispatch. */
-.globl lpr_syscall_entry
-.hidden lpr_syscall_entry
-.type lpr_syscall_entry, @function
-lpr_syscall_entry:
+#ifndef LPR_SYSCALL_ENTRY_NAME
+#define LPR_SYSCALL_ENTRY_NAME lpr_syscall_entry
+#endif
+.globl LPR_SYSCALL_ENTRY_NAME
+.hidden LPR_SYSCALL_ENTRY_NAME
+.type LPR_SYSCALL_ENTRY_NAME, @function
+LPR_SYSCALL_ENTRY_NAME:
     # Native signal delivery addresses its frame and runtime stack relative to
     # the interrupted Linux RSP, then its preparation code grows downward from
     # that runtime RSP. Keep the LPR C stack below both regions; otherwise
     # signal preparation can overwrite a live dispatch stack before returning.
     # A Linux syscall site does not promise SysV call-stack alignment. Preserve
     # its exact RSP for return, but align the private LPR stack before entering C.
+#ifndef LPR_SYSCALL_ENTRY_PRIVATE_STACK
     mov %rsp, %r11
+#endif
     sub $LPR_SYSCALL_ENTRY_RESERVE_BYTES, %rsp
     and $-16, %rsp
     mov %r11, 40(%rsp)
@@ -35,7 +40,28 @@ lpr_syscall_entry:
     mov %r10, 128(%r11)
     movq $0x202, 136(%r11)
     movq $0, 144(%r11)
+    movq $0, 152(%r11)
+#ifdef LPR_SYSCALL_PRESERVE_FP
+    # Linux syscalls preserve FP/SIMD state, unlike a C function call. The
+    # LPR C runtime uses baseline SSE2; legacy SSE leaves YMM upper halves
+    # untouched. Keep this aligned per-call image outside the GPR frame.
+    lea 224(%rsp), %r10
+    mov %r10, 152(%r11)
+    fxsave64 (%r10)
+#endif
 
+#ifdef LPR_SYSCALL_ENTRY_PRIVATE_STACK
+    mov %rsp, %rdi
+    call lpr_entry_stack_prepare
+    mov %rax, %rsp
+    test %rdx, %rdx
+    jz .Lentry_stack_ready
+    # The helper has returned and RSP is private before another initializer
+    # can acquire and reuse the shared bootstrap stack.
+    movl $0, lpr_entry_bootstrap_lock(%rip)
+.Lentry_stack_ready:
+    lea 56(%rsp), %r11
+#endif
     mov 72(%r11), %r10
     mov %r10, 0(%rsp)
     mov 64(%r11), %r10
@@ -55,6 +81,10 @@ lpr_syscall_entry:
     call lpr_dispatch_syscall_frame
 
     lea 56(%rsp), %r11
+#ifdef LPR_SYSCALL_PRESERVE_FP
+    mov 152(%r11), %r10
+    fxrstor64 (%r10)
+#endif
     mov 120(%r11), %rcx
     mov 0(%r11), %r15
     mov 8(%r11), %r14
@@ -74,4 +104,4 @@ lpr_syscall_entry:
     mov 128(%r11), %rsp
     jmp *%rcx
 #endif
-.size lpr_syscall_entry, .-lpr_syscall_entry
+.size LPR_SYSCALL_ENTRY_NAME, .-LPR_SYSCALL_ENTRY_NAME

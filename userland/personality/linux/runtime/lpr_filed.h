@@ -52,6 +52,7 @@ int64_t lpr_linux_vfork(void);
 void lpr_linux_apply_pending_fork_child(void);
 void lpr_linux_prepare_process_exit(uint64_t exit_code);
 int64_t lpr_linux_wait4(uint64_t pid, uint64_t status, uint64_t options, uint64_t rusage, unsigned *wait_not_ready __attribute__((unused)));
+int64_t lpr_linux_waitid(uint64_t which, uint64_t id, uint64_t info, uint64_t options, uint64_t rusage, unsigned *wait_not_ready);
 int64_t lpr_linux_execve(uint64_t path, uint64_t argv, uint64_t envp);
 int64_t lpr_linux_getpid(void);
 int64_t lpr_linux_getppid(void);

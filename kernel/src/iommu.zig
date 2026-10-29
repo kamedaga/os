@@ -38,6 +38,12 @@ pub fn isActive() bool {
     return amd.isActive() or vtd.isActive();
 }
 
+/// Legacy IOAPIC support currently has a checked VT-d path only. AMD's
+/// interrupt-remapping ownership needs its own evidence before admission.
+pub fn legacyInterruptRoutingAllowed() bool {
+    return !amd.isActive() and vtd.legacyInterruptRoutingAllowed();
+}
+
 pub fn deviceIovaWindow(device: types.DmaDeviceId) DeviceIovaWindow {
     if (amd.isActive()) {
         const window = amd.deviceIovaWindow(device);

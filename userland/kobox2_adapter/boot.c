@@ -5,7 +5,11 @@
 #ifndef PH_SANDBOX_AMDGPU
 #define PH_SANDBOX_AMDGPU 0
 #endif
-#if PH_SANDBOX_AMDGPU
+#ifndef PH_SANDBOX_WIFI
+#define PH_SANDBOX_WIFI 0
+#endif
+#define PH_BOOT_LOG_SOURCE (PH_SANDBOX_WIFI ? PACHA_LOG_SOURCE_KOBOX2_NET : PACHA_LOG_SOURCE_KOBOX2_GPU)
+#if PH_SANDBOX_AMDGPU || PH_SANDBOX_WIFI
 #include <pacha/log.h>
 #endif
 
@@ -17,7 +21,7 @@ static struct kobox_linux_task_report task_report;
 static void (*service_main)(const struct kobox_linux_task_report *, void *);
 static void *service_context;
 
-#if PH_SANDBOX_AMDGPU
+#if PH_SANDBOX_AMDGPU || PH_SANDBOX_WIFI
 static pacha_fd_t gpu_log_fd;
 static atomic_flag gpu_log_lock = ATOMIC_FLAG_INIT;
 static char gpu_log_line[256];
@@ -54,7 +58,7 @@ static void gpu_log_fields(const struct gpu_log_field *fields, size_t count) {
             *out++ = "0123456789abcdef"[digit];
         }
     }
-    (void)pacha_log_emit(gpu_log_fd, PACHA_LOG_SOURCE_KOBOX2_GPU,
+    (void)pacha_log_emit(gpu_log_fd, PH_BOOT_LOG_SOURCE,
         line, (size_t)(out - line));
 }
 
@@ -98,7 +102,11 @@ static void gpu_log_copy(const char *text, size_t length) {
                 gpu_log_overflow = 1;
         }
         atomic_flag_clear_explicit(&gpu_log_lock, memory_order_release);
-        if (ready && (has_text(line, ready, "kobox-firmware:") ||
+        if (ready && (has_text(line, ready, "iwlwifi") ||
+                      has_text(line, ready, "cfg80211") ||
+                      has_text(line, ready, "wlan") ||
+                      has_text(line, ready, "firmware") ||
+                      has_text(line, ready, "kobox-firmware:") ||
                       has_text(line, ready, "kobox-pci:") ||
                       has_text(line, ready, "kobox-drm:") ||
                       has_text(line, ready, "kobox-mmio:") ||
@@ -108,14 +116,14 @@ static void gpu_log_copy(const char *text, size_t length) {
                       has_text(line, ready, "ring ") ||
                       has_text(line, ready, "IRQ") ||
                       has_text(line, ready, "irq")))
-            (void)pacha_log_emit(gpu_log_fd, PACHA_LOG_SOURCE_KOBOX2_GPU,
+            (void)pacha_log_emit(gpu_log_fd, PH_BOOT_LOG_SOURCE,
                 line, ready);
     }
 }
 #endif
 
 void ph_boot_set_log_fd(pacha_fd_t fd) {
-#if PH_SANDBOX_AMDGPU
+#if PH_SANDBOX_AMDGPU || PH_SANDBOX_WIFI
     gpu_log_fd = fd >= 16 ? fd : 0;
 #else
     (void)fd;
@@ -124,7 +132,7 @@ void ph_boot_set_log_fd(pacha_fd_t fd) {
 
 void ph_boot_log_fault(unsigned long vector, unsigned long error,
     unsigned long core_relative, unsigned long ip, unsigned long address) {
-#if PH_SANDBOX_AMDGPU
+#if PH_SANDBOX_AMDGPU || PH_SANDBOX_WIFI
     const struct gpu_log_field fields[] = {
         {"Linux fault vector=0x", vector}, {" error=0x", error},
         {" core_relative=0x", core_relative}, {" ip=0x", ip},
@@ -136,9 +144,34 @@ void ph_boot_log_fault(unsigned long vector, unsigned long error,
 #endif
 }
 
+void ph_boot_log_dma_failure(unsigned long stage, long native_status,
+    unsigned long iova, unsigned long bytes, unsigned long mappings,
+    unsigned long mapping_bytes, long fd_status, unsigned long fd_capacity,
+    unsigned long fd_free) {
+#if PH_SANDBOX_AMDGPU || PH_SANDBOX_WIFI
+    const struct gpu_log_field operation[] = {
+        {"native DMA failure stage=0x", stage}, {" native=0x", (unsigned long)native_status},
+        {" iova=0x", iova}, {" bytes=0x", bytes}, {" mappings=0x", mappings},
+    };
+    const struct gpu_log_field resources[] = {
+        {"native DMA resources mapping_bytes=0x", mapping_bytes},
+        {" fd_status=0x", (unsigned long)fd_status}, {" fd_capacity=0x", fd_capacity},
+        {" fd_free=0x", fd_free},
+    };
+    /* Each record remains below the bounded logger line size, including
+     * worst-case hexadecimal values. The longer serial snapshot stays in
+     * device_dma.c; routing that whole line would silently drop it. */
+    gpu_log_fields(operation, sizeof(operation) / sizeof(operation[0]));
+    gpu_log_fields(resources, sizeof(resources) / sizeof(resources[0]));
+#else
+    (void)stage; (void)native_status; (void)iova; (void)bytes; (void)mappings;
+    (void)mapping_bytes; (void)fd_status; (void)fd_capacity; (void)fd_free;
+#endif
+}
+
 void ph_boot_log_fatal(unsigned long source, unsigned long line,
     unsigned long result) {
-#if PH_SANDBOX_AMDGPU
+#if PH_SANDBOX_AMDGPU || PH_SANDBOX_WIFI
     const struct gpu_log_field fields[] = {
         {"Linux fatal source=0x", source}, {" line=0x", line},
         {" result=0x", result},
@@ -151,7 +184,7 @@ void ph_boot_log_fatal(unsigned long source, unsigned long line,
 
 void ph_boot_log_gpu_map_failure(unsigned long stage, long status,
     unsigned long handle, unsigned long bytes) {
-#if PH_SANDBOX_AMDGPU
+#if PH_SANDBOX_AMDGPU || PH_SANDBOX_WIFI
     const struct gpu_log_field fields[] = {
         {"kobox-drm: map failure stage=0x", stage},
         {" status=0x", (unsigned long)status},
@@ -168,7 +201,7 @@ void ph_boot_log_gpu_page_view_failure(long status, unsigned long parent_fd,
     unsigned long rights, unsigned long cache, unsigned long page_count,
     unsigned long first_page, unsigned long middle_page,
     unsigned long last_page) {
-#if PH_SANDBOX_AMDGPU
+#if PH_SANDBOX_AMDGPU || PH_SANDBOX_WIFI
     const struct gpu_log_field fields[] = {
         {"kobox-drm: page view refused status=0x", (unsigned long)status},
         {" parent_fd=0x", parent_fd}, {" rights=0x", rights},
@@ -187,7 +220,7 @@ void ph_boot_log_gpu_bar_export_failure(unsigned long reason, long status,
     unsigned long bar, unsigned long protection, unsigned long cache,
     unsigned long page_count, unsigned long first_page,
     unsigned long last_page) {
-#if PH_SANDBOX_AMDGPU
+#if PH_SANDBOX_AMDGPU || PH_SANDBOX_WIFI
     const struct gpu_log_field fields[] = {
         {"kobox-drm: BAR export refused reason=0x", reason},
         {" status=0x", (unsigned long)status},
@@ -204,7 +237,7 @@ void ph_boot_log_gpu_bar_export_failure(unsigned long reason, long status,
 
 void ph_boot_log_gpu_cache_transition(unsigned long stage,
     unsigned long offset, unsigned long bytes, unsigned long mode, long status) {
-#if PH_SANDBOX_AMDGPU
+#if PH_SANDBOX_AMDGPU || PH_SANDBOX_WIFI
     const struct gpu_log_field fields[] = {
         {"kobox-drm: cache transition stage=0x", stage},
         {" offset=0x", offset}, {" bytes=0x", bytes},
@@ -220,7 +253,7 @@ void ph_boot_log_gpu_cache_reject(long status, unsigned long offset,
     unsigned long bytes, unsigned long direct_overlaps,
     unsigned long scattered_mappings, unsigned long sample_iova,
     long inventory_status) {
-#if PH_SANDBOX_AMDGPU
+#if PH_SANDBOX_AMDGPU || PH_SANDBOX_WIFI
     const struct gpu_log_field fields[] = {
         {"kobox-drm: cache rejected status=0x", (unsigned long)status},
         {" offset=0x", offset}, {" bytes=0x", bytes},
@@ -239,7 +272,7 @@ void ph_boot_log_gpu_cache_reject(long status, unsigned long offset,
 void ph_boot_log_map_failure(unsigned long window, unsigned long offset,
     unsigned long backing, unsigned long bytes, unsigned long protection,
     unsigned long result) {
-#if PH_SANDBOX_AMDGPU
+#if PH_SANDBOX_AMDGPU || PH_SANDBOX_WIFI
     const struct gpu_log_field fields[] = {
         {"native mmap refused window=0x", window},
         {" offset=0x", offset},
@@ -262,7 +295,7 @@ void ph_boot_log_map_failure(unsigned long window, unsigned long offset,
 void ph_boot_log_scatter_failure(unsigned long window, unsigned long offset,
     unsigned long first_page, unsigned long pages, unsigned long protection,
     unsigned long step, unsigned long result) {
-#if PH_SANDBOX_AMDGPU
+#if PH_SANDBOX_AMDGPU || PH_SANDBOX_WIFI
     const struct gpu_log_field fields[] = {
         {"native scatter map refused step=0x", step},
         {" window=0x", window},
@@ -287,7 +320,7 @@ void ph_boot_log_scatter_failure(unsigned long window, unsigned long offset,
 void ph_boot_log_irq_failure(unsigned long mode, unsigned long index,
     unsigned long count, unsigned long cpu, unsigned long step,
     unsigned long raw, unsigned long result) {
-#if PH_SANDBOX_AMDGPU
+#if PH_SANDBOX_AMDGPU || PH_SANDBOX_WIFI
     const struct gpu_log_field fields[] = {
         {"native IRQ allocation refused mode=0x", mode},
         {" index=0x", index},
@@ -311,7 +344,7 @@ void ph_boot_log_irq_failure(unsigned long mode, unsigned long index,
 
 void ph_boot_log_irq_summary(unsigned long received,
     unsigned long dispatched, unsigned long acknowledged) {
-#if PH_SANDBOX_AMDGPU
+#if PH_SANDBOX_AMDGPU || PH_SANDBOX_WIFI
     const struct gpu_log_field fields[] = {
         {"native IRQ summary received=0x", received},
         {" dispatched=0x", dispatched},
@@ -327,7 +360,7 @@ void ph_boot_log_irq_summary(unsigned long received,
 
 void ph_boot_log_irq_ready(unsigned long received,
     unsigned long dispatched, unsigned long acknowledged) {
-#if PH_SANDBOX_AMDGPU
+#if PH_SANDBOX_AMDGPU || PH_SANDBOX_WIFI
     const struct gpu_log_field fields[] = {
         {"native IRQ ready received=0x", received},
         {" dispatched=0x", dispatched},
@@ -345,7 +378,7 @@ static void console_write(void *context, const char *text, size_t length) {
     (void)context;
     (void)pacha_syscall2(1, (uintptr_t)text, length);
     ph_tail_console(text, length);
-#if PH_SANDBOX_AMDGPU
+#if PH_SANDBOX_AMDGPU || PH_SANDBOX_WIFI
     gpu_log_copy(text, length);
 #endif
 }
@@ -362,6 +395,9 @@ _Noreturn void ph_boot_run(const void *core, size_t size,
     PH_CHECK(core && size && main && !service_main);
     service_main = main;
     service_context = context;
+#ifdef PH_USER_PROCESS_SMOKE
+    ph_log("USER_PROCESS_BOOT=setup\n");
+#endif
     boot_task.self = &boot_task;
     boot_task.bound = true;
     extern char ph_boot_stack[];
@@ -378,11 +414,17 @@ _Noreturn void ph_boot_run(const void *core, size_t size,
     PH_OK(pacha_syscall1(PACHA_THREAD_SYSCALL_SET_FS_BASE, (uintptr_t)&boot_task));
     boot_task.fault_stack = ph_alloc(PH_THREAD_STACK_SIZE);
     ph_thread_setup(&boot_task);
+#ifdef PH_USER_PROCESS_SMOKE
+    ph_log("USER_PROCESS_BOOT=thread\n");
+#endif
     boot_task.fd = (pacha_fd_t)pacha_syscall4(PACHA_FD_SYSCALL_DUP, PACHA_THREAD_SELF_FD, 16,
         PACHA_FD_RIGHT_WAIT | PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_PROCESS_SIGNAL, 0);
     PH_CHECK(boot_task.fd >= 16);
 
     PH_OK(ph_image_open(&ph_core, core, size));
+#ifdef PH_USER_PROCESS_SMOKE
+    ph_log("USER_PROCESS_BOOT=image\n");
+#endif
     struct kobox_linux_boot_layout layout;
     ph_layout_init(&ph_core, &layout);
     layout.console_write = console_write;
@@ -391,6 +433,9 @@ _Noreturn void ph_boot_run(const void *core, size_t size,
     task_report.size = sizeof(task_report);
     task_report.identity = KOBOX_LINUX_TASK_HOST_IDENTITY;
     ph_machine_init(&ph_core);
+#ifdef PH_USER_PROCESS_SMOKE
+    ph_log("USER_PROCESS_BOOT=machine\n");
+#endif
     if (prepare)
         prepare(&layout, context);
     PH_OK(ph_task_ops.cpu_enter(0, &boot_fiber));

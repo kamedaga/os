@@ -10,8 +10,12 @@ font_hash="3818f6f8a805515ed24283b8fa050278af877813782b980509d22cad969634c8"
 font_package="$repo_root/.artifacts/third_party/console-setup-linux_1.226ubuntu1_all.deb"
 font_package_hash="d00a8dfd142a1af64c0346b2c8d47c9bd412e15c6b63cf3a42606029bdb862e7"
 
+mkdir -p "$(dirname "$build_dir")"
+# The live_console_assets recipe and direct callers share one checkout.
+exec {lock_fd}>"$(dirname "$build_dir")/.lock"
+flock "$lock_fd"
+
 if [[ ! -d "$source_dir/.git" ]]; then
-  mkdir -p "$(dirname "$source_dir")"
   git clone --filter=blob:none --no-checkout \
     https://github.com/neovim/libvterm.git "$source_dir"
 fi
@@ -37,13 +41,18 @@ printf '%s  %s\n' "$font_hash" "$font_source" | sha256sum -c -
 
 # Generate upstream's build-time tables in a separate build copy; keep its
 # checkout unchanged, as required for Linux-compatible third-party inputs.
-mkdir -p "$build_dir/src" "$build_dir/include"
-cp -a "$source_dir/src/." "$build_dir/src/"
-cp -a "$source_dir/include/." "$build_dir/include/"
+# The copy is assembled aside and replaces the previous one whole.
+staging_dir="$build_dir.tmp"
+rm -rf "$staging_dir"
+mkdir -p "$staging_dir/src" "$staging_dir/include"
+cp -a "$source_dir/src/." "$staging_dir/src/"
+cp -a "$source_dir/include/." "$staging_dir/include/"
 perl -CSD "$source_dir/tbl2inc_c.pl" \
-  "$source_dir/src/encoding/DECdrawing.tbl" > "$build_dir/src/encoding/DECdrawing.inc"
+  "$source_dir/src/encoding/DECdrawing.tbl" > "$staging_dir/src/encoding/DECdrawing.inc"
 perl -CSD "$source_dir/tbl2inc_c.pl" \
-  "$source_dir/src/encoding/uk.tbl" > "$build_dir/src/encoding/uk.inc"
-gzip -cd "$font_source" > "$build_dir/font.psf"
-(cd "$build_dir" && xxd -i font.psf > font_psf.h)
+  "$source_dir/src/encoding/uk.tbl" > "$staging_dir/src/encoding/uk.inc"
+gzip -cd "$font_source" > "$staging_dir/font.psf"
+(cd "$staging_dir" && xxd -i font.psf > font_psf.h)
+rm -rf "$build_dir"
+mv "$staging_dir" "$build_dir"
 printf '%s\n' "$build_dir"

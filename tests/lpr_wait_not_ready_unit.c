@@ -16,9 +16,16 @@ static int64_t native_result;
 static unsigned waits, probes, kernel_pending, deliveries, event_drains, socket_marks;
 static uint64_t returned_events;
 lpr_state_t lpr_state;
+static lpr_thread_record_t retained_record;
+static unsigned retained_mode, retained_flags[8], retained_calls, stale_once;
+static unsigned char retained_memory[8192] __attribute__((aligned(4096)));
+int64_t lpr_pacha_syscall6(uint64_t n,uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
+{ (void)a;(void)b;(void)d;(void)e;(void)f; assert(n==PACHAOS_SYSCALL_MMAP && c==sizeof(retained_memory));return (uintptr_t)retained_memory; }
+int lpr_thread_current_record(lpr_thread_record_t **out)
+{ *out=retained_mode?&retained_record:NULL; return retained_mode?0:-1; }
 void *lpr_memset(void *p, int c, size_t n) { return memset(p,c,n); }
 int64_t lpr_pacha_syscall4(uint64_t n,uint64_t a,uint64_t b,uint64_t c,uint64_t flags)
-{ if(b) ((struct pacha_pollfd *)(uintptr_t)a)[0].revents=returned_events; assert(n==PACHA_FD_SYSCALL_WAIT_MANY && flags==0); ++waits; if(c!=PACHA_FD_WAIT_FOREVER)now_ns+=c*1000000; return native_result; }
+{ if(b) ((struct pacha_pollfd *)(uintptr_t)a)[0].revents=returned_events; assert(n==PACHA_FD_SYSCALL_WAIT_MANY); if(retained_mode){assert(retained_calls<8);retained_flags[retained_calls++]=flags;if(stale_once && flags==PACHA_FD_WAIT_SET_REUSE){stale_once=0;return PACHA_FD_WAIT_SET_INVALIDATED;}}else assert(flags==0); ++waits; if(c!=PACHA_FD_WAIT_FOREVER)now_ns+=c*1000000; return native_result; }
 int64_t lpr_pacha_syscall3(uint64_t n,uint64_t a,uint64_t b,uint64_t c)
 { (void)n;(void)a;(void)b;(void)c; return -1; }
 int64_t lpr_pacha_syscall2(uint64_t n,uint64_t a,uint64_t b)
@@ -34,6 +41,27 @@ int64_t lpr_unix_poll_block(lpr_wait_graph_t *g,const lpr_wait_deadline_t *d,int
 int64_t lpr_linux_dispatch_pending_signals_with_result(int64_t result) { (void)result;return 0; }
 int main(void)
 {
+ /* A returned event is not topology: repeated waits reuse registrations.
+  * Source close invalidation forces replacement; fork identity and changed
+  * write minima cannot inherit an old registration. */
+ retained_mode=1; native_result=PACHA_SYSCALL_ERR_NOT_READY; lpr_supervisor_token=101;
+ lpr_wait_graph_t retained; lpr_wait_graph_init(&retained);
+ retained.leaf_count=1; retained.leaves[0].fd=42;
+ retained.leaves[0].events=PACHA_FD_EVENT_READABLE;
+ assert(lpr_wait_native_retained_fds(retained.leaves, retained.leaf_count, PACHA_FD_WAIT_FOREVER, 0)==PACHA_SYSCALL_ERR_NOT_READY);
+ retained.leaves[0].revents=PACHA_FD_EVENT_READABLE;
+ assert(lpr_wait_native_retained_fds(retained.leaves, retained.leaf_count, PACHA_FD_WAIT_FOREVER, 0)==PACHA_SYSCALL_ERR_NOT_READY);
+ stale_once=1;
+ assert(lpr_wait_native_retained_fds(retained.leaves, retained.leaf_count, PACHA_FD_WAIT_FOREVER, 0)==PACHA_SYSCALL_ERR_NOT_READY);
+ retained.leaves[0].min_write_bytes=7;
+ assert(lpr_wait_native_retained_fds(retained.leaves, retained.leaf_count, PACHA_FD_WAIT_FOREVER, 0)==PACHA_SYSCALL_ERR_NOT_READY);
+ lpr_supervisor_token=102;
+ assert(lpr_wait_native_retained_fds(retained.leaves, retained.leaf_count, PACHA_FD_WAIT_FOREVER, 0)==PACHA_SYSCALL_ERR_NOT_READY);
+ assert(retained_calls==6 && retained_flags[0]==PACHA_FD_WAIT_SET_REPLACE &&
+   retained_flags[1]==PACHA_FD_WAIT_SET_REUSE && retained_flags[2]==PACHA_FD_WAIT_SET_REUSE &&
+   retained_flags[3]==PACHA_FD_WAIT_SET_REPLACE && retained_flags[4]==PACHA_FD_WAIT_SET_REPLACE &&
+   retained_flags[5]==PACHA_FD_WAIT_SET_REPLACE);
+ retained_mode=0; native_result=0;
  for(unsigned signal=0;signal<2;++signal)
  for(unsigned interrupted=0;interrupted<2;++interrupted){
   lpr_native_pending_hint_active=1; lpr_native_pending_hint=0; lpr_state.thread_count=1;

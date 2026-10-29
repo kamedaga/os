@@ -31,7 +31,8 @@ const boot_checkpoint_name = @import("boot_checkpoint_options").name;
 const entry_checkpoint_reset = @import("entry_checkpoint_reset.zig");
 const boot_diag = kernel_api.boot_diag;
 pub const boot_diagnostic_enabled = std.mem.eql(u8, boot_checkpoint_name, "DIAG") or
-    std.mem.eql(u8, boot_checkpoint_name, "DIAGTEST");
+    std.mem.eql(u8, boot_checkpoint_name, "DIAGTEST") or
+    std.mem.eql(u8, boot_checkpoint_name, "DIAGVTD");
 
 // Diagnostic images differ only in this initial byte. Volatile reads keep the
 // complete normal boot path linked in every checkpoint image; otherwise the
@@ -193,6 +194,9 @@ fn limineKernelMain() noreturn {
 
 fn maybeResetAtCheckpoint(checkpoint: u8) void {
     if (comptime boot_diagnostic_enabled) boot_diag.mark(checkpoint);
+    if (comptime std.mem.eql(u8, boot_checkpoint_name, "DIAGVTD")) {
+        if (checkpoint == 'E') entry.diagnosticSnapshotVtd();
+    }
     if (comptime std.mem.eql(u8, boot_checkpoint_name, "DIAGTEST")) {
         if (checkpoint == 'E') kernel_api.halt.haltWithMessage("QEMU diagnostic display halt at E");
     }

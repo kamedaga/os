@@ -26,6 +26,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--bootfs-manifest", type=Path,
                         help="Audit the actual combined bootfs/desktop libraries and RAM footprint")
+    parser.add_argument("--bundle", type=Path, default=ROOT / ".artifacts/live-desktop/desktop.tar.gz")
     args = parser.parse_args()
     host = {}
     if args.bootfs_manifest:
@@ -33,7 +34,7 @@ def main():
             if line and not line.startswith("#"):
                 target, source = line.split("=", 1)
                 host[target.lstrip("/")] = (args.bootfs_manifest.parent / source).resolve()
-    bundle = ROOT / ".artifacts/live-desktop/desktop.tar.gz"
+    bundle = args.bundle
     manifest = json.loads(bundle.with_suffix(bundle.suffix + ".json").read_text())
     assert desktop.sha256(bundle) == manifest["sha256"]
     mesa, mesa_manifest = desktop.mesa_package(desktop.DEFAULT_MESA)

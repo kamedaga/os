@@ -430,14 +430,15 @@ static void publish_expired_clockevent(uint32_t index) {
 static void *timer_entry(void *opaque) {
     uint32_t index = (uint32_t)(uintptr_t)opaque;
     struct ph_cpu *cpu = &cpus[index];
+    struct ph_wait_retained wait_set = {0};
 
     for (;;) {
         struct pacha_pollfd fds[2] = {
             {.fd = cpu->timer_fd, .events = PACHA_FD_EVENT_READABLE},
             {.fd = cpu->stop_fd, .events = PACHA_FD_EVENT_READABLE},
         };
-        long ready_count = pacha_syscall4(PACHA_FD_SYSCALL_WAIT_MANY,
-            (uintptr_t)fds, 2, PACHA_FD_WAIT_FOREVER, 0);
+        long ready_count = ph_wait_many_retained(&wait_set,
+            fds, 2, PACHA_FD_WAIT_FOREVER);
 
         PH_CHECK(ready_count > 0 && ready_count <= 2);
         PH_CHECK(fds[0].revents != 0 || fds[1].revents != 0);

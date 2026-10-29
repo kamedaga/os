@@ -6,8 +6,11 @@
 #include "../userland/personality/linux/runtime/lpr_filed_internal.h"
 #include "../userland/personality/linux/runtime/lpr_vfs/session.h"
 #include "../userland/personality/linux/runtime/lpr_common/boot_diagnostic.h"
+#include <filed/inline_control.h>
+#include "../userland/personality/linux/runtime/lpr_vfs/control_cache.h"
 
 lpr_state_t lpr_state;
+static unsigned active_pins, total_unpins;
 static unsigned log_calls;
 static int64_t log_return;
 #if defined(LPR_BOOT_DIAGNOSTICS) && LPR_BOOT_DIAGNOSTICS
@@ -16,6 +19,8 @@ lpr_boot_diagnostic_state_t lpr_boot_diagnostic_state;
 static unsigned char *mapping;
 static size_t mapping_size;
 static uint64_t control_calls, queue_calls, closes, unmaps;
+static unsigned inline_calls, inline_dup_calls, rejected_caps, lease_closes;
+static unsigned receive_capacity=3;
 static unsigned malformed;
 static int64_t injected;
 static int return_capability;
@@ -45,6 +50,18 @@ lpr_filed_backend_t *lpr_filed_backend(uint64_t fd)
     return fd == 3 ? &first_file : fd == 4 ? &second_file : NULL;
 }
 int lpr_fd_is_filed(uint64_t fd) { return lpr_filed_backend(fd) != NULL; }
+void lpr_fd_arrays_init(void) {}
+int lpr_fd_table_pin(lpr_fd_table_t *table,lpr_linux_fd_t fd,lpr_fd_pin_t *pin)
+{
+    assert(table==&lpr_control_fd_table && !active_pins);
+    lpr_filed_backend_t *file=lpr_filed_backend(fd);
+    if (!file) return -1;
+    *pin=(lpr_fd_pin_t){.fd=fd,.ops_id=LPR_FD_OPS_FILED,.state=file};
+    ++active_pins;
+    return 0;
+}
+void lpr_fd_unpin(const lpr_fd_pin_t *pin)
+{ assert(active_pins==1 && pin->state); --active_pins; ++total_unpins; }
 lpr_block_backend_t *lpr_block_backend(uint64_t fd) { (void)fd; return NULL; }
 int64_t lpr_block_size(uint64_t fd) { (void)fd; assert(0); return 0; }
 
@@ -98,6 +115,8 @@ static size_t answer(unsigned char *wire, size_t request_size, size_t capacity)
     if (route_case && request.opcode == KB2_FILESYSTEM_OP_OPENAT2) {
         ++route_opens;
         assert(request.mask == 0x7ffu);
+        if (request.flags & LPR_LINUX_O_CREAT)
+            assert(request.mode == 0600);
         if (route_case >= 4) {
             response.handle = 432;
             response.data_length = route_case == 5 ? 0 : KB2_FILESYSTEM_STATX_SIZE;
@@ -175,6 +194,31 @@ int64_t lpr_pacha_syscall1(uint64_t nr, uint64_t fd)
     return 0;
 }
 
+/* Wire tests inject one transient scratch allocation per call. The real
+ * cache's reuse, uncertain completion and fork lifetime have a separate unit. */
+int64_t lpr_fs_control_acquire(struct lpr_fs_control_lease *lease,uint64_t bytes)
+{
+    const uint64_t rights=PACHA_FD_RIGHT_INSPECT|PACHA_FD_RIGHT_CLOSE|
+        PACHA_FD_RIGHT_TRANSFER|PACHA_FD_RIGHT_MAP_READ|PACHA_FD_RIGHT_MAP_WRITE;
+    lease->fd=lpr_pacha_syscall3(PACHAOS_SYSCALL_VMO_CREATE,bytes,rights,
+        PACHA_FD_FLAG_PRIVATE|PACHA_FD_FLAG_CLOEXEC);
+    lease->bytes=bytes;
+    lease->address=lpr_pacha_syscall6(PACHAOS_SYSCALL_MMAP,lease->fd,0,bytes,
+        PACHAOS_PROT_READ|PACHAOS_PROT_WRITE,PACHAOS_MMAP_SHARED,0);
+    return 0;
+}
+void lpr_fs_control_release(struct lpr_fs_control_lease *lease,int completed)
+{
+    (void)completed;
+    assert((void*)(uintptr_t)lease->address==mapping&&lease->bytes==mapping_size);
+    free(mapping);mapping=NULL;++unmaps;
+    lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE,lease->fd);
+}
+int64_t lpr_close_native_fd_if_open(uint64_t fd)
+{
+    assert(fd==77);++lease_closes;return 0;
+}
+
 static int64_t fixture_prepare_request(uint64_t nr, uint64_t a, uint64_t b)
 {
     if (nr == PACHAOS_SYSCALL_LOG) {
@@ -188,6 +232,29 @@ static int64_t fixture_prepare_request(uint64_t nr, uint64_t a, uint64_t b)
     }
     assert(nr == PACHAOS_SYSCALL_IPC_CALL && a == 50);
     const struct pacha_ipc_msg *request = (const void *)(uintptr_t)b;
+    receive_capacity=3;
+    if (request->word0 & FILED_CONTROL_INLINE) {
+        kb2_fs_request_t decoded;
+        assert(!mapping && !filed_control_request_decode(request, &decoded));
+        if(decoded.opcode==KB2_FILESYSTEM_OP_TRANSFER_DUP) {
+            receive_capacity=0;
+            assert(decoded.handle==(expected_opcode ? expected_handle : 42));
+            assert(request->fd_count==1 && request->fds[0].fd==77 && !request->fds[0].transfer_flags);
+            completion=(struct pacha_ipc_msg){.word0=FILED_CONTROL_INLINE|decoded.opcode,
+                .word1=injected,.word2=injected ? 0 : 999};
+            if(malformed==1)completion.word0^=1;
+            if(malformed==4)completion.word2=0;
+            ++inline_dup_calls;return 41;
+        }
+        assert(decoded.handle == 42 && decoded.length == 123456);
+        completion = (struct pacha_ipc_msg){
+            .word0 = FILED_CONTROL_INLINE | decoded.opcode,
+            .word1 = injected ? injected : decoded.length};
+        if (malformed == 1) completion.word0 ^= 1;
+        if (malformed == 2) completion.word3 = 2;
+        ++inline_calls;
+        return 41;
+    }
     assert(request->fds[0].fd == 40 &&
         (request->fds[0].rights & PACHA_FD_RIGHT_INSPECT));
     assert(request->word1 <= mapping_size && request->word2 <= mapping_size);
@@ -207,10 +274,12 @@ static int64_t fixture_finish_request(uint64_t nr, uint64_t fd, uint64_t raw,
         timeout == UINT64_MAX && flags == PACHA_WAIT_UNINTERRUPTIBLE);
     struct pacha_ipc_msg *reply = (void *)(uintptr_t)raw;
     struct pacha_ipc_fd *caps = reply->fds;
-    assert(reply->fd_capacity == 3);
+    assert(reply->fd_capacity == receive_capacity);
     *reply = completion;
     reply->fds = caps;
-    if (return_capability) { caps[0].fd = 42; reply->fd_count = 1; }
+    if (return_capability && !(malformed == 3 && (reply->word0 & FILED_CONTROL_INLINE))) {
+        caps[0].fd = 42; reply->fd_count = 1;
+    }
     return 0;
 }
 
@@ -287,6 +356,31 @@ static void test_operation_operands(void)
     assert(!lpr_linux_linkat(UINT64_MAX, (uintptr_t)expected_first, UINT64_MAX,
         (uintptr_t)expected_second, 0));
 
+    /* Qt materializes O_TMPFILE through its own /proc/self/fd magic link.
+     * Storage must receive a live handle, never its unrelated /proc tree. */
+    expected_first = "";
+    expected_handle = 112;
+    expected_flags = LPR_LINUX_AT_EMPTY_PATH;
+    assert(!lpr_linux_linkat(UINT64_MAX, (uintptr_t)"/proc/self/fd/3",
+        UINT64_MAX, (uintptr_t)expected_second, LPR_LINUX_AT_SYMLINK_FOLLOW));
+    assert(!active_pins && total_unpins==1);
+    injected=-LPR_LINUX_EEXIST;
+    assert(lpr_linux_linkat(UINT64_MAX, (uintptr_t)"/proc/self/fd/3",
+        UINT64_MAX, (uintptr_t)expected_second, LPR_LINUX_AT_SYMLINK_FOLLOW)==injected);
+    injected=0;
+    assert(!active_pins && total_unpins==2);
+    const uint64_t calls_before_bad_link=queue_calls+control_calls;
+    assert(lpr_linux_linkat(UINT64_MAX, (uintptr_t)"/proc/self/fd/99",
+        UINT64_MAX, (uintptr_t)expected_second, LPR_LINUX_AT_SYMLINK_FOLLOW)==-LPR_LINUX_ENOENT);
+    assert(lpr_linux_linkat(UINT64_MAX, (uintptr_t)"/proc/self/fd/3",
+        UINT64_MAX, (uintptr_t)"relative-target", LPR_LINUX_AT_SYMLINK_FOLLOW)==-LPR_LINUX_EBADF);
+    assert(!active_pins && total_unpins==3 && queue_calls+control_calls==calls_before_bad_link);
+    expected_first="/proc/self/fd/3";
+    expected_handle=expected_flags=0;
+    assert(!lpr_linux_linkat(UINT64_MAX, (uintptr_t)expected_first,
+        UINT64_MAX, (uintptr_t)expected_second, 0));
+    assert(!active_pins && total_unpins==3);
+
     expected_first = expected_second = NULL;
     expected_opcode = KB2_FILESYSTEM_OP_SYNC;
     assert(!lpr_linux_sync());
@@ -346,7 +440,17 @@ static void test_binding_before_handle_capture(void)
     expected_opcode = KB2_FILESYSTEM_OP_TRANSFER_DUP; expected_length = 0;
     uint64_t transferred = 0;
     assert(!lpr_filed_transfer_dup_handle(first_file.handle, 0, 77, &transferred));
-    assert(transferred == 999);
+    assert(transferred == 999 && lease_closes == 1);
+    injected = -13; transferred = 123;
+    assert(lpr_filed_transfer_dup_handle(first_file.handle,0,77,&transferred)==-13);
+    assert(!transferred && lease_closes==1); /* Error preserves caller ownership. */
+    injected = 0; malformed = 1; transferred = 123;
+    assert(lpr_filed_transfer_dup_handle(first_file.handle,0,77,&transferred)==-LPR_LINUX_EIO);
+    assert(!transferred && lease_closes==1); /* Uncertain completion is not MOVE. */
+    malformed = 4; transferred = 123;
+    assert(lpr_filed_transfer_dup_handle(first_file.handle,0,77,&transferred)==-LPR_LINUX_EIO);
+    assert(!transferred && lease_closes==1); /* A missing lease is not success. */
+    malformed = 0;
     first_file.handle = 112; second_file.handle = 223;
     expected_opcode = 0; expected_first = expected_second = NULL;
     expected_handle = expected_second_handle = 0;
@@ -358,11 +462,15 @@ static void test_device_routes(void)
     uint64_t handle,kind;
     route_case = 1;
     const uint64_t control_before=control_calls, queue_before=queue_calls;
-    assert(!lpr_filed_open_handle_at(LPR_LINUX_AT_FDCWD,"/alias",service_flags,0600,&handle,&kind));
+    /* open/openat ignore file type bits in mode; our strict OPENAT2
+     * transport must not reject tar's ordinary S_IFREG | permissions. */
+    assert(!lpr_filed_open_handle_at(LPR_LINUX_AT_FDCWD,"/alias",service_flags,0100600,&handle,&kind));
     assert(handle==432 && kind==FILED_SERVICE_GPUD_DRM && route_opens==1 && route_probes==1);
     assert(control_calls==control_before+1 && queue_calls==queue_before+1);
     route_case = 2;
-    assert(lpr_filed_open_handle_at(LPR_LINUX_AT_FDCWD,"/alias",service_flags,0600,&handle,&kind)==-LPR_LINUX_ENXIO);
+    /* The authority's routing error must not be hidden by the storage
+     * sandbox's earlier inability to open a driver it does not own. */
+    assert(lpr_filed_open_handle_at(LPR_LINUX_AT_FDCWD,"/alias",service_flags,0600,&handle,&kind)==-LPR_LINUX_ENODEV);
     assert(route_opens==2 && route_probes==2); /* Never replay ordinary OPENAT2. */
     route_case = 3;
     assert(lpr_filed_open_handle_at(LPR_LINUX_AT_FDCWD,"/alias",service_flags,0600,&handle,&kind)==-LPR_LINUX_EACCES);
@@ -410,6 +518,11 @@ static void test_device_routes(void)
 
 int main(void)
 {
+    uint64_t cwd_handle;
+    assert(!lpr_dir_handle_for((uint32_t)LPR_LINUX_AT_FDCWD, "logs", &cwd_handle));
+    assert(cwd_handle == 313);
+    assert(!lpr_dir_handle_for(UINT64_C(0x1234567800000003), "logs", &cwd_handle));
+    assert(cwd_handle == 112);
     lpr_linux_current_pid = 1;
     unsigned char output[20000];
     kb2_fs_request_t request = {.opcode = KB2_FILESYSTEM_OP_READ, .handle = 42,
@@ -439,6 +552,24 @@ int main(void)
     pacha_fd_t cap = -1; return_capability = 1;
     assert(lpr_fs_call(&request, NULL, NULL, NULL, 0, NULL, 0, &response, -1, &cap) == 123456);
     assert(cap == 42 && response.result == 123456 && !response.handle);
+    const unsigned before_inline_unmaps = unmaps, before_inline_closes = closes;
+    request.opcode = KB2_FILESYSTEM_OP_SHARED_FILE_VMO;
+    assert(lpr_fs_call(&request, NULL, NULL, NULL, 0, NULL, 0, &response, -1, &cap) == 123456);
+    assert(cap == 42 && unmaps == before_inline_unmaps && closes == before_inline_closes);
+    for (malformed = 1; malformed <= 3; ++malformed) {
+        cap = -1;
+        assert(lpr_fs_call(&request, NULL, NULL, NULL, 0, NULL, 0, &response, -1, &cap) == -LPR_LINUX_EIO);
+        assert(cap == -1);
+    }
+    rejected_caps = 2; /* Bad envelope/service replies must close their fd. */
+    malformed = 0;
+    injected = -13;
+    assert(lpr_fs_call(&request, NULL, NULL, NULL, 0, NULL, 0, &response, -1, &cap) == -LPR_LINUX_EIO);
+    ++rejected_caps; /* An error reply cannot smuggle a capability. */
+    injected = -13; return_capability = 0;
+    assert(lpr_fs_call(&request, NULL, NULL, NULL, 0, NULL, 0, &response, -1, &cap) == -13);
+    injected = 0;
+    assert(inline_calls == 7);
     return_capability = 0;
     request = (kb2_fs_request_t){.opcode = KB2_FILESYSTEM_OP_HELLO};
     injected = -13;
@@ -484,7 +615,7 @@ int main(void)
     assert(!log_calls);
 #endif
     assert(!mapping && unmaps == control_calls); /* DATA never allocates a staging VMO. */
-    assert(closes == control_calls);
+    assert(closes == control_calls + rejected_caps);
     puts("LPR_FS_RPC_UNIT_PASS");
 }
 

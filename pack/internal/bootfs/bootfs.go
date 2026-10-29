@@ -49,28 +49,79 @@ func BuildImage(manifestPath string, outputPath string) (Result, error) {
 func BuildImageWithOptions(manifestPath string, outputPath string, opts Options) (Result, error) {
 	span := progress.Use(opts.Progress).Start("bootfs image", 4)
 	defer span.Close()
-	span.Set(1, "loading bootfs manifest")
-	manifest, err := rootsync.LoadManifestWithOptionsProgress(manifestPath, rootsync.LoadOptions{CheckSymlinks: true}, span)
+	image, entries, err := renderManifest(manifestPath, opts, span)
 	if err != nil {
-		span.Fail("bootfs manifest failed")
 		return Result{}, err
 	}
-	span.SetTotal(int64(len(manifest.Files) + 4))
+	span.Set(int64(entries+2), "checking existing bootfs image")
+	if existing, err := os.ReadFile(outputPath); err == nil && bytes.Equal(existing, image) {
+		span.Done("bootfs up-to-date")
+		return Result{Path: outputPath, Entries: entries, Bytes: len(image), Skipped: true}, nil
+	}
+	if err := os.MkdirAll(filepath.Dir(outputPath), 0o755); err != nil {
+		span.Fail("bootfs directory create failed")
+		return Result{}, err
+	}
+	span.Set(int64(entries+3), "writing bootfs image")
+	if err := os.WriteFile(outputPath, image, 0o644); err != nil {
+		span.Fail("bootfs write failed")
+		return Result{}, err
+	}
+	span.Done("bootfs built")
+	return Result{Path: outputPath, Entries: entries, Bytes: len(image)}, nil
+}
+
+// ImageUpToDate reports whether outputPath already holds exactly the archive
+// that manifestPath renders to. It never writes.
+func ImageUpToDate(manifestPath string, outputPath string, opts Options) (bool, error) {
+	image, _, err := renderManifest(manifestPath, opts, nil)
+	if err != nil {
+		return false, err
+	}
+	existing, err := os.ReadFile(outputPath)
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return bytes.Equal(existing, image), nil
+}
+
+func renderManifest(manifestPath string, opts Options, span progress.Span) ([]byte, int, error) {
+	fail := func(message string) {
+		if span != nil {
+			span.Fail(message)
+		}
+	}
+	if span != nil {
+		span.Set(1, "loading bootfs manifest")
+	}
+	manifest, err := rootsync.LoadManifestWithOptionsProgress(manifestPath, rootsync.LoadOptions{CheckSymlinks: true}, span)
+	if err != nil {
+		fail("bootfs manifest failed")
+		return nil, 0, err
+	}
+	if span != nil {
+		span.SetTotal(int64(len(manifest.Files) + 4))
+	}
 	items := make([]entry, 0, len(manifest.Files))
 	for index, spec := range manifest.Files {
-		span.Set(int64(index), spec.ImagePath)
+		if span != nil {
+			span.Set(int64(index), spec.ImagePath)
+		}
 		if spec.IsSymlink {
-			span.Fail("bootfs symlink unsupported")
-			return Result{}, fmt.Errorf("bootfs does not support symlink entry: %s", spec.ImagePath)
+			fail("bootfs symlink unsupported")
+			return nil, 0, fmt.Errorf("bootfs does not support symlink entry: %s", spec.ImagePath)
 		}
 		if spec.IsDeviceNode {
-			span.Fail("bootfs device node unsupported")
-			return Result{}, fmt.Errorf("bootfs does not support device node entry: %s", spec.ImagePath)
+			fail("bootfs device node unsupported")
+			return nil, 0, fmt.Errorf("bootfs does not support device node entry: %s", spec.ImagePath)
 		}
 		data, err := os.ReadFile(spec.SourcePath)
 		if err != nil {
-			span.Fail("bootfs file read failed")
-			return Result{}, err
+			fail("bootfs file read failed")
+			return nil, 0, err
 		}
 		items = append(items, entry{
 			ImagePath:  spec.ImagePath,
@@ -81,38 +132,25 @@ func BuildImageWithOptions(manifestPath string, outputPath string, opts Options)
 	if opts.Storage != nil {
 		policy, err := storageEntries(*opts.Storage)
 		if err != nil {
-			return Result{}, err
+			return nil, 0, err
 		}
 		for _, existing := range items {
 			if existing.ImagePath == "/etc/pacha/root-uuid" || existing.ImagePath == "/etc/pacha/storage-policy" {
-				return Result{}, fmt.Errorf("storage launch policy must be generated from the configured disk")
+				return nil, 0, fmt.Errorf("storage launch policy must be generated from the configured disk")
 			}
 		}
 		items = append(items, policy...)
 	}
-	span.Set(int64(len(items)+1), "rendering bootfs image")
+	if span != nil {
+		span.Set(int64(len(items)+1), "rendering bootfs image")
+	}
 	sort.Slice(items, func(i, j int) bool { return items[i].ImagePath < items[j].ImagePath })
 	image, err := render(items)
 	if err != nil {
-		span.Fail("bootfs render failed")
-		return Result{}, err
+		fail("bootfs render failed")
+		return nil, 0, err
 	}
-	span.Set(int64(len(items)+2), "checking existing bootfs image")
-	if existing, err := os.ReadFile(outputPath); err == nil && bytes.Equal(existing, image) {
-		span.Done("bootfs up-to-date")
-		return Result{Path: outputPath, Entries: len(items), Bytes: len(image), Skipped: true}, nil
-	}
-	if err := os.MkdirAll(filepath.Dir(outputPath), 0o755); err != nil {
-		span.Fail("bootfs directory create failed")
-		return Result{}, err
-	}
-	span.Set(int64(len(items)+3), "writing bootfs image")
-	if err := os.WriteFile(outputPath, image, 0o644); err != nil {
-		span.Fail("bootfs write failed")
-		return Result{}, err
-	}
-	span.Done("bootfs built")
-	return Result{Path: outputPath, Entries: len(items), Bytes: len(image)}, nil
+	return image, len(items), nil
 }
 
 func render(items []entry) ([]byte, error) {
@@ -208,7 +246,8 @@ func executablePath(path string) bool {
 		strings.HasPrefix(path, "/usr/bin/") || strings.HasPrefix(path, "/usr/sbin/") ||
 		path == "/lib/pacha/lpr-linux-x86_64.so" ||
 		path == "/lib/ld-musl-x86_64.so.1" ||
-		path == "/lib/linux/ld-musl-x86_64.so.1"
+		path == "/lib/linux/ld-musl-x86_64.so.1" ||
+		path == "/usr/lib/pachaos/ld-musl-x86_64.so.1"
 }
 
 func align(value uint64, boundary uint64) uint64 {

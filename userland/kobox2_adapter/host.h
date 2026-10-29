@@ -27,6 +27,16 @@
 #define PH_RAM_SIZE (384ul << 20)
 #define PH_IMAGE_PHYSICAL_BASE ((size_t)KOBOX_CORE_PHYSICAL_BASE)
 
+/* Each dedicated native waiter owns this cache. Fiber waits may migrate
+ * between native threads and must continue using the transient helper. */
+struct ph_wait_retained {
+    size_t count;
+    int valid;
+    struct { uint64_t fd, events, minimum; } items[256];
+};
+long ph_wait_many_retained(struct ph_wait_retained *cache,
+    struct pacha_pollfd *fds, size_t count, uint64_t timeout);
+
 struct ph_window {
     void *base;
     size_t size;

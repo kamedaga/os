@@ -3,11 +3,13 @@
 #include "filed/exec.h"
 #include "filed/exec_linux_lpr.h"
 #include "filed/ipc_protocol.h"
+#include "filed/inline_control.h"
 #include "filed/client_rights.h"
 #include "filed/storage_owner.h"
 #include "filed/payload.h"
 #include "filed/pager.h"
 #include "pacha/ipc.h"
+#include "../../audiod/include/audiod/protocol.h"
 #include "pacha/syscall.h"
 #include "../../kobox2_owner/fs_channel.h"
 #include "filed/unix_path.h"
@@ -129,18 +131,23 @@ static int make_file_vmo(filed_runtime_t *rt,const kb2_fs_request_t *r,
         ++rt->file_vmo_misses;
         rt->file_vmo_miss_bytes+=length;
     }
+#if defined(FILED_PERF_DIAG) && FILED_PERF_DIAG
     if ((rt->file_vmo_requests&31)==0)
         fprintf(stderr,"[filed] FILE_VMO_STATS requests=%llu misses=%llu miss_bytes=%llu cache_bytes=%llu\n",
             (unsigned long long)rt->file_vmo_requests,
             (unsigned long long)rt->file_vmo_misses,
             (unsigned long long)rt->file_vmo_miss_bytes,
             (unsigned long long)filed_snapshot_cache_resident_bytes(&rt->snapshots));
+#endif
     if (hit) {
         response->result=(int64_t)length;response->handle=vmo_offset;
         response->service=cached_pager ? FILED_FILE_VMO_PAGER : 0;
         return 0;
     }
-    if (mapped>64*1024 && reusable) {
+    /* Executable snapshots need the manifest's instruction/data boundaries
+     * even for small DSOs. The eager raw-copy path makes LPR scan ELF data
+     * as instructions; the size threshold is only a non-executable heuristic. */
+    if (reusable && (rx || mapped>64*1024)) {
         struct filed_pager_record *record=NULL;
         status=filed_pager_create(rt,r->handle,(uint64_t)r->offset,mapped,
             length,rx,&stat,rights,fd,&record);
@@ -214,8 +221,31 @@ static void wr32(uint8_t *p,uint32_t value)
 {
     for (unsigned i=0;i<4;++i) p[i]=(uint8_t)(value>>(8*i));
 }
+/* The checked device inode grants one PCM session, rather than ambient
+ * audio authority in every Linux process. No launch ABI slot is needed. */
+static int open_audio_session(pacha_fd_t endpoint, uint64_t flags, pacha_fd_t *out)
+{
+    const uint64_t rights=AUDIOD_CLIENT_RIGHTS;
+    struct pacha_ipc_channel_pair pair={.a=-1,.b=-1};
+    int status=pacha_ipc_channel_create(&pair,rights,0);
+    if (status) return -EIO;
+    struct pacha_ipc_fd fd={.fd=(uint64_t)pair.b,.rights=AUDIOD_SERVER_RIGHTS,
+        .transfer_flags=PACHA_IPC_TRANSFER_MOVE};
+    const struct pacha_ipc_msg request={.word0=AUDIOD_MAGIC,.word1=AUDIO_OPEN,
+        .word2=flags & (1u|04000u|02000000u),.word3=1,.fds=&fd,.fd_count=1};
+    struct pacha_ipc_msg reply={0};
+    int published=0;
+    status=pacha_ipc_call(endpoint,&request,&reply,PACHA_FD_WAIT_FOREVER,&published);
+    if (published) pair.b=-1;
+    if (status || reply.word0!=AUDIOD_MAGIC || reply.word3!=1) status=-EIO;
+    else status=(int)(int64_t)reply.word1;
+    if (pair.b>=16) (void)pacha_fd_close(pair.b);
+    if (status) (void)pacha_fd_close(pair.a);
+    else *out=pair.a;
+    return status;
+}
 static int route_device(filed_runtime_t *rt,const kb2_fs_request_t *request,
-    const uint8_t *bytes,size_t size,kb2_fs_response_t *response,uint8_t *statx)
+    const uint8_t *bytes,size_t size,kb2_fs_response_t *response,uint8_t *statx,pacha_fd_t *device_fd)
 {
     kb2_fs_request_t probe=*request;
     probe.opcode=KB2_FILESYSTEM_OP_DEVICE_ROUTE;
@@ -226,12 +256,18 @@ static int route_device(filed_runtime_t *rt,const kb2_fs_request_t *request,
     if(status) return status;
     uint32_t service=0;
     if(!status && (stat.mode&0170000)==0020000) {
-        if(stat.rdev_major==226 && rt->gpud_drm_endpoint_fd>=16)
+        if(stat.rdev_major==14 && stat.rdev_minor==3 && rt->audiod_pcm_endpoint_fd>=16)
+            service=FILED_SERVICE_AUDIOD_PCM;
+        else if(stat.rdev_major==226 && rt->gpud_drm_endpoint_fd>=16)
             service=FILED_SERVICE_GPUD_DRM;
         else if(stat.rdev_major==13 && rt->inputd_input_endpoint_fd>=16)
             service=FILED_SERVICE_INPUTD_INPUT;
         else if((stat.rdev_major==4 || stat.rdev_major==5) &&
             rt->termd_tty_endpoint_fd>=16) service=FILED_SERVICE_TERMD_TTY;
+    }
+    if (service==FILED_SERVICE_AUDIOD_PCM && device_fd) {
+        if ((request->flags & 3u)!=1u) status=-EACCES;
+        else status=open_audio_session(rt->audiod_pcm_endpoint_fd,request->flags,device_fd);
     }
     if(status || !service) {
         int closed=filed_storage_close(rt,handle);
@@ -508,6 +544,7 @@ static int dispatch_wire(filed_runtime_t *rt,const kb2_fs_request_t *r,
         case FILED_SERVICE_TERMD_TTY: target=&rt->termd_tty_endpoint_fd; break;
         case FILED_SERVICE_GPUD_DRM: target=&rt->gpud_drm_endpoint_fd; break;
         case FILED_SERVICE_INPUTD_INPUT: target=&rt->inputd_input_endpoint_fd; break;
+        case FILED_SERVICE_AUDIOD_PCM: target=&rt->audiod_pcm_endpoint_fd; break;
         default: status=-EINVAL; break;
         }
         if (!status && source_count!=1) status=-EINVAL;
@@ -581,7 +618,11 @@ static int dispatch_wire(filed_runtime_t *rt,const kb2_fs_request_t *r,
     case KB2_FILESYSTEM_OP_DEVICE_ROUTE:
         if(source_count) status=-EINVAL;
         else if(capacity<KB2_FILESYSTEM_RESPONSE_SIZE+KB2_FILESYSTEM_STATX_SIZE) status=-ENOSPC;
-        else status=route_device(rt,r,bytes,size,&response,out+KB2_FILESYSTEM_RESPONSE_SIZE);
+        else {
+            fds[0]=-1;
+            status=route_device(rt,r,bytes,size,&response,out+KB2_FILESYSTEM_RESPONSE_SIZE,&fds[0]);
+            if (!status && fds[0]>=16) *fd_count=1;
+        }
         break;
     case KB2_FILESYSTEM_OP_OPENAT2:
         if(rt->actor) { status=-EPERM; break; }
@@ -590,7 +631,7 @@ static int dispatch_wire(filed_runtime_t *rt,const kb2_fs_request_t *r,
         if(status) return status;
         if(kb2_fs_response_decode(out,*used,&response)) return -EPROTO;
         if(response.result==-ENXIO || response.result==-ENODEV) {
-            int routed=route_device(rt,r,bytes,size,&response,NULL);
+            int routed=route_device(rt,r,bytes,size,&response,NULL,NULL);
             if(!routed) {
                 if(kb2_fs_response_encode(out,capacity,&response)) return -EPROTO;
                 *used=KB2_FILESYSTEM_RESPONSE_SIZE;
@@ -625,10 +666,23 @@ int filed_receive(filed_runtime_t *rt,pacha_fd_t endpoint)
     void *mapping=NULL;
     uint8_t *snapshot=NULL,*output=NULL;
     size_t mapped=0,used=0;
+    uint8_t inline_request[KB2_FILESYSTEM_REQUEST_SIZE];
+    uint8_t inline_output[KB2_FILESYSTEM_RESPONSE_SIZE];
+    const int inline_control=!!(message.word0 & FILED_CONTROL_INLINE);
     pacha_fd_t fds[3]={-1,-1,-1}; size_t fd_count=0;
     kb2_fs_request_t request={0};
     status=-EINVAL;
-    if (message.fd_count>=1 &&
+    if (inline_control) {
+        if (!filed_control_request_decode(&message,&request) &&
+            !kb2_fs_request_encode(inline_request,sizeof(inline_request),
+                sizeof(inline_request),&request)) {
+            pacha_fd_t sources[PACHA_IPC_MAX_TRANSFER_FDS];
+            for(size_t i=0;i<message.fd_count;i++) sources[i]=(pacha_fd_t)incoming[i].fd;
+            output=inline_output;
+            status=dispatch_wire(rt,&request,inline_request,sizeof(inline_request),
+                output,sizeof(inline_output),&used,sources,message.fd_count,fds,&fd_count);
+        }
+    } else if (message.fd_count>=1 &&
         message.word1>=KB2_FILESYSTEM_REQUEST_SIZE &&
         message.word2>=KB2_FILESYSTEM_RESPONSE_SIZE &&
         message.word1<=SIZE_MAX && message.word2<=SIZE_MAX &&
@@ -668,6 +722,8 @@ int filed_receive(filed_runtime_t *rt,pacha_fd_t endpoint)
             uint64_t rights=0;
             if (request.opcode==KB2_FILESYSTEM_OP_CLIENT_REGISTER)
                 rights=FILED_CLIENT_REGISTER_RIGHTS;
+            else if (request.opcode==KB2_FILESYSTEM_OP_DEVICE_ROUTE)
+                rights=AUDIOD_CLIENT_RIGHTS;
             else if (request.opcode==KB2_FILESYSTEM_OP_FILE_VMO) {
                 rights=PACHA_FD_RIGHT_INSPECT|PACHA_FD_RIGHT_CLOSE|
                     PACHA_FD_RIGHT_TRANSFER|PACHA_FD_RIGHT_DUP|PACHA_FD_RIGHT_MAP_READ;
@@ -712,6 +768,13 @@ int filed_receive(filed_runtime_t *rt,pacha_fd_t endpoint)
             .word1=(uint64_t)(int64_t)(prepare_status ? prepare_status : result),
             .word2=status || prepare_status ? 0 : used,
             .word3=message.word3,.fds=outbound,.fd_count=prepare_status ? 0 : fd_count};
+        if (inline_control) {
+            kb2_fs_response_t decoded={0};
+            if (!status) (void)kb2_fs_response_decode(output,used,&decoded);
+            response.word0=FILED_CONTROL_INLINE | (uint32_t)message.word0;
+            response.word2=prepare_status ? 0 : decoded.handle;
+            response.word3=prepare_status ? 0 : decoded.service;
+        }
         int reply_status=pacha_ipc_reply(reply,&response);
         if (reply_status) {
             const struct pacha_ipc_msg failed = {0};
@@ -726,11 +789,12 @@ int filed_receive(filed_runtime_t *rt,pacha_fd_t endpoint)
         }
     }
     if (mapping) (void)pacha_munmap(mapping,mapped);
-    free(snapshot); free(output);
+    free(snapshot);
+    if (!inline_control) free(output);
     int keep=retained_source(request.opcode,result) ||
         (request.opcode==KB2_FILESYSTEM_OP_SESSION_ATTACH && !rt->storage_generation);
     for(size_t i=0;i<message.fd_count;++i)
-        if (!(keep && i>0))
+        if (!(keep && i>=(inline_control ? 0u : 1u)))
             (void)pacha_fd_close((pacha_fd_t)incoming[i].fd);
     return status;
 }
@@ -811,6 +875,7 @@ static int retire_lease(filed_runtime_t *rt,struct filed_lease *lease)
 int filed_runtime_serve(filed_runtime_t *rt)
 {
     if(!rt || rt->client_endpoint_fd<16) return -EINVAL;
+    static struct pacha_fd_wait_retained retained_wait;
     for(;;) {
         if (rt->snapshots.limit || rt->snapshots.count) {
             filed_snapshot_cache_reserve_fds(&rt->snapshots);
@@ -830,7 +895,7 @@ int filed_runtime_serve(filed_runtime_t *rt)
             poll[at++]=(struct pacha_pollfd){.fd=c->fd,.events=events};
         for(struct filed_lease *l=rt->leases;l;l=l->next)
             poll[at++]=(struct pacha_pollfd){.fd=l->fd,.events=events};
-        long waited=pacha_fd_wait_many_batched(poll,count,
+        long waited=pacha_fd_wait_many_retained(&retained_wait,poll,count,
             PACHA_FD_WAIT_FOREVER);
         if (waited==PACHA_ERR_NOT_READY) { free(poll);continue; }
         if(waited<0) { free(poll); return (int)waited; }

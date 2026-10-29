@@ -29,6 +29,8 @@ SEEDS = (
     "xfce4-session", "xfwm4", "xfdesktop", "xfce4-panel",
     "xfce4-settings", "xfce4-terminal", "gtk+3.0-demo",
     "xrandr", "font-dejavu", "dbus-x11",
+    # Japanese glyph fallback is a runtime resource, not an ELF dependency.
+    "font-ipaex",
     # The stock panel resolves launcher Exec commands at runtime. exo-libs
     # alone does not provide exo-open, and appfinder is not an ELF dependency
     # of the panel; omitting either empties its default launcher slots.
@@ -122,7 +124,7 @@ def normalized(dependency: str) -> str:
     return re.split(r"[<>=~]", dependency, maxsplit=1)[0]
 
 
-def closure(installed: dict, seeds: tuple[str, ...]) -> list[str]:
+def closure(installed: dict, seeds: tuple[str, ...], *, allow_browser: bool = False) -> list[str]:
     providers: dict[str, list[str]] = {}
     for name, (_, _, _, provided) in installed.items():
         for item in provided:
@@ -140,7 +142,7 @@ def closure(installed: dict, seeds: tuple[str, ...]) -> list[str]:
             name = candidates[0]
         if name in selected:
             continue
-        if name.startswith(("epiphany", "libreoffice", "webkit")):
+        if name.startswith("libreoffice") or (not allow_browser and name.startswith(("epiphany", "webkit"))):
             raise ValueError(f"unexpected desktop dependency: {name}")
         selected.add(name)
         for dep in installed[name][2]:

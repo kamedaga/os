@@ -1,5 +1,6 @@
 #include "lpr_memory.h"
 #include "lpr_filed_internal.h"
+#include "lpr_mlock.h"
 
 #include <pachaos/abi.h>
 
@@ -32,12 +33,22 @@ int64_t lpr_linux_mremap(
      * unless FIXED is set; do not forward an unspecified register value. */
     const uint64_t target =
         (flags & LPR_LINUX_MREMAP_FIXED) != 0 ? new_address : 0;
+    const int64_t lock_status=lpr_mlock_vm_begin();
+    if (lock_status) return lock_status;
+    if (lpr_mlock_overlaps(old_address,old_size) ||
+        (target && lpr_mlock_overlaps(target,new_size))) {
+        /* Moving a locked mapping needs lock/limit propagation as well as a
+         * VM move. Until that is implemented, preserve its residency contract. */
+        lpr_mlock_vm_end();
+        return -LPR_LINUX_EOPNOTSUPP;
+    }
     const int64_t result = lpr_drm_native_mremap(
         old_address,
         old_size,
         new_size,
         flags,
         target);
+    lpr_mlock_vm_end();
     if (result >= 4096) {
         return result;
     }

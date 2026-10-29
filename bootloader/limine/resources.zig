@@ -218,7 +218,11 @@ pub fn collectMemoryStatsOrHalt(
                     stop = @min(stop, boundary);
                 };
             const in_image = cursor >= image_start and cursor < image_stop;
-            snapshot[used] = .{ .base = cursor, .bytes = stop - cursor, .usable = item.kind == .usable and !in_image, .prepare_only = false };
+            snapshot[used] = .{ .base = cursor, .bytes = stop - cursor, .usable = item.kind == .usable and !in_image, .prepare_only = false,
+
+                // Preserve provenance for scoped firmware DMA grants. Merely
+                // being absent from usable RAM must not authorize DMA to modules.
+                .firmware_reserved = !in_image and (item.kind == .reserved or item.kind == .acpi_nvs) };
             used += 1;
             cursor = stop;
         }

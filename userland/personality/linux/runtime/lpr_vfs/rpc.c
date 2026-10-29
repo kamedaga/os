@@ -1,8 +1,10 @@
 #include "../lpr_filed_internal.h"
 #include "rpc.h"
+#include "control_cache.h"
 #include "session.h"
 #include "diagnostic.h"
 #include "../lpr_common/boot_diagnostic.h"
+#include <filed/inline_control.h>
 
 #ifdef PH_FS_CHANNEL_PROFILE
 void ph_fs_channel_profile(uint32_t opcode, const uint64_t cycles[4],
@@ -118,6 +120,44 @@ int64_t lpr_fs_call_buffers(kb2_fs_request_t *request,
     return status;
 }
 
+static int64_t call_control_inline(kb2_fs_request_t *request,
+    kb2_fs_response_t *response, pacha_fd_t transfer, pacha_fd_t *returned)
+{
+    struct pacha_ipc_msg message;
+    filed_control_request_encode(request, &message);
+    const int duplicate = request->opcode == KB2_FILESYSTEM_OP_TRANSFER_DUP;
+    struct pacha_ipc_fd grant = {.fd=(uint64_t)transfer,
+        .rights=PACHA_FD_RIGHT_INSPECT|PACHA_FD_RIGHT_CLOSE|PACHA_FD_RIGHT_SEND|
+            PACHA_FD_RIGHT_RECV|PACHA_FD_RIGHT_WAIT|PACHA_FD_RIGHT_POLL};
+    if (duplicate) { message.fds=&grant; message.fd_count=1; }
+    struct pacha_ipc_fd received[3] = {{0}};
+    struct pacha_ipc_msg completion = {.fds = received, .fd_capacity = duplicate ? 0 : 3};
+    int64_t status = lpr_native_ipc_call_wait(lpr_filed_client_fd,
+        &message, &completion, NULL);
+    if (status) status = lpr_pacha_status_to_errno(status);
+    else if (completion.word0 != (FILED_CONTROL_INLINE | request->opcode) ||
+        (request->opcode == KB2_FILESYSTEM_OP_FILE_VMO ?
+            completion.word3 > FILED_FILE_VMO_PAGER : completion.word3 != 0) ||
+        completion.fd_count != (duplicate || (int64_t)completion.word1 < 0 ? 0u : 1u) ||
+        (duplicate && (int64_t)completion.word1 >= 0 && !completion.word2))
+        status = -LPR_LINUX_EIO;
+    else {
+        *response = (kb2_fs_response_t){.opcode = request->opcode,
+            .generation = request->generation, .sequence = request->sequence,
+            .result = (int64_t)completion.word1, .handle = completion.word2,
+            .service = (uint32_t)completion.word3};
+        status = response->result;
+        if (!duplicate && status >= 0 && received[0].fd >= 16) {
+            *returned = (pacha_fd_t)received[0].fd;
+            received[0].fd = 0;
+        } else if (!duplicate && status >= 0) status = -LPR_LINUX_EIO;
+    }
+    for (unsigned i = 0; i < 3; ++i)
+        if (received[i].fd >= 16)
+            (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, received[i].fd);
+    return status;
+}
+
 static int64_t call_impl(kb2_fs_request_t *request, const char *path,
     const char *second_path, const void *data, uint64_t data_bytes,
     void *output, uint64_t output_bytes, kb2_fs_response_t *response,
@@ -163,6 +203,30 @@ static int64_t call_impl(kb2_fs_request_t *request, const char *path,
     request->second_path = (kb2_fs_span_t){0};
     request->groups = (kb2_fs_span_t){0};
     request->data = (kb2_fs_span_t){0};
+    if ((request->opcode == KB2_FILESYSTEM_OP_FILE_VMO ||
+         request->opcode == KB2_FILESYSTEM_OP_SHARED_FILE_VMO) &&
+        request->generation == 1 && request->flags <= 3 && request->mask <= 7 &&
+        !request->second_handle && !request->mode && !request->resolve &&
+        !request->capabilities && !first_bytes && !second_bytes && !data_bytes &&
+        !output_bytes && transfer_fd < 16 && second_transfer_fd < 16 &&
+        returned_capacity == 1) {
+        status = call_control_inline(request, response, -1, returned_fds);
+        lpr_boot_diagnostic_fs_end(1);
+        return status;
+    }
+    /* TRANSFER_DUP carries only a handle and one lease capability. Keep the
+     * authenticated endpoint and backend operation, without mapping a second
+     * VMO just to transport these fixed operands. */
+    if (request->opcode == KB2_FILESYSTEM_OP_TRANSFER_DUP &&
+        request->generation == 1 && !request->flags && !request->mask &&
+        !request->second_handle && !request->mode && !request->resolve &&
+        !request->offset && !request->length && !request->capabilities &&
+        !first_bytes && !second_bytes && !data_bytes && !output_bytes &&
+        transfer_fd >= 16 && second_transfer_fd < 16 && !returned_capacity) {
+        status = call_control_inline(request, response, transfer_fd, NULL);
+        lpr_boot_diagnostic_fs_end(1);
+        return status;
+    }
     uint64_t at = KB2_FILESYSTEM_REQUEST_SIZE;
     if (first_bytes) { request->path = (kb2_fs_span_t){at, first_bytes}; at += first_bytes; }
     if (second_bytes) { request->second_path = (kb2_fs_span_t){at, second_bytes}; at += second_bytes; }
@@ -181,26 +245,14 @@ static int64_t call_impl(kb2_fs_request_t *request, const char *path,
         lpr_boot_diagnostic_fs_end(1);
         return status;
     }
-    const uint64_t rights = PACHA_FD_RIGHT_INSPECT | PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_TRANSFER |
-        PACHA_FD_RIGHT_MAP_READ | PACHA_FD_RIGHT_MAP_WRITE;
-    const int64_t vmo = lpr_pacha_syscall3(PACHAOS_SYSCALL_VMO_CREATE,
-        map_bytes, rights, PACHA_FD_FLAG_PRIVATE | PACHA_FD_FLAG_CLOEXEC);
-    if (vmo < 16) {
-        lpr_boot_diagnostic_fs_emit("fs.rpc.vmo-error", request->opcode, map_bytes,
-            vmo, lpr_pacha_status_to_errno(vmo), vmo);
+    struct lpr_fs_control_lease lease;
+    status = lpr_fs_control_acquire(&lease, map_bytes);
+    if (status) {
         lpr_boot_diagnostic_fs_end(request->opcode >= KB2_FILESYSTEM_OP_OPENAT2);
-        return lpr_pacha_status_to_errno(vmo);
+        return status;
     }
-    const int64_t mapped = lpr_pacha_syscall6(PACHAOS_SYSCALL_MMAP, vmo,
-        0, map_bytes, PACHAOS_PROT_READ | PACHAOS_PROT_WRITE,
-        PACHAOS_MMAP_SHARED, 0);
-    if (mapped < 4096) {
-        lpr_boot_diagnostic_fs_emit("fs.rpc.map-error", request->opcode, vmo,
-            map_bytes, lpr_pacha_status_to_errno(mapped), mapped);
-        (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, vmo);
-        lpr_boot_diagnostic_fs_end(request->opcode >= KB2_FILESYSTEM_OP_OPENAT2);
-        return lpr_pacha_status_to_errno(mapped);
-    }
+    const int64_t vmo = lease.fd;
+    const int64_t mapped = lease.address;
     uint8_t *wire = (uint8_t *)(uintptr_t)mapped;
     at = KB2_FILESYSTEM_REQUEST_SIZE;
     if (first_bytes) {
@@ -286,8 +338,7 @@ static int64_t call_impl(kb2_fs_request_t *request, const char *path,
         if (received[i].fd >= 16)
             (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, received[i].fd);
 release:
-    (void)lpr_pacha_syscall2(PACHAOS_SYSCALL_MUNMAP, mapped, map_bytes);
-    (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, vmo);
+    lpr_fs_control_release(&lease, status >= 0);
     if (request->opcode >= KB2_FILESYSTEM_OP_OPENAT2)
         lpr_boot_diagnostic_fs_emit("fs.rpc.return", request->opcode, request->sequence, 0, status, 0);
     lpr_boot_diagnostic_fs_end(request->opcode >= KB2_FILESYSTEM_OP_OPENAT2);

@@ -5,7 +5,9 @@ const smp = @import("smp.zig");
 const platform = @import("arch/x86_64/platform.zig");
 const hist = @import("smp_histogram.zig");
 pub const Kind = enum(u8) { other, process, fork, exec, map, unmap, fd, ipc, futex, runtime, capsule, irq, teardown, fd_table, fd_close, fd_dup, fd_get_info, fd_set_flags, fd_read, fd_write, fd_readv, fd_writev, fd_fcntl, fd_poll, fd_wait_many, fd_ioctl, fd_stat, eventfd_create, pipe_create, timerfd_create, timerfd_settime, timerfd_gettime, vmo_create, vmo_grow, vmo_cache_policy, vmo_create_page_view, vmo_revoke, ipc_endpoint_create, ipc_channel_create, ipc_send, ipc_recv, ipc_call, ipc_reply, ipc_recv_wait, ipc_notify, ipc_notify_wait };
-pub const Stage = enum(u8) { prepare, commit, retire, copy, zero, pmm, pmm_wait, pt_prepare, ipi_ack, vm_wait, timer_publish };
+pub const Stage = enum(u8) { prepare, commit, retire, copy, zero, pmm, pmm_wait, pt_prepare, ipi_ack, wake_ipi, vm_wait, timer_publish, poll_scan, wait_register, wait_set, park, leave_cleanup, waiter_scan, group_scan, wait_group, reg_task, reg_pipe, reg_ipc, retire_address_spaces, retire_invocation_storage, retire_reference_storage, retire_cancellations, retire_device_memory, retire_ram_cache, retire_persistent_waiters, retire_pending_returns, retire_reference_audit, leave_cancellations, leave_persistent_waiters, leave_device_memory, leave_ram_cache, futex_wait_total, futex_wake_total, futex_wake_wait_total, futex_requeue_total, futex_validate, futex_lock, futex_user_word, futex_registration, futex_hint, futex_scan, futex_wake_dispatch, futex_timer_park, futex_cleanup, futex_empty_wake, futex_wait_mismatch, futex_removal, futex_growth, futex_zero_wake, futex_key_hash };
+pub const FutexOp = enum(u8) { wait, wake, wake_wait, requeue };
+pub const FutexOutcome = enum(u8) { empty_wake, zero_wake, wait_mismatch };
 const kinds = @typeInfo(Kind).@"enum".fields.len;
 const stages = @typeInfo(Stage).@"enum".fields.len;
 const rows = if (enabled) 1 else 0;
@@ -49,7 +51,7 @@ pub fn pmmScopeEnd(returned: bool, start: u64) void {
     _ = @atomicRmw(u64, &pair[0], .Add, 1, .monotonic);
     _ = @atomicRmw(u64, &pair[1], .Add, elapsed, .monotonic);
 }
-const State = struct { pmm_scope_sink: ?PmmScopeSink = null, active: bool = false, kind: Kind = .other, depth: usize = 0, owner_depth: usize = 0, serial: u64 = 0, children: u64 = 0, pending: [stages][3]u64 = @splat(@splat(0)), hold: Token = .{} };
+const State = struct { pmm_scope_sink: ?PmmScopeSink = null, active: bool = false, kind: Kind = .other, depth: usize = 0, owner_depth: usize = 0, serial: u64 = 0, children: u64 = 0, pending: [stages][3]u64 = @splat(@splat(0)), hold: Token = .{}, park: Token = .{}, futex_op: ?FutexOp = null, futex_outcome: ?FutexOutcome = null, futex_wait_cycles: u64 = 0, futex_segment: Token = .{}, wait_caller_row: if (enabled) ?usize else void = if (enabled) null else {}, wait_caller_operation: if (enabled) usize else void = if (enabled) 0 else {} };
 var state_boot: [rows]State = @splat(.{});
 var state: []State = &state_boot;
 pub const Token = struct { start: u64 = 0, epoch: u64 = 0, cpu: usize = 0, serial: u64 = 0, children: u64 = 0, active: bool = false };
@@ -62,6 +64,84 @@ const labels = blk: {
     for (@typeInfo(Stage).@"enum".fields) |f| text = text ++ f.name ++ "\x00";
     break :blk text;
 };
+// K serializes the fixed diagnostic table. A full table is counted rather
+// than changing allocation or wait behavior on a hot syscall path.
+pub const WaitCallerRow = extern struct {
+    principal_plus_one: u64 = 0,
+    label: [32]u8 = @splat(0),
+    calls: [2]u64 = @splat(0),
+    items: [2]u64 = @splat(0),
+    hold_cycles: [2]u64 = @splat(0),
+};
+var wait_caller_rows: [if (enabled) 512 else 0]WaitCallerRow = @splat(.{});
+var wait_caller_overflow: if (enabled) [2]u64 else void = if (enabled) @splat(0) else {};
+pub const FutexCallerRow = extern struct {
+    principal_plus_one: u64 = 0,
+    label: [32]u8 = @splat(0),
+    calls: [4]u64 = @splat(0),
+};
+var futex_caller_rows: [if (enabled) 512 else 0]FutexCallerRow = @splat(.{});
+var futex_caller_overflow: if (enabled) [4]u64 else void = if (enabled) @splat(0) else {};
+// K is already held when these profile-only counters are updated. A fixed
+// table avoids allocation or a second lock on the measured futex path.
+var futex_op_totals: if (enabled) [4][3]u64 else void = if (enabled) @splat(@splat(0)) else {};
+var futex_stage_totals: if (enabled) [4][stages][3]u64 else void = if (enabled) @splat(@splat(@splat(0))) else {};
+var futex_outcome_totals: if (enabled) [3][3]u64 else void = if (enabled) @splat(@splat(0)) else {};
+pub fn futexCall(op: FutexOp, principal: u32, label: []const u8) void {
+    if (comptime !enabled) return;
+    const s = &state[cpuSlot()];
+    if (!s.active or s.depth != s.owner_depth or
+        (s.kind != .futex and !(op == .requeue and s.kind == .runtime))) return;
+    s.futex_op = op;
+    s.futex_outcome = null;
+    s.futex_segment = stageBegin();
+    const key: u64 = @as(u64, principal) + 1;
+    var index: usize = @intCast(key % futex_caller_rows.len);
+    for (0..futex_caller_rows.len) |_| {
+        const row = &futex_caller_rows[index];
+        if (row.principal_plus_one == 0) {
+            row.principal_plus_one = key;
+            @memcpy(row.label[0..@min(label.len, row.label.len - 1)], label[0..@min(label.len, row.label.len - 1)]);
+        }
+        if (row.principal_plus_one == key) {
+            row.calls[@intFromEnum(op)] +%= 1;
+            return;
+        }
+        index = (index + 1) % futex_caller_rows.len;
+    }
+    futex_caller_overflow[@intFromEnum(op)] +%= 1;
+}
+pub fn futexOutcome(outcome: FutexOutcome) void {
+    if (comptime !enabled) return;
+    const s = &state[cpuSlot()];
+    if (!s.active or s.depth != s.owner_depth or s.futex_op == null) return;
+    // The fast-path outcome is known before K drops, but its full hold and
+    // preceding K wait are only finalized at release.
+    s.futex_outcome = outcome;
+}
+pub fn waitCaller(principal: u32, label: []const u8, count: u64, replace: bool) void {
+    if (comptime !enabled) return;
+    const operation: usize = @intFromBool(replace);
+    const key: u64 = @as(u64, principal) + 1;
+    var index: usize = @intCast(key % wait_caller_rows.len);
+    for (0..wait_caller_rows.len) |_| {
+        const row = &wait_caller_rows[index];
+        if (row.principal_plus_one == 0) {
+            row.principal_plus_one = key;
+            @memcpy(row.label[0..@min(label.len, row.label.len - 1)], label[0..@min(label.len, row.label.len - 1)]);
+        }
+        if (row.principal_plus_one == key) {
+            row.calls[operation] +%= 1;
+            row.items[operation] +%= count;
+            const cpu = cpuSlot();
+            state[cpu].wait_caller_row = index;
+            state[cpu].wait_caller_operation = operation;
+            return;
+        }
+        index = (index + 1) % wait_caller_rows.len;
+    }
+    wait_caller_overflow[operation] +%= 1;
+}
 comptime {
     if (enabled) {
         @export(&free_floor_view, .{ .name = "lock_profile_free_floor" });
@@ -72,6 +152,13 @@ comptime {
         @export(&epoch_word, .{ .name = "lock_profile_epoch" });
         @export(&layout, .{ .name = "lock_profile_layout" });
         @export(labels.ptr, .{ .name = "lock_profile_labels" });
+        @export(&wait_caller_rows, .{ .name = "lock_profile_wait_callers" });
+        @export(&wait_caller_overflow, .{ .name = "lock_profile_wait_caller_overflow" });
+        @export(&futex_caller_rows, .{ .name = "lock_profile_futex_callers" });
+        @export(&futex_caller_overflow, .{ .name = "lock_profile_futex_caller_overflow" });
+        @export(&futex_op_totals, .{ .name = "lock_profile_futex_ops" });
+        @export(&futex_stage_totals, .{ .name = "lock_profile_futex_stages" });
+        @export(&futex_outcome_totals, .{ .name = "lock_profile_futex_outcomes" });
     }
 }
 // No AP or interrupt may observe the BSP-only migration. Preserve active
@@ -249,6 +336,11 @@ pub fn acquired(kind: Kind, wait: OptionalToken, is_try: bool) void {
         s.children = 0;
         s.pending = @splat(@splat(0));
         s.hold = hold;
+        s.futex_op = null;
+        s.futex_outcome = null;
+        s.futex_wait_cycles = if (!is_try) hold.start -% wait.start else 0;
+        s.futex_segment = .{};
+        s.wait_caller_row = null;
         copyEnd(.invocation, copyTimestamp());
     }
 }
@@ -260,13 +352,48 @@ pub fn release() void {
             _ = @atomicRmw(u64, &writers[cpu], .Sub, 1, .monotonic);
         }
         const s = &state[cpuSlot()];
+        if (s.futex_op) |op| {
+            // A blocking futex may drop K in a scheduler leave callback and
+            // never return through its handler. Close the operation here.
+            stageEnd(switch (op) {
+                .wait => .futex_wait_total,
+                .wake => .futex_wake_total,
+                .wake_wait => .futex_wake_wait_total,
+                .requeue => .futex_requeue_total,
+            }, s.futex_segment);
+            if (s.hold.epoch == epoch()) {
+                const row = &futex_op_totals[@intFromEnum(op)];
+                row[0] +%= 1;
+                row[1] +%= s.futex_wait_cycles;
+                row[2] +%= now() -% s.hold.start;
+                if (s.futex_outcome) |outcome| {
+                    const outcome_row = &futex_outcome_totals[@intFromEnum(outcome)];
+                    outcome_row[0] +%= 1;
+                    outcome_row[1] +%= s.futex_wait_cycles;
+                    outcome_row[2] +%= now() -% s.hold.start;
+                }
+                // Flush the same epoch-bound pending stages while K still
+                // identifies this caller; a park may never return to its
+                // original frame to supply an op label later.
+                for (&s.pending, 0..) |*pending_row, stage| for (pending_row, 0..) |v, col| {
+                    futex_stage_totals[@intFromEnum(op)][stage][col] +%= v;
+                };
+            }
+        }
         if (s.hold.epoch == epoch()) {
             for (&s.pending, 0..) |*row, stage| for (row, 0..) |v, col| {
                 _ = @atomicRmw(u64, &stage_totals[s.hold.cpu][@intFromEnum(s.kind)][stage][col], .Add, v, .monotonic);
             };
         }
-        record(s.hold, @as(usize, @intFromEnum(s.kind)) * 2 + 1, s.kind, now() -% s.hold.start, 0);
+        const elapsed = now() -% s.hold.start;
+        if (s.wait_caller_row) |index| {
+            if (s.hold.epoch == epoch()) wait_caller_rows[index].hold_cycles[s.wait_caller_operation] +%= elapsed;
+        }
+        record(s.hold, @as(usize, @intFromEnum(s.kind)) * 2 + 1, s.kind, elapsed, 0);
         s.active = false;
+        s.futex_op = null;
+        s.futex_outcome = null;
+        s.wait_caller_row = null;
     }
 }
 pub fn irqEnter(from_user: bool) void {
@@ -289,6 +416,20 @@ pub fn stageBegin() OptionalToken {
     t.serial = s.serial;
     t.children = s.children;
     return t;
+}
+/// A blocking syscall keeps K from its park decision until the scheduler's
+/// leave callback drops it on this CPU. The token cannot live on the caller's
+/// stack across that callback, so it is parked in the owner's CPU state.
+pub fn parkBegin() void {
+    if (comptime !enabled) return;
+    state[cpuSlot()].park = stageBegin();
+}
+pub fn parkEnd() void {
+    if (comptime !enabled) return;
+    const s = &state[cpuSlot()];
+    const t = s.park;
+    s.park = .{};
+    stageEnd(.park, t);
 }
 pub fn stageEnd(stage: Stage, t: OptionalToken) void {
     if (comptime enabled) {
@@ -390,6 +531,24 @@ test "profile epoch IRQ handoff and exclusive attribution" {
     epoch_word = 3;
     release();
     try std.testing.expectEqual(@as(u64, 0), stage_totals[71][@intFromEnum(Kind.fd)][@intFromEnum(Stage.pmm)][0]);
+    // Closing a blocking futex at K release must retain its op, caller and
+    // nested stage even when its handler cannot return through a defer.
+    root.profile_test_cpu = 0;
+    root.profile_test_time = 1000;
+    acquired(.futex, begin(), false);
+    futexCall(.wait, 7, "probe");
+    const word = stageBegin();
+    root.profile_test_time += 10;
+    stageEnd(.futex_user_word, word);
+    futexOutcome(.wait_mismatch);
+    root.profile_test_time += 5;
+    release();
+    try std.testing.expectEqual(@as(u64, 1), futex_op_totals[@intFromEnum(FutexOp.wait)][0]);
+    try std.testing.expectEqual(@as(u64, 15), futex_op_totals[@intFromEnum(FutexOp.wait)][2]);
+    try std.testing.expectEqual(@as(u64, 1), futex_stage_totals[@intFromEnum(FutexOp.wait)][@intFromEnum(Stage.futex_user_word)][0]);
+    try std.testing.expectEqual(@as(u64, 10), futex_stage_totals[@intFromEnum(FutexOp.wait)][@intFromEnum(Stage.futex_user_word)][2]);
+    try std.testing.expectEqual(@as(u64, 1), futex_caller_rows[8].calls[@intFromEnum(FutexOp.wait)]);
+    try std.testing.expectEqual(@as(u64, 15), futex_outcome_totals[@intFromEnum(FutexOutcome.wait_mismatch)][2]);
 }
 
 pub fn staticEnd() usize {

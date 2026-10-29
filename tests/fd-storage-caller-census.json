@@ -41,6 +41,10 @@
     "fdPayloadWithRightsConst": 2,
     "getFdTableConst": 1
   },
+  "kernel/src/state/persistent_wait.zig": {
+    "fdEntryConst": 2,
+    "fdTableForActiveProcessConst": 1
+  },
   "kernel/src/state/pipe.zig": {
     "fdEntryConst": 4,
     "fdPayloadWithRightsConst": 2
@@ -77,10 +81,11 @@
     "fdPayloadWithRightsConst": 6
   },
   "kernel/src/syscall/fd.zig": {
-    "before_current_thread_leave": 2,
+    "before_current_thread_leave": 3,
     "ensureFdTableCapacity": 1,
-    "fdEntryConst": 2,
+    "fdEntryConst": 3,
     "fdPayloadWithRightsConst": 8,
+    "fdTableForActiveProcessConst": 1,
     "getFdTableConst": 2
   },
   "kernel/src/syscall/native_ipc.zig": {

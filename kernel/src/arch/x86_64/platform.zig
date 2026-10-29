@@ -44,6 +44,11 @@ pub const gdt_kernel_data_selector: u16 = 0x10;
 pub const gdt_user_data_selector: u16 = 0x18;
 pub const gdt_user_code_selector: u16 = 0x20;
 pub const gdt_tss_selector: u16 = 0x28;
+// AMD SYSRET takes SS.RPL directly from STAR[49:48], unlike Intel's forced
+// RPL=3. Leaving these bits zero produces SS=0x18 and a later IRET #GP(0x18).
+// Both CPUs must return with the same CS=0x23/SS=0x1b descriptor pair.
+const syscall_star_value: u64 = (@as(u64, gdt_kernel_code_selector) << 32) |
+    (@as(u64, (gdt_user_data_selector - 8) | 3) << 48);
 pub fn validUserSelectors(cs: u64, ss: u64) bool {
     return cs == (gdt_user_code_selector | 3) and ss == (gdt_user_data_selector | 3);
 }
@@ -707,8 +712,7 @@ pub fn enableFsgsbaseOnCurrentCpu() bool {
 }
 
 pub fn enableSyscallEntry(entry: usize) void {
-    const star = (@as(u64, gdt_kernel_code_selector) << 32) | (@as(u64, gdt_user_data_selector - 8) << 48);
-    writeMsr(msr_ia32_star, star);
+    writeMsr(msr_ia32_star, syscall_star_value);
     writeMsr(msr_ia32_lstar, @intCast(entry));
     // Clear IF and DF on syscall entry: kernel code (compiler-emitted string
     // copies included) assumes DF=0, and a user may enter with DF=1.
@@ -877,6 +881,31 @@ pub fn checkBootPermissions(list: anytype) bool {
     return true;
 }
 
+pub fn deviceInterruptLayoutValid(first: u8, count: u8, timer: u8, wake: u8, unrouted: u8) bool {
+    const end = @as(u16, first) + count;
+    if (first < 32 or count == 0 or end > 256 or timer == wake or timer == unrouted or wake == unrouted) return false;
+    for ([_]u8{ 0x20, timer, wake, unrouted }) |reserved| {
+        if (reserved >= first and reserved < end) return false;
+    }
+    return true;
+}
+
+/// Shared by real IDT construction and host regression tests. Validate the
+/// entire range before writing any gate: otherwise a later device loop can
+/// silently replace the maintenance IPI gate and deadlock TLB shootdowns.
+pub fn installDeviceInterruptGates(table: *[256]interrupts.IdtEntry, targets: TrapTargets) bool {
+    if (!deviceInterruptLayoutValid(targets.device_interrupt_vector, targets.device_interrupt_vector_count,
+        targets.lapic_timer_vector, targets.scheduler_wake_ipi_vector, targets.unrouted_device_interrupt_vector)) return false;
+    interrupts.setIdtEntry(table, targets.unrouted_device_interrupt_vector,
+        gdt_kernel_code_selector, targets.device_interrupt_stub, 0x8E);
+    var index: u16 = 0;
+    while (index < targets.device_interrupt_vector_count) : (index += 1) {
+        interrupts.setIdtEntry(table, @as(u16, targets.device_interrupt_vector) + index,
+            gdt_kernel_code_selector, targets.device_interrupt_stub, 0x8E);
+    }
+    return true;
+}
+
 pub fn installInterruptTrampolines(targets: TrapTargets) void {
     de_trampoline_entry = buildCr3SwitchTrampoline(&de_trampoline_page, targets.divide_error_stub);
     bp_trampoline_entry = buildCr3SwitchTrampoline(&bp_trampoline_page, targets.breakpoint_stub);
@@ -902,18 +931,7 @@ pub fn installInterruptTrampolines(targets: TrapTargets) void {
     interrupts.setIdtEntry(&idt, 0x20, gdt_kernel_code_selector, timer_trampoline_entry, 0x8E);
     interrupts.setIdtEntry(&idt, targets.lapic_timer_vector, gdt_kernel_code_selector, timer_trampoline_entry, 0x8E);
     interrupts.setIdtEntry(&idt, targets.scheduler_wake_ipi_vector, gdt_kernel_code_selector, targets.scheduler_wake_ipi_stub, 0x8E);
-    interrupts.setIdtEntry(
-        &idt,
-        targets.unrouted_device_interrupt_vector,
-        gdt_kernel_code_selector,
-        targets.device_interrupt_stub,
-        0x8E,
-    );
-    var device_vector_index: u16 = 0;
-    while (device_vector_index < targets.device_interrupt_vector_count) : (device_vector_index += 1) {
-        const vector: usize = @as(usize, targets.device_interrupt_vector) + @as(usize, device_vector_index);
-        interrupts.setIdtEntry(&idt, vector, gdt_kernel_code_selector, targets.device_interrupt_stub, 0x8E);
-    }
+    if (!installDeviceInterruptGates(&idt, targets)) @import("../../halt.zig").haltWithMessage("device interrupt vector overlaps a reserved gate");
     interrupts.loadIdt(&idt);
 }
 
@@ -2286,4 +2304,21 @@ test "SYSRET has one user descriptor pair and rejects obsolete selectors" {
     try std.testing.expect(!validUserSelectors(0x1b, 0x23));
     try std.testing.expect(!validUserSelectors(0x43, 0x23));
     try std.testing.expect(!validUserSelectors(0x08, 0x10));
+}
+
+test "SYSRET STAR preserves user RPL under AMD and Intel selector rules" {
+    const base: u16 = @truncate(syscall_star_value >> 48);
+    const kernel_cs: u16 = @truncate(syscall_star_value >> 32);
+    try std.testing.expectEqual(@as(u16, 0x13), base);
+    try std.testing.expectEqual(@as(u16, 0x08), kernel_cs);
+    const cs = (base + 16) | 3;
+    const amd_ss = base + 8;
+    const intel_ss = (base + 8) | 3;
+    try std.testing.expect(validUserSelectors(cs, amd_ss));
+    try std.testing.expect(validUserSelectors(cs, intel_ss));
+    // The old RPL-0 value happens to work on Intel but fails on AMD when a
+    // hardware interrupt saves SS and IRET later validates its privilege.
+    const old_base = gdt_user_data_selector - 8;
+    try std.testing.expect(!validUserSelectors((old_base + 16) | 3, old_base + 8));
+    try std.testing.expect(validUserSelectors((old_base + 16) | 3, (old_base + 8) | 3));
 }

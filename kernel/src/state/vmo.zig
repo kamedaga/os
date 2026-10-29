@@ -763,6 +763,17 @@ pub fn nativeVmoSparsePageViewHole(self: anytype, ref: NativeVmoRef, page: usize
     return vmoBackingPageStorePaddr(slot.page_store_start, slot.page_count, page) == @as(?u64, 0);
 }
 
+/// An unsupplied pager page has no physical alias to admit. Keep this proof
+/// separate from resolution: fault callers must still request its file data
+/// rather than treating the absence as an anonymous zero-fill page.
+pub fn nativeVmoUnsuppliedPagerPage(self: anytype, ref: NativeVmoRef, page: usize) bool {
+    const slot = self.nativeVmoSlotConst(ref) orelse return false;
+    if (slot.kind != .pager or !slot.has_page_store or page >= slot.page_count) return false;
+    const owner = vmoBackingStoreOwner(.native_vmo, ref.index, ref.generation);
+    if (!types.vmoBackingPageStoreOwnerMatches(slot.page_store_start, slot.page_count, slot.page_store_owner, owner)) return false;
+    return vmoBackingPageStorePaddr(slot.page_store_start, slot.page_count, page) == @as(?u64, 0);
+}
+
 pub fn nativeVmoOwnPagePaddr(self: anytype, vmo_ref: NativeVmoRef, page_index: usize) ?u64 {
     const paddr = self.nativeVmoPagePaddrOrHole(vmo_ref, page_index) orelse return null;
     if (paddr == 0) return null;

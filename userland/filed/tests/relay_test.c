@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: MIT */
 #include "../src/relay.c"
+#include "no_audio_control.h"
 #include <assert.h>
 #include <stdio.h>
 
@@ -13,6 +14,15 @@ static uint8_t *vmo_memory;
 static size_t vmo_size;
 static int executable_status,create_error,map_error,read_error,unmap_error;
 static unsigned vmo_closes;
+int __wrap_filed_pager_create(struct filed_runtime *rt,uint64_t handle,
+    uint64_t offset,uint64_t length,uint64_t rx_length,int rx,
+    const filed_storage_stat_t *stat,uint64_t rights,pacha_fd_t *fd,
+    struct filed_pager_record **record)
+{
+    (void)stat;(void)rights;(void)fd;(void)record;
+    assert(rt && handle==90 && !offset && length==12288 && rx_length==10000 && rx);
+    return -EAGAIN;
+}
 int filed_storage_executable_mapping(filed_runtime_t *rt,uint64_t handle)
 {
     assert(rt && handle==90);return executable_status;
@@ -179,6 +189,10 @@ int main(void)
     read_error=0;unmap_error=-EIO;
     assert(make_file_vmo(&runtime,&request,&response,&vmo)==-EIO && !vmo_memory && !runtime.storage_generation);
     unmap_error=0;assert(vmo_closes==3);
+    /* Small executable DSOs must use the checked manifest pager too. */
+    request=(kb2_fs_request_t){.handle=90,.length=12288,.flags=FILED_FILE_VMO_EXEC};
+    executable_status=0;
+    assert(make_file_vmo(&runtime,&request,&response,&vmo)==-EAGAIN && !vmo_memory);
     puts("filed snapshot fill failures: CREATE/map/PREAD/munmap cleanup, no invalid positive FD, failed unmap retires owner: PASS");
     request.length=UINT64_MAX;assert(make_file_vmo(&runtime,&request,&response,&vmo)==-EINVAL);
     request.length=1;request.offset=-1;assert(make_file_vmo(&runtime,&request,&response,&vmo)==-EINVAL);

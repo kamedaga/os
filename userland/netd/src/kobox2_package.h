@@ -8,6 +8,7 @@
 
 #include <kobox2/controller.h>
 #include <kobox2/closure_manifest.h>
+#include <filed_client/module_image.h>
 
 enum { NETD_PACKAGE_MAX_ARTIFACTS = 64, NETD_PACKAGE_ITEMS = 67 };
 
@@ -23,6 +24,9 @@ struct netd_kobox2_package {
     struct ph_package_identity identity;
     struct ph_device_authority device;
     pacha_fd_t device_fd;
+    unsigned wireless;
+    struct filed_client_module_image firmware;
+    uint8_t firmware_sha256[32];
 };
 
 int netd_kobox2_package_open(struct netd_kobox2_package *package,

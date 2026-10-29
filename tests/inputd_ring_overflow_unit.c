@@ -366,9 +366,9 @@ static int test_usb_source_hotplug_and_read(void)
     memcpy(mouse.name, "QEMU USB Mouse", sizeof("QEMU USB Mouse"));
     struct inputd_public_device first, second;
     if (inputd_input_source_begin(island, 42, 1, 0) != 0 ||
-        inputd_input_source_device(island, 42, 1, 0, 0, 4, 0,
+        inputd_input_source_device(island, 42, 1, INPUTD_SOURCE_PCI, 0, 0, 0, 4, 0,
             &keyboard, &first) != 1 ||
-        inputd_input_source_device(island, 42, 1, 0, 0, 4, 0,
+        inputd_input_source_device(island, 42, 1, INPUTD_SOURCE_PCI, 0, 0, 0, 4, 0,
             &mouse, &second) != 1 ||
         inputd_input_source_mark_published(island, 42, 1, 1) != 0 ||
         inputd_input_source_mark_published(island, 42, 1, 2) != 0 ||
@@ -403,7 +403,7 @@ static int test_usb_source_hotplug_and_read(void)
     if (inputd_input_ioctl(&state) != 0 ||
         !(state.data[30 / 8] & (1u << (30 % 8)))) return 6;
     if (inputd_input_source_begin(island, 42, 1, 0) != 0 ||
-        inputd_input_source_device(island, 42, 1, 0, 0, 4, 0,
+        inputd_input_source_device(island, 42, 1, INPUTD_SOURCE_PCI, 0, 0, 0, 4, 0,
             &mouse, &second) != 0 ||
         inputd_input_source_end(island, 42, 1, NULL, NULL) != 0)
         return 7;
@@ -412,7 +412,7 @@ static int test_usb_source_hotplug_and_read(void)
     if (inputd_input_poll(&poll) != 0 || poll.revents != INPUTD_POLLHUP)
         return 9;
     if (inputd_input_source_begin(island, 42, 1, 0) != 0 ||
-        inputd_input_source_device(island, 42, 1, 0, 0, 4, 0,
+        inputd_input_source_device(island, 42, 1, INPUTD_SOURCE_PCI, 0, 0, 0, 4, 0,
             &keyboard, &first) != 1 ||
         inputd_input_source_end(island, 42, 1, NULL, NULL) != 0 ||
         first.event_index <= second.event_index)
@@ -538,6 +538,41 @@ static int test_mouse_clicks_and_signed_motion_independent_readers(void)
     return 0;
 }
 
+static int test_ps2_source_identity_and_keyboard_events(void)
+{
+    reset_inputd(0);
+    struct kobox_linux_input_device_info keyboard = {.id = 1, .bus = 0x11,
+        .event_bits = (UINT64_C(1) << TEST_EV_KEY)};
+    keyboard.key_bits[30 / 64] = UINT64_C(1) << (30 % 64);
+    memcpy(keyboard.name, "AT Translated Set 2 keyboard", sizeof("AT Translated Set 2 keyboard"));
+    struct inputd_public_device published;
+    if (inputd_input_source_device(active_island, 1, 1, INPUTD_SOURCE_PLATFORM,
+            1, 0, 0, 1, 0, &keyboard, &published) != -22) return 1;
+    if (inputd_input_source_device(active_island, 1, 1, INPUTD_SOURCE_PCI,
+            1, 0, 0, 0, 0, &keyboard, &published) != -22) return 2;
+    if (inputd_input_source_device(active_island, 1, 1, INPUTD_SOURCE_PLATFORM,
+            0, 0, 0, 0, 0, &keyboard, &published) != -22) return 3;
+    if (inputd_input_source_begin(active_island, 1, 1, 0) ||
+        inputd_input_source_device(active_island, 1, 1, INPUTD_SOURCE_PLATFORM,
+            1, 0, 0, 0, 0, &keyboard, &published) != 1 ||
+        published.source_kind != INPUTD_SOURCE_PLATFORM || published.platform_id != 1 ||
+        !(published.capabilities & INPUTD_INPUT_CAP_KEYBOARD)) return 4;
+    inputd_registry_entry_t *entry = lookup_registry_by_event(published.event_index);
+    if (!entry) return 5;
+    setup_handle(entry->kobox_device_id, next_sequence);
+    const struct kobox_linux_input_record events[] = {
+        {.device_id = 1, .kind = KOBOX_INPUT_EVENT, .type = TEST_EV_KEY, .code = 30, .value = 1},
+        {.device_id = 1, .kind = KOBOX_INPUT_EVENT, .type = INPUTD_EV_SYN, .code = INPUTD_SYN_REPORT},
+        {.device_id = 1, .kind = KOBOX_INPUT_EVENT, .type = TEST_EV_KEY, .code = 30, .value = 0},
+        {.device_id = 1, .kind = KOBOX_INPUT_EVENT, .type = INPUTD_EV_SYN, .code = INPUTD_SYN_REPORT},
+    };
+    if (inputd_input_source_events(active_island, 1, 1, events, 4)) return 6;
+    inputd_read_request_t request = {.handle = 1, .event_capacity = 4};
+    if (inputd_input_read(&request) || request.event_count != 4 ||
+        request.events[0].value != 1 || request.events[2].value != 0) return 7;
+    return 0;
+}
+
 int main(void)
 {
     int status = test_other_device_overflow_does_not_drop();
@@ -558,5 +593,7 @@ int main(void)
     if (status != 0) return 110 + status;
     status = test_mouse_clicks_and_signed_motion_independent_readers();
     if (status != 0) return 120 + status;
+    status = test_ps2_source_identity_and_keyboard_events();
+    if (status != 0) return 140 + status;
     return 0;
 }

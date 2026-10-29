@@ -366,6 +366,7 @@ void lpr_signal_thread_state_after_fork_child(void)
                 }
         }
     inherited.fault_registered = 0;
+    inherited.async_registered = 0;
     lpr_state.signal.grow_lock_word = 0;
     __atomic_store_n(
         &lpr_state.signal.signalfd_pending_mask,

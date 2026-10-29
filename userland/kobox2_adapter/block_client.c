@@ -21,15 +21,14 @@ static int wait_reply(struct ph_ipc *ipc, pacha_fd_t process_fd,
     uint64_t operation, uint64_t sequence, uint64_t *status) {
     for (;;) {
         struct ph_ipc_packet reply = {0};
-        int result = ph_ipc_receive(ipc, ipc->generation, &reply);
+        /* A bounded native receive waits on the reply directly. The process
+         * FD is checked after timeout in case other owners keep IPC alive. */
+        int result = ph_ipc_receive_wait(ipc, ipc->generation, &reply, 100);
         if (result == -EAGAIN) {
-            struct pacha_pollfd events[2] = {
-                {.fd = ipc->fd, .events = PACHA_FD_EVENT_READABLE | PACHA_FD_EVENT_HANGUP},
-                {.fd = process_fd, .events = PACHA_FD_EVENT_READABLE | PACHA_FD_EVENT_HANGUP},
-            };
-            long waited = pacha_fd_wait_many(events, 2, PACHA_FD_WAIT_FOREVER);
-            if (waited <= 0 || events[1].revents ||
-                events[0].revents != PACHA_FD_EVENT_READABLE) return -EPIPE;
+            struct pacha_pollfd process = {.fd = process_fd,
+                .events = PACHA_FD_EVENT_READABLE | PACHA_FD_EVENT_HANGUP};
+            long polled = pacha_fd_poll(&process, 1);
+            if (polled != 0 || process.revents) return -EPIPE;
             continue;
         }
         if (result) return result;

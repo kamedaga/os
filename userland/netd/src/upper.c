@@ -15,7 +15,7 @@ int netd_upper_start(struct netd_runtime *runtime)
     g_upper_delivered = 0;
     g_upper_trace = (runtime->cfg->flags & NETD_BOOT_FLAG_TRACE) != 0;
 
-    int status = netd_libuinet_start(runtime);
+    int status = netd_libuinet_reconfigure(runtime);
     if (status != 0) {
         return status;
     }

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
-"""Build a fixed-hash, read-only launch bundle for the AMDGPU sandbox."""
+"""Build a fixed-hash, read-only firmware launch bundle."""
 
 import argparse
 import hashlib
@@ -20,6 +20,7 @@ def main():
     parser.add_argument("--manifest", type=pathlib.Path, required=True)
     parser.add_argument("--firmware-dir", type=pathlib.Path, required=True)
     parser.add_argument("--output", type=pathlib.Path, required=True)
+    parser.add_argument("--profile", choices=("amdgpu", "wifi"), default="amdgpu")
     args = parser.parse_args()
 
     entries = []
@@ -29,7 +30,10 @@ def main():
         digest, name = line.split(maxsplit=1)
         name = name.strip()
         if (len(digest) != 64 or not re.fullmatch(r"[0-9a-f]{64}", digest) or
-                len(name) > 127 or not name.startswith("amdgpu/") or
+                len(name) > 127 or
+                not (name.startswith("amdgpu/") if args.profile == "amdgpu" else
+                     name in ("iwlwifi-ty-a0-gf-a0-89.ucode", "iwlwifi-ty-a0-gf-a0.pnvm",
+                              "regulatory.db", "regulatory.db.p7s")) or
                 any(not part or part in (".", "..") or
                     not re.fullmatch(r"[A-Za-z0-9_.-]+", part)
                     for part in name.split("/"))):

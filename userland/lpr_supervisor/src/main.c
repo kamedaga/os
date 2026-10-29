@@ -1553,7 +1553,7 @@ static int lprs_wait4(void *page, uint64_t *out_result)
     if (parent == NULL) {
         return PACHA_STATUS_ESRCH;
     }
-    if ((req->options & ~((uint64_t)LPRS_WNOHANG)) != 0) {
+    if ((req->options & ~((uint64_t)LPRS_WNOHANG | LPRS_WAIT4_WNOWAIT)) != 0) {
         return PACHA_STATUS_EINVAL;
     }
     uint64_t selected_index = UINT64_MAX;
@@ -1582,12 +1582,14 @@ static int lprs_wait4(void *page, uint64_t *out_result)
         return PACHA_STATUS_ECHILD;
     }
     req->result_pid = (int64_t)selected_pid;
+    req->uid = selected->credentials.uid;
     req->exit_code = exit_code;
     req->status = exit_state == LPRS_NATIVE_PROCESS_KILLED ?
         ((exit_code >= 128u ? exit_code - 128u : exit_code) & 0x7fu) :
         ((exit_code & 0xffu) << 8);
     *out_result = LPRS_WAIT4_RESULT_PACK(selected_pid, req->status);
-    lprs_process_reap(selected);
+    if ((req->options & LPRS_WAIT4_WNOWAIT) == 0)
+        lprs_process_reap(selected);
     return 0;
 }
 
@@ -2503,6 +2505,7 @@ int main(int argc, char **argv)
     if (lprs_boot_diag_start() != 0) return 1;
 #endif
 
+    static struct pacha_fd_wait_retained retained_wait;
     for (;;) {
         struct pacha_pollfd pollfds[LPRS_WAIT_FD_CAPACITY];
         uint64_t process_indices[LPRS_WAIT_FD_CAPACITY];
@@ -2571,7 +2574,7 @@ int main(int argc, char **argv)
             count++;
         }
 
-        status = (pacha_fd_t)pacha_fd_wait_many(pollfds, count, UINT64_MAX);
+        status = (pacha_fd_t)pacha_fd_wait_many_retained(&retained_wait, pollfds, count, UINT64_MAX);
 #if LPRS_BOOT_DIAGNOSTICS
         if (g_boot_diag_error ||
             ((pollfds[1].revents & PACHA_FD_EVENT_READABLE) &&

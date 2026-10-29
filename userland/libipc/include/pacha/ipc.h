@@ -94,6 +94,19 @@ struct pacha_service_wait_set {
     uint64_t count;
 };
 
+enum { PACHA_FD_WAIT_RETAINED_MAX_FDS = 256 };
+struct pacha_fd_wait_retained_item {
+    uint64_t fd, events, min_write_bytes;
+};
+/* Caller owns one zero-initialized state per waiting thread: the kernel keeps
+ * exactly one persistent wait set per thread, and native threads have no TLS.
+ * Do not use a second retained state on the same thread between these waits. */
+struct pacha_fd_wait_retained {
+    uint64_t count;
+    int valid;
+    struct pacha_fd_wait_retained_item items[PACHA_FD_WAIT_RETAINED_MAX_FDS];
+};
+
 enum pacha_ipc_fast_backend {
     PACHA_IPC_BACKEND_NORMAL = 0,
     PACHA_IPC_BACKEND_PKEY_RING = 2,
@@ -259,9 +272,13 @@ long pacha_fd_writev(pacha_fd_t fd, const struct pacha_iovec *iov, uint64_t iov_
 long pacha_fd_fcntl(pacha_fd_t fd, uint64_t cmd, uint64_t arg0, uint64_t arg1);
 long pacha_fd_poll(struct pacha_pollfd *fds, uint64_t count);
 long pacha_fd_wait_many(struct pacha_pollfd *fds, uint64_t count, uint64_t timeout_ticks);
+long pacha_fd_wait_many_retained(struct pacha_fd_wait_retained *retained,
+    struct pacha_pollfd *fds, uint64_t count, uint64_t timeout_ticks);
 int pacha_service_wait_init(struct pacha_service_wait_set *set, pacha_fd_t endpoint_fd);
 int pacha_service_wait_add(struct pacha_service_wait_set *set, pacha_fd_t fd, uint32_t events);
 long pacha_service_wait(struct pacha_service_wait_set *set, uint64_t timeout_ticks);
+long pacha_service_wait_retained(struct pacha_service_wait_set *set,
+    struct pacha_fd_wait_retained *retained, uint64_t timeout_ticks);
 uint64_t pacha_service_wait_revents(
     const struct pacha_service_wait_set *set,
     pacha_fd_t fd);

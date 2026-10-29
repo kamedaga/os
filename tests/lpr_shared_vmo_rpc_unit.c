@@ -83,7 +83,7 @@ int main(void)
     }
     failure = 0;
     uint64_t loaded = 0;
-    assert(lpr_linux_file_vmo(10, 0, 8192, 0, &loaded, NULL) == 200 && loaded == 4096);
+    assert(lpr_linux_file_vmo(10, 0, 8192, 0, &loaded, NULL, NULL) == 200 && loaded == 4096);
     assert(lpr_linux_shared_file_vmo(99, 0, 8192, 0, 1, 1, &loaded) == -LPR_LINUX_EBADF);
     assert(!loaded);
     assert(!pthread_barrier_destroy(&barrier));

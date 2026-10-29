@@ -65,7 +65,7 @@ static int runner_progress_phase(struct runner_progress *state,
     switch (wire->phase) {
     case INSTALLER_PROGRESS_PREFLIGHT_FILES:
         state->base = 1; state->span = 5;
-        state->label = "Checking boot payload files"; break;
+        state->label = "Preparing boot payload files"; break;
     case INSTALLER_PROGRESS_PREFLIGHT_ROOTFS:
         state->base = 6; state->span = 12;
         state->label = "Hashing the root filesystem archive"; break;

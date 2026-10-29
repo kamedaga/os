@@ -9,12 +9,16 @@ case "$output" in
     /*) ;;
     *) output="$repo/$output" ;;
 esac
-toolchain="$repo/.artifacts/build/mesa-25.1.9/toolchain-b865abb753262990"
-source_tree="$repo/.artifacts/build/mesa-25.1.9/0c2ef400f215231042faeb98f8cc9145/source"
-runtime="$repo/.artifacts/kobox2-amdgpu-mesa-package/rootfs/usr/lib"
-[[ -f "$source_tree/include/EGL/egl.h" && -f "$runtime/libEGL.so.1.0.0" &&
-   -f "$repo/tests/amdgpu_mesa_gears.c" ]] || {
-    echo 'Pinned Mesa development headers/runtime are not available.' >&2
+# The wsl_alpine_mesa recipe's outputs: the pinned runtime, its headers, and
+# the record naming the Alpine build toolchain it was compiled with.
+mesa_root="$repo/.artifacts/userland-fixtures/alpine-mesa-root"
+mesa_include="$repo/.artifacts/userland-fixtures/alpine-mesa-dev-root/usr/include"
+runtime="$mesa_root/usr/lib"
+toolchain_key="$(awk '$1 == "toolchain-key" { print $2 }' "$mesa_root/usr/share/pacha/mesa-virgl-build.txt" 2>/dev/null || true)"
+toolchain="${MESA_TOOLCHAIN:-$repo/.artifacts/build/mesa-25.1.9/toolchain-$toolchain_key}"
+[[ -n "$toolchain_key" && -f "$toolchain/usr/bin/gcc" && -f "$mesa_include/EGL/egl.h" &&
+   -f "$runtime/libEGL.so.1.0.0" && -f "$repo/tests/amdgpu_mesa_gears.c" ]] || {
+    echo 'Pinned Mesa development headers/runtime are not available; build wsl_alpine_mesa first.' >&2
     exit 1
 }
 mkdir -p "$(dirname "$output")"
@@ -22,12 +26,15 @@ output_dir="$(dirname "$output")"
 output_name="$(basename "$output")"
 bwrap --unshare-user --uid 0 --gid 0 --ro-bind "$toolchain" / \
     --dev /dev --proc /proc --tmpfs /tmp \
-    --ro-bind "$source_tree" /tmp/mesa \
+    --ro-bind "$mesa_include/EGL" /tmp/mesa/include/EGL \
+    --ro-bind "$mesa_include/GLES2" /tmp/mesa/include/GLES2 \
+    --ro-bind "$mesa_include/KHR" /tmp/mesa/include/KHR \
+    --ro-bind "$mesa_include/gbm.h" /tmp/mesa/include/gbm.h \
     --ro-bind "$runtime" /tmp/runtime \
     --ro-bind "$repo/tests/amdgpu_mesa_gears.c" /tmp/gears.c \
     --bind "$output_dir" /tmp/out \
     /usr/bin/gcc -std=c11 -O2 -Wall -Wextra -Werror \
-    -I/tmp/mesa/include -I/tmp/mesa/src/gbm/main -I/usr/include/libdrm \
+    -I/tmp/mesa/include -I/usr/include/libdrm \
     /tmp/gears.c /tmp/runtime/libEGL.so.1.0.0 \
     /tmp/runtime/libGLESv2.so.2.0.0 /tmp/runtime/libgbm.so.1.0.0 \
     -ldrm -ldl -lm -Wl,-rpath-link=/usr/lib:/tmp/runtime \

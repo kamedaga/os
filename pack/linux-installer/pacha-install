@@ -1,0 +1,210 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# Runs on SystemRescue Linux. The installed operating system is PachaOS.
+set -Eeuo pipefail
+export LC_ALL=C
+payload=/run/archiso/bootmnt/pacha
+work=/run/pacha-install
+planner="$payload/pacha-install-plan.py"
+mkdir -p "$work"
+exec > >(tee -a "$work/install.log") 2>&1
+exec 9>"$work/lock"
+flock -n 9 || { echo 'Another installer is running.'; exit 1; }
+phase=preflight
+target_written=0
+root_mount="$work/root"
+esp_mount="$work/esp"
+cleanup() {
+    local rc=$?
+    trap - EXIT
+    if mountpoint -q "$esp_mount"; then umount "$esp_mount" || rc=1; fi
+    if mountpoint -q "$root_mount"; then umount "$root_mount" || rc=1; fi
+    if (( rc != 0 )); then
+        echo "Stopped: phase=$phase status=$rc. Log: $work/install.log"
+        if (( target_written )); then
+            echo 'Do not boot an incomplete installation.'
+        else
+            echo 'Target was not written.'
+        fi
+        echo 'The Linux shell and SSH remain available.'
+    fi
+    exit "$rc"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+fail() { echo "ERROR: $*"; exit 1; }
+step() { phase=$1; printf '\n[%s] %s\n' "$(date -Is)" "$phase"; }
+[[ $EUID == 0 ]] || fail 'Run as root.'
+for tool in lsblk blockdev sfdisk udevadm mkfs.fat mkfs.ext4 mount umount tar pv efibootmgr blkid python3 cmp; do
+    command -v "$tool" >/dev/null || fail "Missing tool: $tool"
+done
+[[ -d /sys/firmware/efi ]] || fail 'Boot this USB in UEFI mode.'
+if ! mountpoint -q /sys/firmware/efi/efivars; then
+    mount -t efivarfs efivarfs /sys/firmware/efi/efivars
+fi
+efibootmgr >/dev/null || fail 'UEFI boot variables are unavailable.'
+[[ -w /sys/firmware/efi/efivars ]] || fail 'UEFI variables are read-only.'
+[[ -s "$payload/files.json" ]] || fail 'Installation payload is missing.'
+[[ -f "$planner" ]] || fail 'Partition planner is missing.'
+# Check file presence, sizes and UUID binding, without reading ROOTFS.TAR.
+root_uuid=$(python3 - "$payload" <<'PY'
+import json, pathlib, sys, uuid
+p = pathlib.Path(sys.argv[1])
+m = json.loads((p / 'files.json').read_text())
+for name, size in m['files'].items():
+    assert name in ('ROOTFS.TAR', 'SYSTEM.BOOTFS', 'KERNEL.ELF', 'INITAPP.ELF', 'LIMINE.EFI', 'limine.conf'), name
+    assert (p / name).is_file() and (p / name).stat().st_size == size, name
+assert len(m['files']) == 6
+value = str(uuid.UUID(m['root_uuid']))
+assert (p / 'root-uuid.txt').read_text().strip() == value
+print(value)
+PY
+)
+[[ $root_uuid =~ ^[0-9a-f-]{36}$ ]] || fail 'Invalid root UUID.'
+echo 'PachaOS installer (running on Linux); default: Windows coexistence'
+echo 'Available disks:'
+lsblk -d -e 7 -o PATH,SIZE,MODEL,SERIAL,TRAN,RO
+disk=
+plan_only=0
+erase_disk=0
+size_args=()
+while (($#)); do
+    case $1 in
+        --plan) plan_only=1; shift ;;
+        --erase-disk) erase_disk=1; shift ;;
+        --root-size-gib)
+            [[ $# -ge 2 && $2 =~ ^[0-9]+$ ]] || fail 'Invalid root size.'
+            size_args=(--root-size-gib "$2"); shift 2 ;;
+        /dev/nvme*) [[ -z $disk ]] || fail 'Only one target is allowed.'; disk=$1; shift ;;
+        *) fail 'Usage: pacha-install [--plan] [--erase-disk] [--root-size-gib N] [/dev/nvmeXnY]' ;;
+    esac
+done
+if [[ -z $disk ]]; then
+    read -r -p 'Target NVMe (example: /dev/nvme0n1): ' disk
+fi
+[[ $disk =~ ^/dev/nvme[0-9]+n[0-9]+$ && -b $disk ]] || fail 'Choose a whole NVMe disk.'
+[[ $(lsblk -dnro TYPE "$disk") == disk ]] || fail 'Target is not a whole disk.'
+[[ $(blockdev --getro "$disk") == 0 ]] || fail 'Target is read-only.'
+[[ $(blockdev --getsize64 "$disk") -ge 8589934592 ]] || fail 'Target must be at least 8 GiB.'
+disk_identity=$(lsblk -dnbo MAJ:MIN,SIZE,MODEL,SERIAL "$disk")
+check_unused() {
+    [[ $(lsblk -dnbo MAJ:MIN,SIZE,MODEL,SERIAL "$disk") == "$disk_identity" ]] || fail 'Disk identity changed.'
+    [[ -z $(lsblk -nr -o MOUNTPOINTS "$disk" | tr -d '[:space:]') ]] || fail 'Target has mounted filesystems or swap.'
+    local child
+    while read -r child; do
+        [[ -z $(ls "/sys/class/block/$child/holders") ]] || fail "$child is in use by another block device."
+    done < <(lsblk -nr -o KNAME "$disk")
+}
+check_unused
+while read -r existing; do
+    [[ -z $existing ]] && continue
+    ((erase_disk)) && [[ $existing == "$disk"p* ]] && continue
+    fail "A disk already uses the PachaOS root UUID: $existing"
+done < <(blkid -c /dev/null -t "UUID=$root_uuid" -o device || true)
+disk_bytes=$(blockdev --getsize64 "$disk")
+partition_args=(--append --wipe never --wipe-partitions never)
+boot_args=()
+if ((erase_disk)); then
+    python3 "$planner" fingerprint "$disk" "$disk_bytes" >"$work/metadata.before.sha256"
+    # Existing GPT, MBR, unpartitioned and damaged disks can be replaced.
+    sfdisk --json "$disk" >"$work/partition-table.before.json" 2>"$work/old-table.error" || true
+    sfdisk --dump "$disk" >"$work/partition-table.before.sfdisk" 2>>"$work/old-table.error" || true
+    python3 "$planner" erase-plan "$disk" "$disk_bytes" "$(blockdev --getss "$disk")" \
+        "$work/plan.json" "$work/append.sfdisk" "${size_args[@]}"
+    partition_args=(--wipe always --wipe-partitions always)
+    boot_args=(--first)
+else
+    sfdisk --verify "$disk"
+    sfdisk --json "$disk" >"$work/partition-table.before.json"
+    sfdisk --dump "$disk" >"$work/partition-table.before.sfdisk"
+    python3 "$planner" plan "$work/partition-table.before.json" \
+        "$disk_bytes" "$work/plan.json" "$work/append.sfdisk" "${size_args[@]}"
+fi
+efibootmgr -v >"$work/uefi.before.txt"
+python3 "$planner" boot-check "$work/uefi.before.txt"
+# Validate the planned write without changing the disk, before confirmation.
+sfdisk --no-act "${partition_args[@]}" "$disk" <"$work/append.sfdisk"
+if ((plan_only)); then
+    echo "PLAN_ONLY: target was not written. Plan: $work/plan.json"
+    exit 0
+fi
+echo
+lsblk -d -o PATH,SIZE,MODEL,SERIAL "$disk"
+if ((erase_disk)); then
+    lsblk -o PATH,SIZE,FSTYPE,LABEL,PARTLABEL "$disk"
+    echo 'ERASE DISK: Windows, recovery and ALL existing partitions on this disk will be removed.'
+    echo 'This is a reinstall, not a secure erase of all old data.'
+    confirmation="ERASE DISK $disk"
+else
+    echo 'Only the two planned NEW partitions will be formatted.'
+    echo 'Existing Windows, recovery and EFI partitions will be preserved.'
+    confirmation="ADD PACHAOS $disk"
+fi
+read -r -p "Type $confirmation to install: " answer
+[[ $answer == "$confirmation" ]] || fail 'Cancelled; target was not written.'
+check_unused
+if ((erase_disk)); then
+    python3 "$planner" fingerprint "$disk" "$disk_bytes" >"$work/metadata.recheck.sha256"
+    cmp "$work/metadata.before.sha256" "$work/metadata.recheck.sha256" || fail 'Disk metadata changed after planning.'
+    step replace-disk-partitions
+else
+    sfdisk --json "$disk" >"$work/partition-table.recheck.json"
+    cmp "$work/partition-table.before.json" "$work/partition-table.recheck.json" || fail 'Partition table changed after planning.'
+    step append-pachaos-partitions
+fi
+target_written=1
+sfdisk --lock=yes --backup --backup-file "$work/gpt-before" \
+    "${partition_args[@]}" "$disk" <"$work/append.sfdisk"
+udevadm settle
+sfdisk --json "$disk" >"$work/partition-table.after.json"
+python3 "$planner" verify "$work/plan.json" "$work/partition-table.after.json" >"$work/new-partitions"
+mapfile -t new_partitions <"$work/new-partitions"
+[[ ${#new_partitions[@]} == 2 ]] || fail 'New partition verification failed.'
+esp=${new_partitions[0]}
+root=${new_partitions[1]}
+[[ $esp == "$disk"p* && $root == "$disk"p* && $esp != "$root" ]] || fail 'Unexpected new partition devices.'
+[[ -b $esp && -b $root ]] || fail 'Partition devices did not appear.'
+step format-filesystems
+mkfs.fat -F 32 -n PACHAESP "$esp"
+# PachaOS currently flushes root before power-off without Linux's full unmount
+# choreography. Do not create the transient orphan_present feature.
+mkfs.ext4 -F -b 4096 -O '^orphan_file' -U "$root_uuid" -L pacha-root "$root"
+mkdir -p "$root_mount" "$esp_mount"
+mount -t ext4 "$root" "$root_mount"
+mount -t vfat "$esp" "$esp_mount"
+step extract-rootfs-from-usb-to-nvme
+pv -f -i 2 -p -t -e -b "$payload/ROOTFS.TAR" | tar --numeric-owner -xpf - -C "$root_mount"
+[[ -x "$root_mount/usr/bin/pacha-desktop" && -e "$root_mount/usr/local/bin/java" ]] || fail 'Installed desktop or Java is missing.'
+[[ $(stat -c %a "$root_mount/root/.ssh") == 700 ]] || fail 'Invalid SSH directory permissions.'
+[[ $(stat -c %a "$root_mount/root/.ssh/authorized_keys") == 600 ]] || fail 'Invalid SSH key permissions.'
+step install-uefi-files
+mkdir -p "$esp_mount/EFI/BOOT" "$esp_mount/EFI/PachaOS"
+cp "$payload/LIMINE.EFI" "$esp_mount/EFI/BOOT/BOOTX64.EFI"
+cp "$payload/LIMINE.EFI" "$esp_mount/EFI/PachaOS/LIMINE.EFI"
+cp "$payload/KERNEL.ELF" "$payload/INITAPP.ELF" "$esp_mount/"
+cp "$payload/SYSTEM.BOOTFS" "$esp_mount/BOOTFS.IMG"
+cp "$payload/limine.conf" "$esp_mount/limine.conf"
+step flush-and-unmount
+umount "$esp_mount"
+umount "$root_mount"
+step register-uefi-boot-entry
+# Coexistence mode appends the new entry and preserves the previous default.
+# Erase mode puts PachaOS first. Both retain all previous firmware entries.
+efibootmgr -v >"$work/uefi.precreate.txt"
+cmp "$work/uefi.before.txt" "$work/uefi.precreate.txt" || fail 'UEFI entries changed during installation.'
+efibootmgr --create-only --disk "$disk" --part "${esp##*p}" --label PachaOS --loader '\EFI\PachaOS\LIMINE.EFI'
+efibootmgr -v >"$work/uefi.created.txt"
+new_order=$(python3 "$planner" boot-order "$work/uefi.before.txt" "$work/uefi.created.txt" "${boot_args[@]}")
+efibootmgr --bootorder "$new_order"
+efibootmgr -v >"$work/uefi.after.txt"
+[[ $(sed -n 's/^BootOrder: //p' "$work/uefi.after.txt") == "$new_order" ]] || fail 'UEFI boot order verification failed.'
+step complete
+echo "Installed PachaOS in $root with its own EFI partition $esp; root UUID=$root_uuid"
+if ((erase_disk)); then
+    echo 'The disk was replaced with PachaOS partitions. PachaOS is first in UEFI BootOrder.'
+else
+    echo 'Windows partitions and the previous default boot order were preserved.'
+fi
+echo 'Shut down with: poweroff'
+echo 'Then remove the USB and select PachaOS in the UEFI boot menu. Desktop command: pacha-desktop'

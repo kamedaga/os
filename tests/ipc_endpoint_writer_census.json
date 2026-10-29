@@ -27,7 +27,8 @@
     "ipcRecv": 2
   },
   "state/fd.zig": {
-    "detachFdWaitGroup": 1
+    "detachFdWaitGroup": 1,
+    "retirePersistentRegistration": 1
   },
   "state/types.zig": {
     "appendReceive": 6,
@@ -44,9 +45,8 @@
     "ipcBlockReusable": 1,
     "tryIpcFastCall": 5,
     "tryIpcFastEnqueue": 4,
-    "prepareDirectHandoff": 6,
+    "prepareDirectHandoff": 4,
     "commitDirectHandoff": 6,
-    "prepareDirectNotify": 1,
     "commitDirectNotify": 8,
     "tryIpcFastReplyRecv": 5
   },

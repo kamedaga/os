@@ -84,12 +84,17 @@ int main(int argc, char **argv)
     printf("[inputd] service loop endpoint_fd=%llu\n",
         (unsigned long long)cfg->input_endpoint_fd);
     static struct pacha_service_wait_set wait_set;
+    static struct pacha_fd_wait_retained retained_wait;
     static struct inputd_wait_source wait_sources[PACHA_SERVICE_WAIT_MAX_FDS];
     size_t wait_source_count = 0;
     uint64_t built_wait_generation = 0;
+    int built_wait_valid = 0, built_netd_pending = 0;
     for (;;) {
+        (void)inputd_service_flush_uevents(&service);
+        const int netd_pending = inputd_service_uevents_pending(&service);
         const uint64_t current_wait_generation = inputd_input_wait_generation();
-        if (built_wait_generation != current_wait_generation) {
+        if (!built_wait_valid || built_wait_generation != current_wait_generation ||
+            built_netd_pending != netd_pending) {
             if (pacha_service_wait_init(&wait_set, (pacha_fd_t)cfg->input_endpoint_fd) != 0)
                 return 1;
             if (pacha_service_wait_add(&wait_set, (pacha_fd_t)cfg->source_endpoint_fd,
@@ -102,15 +107,28 @@ int main(int argc, char **argv)
             }
             wait_source_count = inputd_input_collect_wait_sources(
                 wait_sources,
-                PACHA_SERVICE_WAIT_MAX_FDS - 2u - cfg->device_count);
+                PACHA_SERVICE_WAIT_MAX_FDS - 2u - cfg->device_count - (unsigned)netd_pending);
             for (size_t i = 0; i < wait_source_count; i++) {
                 if (pacha_service_wait_add(
                         &wait_set, wait_sources[i].fd, PACHA_FD_EVENT_HANGUP) != 0)
                     return 1;
             }
+            if (netd_pending && pacha_service_wait_add(&wait_set,
+                    (pacha_fd_t)cfg->netd_endpoint_fd, PACHA_FD_EVENT_WRITABLE) != 0)
+                return 1;
             built_wait_generation = current_wait_generation;
+            built_netd_pending = netd_pending;
+            built_wait_valid = 1;
         }
-        if (pacha_service_wait(&wait_set, PACHA_FD_WAIT_FOREVER) < 0) return 1;
+        int waited = pacha_service_wait_retained(&wait_set, &retained_wait, PACHA_FD_WAIT_FOREVER);
+        if (waited < 0) {
+            fprintf(stderr, "[inputd] service wait failed status=%d\n", waited);
+            return 1;
+        }
+        if (built_netd_pending &&
+            (wait_set.fds[wait_set.count - 1].revents &
+                (PACHA_FD_EVENT_HANGUP | PACHA_FD_EVENT_ERROR)))
+            inputd_service_uevent_hangup(&service);
 
         for (size_t i = 0; i < cfg->device_count; i++) {
             const size_t wait_index = 2u + i;

@@ -1,7 +1,9 @@
 cmake_minimum_required(VERSION 3.16)
-
-set(CMAKE_SYSTEM_NAME Generic)
-set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
+if(NOT DEFINED CMAKE_TOOLCHAIN_FILE)
+  set(CMAKE_TOOLCHAIN_FILE "${CMAKE_CURRENT_SOURCE_DIR}/../cmake/pachaos-native.toolchain.cmake")
+endif()
+# Depfile paths are rewritten relative to the build tree for Ninja.
+cmake_policy(SET CMP0116 NEW)
 project(gpud C ASM)
 
 option(GPUD_DRM_RPC_PROFILE "Measure native DRM request mapping costs" OFF)
@@ -11,31 +13,18 @@ if(GPUD_DRM_RPC_PROFILE)
 endif()
 
 set(REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../..")
-include("${REPO_ROOT}/userland/cmake/pachaos_native_dependencies.cmake")
-set(GPUD_ELF "${CMAKE_BINARY_DIR}/gpud.elf")
+include("${REPO_ROOT}/userland/cmake/pachaos_native.cmake")
 set(SANDBOX_ELF "${CMAKE_BINARY_DIR}/sandbox.elf")
 set(PROTOCOL "${REPO_ROOT}/kobox2/protocol")
 
-file(GLOB_RECURSE SANDBOX_INPUTS CONFIGURE_DEPENDS
-  "${CMAKE_CURRENT_SOURCE_DIR}/*.h"
-  "${CMAKE_CURRENT_SOURCE_DIR}/gpu_sessions.c"
-  "${CMAKE_CURRENT_SOURCE_DIR}/gpu_channel.c"
-  "${REPO_ROOT}/userland/kobox2_adapter/*.c"
-  "${REPO_ROOT}/userland/kobox2_adapter/*.h"
-  "${REPO_ROOT}/userland/kobox2_adapter/*.S"
-  "${REPO_ROOT}/userland/libpacha/include/*.h"
-  "${REPO_ROOT}/userland/libpacha/src/syscall.c"
-  "${REPO_ROOT}/userland/libpacha/src/log.c"
-  "${REPO_ROOT}/kobox2/linux-sandbox/kobox/*.c"
-  "${REPO_ROOT}/kobox2/linux-sandbox/kobox/*.h"
-  "${PROTOCOL}/*.c" "${PROTOCOL}/*.h")
 add_custom_command(
   OUTPUT "${SANDBOX_ELF}"
+  DEPFILE "${SANDBOX_ELF}.d"
   COMMAND bash "${REPO_ROOT}/userland/kobox2_adapter/build-sandbox.sh" "${SANDBOX_ELF}"
-  DEPENDS ${SANDBOX_INPUTS} "${REPO_ROOT}/userland/kobox2_adapter/build-sandbox.sh"
+  DEPENDS "${REPO_ROOT}/userland/kobox2_adapter/build-sandbox.sh"
   WORKING_DIRECTORY "${REPO_ROOT}"
   VERBATIM)
-add_custom_target(gpud_sandbox DEPENDS "${SANDBOX_ELF}")
+add_custom_target(gpud_sandbox ALL DEPENDS "${SANDBOX_ELF}")
 
 set(GPUD_SOURCES
   "${REPO_ROOT}/userland/kobox2_owner/boot.c"
@@ -77,28 +66,32 @@ set(GPUD_SOURCES
   "${PROTOCOL}/src/virtqueue.c"
   "${PROTOCOL}/src/virtqueue_memory.c"
   "${PROTOCOL}/arch/x86_64/virtqueue_atomic.c")
-string(REPLACE ";" " " GPUD_SOURCES_ENV "${GPUD_SOURCES}")
-file(GLOB_RECURSE GPUD_HEADERS CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/*.h")
-
-add_custom_command(
-  OUTPUT "${GPUD_ELF}"
-  COMMAND ${CMAKE_COMMAND} -E env
-    "PACHAOS_MUSL_APP_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/main.c"
-    "PACHAOS_MUSL_EXTRA_SOURCES=${GPUD_SOURCES_ENV} ${REPO_ROOT}/userland/libfiled_client/src/client.c ${REPO_ROOT}/kobox2/protocol/src/filesystem.c"
-    "PACHAOS_MUSL_EXTRA_INCLUDE_DIRS=${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/include ${REPO_ROOT}/userland/filed/include ${REPO_ROOT}/userland/libfiled_client/include ${REPO_ROOT}/userland/libipc/include ${REPO_ROOT}/userland/libcapsule/include ${REPO_ROOT}/userland/libpacha/include ${REPO_ROOT}/kobox2/include ${PROTOCOL}/include ${PROTOCOL}/generated/include ${REPO_ROOT}/userland/libfiled_client/include ${REPO_ROOT}/kobox2/protocol/include ${REPO_ROOT}/kobox2/protocol/generated/include"
-    "PACHAOS_MUSL_EXTRA_CFLAGS=-std=c11 -Oz -ffunction-sections -fdata-sections -Wframe-larger-than=65536 -Werror=frame-larger-than ${GPUD_DRM_PROFILE_FLAGS}"
-    "PACHAOS_MUSL_EXTRA_LINK_FLAGS=-Wl,--gc-sections"
-    bash "${REPO_ROOT}/musl/pachaos/build/build-smokes.sh" "${GPUD_ELF}"
-  DEPENDS ${PACHAOS_NATIVE_DEPENDENCIES} "${CMAKE_CURRENT_SOURCE_DIR}/main.c" ${GPUD_SOURCES} ${GPUD_HEADERS}
+pachaos_native_executable(gpud
+  SOURCES
+    "${CMAKE_CURRENT_SOURCE_DIR}/main.c"
+    ${GPUD_SOURCES}
     "${REPO_ROOT}/userland/libfiled_client/src/client.c"
-    "${REPO_ROOT}/userland/libfiled_client/include/filed_client/client.h"
-    "${REPO_ROOT}/kobox2/protocol/src/filesystem.c"
-    "${REPO_ROOT}/kobox2/protocol/include/kobox2/filesystem.h"
-    "${REPO_ROOT}/kobox2/protocol/generated/include/kobox2/filesystem_layout.h"
-    "${REPO_ROOT}/userland/kobox2_owner/boot.h"
-    "${REPO_ROOT}/userland/libpacha/include/pacha/abi.h"
-    "${REPO_ROOT}/musl/pachaos/include/pachaos/abi.h"
-    "${REPO_ROOT}/musl/pachaos/build/build-smokes.sh" "${SANDBOX_ELF}"
-  WORKING_DIRECTORY "${REPO_ROOT}"
-  VERBATIM)
-add_custom_target(gpud ALL DEPENDS "${GPUD_ELF}" "${SANDBOX_ELF}")
+    "${PROTOCOL}/src/filesystem.c"
+  INCLUDE_DIRECTORIES
+    "${CMAKE_CURRENT_SOURCE_DIR}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/include"
+    "${REPO_ROOT}/userland/filed/include"
+    "${REPO_ROOT}/userland/libfiled_client/include"
+    "${REPO_ROOT}/userland/libipc/include"
+    "${REPO_ROOT}/userland/libcapsule/include"
+    "${REPO_ROOT}/userland/libpacha/include"
+    "${REPO_ROOT}/kobox2/include"
+    "${PROTOCOL}/include"
+    "${PROTOCOL}/generated/include"
+  COMPILE_OPTIONS
+    -std=c11
+    -Oz
+    -ffunction-sections
+    -fdata-sections
+    -Wframe-larger-than=65536
+    -Werror=frame-larger-than
+    ${GPUD_DRM_PROFILE_FLAGS}
+  LINK_OPTIONS
+    -Wl,--gc-sections)
+# Building the gpud target delivers both ELFs.
+add_dependencies(gpud gpud_sandbox)

@@ -1,13 +1,11 @@
 cmake_minimum_required(VERSION 3.16)
-
-set(CMAKE_SYSTEM_NAME Generic)
-set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
-
+if(NOT DEFINED CMAKE_TOOLCHAIN_FILE)
+  set(CMAKE_TOOLCHAIN_FILE "${CMAKE_CURRENT_SOURCE_DIR}/../cmake/pachaos-native.toolchain.cmake")
+endif()
 project(inputd C ASM)
 
 set(REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../..")
-include("${REPO_ROOT}/userland/cmake/pachaos_native_dependencies.cmake")
-set(INPUTD_ELF "${CMAKE_BINARY_DIR}/inputd.elf")
+include("${REPO_ROOT}/userland/cmake/pachaos_native.cmake")
 
 set(KOBOX_RUNTIME_SOURCES
   "${REPO_ROOT}/userland/libipc/src/ipc.c"
@@ -80,44 +78,41 @@ set(KOBOX_RUNTIME_SOURCES
   "${CMAKE_CURRENT_SOURCE_DIR}/src/input_namespace.c"
 )
 
-string(REPLACE ";" " " INPUTD_EXTRA_SOURCES_ENV "${KOBOX_RUNTIME_SOURCES}")
-
-add_custom_command(
-  OUTPUT "${INPUTD_ELF}"
-  COMMAND
-    ${CMAKE_COMMAND} -E env
-      "PACHAOS_MUSL_APP_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/src/main.c"
-      "PACHAOS_MUSL_EXTRA_SOURCES=${INPUTD_EXTRA_SOURCES_ENV} ${REPO_ROOT}/userland/libfiled_client/src/client.c ${REPO_ROOT}/kobox2/protocol/src/filesystem.c"
-      "PACHAOS_MUSL_EXTRA_INCLUDE_DIRS=${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src ${REPO_ROOT}/userland/netd/include ${REPO_ROOT}/userland/filed/include ${REPO_ROOT}/userland/libfiled_client/include ${REPO_ROOT}/userland/libipc/include ${REPO_ROOT}/userland/libcapsule/include ${REPO_ROOT}/userland/libpacha/include ${REPO_ROOT}/kobox2/linux-sandbox/kobox ${REPO_ROOT}/_kobox/include ${REPO_ROOT}/_kobox/src ${REPO_ROOT}/userland/libfiled_client/include ${REPO_ROOT}/kobox2/protocol/include ${REPO_ROOT}/kobox2/protocol/generated/include"
-      "PACHAOS_MUSL_EXTRA_CFLAGS=-D__pachaos__ -Oz -ffunction-sections -fdata-sections -fno-unwind-tables -fno-asynchronous-unwind-tables -Wno-unused-parameter -Wno-unused-variable -Wno-unused-function -Wno-sign-compare -Wno-pointer-sign -Wno-missing-field-initializers -Wno-deprecated-non-prototype"
-      "PACHAOS_MUSL_LIBC_EXTRA_CFLAGS=-Oz -ffunction-sections -fdata-sections -fno-unwind-tables -fno-asynchronous-unwind-tables"
-      "PACHAOS_MUSL_EXTRA_LINK_FLAGS=-Wl,--gc-sections -Wl,--strip-all"
-      bash "${REPO_ROOT}/musl/pachaos/build/build-smokes.sh" "${INPUTD_ELF}"
-  DEPENDS ${PACHAOS_NATIVE_DEPENDENCIES}
-    "${REPO_ROOT}/userland/libfiled_client/src/client.c"
-    "${REPO_ROOT}/userland/libfiled_client/include/filed_client/client.h"
-    "${REPO_ROOT}/kobox2/protocol/src/filesystem.c"
-    "${REPO_ROOT}/kobox2/protocol/include/kobox2/filesystem.h"
-    "${REPO_ROOT}/kobox2/protocol/generated/include/kobox2/filesystem_layout.h"
-    "${REPO_ROOT}/userland/filed/include/filed/payload.h"
-    "${REPO_ROOT}/userland/libpacha/include/pacha/abi.h"
-    "${REPO_ROOT}/musl/pachaos/include/pachaos/abi.h"
-    "${REPO_ROOT}/userland/filed/include/filed/ipc_protocol.h"
-    "${REPO_ROOT}/userland/libfiled_client/include/filed_client/module_image.h"
-    "${CMAKE_CURRENT_SOURCE_DIR}/include/inputd/boot_config.h"
-    "${CMAKE_CURRENT_SOURCE_DIR}/include/inputd/ipc_protocol.h"
-    "${CMAKE_CURRENT_SOURCE_DIR}/include/inputd/source_protocol.h"
+pachaos_native_executable(inputd
+  LIBC oz
+  SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/src/main.c"
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/input_island.c"
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/input_island.h"
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/inputd_service.c"
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/inputd_service.h"
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/input_namespace.h"
-    "${REPO_ROOT}/userland/netd/include/netd/ipc_protocol.h"
-    "${REPO_ROOT}/musl/pachaos/build/build-smokes.sh"
     ${KOBOX_RUNTIME_SOURCES}
-  WORKING_DIRECTORY "${REPO_ROOT}"
-  VERBATIM
-)
-
-add_custom_target(inputd ALL DEPENDS "${INPUTD_ELF}")
+    "${REPO_ROOT}/userland/libfiled_client/src/client.c"
+    "${REPO_ROOT}/kobox2/protocol/src/filesystem.c"
+  INCLUDE_DIRECTORIES
+    "${CMAKE_CURRENT_SOURCE_DIR}/include"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src"
+    "${REPO_ROOT}/userland/netd/include"
+    "${REPO_ROOT}/userland/filed/include"
+    "${REPO_ROOT}/userland/libfiled_client/include"
+    "${REPO_ROOT}/userland/libipc/include"
+    "${REPO_ROOT}/userland/libcapsule/include"
+    "${REPO_ROOT}/userland/libpacha/include"
+    "${REPO_ROOT}/kobox2/linux-sandbox/kobox"
+    "${REPO_ROOT}/_kobox/include"
+    "${REPO_ROOT}/_kobox/src"
+    "${REPO_ROOT}/kobox2/protocol/include"
+    "${REPO_ROOT}/kobox2/protocol/generated/include"
+  COMPILE_OPTIONS
+    -D__pachaos__
+    -Oz
+    -ffunction-sections
+    -fdata-sections
+    -fno-unwind-tables
+    -fno-asynchronous-unwind-tables
+    -Wno-unused-parameter
+    -Wno-unused-variable
+    -Wno-unused-function
+    -Wno-sign-compare
+    -Wno-pointer-sign
+    -Wno-missing-field-initializers
+    -Wno-deprecated-non-prototype
+  LINK_OPTIONS
+    -Wl,--gc-sections
+    -Wl,--strip-all)

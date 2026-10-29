@@ -47,6 +47,7 @@ pub const syscall_futex_wait: u64 = runtime_abi.syscall_futex_wait;
 pub const syscall_futex_wake: u64 = runtime_abi.syscall_futex_wake;
 pub const syscall_futex_wake_wait: u64 = runtime_abi.syscall_futex_wake_wait;
 pub const syscall_futex_requeue: u64 = runtime_abi.syscall_futex_requeue;
+pub const syscall_futex_wake_op: u64 = runtime_abi.syscall_futex_wake_op;
 pub const syscall_getrandom: u64 = runtime_abi.syscall_getrandom;
 pub const syscall_power_control: u64 = runtime_abi.syscall_power_control;
 
@@ -74,6 +75,7 @@ pub const syscall_vmo_grow: u64 = fd_abi.syscall_vmo_grow;
 pub const syscall_vmo_cache_policy: u64 = fd_abi.syscall_vmo_cache_policy;
 pub const syscall_vmo_create_page_view: u64 = fd_abi.syscall_vmo_create_page_view;
 pub const syscall_vmo_refresh_page_view: u64 = fd_abi.syscall_vmo_refresh_page_view;
+pub const syscall_vmo_collect_dirty: u64 = fd_abi.syscall_vmo_collect_dirty;
 pub const syscall_vmo_revoke: u64 = fd_abi.syscall_vmo_revoke;
 pub const syscall_pager_port_create: u64 = pager_abi.syscall_pager_port_create;
 pub const syscall_pager_attach: u64 = pager_abi.syscall_pager_attach;
@@ -99,6 +101,10 @@ pub const syscall_ipc_notify: u64 = ipc_abi.syscall_ipc_notify;
 pub const syscall_ipc_notify_wait: u64 = ipc_abi.syscall_ipc_notify_wait;
 
 pub const syscall_capsule_query: u64 = capsule_abi.syscall_capsule_query;
+pub const syscall_capsule_platform_enumerate: u64 = capsule_abi.syscall_capsule_platform_enumerate;
+pub const syscall_capsule_platform_claim: u64 = capsule_abi.syscall_capsule_platform_claim;
+pub const syscall_capsule_io_read: u64 = capsule_abi.syscall_capsule_io_read;
+pub const syscall_capsule_io_write: u64 = capsule_abi.syscall_capsule_io_write;
 pub const syscall_capsule_derive_mmio: u64 = capsule_abi.syscall_capsule_derive_mmio;
 pub const syscall_capsule_derive_dma_buffer: u64 = capsule_abi.syscall_capsule_derive_dma_buffer;
 pub const syscall_capsule_derive_dma_mapping: u64 = capsule_abi.syscall_capsule_derive_dma_mapping;
@@ -107,6 +113,8 @@ pub const syscall_capsule_derive_dma_mapping_from_buffer: u64 = capsule_abi.sysc
 pub const syscall_capsule_dma_set_enabled: u64 = capsule_abi.syscall_capsule_dma_set_enabled;
 pub const syscall_capsule_derive_irq: u64 = capsule_abi.syscall_capsule_derive_irq;
 pub const syscall_capsule_irq_route: u64 = capsule_abi.syscall_capsule_irq_route;
+pub const syscall_capsule_irq_set_mask: u64 = capsule_abi.syscall_capsule_irq_set_mask;
+pub const syscall_capsule_irq_poll: u64 = capsule_abi.syscall_capsule_irq_poll;
 pub const syscall_capsule_irq_quiesce: u64 = capsule_abi.syscall_capsule_irq_quiesce;
 pub const syscall_capsule_irq_retire: u64 = capsule_abi.syscall_capsule_irq_retire;
 pub const syscall_capsule_pci_enumerate: u64 = capsule_abi.syscall_capsule_pci_enumerate;
@@ -114,7 +122,6 @@ pub const syscall_capsule_pci_claim: u64 = capsule_abi.syscall_capsule_pci_claim
 pub const syscall_capsule_pci_config_read: u64 = capsule_abi.syscall_capsule_pci_config_read;
 pub const syscall_capsule_pci_config_write: u64 = capsule_abi.syscall_capsule_pci_config_write;
 pub const syscall_capsule_pci_bar_info: u64 = capsule_abi.syscall_capsule_pci_bar_info;
-pub const syscall_capsule_irq_poll: u64 = capsule_abi.syscall_capsule_irq_poll;
 pub const syscall_capsule_dma_pool_create: u64 = capsule_abi.syscall_capsule_dma_pool_create;
 
 pub const syscall_last: u64 = syscall_capsule_dma_pool_create;
@@ -175,6 +182,7 @@ test "native syscall numbers are contiguous" {
         syscall_futex_wake,
         syscall_futex_wake_wait,
         syscall_futex_requeue,
+        syscall_futex_wake_op,
         syscall_getrandom,
         syscall_power_control,
         syscall_fd_table,
@@ -201,6 +209,7 @@ test "native syscall numbers are contiguous" {
         syscall_vmo_cache_policy,
         syscall_vmo_create_page_view,
         syscall_vmo_refresh_page_view,
+        syscall_vmo_collect_dirty,
         syscall_vmo_revoke,
         syscall_pager_port_create,
         syscall_pager_attach,
@@ -224,6 +233,10 @@ test "native syscall numbers are contiguous" {
         syscall_ipc_notify,
         syscall_ipc_notify_wait,
         syscall_capsule_query,
+        syscall_capsule_platform_enumerate,
+        syscall_capsule_platform_claim,
+        syscall_capsule_io_read,
+        syscall_capsule_io_write,
         syscall_capsule_derive_mmio,
         syscall_capsule_derive_dma_buffer,
         syscall_capsule_derive_dma_mapping,
@@ -232,6 +245,7 @@ test "native syscall numbers are contiguous" {
         syscall_capsule_dma_set_enabled,
         syscall_capsule_derive_irq,
         syscall_capsule_irq_route,
+        syscall_capsule_irq_set_mask,
         syscall_capsule_irq_poll,
         syscall_capsule_irq_quiesce,
         syscall_capsule_irq_retire,

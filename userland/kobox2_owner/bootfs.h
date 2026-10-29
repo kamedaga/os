@@ -19,6 +19,9 @@ int ph_bootfs_view(struct ph_bootfs *archive, const void *image, size_t size);
 int ph_bootfs_open(struct ph_bootfs *archive, pacha_fd_t fd, uint64_t size);
 int ph_bootfs_find(const struct ph_bootfs *archive, const char *path,
                   const unsigned char **bytes, size_t *size);
+/* Borrow one validated entry; path is length-delimited, not a C string. */
+int ph_bootfs_entry(const struct ph_bootfs *, uint32_t, const unsigned char **,
+    size_t *, const unsigned char **, size_t *, uint32_t *);
 int ph_bootfs_close(struct ph_bootfs *archive);
 
 #endif

@@ -26,6 +26,10 @@ struct ph_vm_space {
     pacha_fd_t kick_fd;
     pacha_fd_t event_fd;
     pacha_fd_t control_fd;
+    /* Independent guardian can terminate the child even while it is STOPped. */
+    pacha_fd_t lifeline_fd;
+    pacha_fd_t guardian_fd;
+    pacha_fd_t guardian_thread_fd;
     /* Parent-only capabilities: target max_prot must not exceed Linux PTE
      * permissions even if the child directly invokes native MPROTECT. */
     pacha_fd_t ram_grant_fds[8];
