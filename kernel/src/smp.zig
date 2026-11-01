@@ -719,7 +719,7 @@ test "MMIO alias RAM proof accepts AMD TOM2 default only with matching CPU evide
         .capability = 1,
         .default_type = 1 << 11, // UC outside TOM2.
         .physical_bits = 46,
-        .amd_pat_mtrr_semantics = true,
+        .vendor = .amd,
         .amd_syscfg = (1 << 21) | (1 << 22),
         .amd_top_mem2 = 0x8_0000_0000,
     };
@@ -756,9 +756,12 @@ fn wcMmioProofWithSnapshots(
     // No firmware WC PAT entry is required for this proven combination.
     if (mtrr_type == .wc) return .{ .pat_slot = 0, .mtrr_type = .wc };
 
-    // PAT WC overrides other supported MTRR types on AMD, but not on every
-    // x86 implementation. Never infer this from the PAT MSR alone.
-    if (!boot.amd_pat_mtrr_semantics) return error.UnsupportedCpu;
+    // Intel SDM 325462-090 Vol. 3A Table 14-7 and AMD APM Vol. 2's
+    // effective-type table both define PAT WC as WC for each supported
+    // MTRR type. This proves only that column, not arbitrary combinations.
+    // Vendor and normal CR0 caching are captured on every CPU; a WC byte in
+    // an unknown vendor's PAT MSR alone does not establish those semantics.
+    if (boot.vendor == .unknown) return error.UnsupportedCpu;
     // This proves only the proposed mapping's effective type; the caller
     // must settle every preexisting physical alias before publishing its PTE.
     for ([_]u3{ 1, 4, 5, 6, 7 }) |pat_slot| {
@@ -788,7 +791,7 @@ test "MMIO alias WC proof requires all online CPUs to share a usable PAT slot" {
         .capability = 1 << 10,
         .default_type = 1 << 11, // MTRR default UC.
         .physical_bits = 46,
-        .amd_pat_mtrr_semantics = true,
+        .vendor = .amd,
     };
     var snapshots = [_]mtrr.CacheSnapshot{ base, base };
     const ready = try wcMmioProofWithSnapshots(&snapshots, testSet(0b11), testSet(0b11), address, 8192);
@@ -804,9 +807,48 @@ test "MMIO alias WC proof requires all online CPUs to share a usable PAT slot" {
 
     try std.testing.expectError(error.CacheEvidenceMissing, wcMmioProofWithSnapshots(&snapshots, testSet(0b01), testSet(0b11), address, 8192));
     try std.testing.expectError(error.InvalidRange, wcMmioProofWithSnapshots(&snapshots, testSet(0b11), testSet(0b11), address + 1, 8192));
-    snapshots[0].amd_pat_mtrr_semantics = false;
-    snapshots[1].amd_pat_mtrr_semantics = false;
+    snapshots[0].vendor = .unknown;
+    snapshots[1].vendor = .unknown;
     try std.testing.expectError(error.UnsupportedCpu, wcMmioProofWithSnapshots(&snapshots, testSet(0b11), testSet(0b11), address, 8192));
+}
+
+test "MMIO alias WC proof admits Intel high BAR only with consistent CPU evidence" {
+    const address: u64 = 0x4000000000;
+    const bytes: u64 = 0x10000000;
+    const base = mtrr.CacheSnapshot{
+        .pat = 6 | (@as(u64, 1) << 8) | (@as(u64, 7) << 16),
+        .capability = 1 << 10,
+        .default_type = 1 << 11,
+        .physical_bits = 39,
+        .vendor = .intel,
+    };
+    for ([_]mtrr.MemoryType{ .uc, .wc, .wt, .wb, .wp }) |kind| {
+        var snapshot = base;
+        snapshot.default_type |= @intFromEnum(kind);
+        const snapshots = [_]mtrr.CacheSnapshot{ snapshot, snapshot };
+        const proof = try wcMmioProofWithSnapshots(&snapshots, testSet(0b11), testSet(0b11), address, bytes);
+        try std.testing.expectEqual(kind, proof.mtrr_type);
+        try std.testing.expectEqual(@as(u3, if (kind == .wc) 0 else 1), proof.pat_slot);
+    }
+
+    var snapshots = [_]mtrr.CacheSnapshot{ base, base };
+    snapshots[1].vendor = .amd;
+    try std.testing.expectError(error.CacheEvidenceMissing, wcMmioProofWithSnapshots(&snapshots, testSet(0b11), testSet(0b11), address, bytes));
+    snapshots[1] = base;
+    snapshots[1].vendor = .unknown;
+    try std.testing.expectError(error.CacheEvidenceMissing, wcMmioProofWithSnapshots(&snapshots, testSet(0b11), testSet(0b11), address, bytes));
+    for ([_]u2{ 1, 2, 3 }) |mode| {
+        snapshots[1] = base;
+        snapshots[1].cache_control = mode;
+        try std.testing.expectError(error.CacheEvidenceMissing, wcMmioProofWithSnapshots(&snapshots, testSet(0b11), testSet(0b11), address, bytes));
+    }
+    snapshots[1] = base;
+    snapshots[1].pat &= ~(@as(u64, 0xff) << 8);
+    try std.testing.expectError(error.WcPatUnavailable, wcMmioProofWithSnapshots(&snapshots, testSet(0b11), testSet(0b11), address, bytes));
+    for (&snapshots) |*snapshot| snapshot.pat |= @as(u64, 1) << 32;
+    const high_slot = try wcMmioProofWithSnapshots(&snapshots, testSet(0b11), testSet(0b11), address, bytes);
+    try std.testing.expectEqual(@as(u3, 4), high_slot.pat_slot);
+    try std.testing.expectError(error.InvalidRange, wcMmioProofWithSnapshots(&snapshots, testSet(0b11), testSet(0b11), @as(u64, 1) << 39, bytes));
 }
 
 test "MMIO alias WC proof admits PAT0 when every MTRR is WC" {

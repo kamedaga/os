@@ -39,54 +39,56 @@
 #define PACHAOS_SYSCALL_FUTEX_WAKE_WAIT 37
 #define PACHAOS_SYSCALL_FUTEX_REQUEUE 38
 #define PACHAOS_SYSCALL_FUTEX_WAKE_OP 39
-#define PACHAOS_SYSCALL_GETRANDOM 40
-#define PACHAOS_SYSCALL_POWER_CONTROL 41
-#define PACHAOS_SYSCALL_FD_TABLE 42
-#define PACHAOS_SYSCALL_FD_CLOSE 43
-#define PACHAOS_SYSCALL_FD_DUP 44
-#define PACHAOS_SYSCALL_FD_GET_INFO 45
-#define PACHAOS_SYSCALL_FD_READ 47
-#define PACHAOS_SYSCALL_FD_WRITE 48
-#define PACHAOS_SYSCALL_FD_READV 49
-#define PACHAOS_SYSCALL_FD_WRITEV 50
-#define PACHAOS_SYSCALL_FD_FCNTL 51
-#define PACHAOS_SYSCALL_FD_POLL 52
-#define PACHAOS_SYSCALL_FD_WAIT_MANY 53
-#define PACHAOS_SYSCALL_FD_IOCTL 54
-#define PACHAOS_SYSCALL_FD_STAT 55
-#define PACHAOS_SYSCALL_EVENTFD_CREATE 56
-#define PACHAOS_SYSCALL_PIPE_CREATE 57
-#define PACHAOS_SYSCALL_TIMERFD_CREATE 58
-#define PACHAOS_SYSCALL_TIMERFD_SETTIME 59
-#define PACHAOS_SYSCALL_TIMERFD_GETTIME 60
-#define PACHAOS_SYSCALL_VMO_CREATE 61
-#define PACHAOS_SYSCALL_VMO_GROW 62
-#define PACHAOS_SYSCALL_VMO_CACHE_POLICY 63
-#define PACHAOS_SYSCALL_VMO_CREATE_PAGE_VIEW 64
-#define PACHAOS_SYSCALL_VMO_REFRESH_PAGE_VIEW 65
-#define PACHAOS_SYSCALL_VMO_COLLECT_DIRTY 66
-#define PACHAOS_SYSCALL_VMO_REVOKE 67
-#define PACHAOS_SYSCALL_PAGER_PORT_CREATE 68
-#define PACHAOS_SYSCALL_PAGER_ATTACH 69
-#define PACHAOS_SYSCALL_PAGER_WAIT 70
-#define PACHAOS_SYSCALL_PAGER_SUPPLY 71
-#define PACHAOS_SYSCALL_PAGER_FAIL 72
-#define PACHAOS_SYSCALL_MMAP 73
-#define PACHAOS_SYSCALL_MUNMAP 74
-#define PACHAOS_SYSCALL_MPROTECT 75
-#define PACHAOS_SYSCALL_MREMAP 76
-#define PACHAOS_SYSCALL_MADVISE 77
-#define PACHAOS_SYSCALL_IPC_ENDPOINT_CREATE 78
-#define PACHAOS_SYSCALL_IPC_CHANNEL_CREATE 79
-#define PACHAOS_SYSCALL_IPC_SEND 80
-#define PACHAOS_SYSCALL_IPC_RECV 81
-#define PACHAOS_SYSCALL_IPC_CALL 82
-#define PACHAOS_SYSCALL_IPC_REPLY 83
-#define PACHAOS_SYSCALL_IPC_REPLY_RECV 84
-#define PACHAOS_SYSCALL_IPC_REPLY_EXTRACT 85
-#define PACHAOS_SYSCALL_IPC_RECV_WAIT 86
-#define PACHAOS_SYSCALL_IPC_NOTIFY 87
-#define PACHAOS_SYSCALL_IPC_NOTIFY_WAIT 88
+#define PACHAOS_SYSCALL_FUTEX_PI 40
+#define PACHAOS_SYSCALL_GETRANDOM 41
+#define PACHAOS_SYSCALL_POWER_CONTROL 42
+#define PACHAOS_SYSCALL_FD_TABLE 43
+#define PACHAOS_SYSCALL_FD_CLOSE 44
+#define PACHAOS_SYSCALL_FD_DUP 45
+#define PACHAOS_SYSCALL_FD_GET_INFO 46
+#define PACHAOS_SYSCALL_FD_READ 48
+#define PACHAOS_SYSCALL_FD_WRITE 49
+#define PACHAOS_SYSCALL_FD_READV 50
+#define PACHAOS_SYSCALL_FD_WRITEV 51
+#define PACHAOS_SYSCALL_FD_FCNTL 52
+#define PACHAOS_SYSCALL_FD_POLL 53
+#define PACHAOS_SYSCALL_FD_WAIT_MANY 54
+#define PACHAOS_SYSCALL_FD_IOCTL 55
+#define PACHAOS_SYSCALL_FD_STAT 56
+#define PACHAOS_SYSCALL_EVENTFD_CREATE 57
+#define PACHAOS_SYSCALL_PIPE_CREATE 58
+#define PACHAOS_SYSCALL_TIMERFD_CREATE 59
+#define PACHAOS_SYSCALL_TIMERFD_SETTIME 60
+#define PACHAOS_SYSCALL_TIMERFD_GETTIME 61
+#define PACHAOS_SYSCALL_VMO_CREATE 62
+#define PACHAOS_SYSCALL_VMO_GROW 63
+#define PACHAOS_SYSCALL_VMO_CACHE_POLICY 64
+#define PACHAOS_SYSCALL_VMO_CREATE_PAGE_VIEW 65
+#define PACHAOS_SYSCALL_VMO_REFRESH_PAGE_VIEW 66
+#define PACHAOS_SYSCALL_VMO_COLLECT_DIRTY 67
+#define PACHAOS_SYSCALL_VMO_REVOKE 68
+#define PACHAOS_SYSCALL_PAGER_PORT_CREATE 69
+#define PACHAOS_SYSCALL_PAGER_ATTACH 70
+#define PACHAOS_SYSCALL_PAGER_WAIT 71
+#define PACHAOS_SYSCALL_PAGER_SUPPLY 72
+#define PACHAOS_SYSCALL_PAGER_FAIL 73
+#define PACHAOS_SYSCALL_VM_QUERY 74
+#define PACHAOS_SYSCALL_MMAP 75
+#define PACHAOS_SYSCALL_MUNMAP 76
+#define PACHAOS_SYSCALL_MPROTECT 77
+#define PACHAOS_SYSCALL_MREMAP 78
+#define PACHAOS_SYSCALL_MADVISE 79
+#define PACHAOS_SYSCALL_IPC_ENDPOINT_CREATE 80
+#define PACHAOS_SYSCALL_IPC_CHANNEL_CREATE 81
+#define PACHAOS_SYSCALL_IPC_SEND 82
+#define PACHAOS_SYSCALL_IPC_RECV 83
+#define PACHAOS_SYSCALL_IPC_CALL 84
+#define PACHAOS_SYSCALL_IPC_REPLY 85
+#define PACHAOS_SYSCALL_IPC_REPLY_RECV 86
+#define PACHAOS_SYSCALL_IPC_REPLY_EXTRACT 87
+#define PACHAOS_SYSCALL_IPC_RECV_WAIT 88
+#define PACHAOS_SYSCALL_IPC_NOTIFY 89
+#define PACHAOS_SYSCALL_IPC_NOTIFY_WAIT 90
 
 #define PACHAOS_FD_FLAG_CLOEXEC 1
 #define PACHAOS_FD_FLAG_NONBLOCK 2
@@ -259,7 +261,7 @@ static __inline long __pachaos_raw1(long n, long a1)
 
 static __inline long __pachaos_raw2(long n, long a1, long a2)
 {
-    if (n == 51 || n == 52) return pacha_poll_registers(n, a1, a2, 0, 0);
+    if (n == PACHAOS_SYSCALL_FD_POLL || n == PACHAOS_SYSCALL_FD_WAIT_MANY) return pacha_poll_registers(n, a1, a2, 0, 0);
 	unsigned long ret;
 	__asm__ __volatile__ ("syscall" : "=a"(ret) : "a"(n), "D"(a1), "S"(a2) : "rcx", "r11", "memory");
 	return ret;
@@ -267,7 +269,7 @@ static __inline long __pachaos_raw2(long n, long a1, long a2)
 
 static __inline long __pachaos_raw3(long n, long a1, long a2, long a3)
 {
-    if (n == 51 || n == 52) return pacha_poll_registers(n, a1, a2, a3, 0);
+    if (n == PACHAOS_SYSCALL_FD_POLL || n == PACHAOS_SYSCALL_FD_WAIT_MANY) return pacha_poll_registers(n, a1, a2, a3, 0);
 	unsigned long ret;
 	__asm__ __volatile__ ("syscall" : "=a"(ret) : "a"(n), "D"(a1), "S"(a2), "d"(a3) : "rcx", "r11", "memory");
 	return ret;
@@ -275,7 +277,7 @@ static __inline long __pachaos_raw3(long n, long a1, long a2, long a3)
 
 static __inline long __pachaos_raw4(long n, long a1, long a2, long a3, long a4)
 {
-    if (n == 51 || n == 52) return pacha_poll_registers(n, a1, a2, a3, a4);
+    if (n == PACHAOS_SYSCALL_FD_POLL || n == PACHAOS_SYSCALL_FD_WAIT_MANY) return pacha_poll_registers(n, a1, a2, a3, a4);
 	unsigned long ret;
 	register long r10 __asm__("r10") = a4;
 	__asm__ __volatile__ ("syscall" : "=a"(ret) : "a"(n), "D"(a1), "S"(a2), "d"(a3), "r"(r10) : "rcx", "r11", "memory");
@@ -284,7 +286,7 @@ static __inline long __pachaos_raw4(long n, long a1, long a2, long a3, long a4)
 
 static __inline long __pachaos_raw5(long n, long a1, long a2, long a3, long a4, long a5)
 {
-    if (n == 51 || n == 52) return pacha_poll_registers(n, a1, a2, a3, a4);
+    if (n == PACHAOS_SYSCALL_FD_POLL || n == PACHAOS_SYSCALL_FD_WAIT_MANY) return pacha_poll_registers(n, a1, a2, a3, a4);
 	unsigned long ret;
 	register long r10 __asm__("r10") = a4;
 	register long r8 __asm__("r8") = a5;
@@ -294,7 +296,7 @@ static __inline long __pachaos_raw5(long n, long a1, long a2, long a3, long a4, 
 
 static __inline long __pachaos_raw6(long n, long a1, long a2, long a3, long a4, long a5, long a6)
 {
-    if (n == 51 || n == 52) return pacha_poll_registers(n, a1, a2, a3, a4);
+    if (n == PACHAOS_SYSCALL_FD_POLL || n == PACHAOS_SYSCALL_FD_WAIT_MANY) return pacha_poll_registers(n, a1, a2, a3, a4);
 	unsigned long ret;
 	register long r10 __asm__("r10") = a4;
 	register long r8 __asm__("r8") = a5;

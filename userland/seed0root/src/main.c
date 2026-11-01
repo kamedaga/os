@@ -3059,6 +3059,46 @@ static int seed0root_start_logd(pacha_fd_t filed_endpoint_fd, pacha_fd_t *out_en
  * This owner neither knows a GPU PCI ID nor starts a driver: gpud waits for
  * an explicit RAM command after SSH is available. Ambiguous hosts fail
  * closed rather than silently selecting a different physical GPU. */
+static int seed0root_gpu_pci_metadata(const struct seed0root_root_devices *devices,
+    int selected, struct kobox_linux_pci_topology *topology)
+{
+    const struct pacha_root_device_record *gpu = &devices->metadata.devices[selected];
+    memset(topology, 0, sizeof(*topology));
+    topology->segment = gpu->pci_segment;
+    topology->bus = gpu->pci_bus;
+    topology->devfn = gpu->pci_device * 8 + gpu->pci_function;
+    /* Snapshot only BAR-less host/ISA companion metadata on the same bus.
+     * gpud decides whether its verified driver needs this view. The native
+     * owner neither selects a driver nor delegates companion control rights;
+     * Linux-captured physical register state is never installed as policy. */
+    for (uint64_t i = 0; i < devices->metadata.device_count; ++i) {
+        const struct pacha_root_device_record *record = &devices->metadata.devices[i];
+        if (record->resource_kind != PACHA_ROOT_DEVICE_PCI ||
+            record->pci_segment != gpu->pci_segment || record->pci_bus != gpu->pci_bus ||
+            (record->class_code != 0x060000 && record->class_code != 0x060100))
+            continue;
+        if (topology->metadata_count == KOBOX_PCI_METADATA_MAX)
+            return -17;
+        struct kobox_linux_pci_metadata *metadata =
+            &topology->metadata[topology->metadata_count++];
+        metadata->devfn = record->pci_device * 8 + record->pci_function;
+        for (uint32_t offset = 0; offset < sizeof(metadata->config); offset += 4) {
+            uint32_t value = 0;
+            int status = pacha_capsule_pci_config_read(devices->fds[i], offset, 4, &value);
+            if (status) return status;
+            memcpy(metadata->config + offset, &value, sizeof(value));
+        }
+        if ((uint32_t)(metadata->config[0] | metadata->config[1] << 8) != record->vendor_id ||
+            (uint32_t)(metadata->config[2] | metadata->config[3] << 8) != record->device_id ||
+            (uint32_t)(metadata->config[9] | metadata->config[10] << 8 |
+                       metadata->config[11] << 16) != record->class_code)
+            return -71;
+    }
+    if (!kobox_pci_metadata_valid(topology))
+        return -19;
+    return 0;
+}
+
 static int seed0root_start_optional_gpu_probe(pacha_fd_t filed_fd,
     const struct seed0root_root_devices *devices, pacha_fd_t log_fd,
     int network_started,
@@ -3102,6 +3142,14 @@ static int seed0root_start_optional_gpu_probe(pacha_fd_t filed_fd,
     }
     if (selected < 0)
         return -19;
+    status = seed0root_gpu_pci_metadata(devices, selected, &config.pci_topology);
+    if (status) {
+        /* Optional metadata must not break drivers using only their device
+         * grant. A driver requiring companions rejects the incomplete view
+         * before releasing GOP, after its verified package selects it. */
+        printf("[seed0root] GPU companion metadata unavailable status=%d\n", status);
+        memset(&config.pci_topology, 0, sizeof(config.pci_topology));
+    }
     struct pacha_capsule_info info = {0};
     status = pacha_capsule_query(devices->fds[selected], &info);
     if (status || info.kind != PACHA_CAPSULE_KIND_DEVICE ||

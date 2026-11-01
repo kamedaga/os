@@ -22,6 +22,9 @@
 #include <string.h>
 
 enum { NETD_RESOURCE_SET_ID = 1, NETD_SANDBOX_ID = 1 };
+#ifndef NETD_NET_RX_CONTROL
+#define NETD_NET_RX_CONTROL 0
+#endif
 
 struct nic_generation {
     uint64_t id;
@@ -42,6 +45,9 @@ static struct {
     uint32_t initial_mtu;
     int started;
     int failed;
+    int more_rx;
+    uint64_t rx_drops;
+    struct kobox_linux_net_rx_stats rx_stats;
 } nic;
 static struct netd_nic_diagnostic diagnostic;
 static const struct netd_boot_config *status_config;
@@ -407,6 +413,13 @@ static void nic_poll(void *context)
     (void)context;
     if (!nic.started || nic.failed) return;
     struct nic_generation *current = &nic.generation;
+    nic.more_rx = 0;
+    struct pacha_pollfd wake = {.fd = current->frames.rx_wake_fd,
+        .events = PACHA_FD_EVENT_READABLE};
+    if (pacha_fd_poll(&wake, 1) > 0 && (wake.revents & PACHA_FD_EVENT_READABLE)) {
+        uint64_t edges;
+        (void)pacha_fd_read(wake.fd, &edges, sizeof(edges));
+    }
     if (sandbox_exited(current->launch.process.fd)) {
         int error = restart_generation();
         if (!error) error = start_generation();
@@ -435,6 +448,8 @@ static void nic_poll(void *context)
         netd_wifi_control_link_changed(info.carrier);
     }
     (void)netd_link_set_carrier(current->id, info.carrier);
+    nic.rx_stats = current->frames.shared->rx_stats;
+    nic.rx_drops = info.rx_drops;
     for (unsigned round = 0; round < 4; ++round) {
         const struct kobox_linux_net_frame *frames = NULL;
         size_t count = 0;
@@ -444,8 +459,24 @@ static void nic_poll(void *context)
         for (size_t i = 0; i < count; ++i)
             (void)netd_link_receive(current->id, frames[i].bytes, frames[i].length);
         if (count < PH_NET_FRAME_BATCH) break;
+        /* A full final batch can leave the authoritative queue nonempty.
+         * Continue on the next event-loop turn instead of waiting for an
+         * empty->nonempty edge that cannot happen until we drain it. */
+        if (!NETD_NET_RX_CONTROL && round == 3) nic.more_rx = 1;
     }
 }
+
+int netd_kobox2_nic_collect_wait_sources(struct pacha_service_wait_set *set)
+{
+    if (NETD_NET_RX_CONTROL || !nic.started || nic.failed) return 0;
+    return pacha_service_wait_add(set, nic.generation.frames.rx_wake_fd,
+        PACHA_FD_EVENT_READABLE);
+}
+
+int netd_kobox2_nic_rx_pending(void) { return nic.more_rx; }
+const struct kobox_linux_net_rx_stats *netd_kobox2_nic_rx_stats(void)
+{ return &nic.rx_stats; }
+uint64_t netd_kobox2_nic_rx_drops(void) { return nic.rx_drops; }
 
 uint64_t netd_kobox2_wifi_generation(void)
 {

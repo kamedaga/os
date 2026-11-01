@@ -1,3 +1,5 @@
+#include <kobox2/i915_context_shape.h>
+#include <kobox2/i915_bo_shape.h>
 /* SPDX-License-Identifier: MIT */
 #include "drm_reply.h"
 #include <gpud/drm_kms_query.h>
@@ -29,6 +31,9 @@ int gpud_drm_status_errno(uint32_t status) {
     case KB2_GPU_STATUS_LIMIT: return -ENOSPC;
     case KB2_GPU_STATUS_NO_MEMORY: return -ENOMEM;
     case KB2_GPU_STATUS_BUSY: return -EBUSY;
+    case KB2_GPU_STATUS_RETRY: return -EAGAIN;
+    case KB2_GPU_STATUS_INTERRUPTED: return -EINTR;
+    case KB2_GPU_STATUS_EXPIRED: return -ETIME;
     case KB2_GPU_STATUS_TIMED_OUT: return -ETIMEDOUT;
     case KB2_GPU_STATUS_CANCELED: return -ECANCELED;
     case KB2_GPU_STATUS_SESSION_LOST:
@@ -128,9 +133,14 @@ int gpud_drm_ioctl_reply(gpud_drm_ioctl_request_t *request,
     const int amdgpu_map =
         expected.command_set_id == KB2_GPU_DRM_AMDGPU_SET_ID &&
         expected.command_id == KB2_GPU_DRM_AMDGPU_COMMAND_GEM_MMAP;
-    if (mode_map || virtgpu_map || amdgpu_map) {
+    const int i915_map = expected.command_set_id == KB2_GPU_DRM_I915_SET_ID &&
+        expected.command_id == KB2_GPU_DRM_I915_COMMAND_GEM_MMAP_OFFSET;
+    if (mode_map || virtgpu_map || amdgpu_map || i915_map) {
         kb2_gpu_virtgpu_map_completion_t mapped;
-        const kb2_protocol_status_t decoded = amdgpu_map ?
+        const kb2_protocol_status_t decoded = i915_map ?
+            kb2_gpu_i915_map_completion_decode(
+                reply+KB2_PROTOCOL_MESSAGE_ENVELOPE_SIZE,envelope.payload_length,
+                binding.session_id,binding.generation,&mapped) : amdgpu_map ?
             kb2_gpu_amdgpu_map_completion_decode(
                 reply + KB2_PROTOCOL_MESSAGE_ENVELOPE_SIZE,
                 envelope.payload_length, binding.session_id,
@@ -162,13 +172,16 @@ int gpud_drm_ioctl_reply(gpud_drm_ioctl_request_t *request,
                 (KB2_GPU_SPAN_RIGHT_READ | KB2_GPU_SPAN_RIGHT_WRITE) ||
             mapped.cache_policy > KB2_GPU_MAPPING_CACHE_UC || mapped.length > UINT32_MAX)
             return -EPROTO;
+        if((i915_map || (mode_map && binding.profile_kind==KB2_GPU_PROFILE_I915)) &&
+            mapped.cache_policy != ((!mode_map && expected.mapping_cache_kind==1) ?
+                KB2_GPU_MAPPING_CACHE_WB : KB2_GPU_MAPPING_CACHE_WC)) return -EPROTO;
         translation->mapping_id = mapped.mapping_id;
         translation->mapping_length = mapped.length;
         translation->mapping_exchange = mapped.exchange_id;
         translation->mapping_rights = (uint32_t)mapped.rights;
         translation->mapping_cache_policy = mapped.cache_policy;
         memcpy(request->data + (mode_map ?
-            offsetof(gpud_drm_mode_map_dumb_t, offset) : 0),
+            offsetof(gpud_drm_mode_map_dumb_t, offset) : i915_map ? 8 : 0),
             &mapped.mapping_id, sizeof(mapped.mapping_id));
         return 0;
     }
@@ -185,6 +198,105 @@ int gpud_drm_ioctl_reply(gpud_drm_ioctl_request_t *request,
         return -ENOSYS;
     int result = gpud_drm_status_errno(completion.status);
     if (result) return result;
+    if(expected.command_set_id==KB2_GPU_DRM_I915_SET_ID &&
+        expected.command_id==KB2_GPU_DRM_I915_COMMAND_GEM_CREATE_EXT) {
+        if(completion.record_schema_id!=KB2_GPU_DRM_I915_RECORD_CREATE_EXT_RESULT || completion.length!=16 ||
+            !read_u32(completion.data+8) || read_u32(completion.data+12)) return -EPROTO;
+        memcpy(request->data,completion.data,16);request->data_size=16;return 0;
+    }
+    if(expected.command_set_id==KB2_GPU_DRM_I915_SET_ID &&
+        expected.command_id==KB2_GPU_DRM_I915_COMMAND_EXECBUFFER) {
+        if(completion.record_schema_id!=KB2_GPU_DRM_I915_RECORD_EXEC_RESULT || completion.length!=8 ||
+            read_u32(completion.data+4)) return -EPROTO;
+        const int32_t result=(int32_t)read_u32(completion.data);
+        if(result>0 || result< -4095) return -EPROTO;
+        memcpy(request->data,completion.data,8);request->data_size=8;
+        return result;
+    }
+    if(expected.command_set_id==KB2_GPU_DRM_I915_SET_ID &&
+        kb2_i915_context_command(expected.command_id)) {
+        if(expected.command_id==KB2_GPU_DRM_I915_COMMAND_CONTEXT_CREATE) {
+            if(completion.record_schema_id!=KB2_GPU_DRM_I915_RECORD_CONTEXT_HANDLE ||
+                completion.length!=8 || !read_u32(completion.data) || read_u32(completion.data+4)) return -EPROTO;
+            memcpy(request->data,completion.data,8);request->data_size=8;
+        } else if(completion.record_schema_id || completion.length) return -EPROTO;
+        return 0;
+    }
+    struct kb2_i915_bo_shape bo;
+    if (expected.command_set_id == KB2_GPU_DRM_I915_SET_ID &&
+        kb2_i915_bo_shape_command(expected.command_id, &bo)) {
+        const uint32_t result_record = bo.command == KB2_GPU_DRM_I915_COMMAND_GEM_WAIT ?
+            KB2_GPU_DRM_I915_RECORD_GEM_WAIT_RESULT : bo.result_bytes ? bo.record : 0;
+        if (completion.length != bo.result_bytes ||
+            completion.record_schema_id != result_record) return -EPROTO;
+        if (!bo.result_bytes) return 0;
+        const unsigned char *data = completion.data;
+        switch (bo.command) {
+        case KB2_GPU_DRM_I915_COMMAND_GEM_CREATE:
+            if (!read_u32(data + 8) || read_u32(data + 12) ||
+                read_u64(data) < read_u64(request->data) || (read_u64(data) & 4095)) return -EPROTO;
+            break;
+        case KB2_GPU_DRM_I915_COMMAND_GEM_BUSY:
+            if (read_u32(data) != read_u32(request->data)) return -EPROTO;
+            break;
+        case KB2_GPU_DRM_I915_COMMAND_GEM_MADVISE:
+            if (memcmp(data, request->data, 8) || read_u32(data + 8) > 1) return -EPROTO;
+            break;
+        case KB2_GPU_DRM_I915_COMMAND_GEM_WAIT: {
+            const int32_t wait_result = (int32_t)read_u32(data + 16);
+            if (memcmp(data, request->data, 8) || read_u32(data + 20) ||
+                wait_result > 0 || wait_result < -4095) return -EPROTO;
+            memcpy(request->data, data, bo.result_bytes);
+            /* Distinguish a validated WAIT result from a transport failure:
+             * both the remaining time and errno survive the native reply. */
+            request->data_size = bo.result_bytes;
+            return wait_result;
+        }
+        default: return -EPROTO;
+        }
+        memcpy(request->data, data, bo.result_bytes);
+        return 0;
+    }
+    if (expected.command_set_id == KB2_GPU_DRM_I915_SET_ID &&
+        expected.command_id == KB2_GPU_DRM_I915_COMMAND_GETPARAM) {
+        if (completion.record_schema_id != KB2_GPU_DRM_I915_RECORD_GETPARAM_RESULT ||
+            completion.length != KB2_GPU_DRM_I915_RECORD_GETPARAM_RESULT_SIZE)
+            return -EPROTO;
+        const int32_t operation_result = (int32_t)read_u32(completion.data + 4);
+        if (operation_result > 0 || operation_result < -4095 ||
+            (operation_result && read_u32(completion.data)))
+            return -EPROTO;
+        if (operation_result)
+            return operation_result;
+        memcpy(request->data + 4, completion.data, sizeof(int32_t));
+        return 0;
+    }
+    if (expected.command_set_id == KB2_GPU_DRM_I915_SET_ID &&
+        expected.command_id == KB2_GPU_DRM_I915_COMMAND_GET_APERTURE) {
+        if (completion.record_schema_id != KB2_GPU_DRM_I915_RECORD_APERTURE_RESULT ||
+            completion.length != KB2_GPU_DRM_I915_RECORD_APERTURE_RESULT_SIZE ||
+            read_u64(completion.data + 8) > read_u64(completion.data)) return -EPROTO;
+        memcpy(request->data, completion.data, 16);
+        return 0;
+    }
+    if (expected.command_set_id == KB2_GPU_DRM_I915_SET_ID &&
+        expected.command_id == KB2_GPU_DRM_I915_COMMAND_CONTEXT_GETPARAM) {
+        if (completion.record_schema_id != KB2_GPU_DRM_I915_RECORD_CONTEXT_PARAM_RESULT ||
+            completion.length != KB2_GPU_DRM_I915_RECORD_CONTEXT_PARAM_RESULT_SIZE) return -EPROTO;
+        memcpy(request->data + 16, completion.data, 8);
+        return 0;
+    }
+    if (expected.command_set_id == KB2_GPU_DRM_I915_SET_ID &&
+        expected.command_id == KB2_GPU_DRM_I915_COMMAND_QUERY) {
+        if (completion.record_schema_id != KB2_GPU_DRM_I915_RECORD_QUERY_RESULT ||
+            completion.length != KB2_GPU_DRM_I915_RECORD_QUERY_RESULT_SIZE ||
+            read_u32(completion.data) != translation->output_capacity[0] ||
+            read_u32(completion.data + 4) ||
+            read_u64(completion.data + 8) != translation->output_capacity[1] ||
+            request->aux_size != translation->region.length)
+            return -EPROTO;
+        return 0;
+    }
     if (expected.command_set_id == KB2_GPU_DRM_CORE_SET_ID) switch (expected.command_id) {
     case KB2_GPU_DRM_CORE_COMMAND_VERSION: {
         if (completion.record_schema_id != KB2_GPU_DRM_CORE_RECORD_VERSION_RESULT ||

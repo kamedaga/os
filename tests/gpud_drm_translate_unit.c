@@ -93,6 +93,9 @@ static void scalar_commands(void) {
     command = decode(&translation);
     data = kb2_gpu_command_inline_data(&command, &size);
     assert(command.command_id == KB2_GPU_DRM_CORE_COMMAND_GEM_CLOSE && size == 8 && read_u64(data) == 5);
+    request.data[0] = 0;
+    expect_failure(&request, -EINVAL);
+    request.data[0] = 5;
     request.data[4] = 1;
     expect_failure(&request, -EINVAL);
 }
@@ -730,9 +733,9 @@ static void inline_ioctl_bounds(void) {
 }
 
 static void common_syncobj_profiles(void) {
-    const uint32_t profiles[] = {KB2_GPU_PROFILE_VIRGL, KB2_GPU_PROFILE_AMDGPU};
+    const uint32_t profiles[] = {KB2_GPU_PROFILE_VIRGL, KB2_GPU_PROFILE_I915, KB2_GPU_PROFILE_AMDGPU};
     const uint32_t requests[] = {0xc02864c3, 0xc01064c4, 0xc01064c5};
-    for (unsigned int p = 0; p < 2; ++p) for (unsigned int i = 0; i < 3; ++i) {
+    for (unsigned int p = 0; p < 3; ++p) for (unsigned int i = 0; i < 3; ++i) {
         struct gpud_drm_binding sync_binding = binding;
         sync_binding.profile_kind = profiles[p];
         gpud_drm_ioctl_request_t request = {.handle = binding.frontend_handle,
@@ -755,8 +758,8 @@ static void common_syncobj_profiles(void) {
 }
 
 static void display_timing_commands(void) {
-    const uint32_t profiles[] = {KB2_GPU_PROFILE_VIRGL, KB2_GPU_PROFILE_AMDGPU};
-    for (unsigned int i = 0; i < 2; ++i) {
+    const uint32_t profiles[] = {KB2_GPU_PROFILE_VIRGL, KB2_GPU_PROFILE_I915, KB2_GPU_PROFILE_AMDGPU};
+    for (unsigned int i = 0; i < 3; ++i) {
         struct gpud_drm_binding timing_binding = binding;
         timing_binding.profile_kind = profiles[i];
         gpud_drm_ioctl_request_t request = {.handle = binding.frontend_handle,
@@ -784,7 +787,46 @@ static void display_timing_commands(void) {
     }
 }
 
+static void i915_private_requests_are_not_other_drivers(void) {
+    struct gpud_drm_binding intel = binding;
+    intel.profile_kind = KB2_GPU_PROFILE_I915;
+    const uint32_t private_requests[] = {
+        GPUD_DRM_IOCTL_VIRTGPU_GETPARAM, GPUD_DRM_IOCTL_AMDGPU_INFO,
+        0x40406469u, /* I915_GEM_EXECBUFFER2 must never become virtio exec. */
+    };
+    for (size_t i = 0; i < sizeof(private_requests)/sizeof(private_requests[0]); ++i) {
+        gpud_drm_ioctl_request_t request = {.handle = binding.frontend_handle,
+            .request = private_requests[i], .arg_size = 16, .data_size = 16};
+        struct gpud_drm_translation translation;
+        memset(&translation, 0xa5, sizeof(translation));
+        const struct gpud_drm_translation before = translation;
+        const int result=gpud_drm_ioctl_encode(&translation, &intel, &request, 0);
+        assert(result == (private_requests[i]==GPUD_DRM_IOCTL_I915_GEM_MMAP_OFFSET ||
+             private_requests[i]==GPUD_DRM_IOCTL_I915_EXECBUFFER ||
+             private_requests[i]==GPUD_DRM_IOCTL_I915_EXECBUFFER_WR ? -EINVAL : -EOPNOTSUPP));
+        assert(!memcmp(&translation, &before, sizeof(before)));
+    }
+    gpud_drm_i915_getparam_wire_t wire = {.parameter = 4};
+    gpud_drm_ioctl_request_t request = {.handle = intel.frontend_handle,
+        .request = GPUD_DRM_IOCTL_I915_GETPARAM,
+        .arg_size = sizeof(gpud_drm_i915_getparam_t), .data_size = sizeof(wire)};
+    memcpy(request.data, &wire, sizeof(wire));
+    struct gpud_drm_translation translation;
+    assert(!gpud_drm_ioctl_encode(&translation, &intel, &request, 0));
+    assert(translation.command_set_id == KB2_GPU_DRM_I915_SET_ID &&
+        translation.command_id == KB2_GPU_DRM_I915_COMMAND_GETPARAM &&
+        translation.generation == intel.generation &&
+        translation.frontend_handle == intel.frontend_handle &&
+        translation.session_id == intel.session_id);
+    request.data_size = sizeof(gpud_drm_i915_getparam_t);
+    assert(gpud_drm_ioctl_encode(&translation, &intel, &request, 0) == -EINVAL);
+    request.data_size = sizeof(wire);
+    request.data[4] = 1;
+    assert(gpud_drm_ioctl_encode(&translation, &intel, &request, 0) == -EINVAL);
+}
+
 int main(void) {
+    i915_private_requests_are_not_other_drivers();
     common_syncobj_profiles();
     display_timing_commands();
     inline_ioctl_bounds();

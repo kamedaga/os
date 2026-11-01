@@ -20,7 +20,7 @@ def main():
     parser.add_argument("--manifest", type=pathlib.Path, required=True)
     parser.add_argument("--firmware-dir", type=pathlib.Path, required=True)
     parser.add_argument("--output", type=pathlib.Path, required=True)
-    parser.add_argument("--profile", choices=("amdgpu", "wifi"), default="amdgpu")
+    parser.add_argument("--profile", choices=("amdgpu", "i915", "wifi"), default="amdgpu")
     args = parser.parse_args()
 
     entries = []
@@ -31,7 +31,7 @@ def main():
         name = name.strip()
         if (len(digest) != 64 or not re.fullmatch(r"[0-9a-f]{64}", digest) or
                 len(name) > 127 or
-                not (name.startswith("amdgpu/") if args.profile == "amdgpu" else
+                not (name.startswith(args.profile + "/") if args.profile in ("amdgpu", "i915") else
                      name in ("iwlwifi-ty-a0-gf-a0-89.ucode", "iwlwifi-ty-a0-gf-a0.pnvm",
                               "regulatory.db", "regulatory.db.p7s")) or
                 any(not part or part in (".", "..") or

@@ -40,6 +40,8 @@ struct netd_packet_io {
 
 static struct netd_packet_io g_packet_io;
 
+uint64_t netd_packet_io_rx_drops(void) { return g_packet_io.rx_drops; }
+
 static uint64_t monotonic_ms(void)
 {
     struct timespec now;

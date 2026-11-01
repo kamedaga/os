@@ -6,6 +6,7 @@
 
 #define LPR_WAIT_NS_PER_MS 1000000ull
 #define LPR_WAIT_NS_PER_SEC 1000000000ull
+#define LPR_WAIT_FILED_RESCAN_NS LPR_WAIT_NS_PER_MS
 
 enum {
     LPR_WAIT_DRAIN_NONE = 0u,
@@ -243,7 +244,16 @@ int64_t lpr_wait_graph_add_fd(
             graph, native_fd, PACHA_FD_EVENT_READABLE,
             0, LPR_WAIT_DRAIN_EVENT, (uint32_t)fd);
     }
-    if (lpr_linux_filed_fd_active(fd) || lpr_linux_device_fd_active(fd))
+    if (lpr_linux_filed_fd_active(fd)) {
+        /* Filed retains the Linux open description but cannot export its
+         * waitqueue as a native capability.  Keep native signals immediately
+         * interruptible and bound the readiness rescan without spinning. */
+        if (lpr_filed_poll_needs_rescan(fd))
+            lpr_wait_graph_add_relative_deadline(
+                graph, LPR_WAIT_FILED_RESCAN_NS);
+        return 0;
+    }
+    if (lpr_linux_device_fd_active(fd))
         return 0;
     return -LPR_LINUX_EBADF;
 }
@@ -596,11 +606,17 @@ static int64_t lpr_wait_graph_block_native(
      * TTY operations still pump explicitly when their own reply reports
      * EINTR, closing the reply-versus-forwarding race at that boundary. */
 
-    /* NOT_READY is also the signal-interrupt resume value.  Unwind even if a
-     * concurrent fd event populated revents so the dispatcher can deliver the
-     * pending native frame before the atomic wait restores its signal mask. */
+    /* Native NOT_READY (2) shares its value with a successful two-leaf
+     * completion. The poll wrapper clears outputs before entry; the kernel
+     * writes two revents only for that successful completion. Treating it as
+     * an interruption drains the socket token then restarts select with its
+     * output fd_sets, losing every requested descriptor. A real interrupted
+     * wait has no complete two-leaf output and retains the signal path. */
+    uint32_t ready_count = 0;
+    for (uint32_t i = 0; i < graph->leaf_count; ++i)
+        ready_count += graph->leaves[i].revents != 0;
     const int retryable_wake =
-        status == PACHA_SYSCALL_ERR_NOT_READY ||
+        (status == PACHA_SYSCALL_ERR_NOT_READY && ready_count != 2) ||
          status == -PACHA_SYSCALL_ERR_NOT_READY ||
          status == -LPR_LINUX_EAGAIN;
     if (retryable_wake) {

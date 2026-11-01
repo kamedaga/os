@@ -95,6 +95,13 @@ int lpr_patch_scan_syscalls(unsigned char *bytes,uint64_t size,
 {
     (void)bytes;(void)size;(void)start;(void)out;assert(0);return -1;
 }
+int lpr_patch_scan_syscalls_resolved(unsigned char *bytes,uint64_t size,
+    uint64_t start,lpr_patch_scan_ambiguous_fn ambiguous,void *context,
+    lpr_patch_scan_result_t *out)
+{
+    (void)bytes;(void)size;(void)start;(void)ambiguous;(void)context;(void)out;
+    assert(0);return -1;
+}
 static void assert_drained(void)
 {
     for(unsigned i=0;i<next_object;++i) assert(!objects[i].refs && !objects[i].bytes);

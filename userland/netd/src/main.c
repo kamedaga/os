@@ -298,6 +298,7 @@ int main(int argc, char **argv)
 
     uint64_t policy_ticks = 0;
     uint64_t wifi_ticks = 0;
+    uint64_t rx_stats_ticks = 0;
     unsigned policy_attempted_ack = 0;
     int last_reported_carrier = netd_link_current() ?
         (int)netd_link_current()->carrier : -1;
@@ -309,6 +310,11 @@ int main(int argc, char **argv)
             uint64_t expirations = 0;
             (void)pacha_fd_read(timer_fd, &expirations, sizeof(expirations));
             wifi_ticks += expirations;
+            rx_stats_ticks += expirations;
+            if (rx_stats_ticks >= 100) {
+                rx_stats_ticks %= 100;
+                netd_status_file_network_metrics(cfg);
+            }
             if (wifi_ticks >= 100) {
                 wifi_ticks %= 100;
                 if (!wifi_backend && netd_kobox2_wifi_generation())
@@ -391,7 +397,7 @@ int main(int argc, char **argv)
         if (link && (int)link->carrier != last_reported_carrier &&
             report_link_status(cfg, 0, NETD_BOOT_STAGE_LINK) == 0)
             last_reported_carrier = link->carrier;
-        const int busy = netd_socket_service_poll();
+        const int busy = netd_socket_service_poll() | netd_kobox2_nic_rx_pending();
         static struct pacha_service_wait_set wait_set;
         static struct pacha_fd_wait_retained retained_wait;
         status = pacha_service_wait_init(
@@ -403,6 +409,9 @@ int main(int argc, char **argv)
             &wait_set, timer_fd, PACHA_FD_EVENT_READABLE);
         if (status != 0)
             return netd_wait_set_failure("nic_timer", status, &wait_set);
+        status = netd_kobox2_nic_collect_wait_sources(&wait_set);
+        if (status != 0)
+            return netd_wait_set_failure("nic_rx", status, &wait_set);
         status = netd_libuinet_collect_runtime_wait_sources(&wait_set);
         if (status != 0)
             return netd_wait_set_failure(

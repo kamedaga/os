@@ -48,6 +48,7 @@ pub const syscall_futex_wake: u64 = runtime_abi.syscall_futex_wake;
 pub const syscall_futex_wake_wait: u64 = runtime_abi.syscall_futex_wake_wait;
 pub const syscall_futex_requeue: u64 = runtime_abi.syscall_futex_requeue;
 pub const syscall_futex_wake_op: u64 = runtime_abi.syscall_futex_wake_op;
+pub const syscall_futex_pi: u64 = runtime_abi.syscall_futex_pi;
 pub const syscall_getrandom: u64 = runtime_abi.syscall_getrandom;
 pub const syscall_power_control: u64 = runtime_abi.syscall_power_control;
 
@@ -82,6 +83,7 @@ pub const syscall_pager_attach: u64 = pager_abi.syscall_pager_attach;
 pub const syscall_pager_wait: u64 = pager_abi.syscall_pager_wait;
 pub const syscall_pager_supply: u64 = pager_abi.syscall_pager_supply;
 pub const syscall_pager_fail: u64 = pager_abi.syscall_pager_fail;
+pub const syscall_vm_query: u64 = vm_abi.syscall_vm_query;
 pub const syscall_mmap: u64 = vm_abi.syscall_mmap;
 pub const syscall_munmap: u64 = vm_abi.syscall_munmap;
 pub const syscall_mprotect: u64 = vm_abi.syscall_mprotect;

@@ -4,6 +4,10 @@
 #include "boot.h"
 #include <pacha/capsule.h>
 #include <errno.h>
+#if defined(PH_DMA_LATENCY) && PH_DMA_LATENCY
+#define PH_DMA_LATENCY_IMPLEMENTATION
+#include "dma_latency.h"
+#endif
 
 #if defined(PH_DMA_PROFILE) && PH_DMA_PROFILE
 /* Successful operations only. Log powers of two per size/direction/path
@@ -102,8 +106,15 @@ static int dma_native_status(long result) {
 }
 
 static void dma_lock(struct ph_dma *dma) {
+#if defined(PH_DMA_LATENCY) && PH_DMA_LATENCY
+    int token=dl_begin(2,0,0,0,dma->config.native_device);uint64_t before=token>=0?dl_tsc():0;dl_started(token,before);
+#endif
     while (atomic_exchange_explicit(&dma->lock, 1, memory_order_acquire))
         __asm__ volatile("pause");
+#if defined(PH_DMA_LATENCY) && PH_DMA_LATENCY
+    uint64_t after=token>=0?dl_tsc():0;dl_finished(token,after);
+    uint64_t elapsed=after-before;dl_end(token,elapsed,0,dma->latency_live);
+#endif
 }
 
 static void dma_unlock(struct ph_dma *dma) {
@@ -189,6 +200,26 @@ static int dma_enable(void *context, unsigned int enabled) {
     return result;
 }
 
+/* Time only the native operation, excluding diagnostic locks and table
+ * scans. Retry attempts remain distinct observations, including failures. */
+static long dma_derive_measured(struct ph_dma *dma,uintptr_t address,uint64_t iova,
+    size_t length,unsigned direction,unsigned scatter) {
+#if defined(PH_DMA_LATENCY) && PH_DMA_LATENCY
+    int token=dl_begin(0,length/PH_PAGE_SIZE,scatter,dma->latency_live,dma->config.native_device);
+    uint64_t before=token>=0?dl_tsc():0;dl_started(token,before);
+#else
+    (void)scatter;
+#endif
+    long fd=pacha_syscall6(PACHA_CAPSULE_SYSCALL_DERIVE_DMA_MAPPING,
+        dma->config.device_fd,address,iova,length,direction,0);
+#if defined(PH_DMA_LATENCY) && PH_DMA_LATENCY
+    uint64_t after=token>=0?dl_tsc():0;dl_finished(token,after);
+    uint64_t elapsed=after-before;
+    dl_end(token,elapsed,fd>=16 && fd<PACHA_THREAD_SELF_FD?0:fd<0?fd:-EPROTO,0);
+#endif
+    return fd;
+}
+
 static int dma_map(void *context, uint64_t iova, uint64_t ram_offset,
     size_t length, unsigned int protection) {
     struct ph_dma *dma = context;
@@ -220,11 +251,9 @@ static int dma_map(void *context, uint64_t iova, uint64_t ram_offset,
         dma_unlock(dma);
         return result;
     }
-    long fd = pacha_syscall6(PACHA_CAPSULE_SYSCALL_DERIVE_DMA_MAPPING, config->device_fd,
-        (uintptr_t)config->ram + ram_offset, iova, length, direction, 0);
+    long fd = dma_derive_measured(dma,(uintptr_t)config->ram+ram_offset,iova,length,direction,0);
     if (fd == PACHA_SYSCALL_ERR_ALLOC && dma_restore_fd_headroom(dma))
-        fd = pacha_syscall6(PACHA_CAPSULE_SYSCALL_DERIVE_DMA_MAPPING, config->device_fd,
-            (uintptr_t)config->ram + ram_offset, iova, length, direction, 0);
+        fd = dma_derive_measured(dma,(uintptr_t)config->ram+ram_offset,iova,length,direction,0);
     if (fd < 16 || fd >= PACHA_THREAD_SELF_FD) {
         struct pacha_capsule_info info = {0};
         int query_result;
@@ -240,6 +269,9 @@ static int dma_map(void *context, uint64_t iova, uint64_t ram_offset,
         dma_unlock(dma);
         return result;
     }
+#if defined(PH_DMA_LATENCY) && PH_DMA_LATENCY
+    dma->latency_live++;
+#endif
     *slot = (struct ph_dma_mapping){
         .iova = iova, .ram_offset = ram_offset, .length = length, .fd = (pacha_fd_t)fd,
     };
@@ -344,11 +376,9 @@ static int dma_map_page_list(void *context, uint64_t iova,
         dma_unlock(dma);
         return result;
     }
-    long fd = pacha_syscall6(PACHA_CAPSULE_SYSCALL_DERIVE_DMA_MAPPING,
-        config->device_fd, (uintptr_t)view, iova, length, direction, 0);
+    long fd = dma_derive_measured(dma,(uintptr_t)view,iova,length,direction,1);
     if (fd == PACHA_SYSCALL_ERR_ALLOC && dma_restore_fd_headroom(dma))
-        fd = pacha_syscall6(PACHA_CAPSULE_SYSCALL_DERIVE_DMA_MAPPING,
-            config->device_fd, (uintptr_t)view, iova, length, direction, 0);
+        fd = dma_derive_measured(dma,(uintptr_t)view,iova,length,direction,1);
     if (fd < 16 || fd >= PACHA_THREAD_SELF_FD) {
         struct pacha_capsule_info info = {0};
         dma_failure_record(dma, DMA_FAILURE_SCATTERED, fd, iova, length);
@@ -365,6 +395,9 @@ static int dma_map_page_list(void *context, uint64_t iova,
         dma_unlock(dma);
         return result;
     }
+#if defined(PH_DMA_LATENCY) && PH_DMA_LATENCY
+    dma->latency_live++;
+#endif
     *slot = (struct ph_dma_mapping){
         .iova = iova, .length = length, .fd = (pacha_fd_t)fd,
         .view = view,
@@ -386,12 +419,23 @@ static int dma_unmap(void *context, uint64_t iova, size_t length) {
         if (!length || mapping->iova != iova || mapping->length != length) continue;
         int result = 0;
         if (mapping->fd) {
-            result = dma_native_status(pacha_syscall1(PACHA_FD_SYSCALL_CLOSE,
-                mapping->fd));
+#if defined(PH_DMA_LATENCY) && PH_DMA_LATENCY
+            int token=dl_begin(1,mapping->length/PH_PAGE_SIZE,mapping->view!=NULL,dma->latency_live,dma->config.native_device);
+            uint64_t before=token>=0?dl_tsc():0;dl_started(token,before);
+#endif
+            long closed=pacha_syscall1(PACHA_FD_SYSCALL_CLOSE,mapping->fd);
+#if defined(PH_DMA_LATENCY) && PH_DMA_LATENCY
+            uint64_t after=token>=0?dl_tsc():0;dl_finished(token,after);
+    uint64_t elapsed=after-before;dl_end(token,elapsed,closed,0);
+#endif
+            result=dma_native_status(closed);
             if (result) {
                 dma_unlock(dma);
                 return result; /* Retain FD, IOVA and RAM ownership on failure. */
             }
+#if defined(PH_DMA_LATENCY) && PH_DMA_LATENCY
+            PH_CHECK(dma->latency_live!=0);dma->latency_live--;
+#endif
             mapping->fd = 0;
         }
         if (mapping->view) {

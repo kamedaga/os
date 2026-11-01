@@ -806,9 +806,7 @@ fn requestPagerForCopyWithAddressSpaceLocked(principal: kernel.PrincipalId, page
     user_vm.lockSharedVmObjects();
     defer user_vm.unlockSharedVmObjects();
     const fault = getHooks().state.pendingPagerFaultPage(principal, page.toInt(), write_access, false) orelse return;
-    const outcome = getHooks().state.requestPagerFault(fault.vmo, fault.index,
-        if (write_access) @import("kernel_abi_root").pager_abi.access_write else @import("kernel_abi_root").pager_abi.access_read,
-        principal, 0, 0, 0, 0) catch return;
+    const outcome = getHooks().state.requestPagerFault(fault.vmo, fault.index, if (write_access) @import("kernel_abi_root").pager_abi.access_write else @import("kernel_abi_root").pager_abi.access_read, principal, 0, 0, 0, 0) catch return;
     if (outcome == .pending) {
         const slot = boundedCurrentCpuSlot();
         // A sender may copy into another principal's previously registered
@@ -848,10 +846,9 @@ pub fn probeUserRange(principal: kernel.PrincipalId, start_va: u64, length: usiz
             user_vm.lockSharedVmObjects();
             const candidate = getHooks().state.pendingPagerFaultPage(principal, page_va, write_access, false);
             const outcome = if (candidate) |fault|
-                getHooks().state.requestPagerFault(fault.vmo, fault.index,
-                    if (write_access) @import("kernel_abi_root").pager_abi.access_write else @import("kernel_abi_root").pager_abi.access_read,
-                    principal, 0, 0, 0, 0) catch .invalid
-            else .invalid;
+                getHooks().state.requestPagerFault(fault.vmo, fault.index, if (write_access) @import("kernel_abi_root").pager_abi.access_write else @import("kernel_abi_root").pager_abi.access_read, principal, 0, 0, 0, 0) catch .invalid
+            else
+                .invalid;
             user_vm.unlockSharedVmObjects();
             user_vm.unlockAddressSpace(principal);
             if (outcome == .pending) return .{ .backing_absent = page_va };
@@ -1287,6 +1284,35 @@ pub fn atomicUserU32ResidentWithAddressSpaceLocked(
         };
     };
     kernel.page_view_dirty.markSoftwareWrite(getHooks().state, principal, user_va);
+    return previous;
+}
+
+/// Ownership handoff must compare with userspace fastpaths on the same RAM
+/// word. AS pins backing while the per-CPU copy window supplies the alias;
+/// failure never writes, faults, allocates, or dirties a different VMA.
+pub fn compareExchangeUserU32ResidentWithAddressSpaceLocked(
+    principal: kernel.PrincipalId,
+    user_va: u64,
+    expected: u32,
+    desired: u32,
+) ?u32 {
+    if (user_va == 0 or (user_va & 3) != 0) return null;
+    const vma = getHooks().state.vmaEntryForVaConst(principal, user_va) orelse return null;
+    if (vma.device_backing or !vma.prot.write) return null;
+    const page = address_types.UserVirtualAddress.fromInt(user_va & ~@as(u64, 4095));
+    const paddr = user_vm.lookupUserPhysicalPageWithAddressSpaceLocked(principal, page, true, false) orelse return null;
+    if (ramCachePolicyForLockedPage(paddr.toInt()) != .ordinary) return null;
+    const address, const overflow = @addWithOverflow(paddr.toInt(), user_va & 4095);
+    if (overflow != 0) return null;
+    const previous = blk: {
+        const window = PhysCopyWindowGuard.lock();
+        defer window.unlock();
+        const alias = physWindowAddr(address, @sizeOf(u32), window.cpu_slot) orelse return null;
+        const word: *u32 = @ptrCast(@alignCast(alias));
+        break :blk @cmpxchgStrong(u32, word, expected, desired, .seq_cst, .seq_cst) orelse expected;
+    };
+    if (previous == expected)
+        kernel.page_view_dirty.markSoftwareWrite(getHooks().state, principal, user_va);
     return previous;
 }
 

@@ -13,7 +13,7 @@ zydis="$(bash pack/scripts/download_zydis.sh)"
   -Iuserland/personality/linux/decoder \
   -Ikobox2/protocol/include -Ikobox2/protocol/generated/include \
   -I"$zydis/include" -I"$zydis/src" -I"$zydis/dependencies/zycore/include" \
-  userland/filed/tests/manifest_test.c userland/filed/src/manifest.c \
+  userland/filed/tests/manifest_test.c userland/filed/src/manifest.c userland/filed/src/code_ranges.c \
   userland/personality/linux/decoder/patch_scan.c \
   kobox2/protocol/src/sha256.c \
   "$zydis/src/Decoder.c" "$zydis/src/DecoderData.c" \

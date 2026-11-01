@@ -106,7 +106,32 @@ static int initial_elf_loads(const uint8_t *raw,size_t length,uint64_t offset,
     return initial_rx && ordered && loads>1;
 }
 
-static int patch_exec_section(const uint8_t *raw,uint8_t *patched,size_t length)
+struct ambiguous_context {
+    const filed_rx_code_ranges_t *code;
+    uint64_t base;
+};
+
+/* An ambiguous candidate is data only when neither byte lies in any FDE
+ * range. Functions own their bytes; a gap between FDEs is a table such as
+ * OpenSSL's text-embedded EC constants. Without FDE data nothing is data. */
+static int candidate_outside_code(void *raw,uint64_t offset)
+{
+    const struct ambiguous_context *context=raw;
+    if (!context->code || offset>UINT64_MAX-context->base) return 0;
+    return filed_rx_code_ranges_outside(context->code,context->base+offset);
+}
+
+static int scan_conservative(uint8_t *patched,size_t length,
+    const filed_rx_code_ranges_t *code,uint64_t base)
+{
+    lpr_patch_scan_result_t scan;
+    struct ambiguous_context context={code,base};
+    return lpr_patch_scan_syscalls_resolved(patched,length,0,
+        candidate_outside_code,&context,&scan) ? -EIO : 0;
+}
+
+static int patch_exec_section(const uint8_t *raw,uint8_t *patched,size_t length,
+    const filed_rx_code_ranges_t *code,uint64_t base)
 {
     lpr_patch_scan_result_t scan;
     if (!lpr_patch_scan_syscalls(patched,length,LPR_PATCH_SCAN_START_BOUNDARY,&scan))
@@ -117,17 +142,17 @@ static int patch_exec_section(const uint8_t *raw,uint8_t *patched,size_t length)
      * overlapping-stream decoder. Ambiguous candidates still reject the image;
      * an undecodable data byte is never itself a reason to skip a candidate. */
     memcpy(patched,raw,length);
-    return lpr_patch_scan_syscalls(patched,length,0,&scan) ? -EIO : 0;
+    return scan_conservative(patched,length,code,base);
 }
 
 static int patch_snapshot(const uint8_t *raw,uint8_t *patched,size_t length,uint64_t offset,
-    const uint8_t identity[KB2_FILESYSTEM_SNAPSHOT_STAT_SIZE])
+    const uint8_t identity[KB2_FILESYSTEM_SNAPSHOT_STAT_SIZE],
+    const filed_rx_code_ranges_t *code)
 {
     Elf64_Ehdr header;
     const int elf=initial_elf_loads(raw,length,offset,identity,&header);
     if (elf<0) return elf;
-    lpr_patch_scan_result_t scan;
-    if (!elf) return lpr_patch_scan_syscalls(patched,length,0,&scan) ? -EIO : 0;
+    if (!elf) return scan_conservative(patched,length,code,offset);
     /* Older linkers place unwind tables and rodata in the RX PT_LOAD too.
      * Section flags (not section names or symbols) identify instruction bytes.
      * No section table remains supported by the conservative segment scan. */
@@ -168,7 +193,7 @@ static int patch_snapshot(const uint8_t *raw,uint8_t *patched,size_t length,uint
             memcpy(&sh,raw+header.e_shoff+(size_t)i*sizeof(sh),sizeof(sh));
             if ((sh.sh_flags&SHF_EXECINSTR) && sh.sh_size &&
                 patch_exec_section(raw+sh.sh_offset,patched+sh.sh_offset,
-                    sh.sh_size)) return -EIO;
+                    sh.sh_size,code,sh.sh_offset)) return -EIO;
         }
         return 0;
     }
@@ -176,7 +201,7 @@ static int patch_snapshot(const uint8_t *raw,uint8_t *patched,size_t length,uint
         Elf64_Phdr ph;
         memcpy(&ph,raw+header.e_phoff+(size_t)i*sizeof(ph),sizeof(ph));
         if (ph.p_type!=PT_LOAD || !(ph.p_flags&PF_X) || !ph.p_filesz) continue;
-        if (lpr_patch_scan_syscalls(patched+ph.p_offset,ph.p_filesz,0,&scan))
+        if (scan_conservative(patched+ph.p_offset,ph.p_filesz,code,ph.p_offset))
             return -EIO;
     }
     return 0;
@@ -185,7 +210,8 @@ static int patch_snapshot(const uint8_t *raw,uint8_t *patched,size_t length,uint
 int filed_rx_manifest_build(const uint8_t *raw,size_t length,
     uint64_t file_offset,const uint8_t root_uuid[16],
     const uint8_t identity[KB2_FILESYSTEM_SNAPSHOT_STAT_SIZE],
-    const uint8_t scanner_hash[32],filed_rx_manifest_t *out)
+    const uint8_t scanner_hash[32],const filed_rx_code_ranges_t *code,
+    filed_rx_manifest_t *out)
 {
     if (!raw || !length || !root_uuid || !identity || !scanner_hash || !out ||
         length>SIZE_MAX-4095) return -EINVAL;
@@ -205,7 +231,8 @@ int filed_rx_manifest_build(const uint8_t *raw,size_t length,
     for (uint64_t i=0;i<m.page_count;++i)
         page_digest(raw,length,i,m.page_hashes+i*FILED_RX_HASH_BYTES);
     memcpy(patched,raw,length);
-    const int patch_status=patch_snapshot(raw,patched,length,file_offset,identity);
+    const int patch_status=patch_snapshot(raw,patched,length,file_offset,
+        identity,code);
     if (patch_status) {
         free(patched);filed_rx_manifest_free(&m);return patch_status;
     }

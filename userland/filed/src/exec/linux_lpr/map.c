@@ -471,7 +471,8 @@ static int prepare_image(const lpr_exec_image_t *image, uint64_t dyn_base,
             uint64_t until = off+filesz < textoff+textsize ? off+filesz : textoff+textsize;
             if (until > from) {
                 uint64_t patched = 0;
-                status = lpr_exec_patch_syscalls(mapped + va-low + from-off,
+                status = lpr_exec_patch_syscalls(image, from,
+                                                 mapped + va-low + from-off,
                                                  until-from, &patched);
                 if (status) goto done;
             }

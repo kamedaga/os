@@ -80,14 +80,14 @@ static void prepare_count(unsigned count) {
     bundle = (struct ph_bootstrap_receiver){.generation = 7, .artifact_count = 1,
         .resource_count = count, .received = 3 + count, .complete = 1};
     bundle.items[3].capability = (struct pacha_ipc_fd){.fd = 100,
-        .rights = PH_DEVICE_FUNCTION_RIGHTS, .flags = PACHA_FD_FLAG_CLOEXEC};
+        .rights = PH_DEVICE_ADMITTED_RIGHTS, .flags = PACHA_FD_FLAG_CLOEXEC};
     if (count == 2) bundle.items[4].capability = (struct pacha_ipc_fd){.fd = 101,
-        .rights = PH_DEVICE_FUNCTION_RIGHTS, .flags = PACHA_FD_FLAG_CLOEXEC};
+        .rights = PH_DEVICE_ADMITTED_RIGHTS, .flags = PACHA_FD_FLAG_CLOEXEC};
     authority = (struct ph_device_authority){.generation = 7, .object_id = 23,
         .native_device = 42, .slot_id = 1, .node_id = 1};
-    info = (struct pacha_fd_info){.rights = PH_DEVICE_FUNCTION_RIGHTS, .flags = PACHA_FD_FLAG_CLOEXEC};
+    info = (struct pacha_fd_info){.rights = PH_DEVICE_ADMITTED_RIGHTS, .flags = PACHA_FD_FLAG_CLOEXEC};
     capsule = (struct pacha_capsule_info){.fd = 100, .kind = PACHA_CAPSULE_KIND_DEVICE,
-        .device = 42, .rights = PH_DEVICE_FUNCTION_RIGHTS, .flags = PACHA_CAPSULE_DMA_TRANSLATED};
+        .device = 42, .rights = PH_DEVICE_ADMITTED_RIGHTS, .flags = PACHA_CAPSULE_DMA_TRANSLATED};
     info_result = close_result = 0;
     query_result = 11;
     calls = 0;
@@ -114,6 +114,13 @@ int main(void) {
     prepare(); info.rights |= PACHA_FD_RIGHT_TRANSFER; rejected(-EACCES, 1);
     prepare(); info.flags = 0; rejected(-EACCES, 1);
     prepare(); info_result = PACHA_SYSCALL_ERR_NOT_READY; rejected(-EAGAIN, 1);
+#if defined(PH_SANDBOX_I915) && PH_SANDBOX_I915
+    prepare(); bundle.items[3].capability.rights &= ~PACHA_FD_RIGHT_CPU_READ; rejected(-EACCES, 0);
+    prepare(); info.rights &= ~PACHA_FD_RIGHT_CPU_WRITE; rejected(-EACCES, 1);
+    prepare(); capsule.rights &= ~PACHA_FD_RIGHT_CPU_READ; rejected(-EACCES, 2);
+#else
+    prepare(); bundle.items[3].capability.rights |= PACHA_FD_RIGHT_CPU_READ; rejected(-EACCES, 0);
+#endif
     prepare(); capsule.device = 43; rejected(-EACCES, 2);
     prepare(); capsule.kind = PACHA_CAPSULE_KIND_IRQ; rejected(-EACCES, 2);
     prepare(); capsule.rights &= ~PACHA_FD_RIGHT_DERIVE_IRQ; rejected(-EACCES, 2);

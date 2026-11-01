@@ -185,7 +185,10 @@ int lpr_exec_meta_get_interp_path(
     size_t out_size);
 int lpr_exec_image_find_text_section(const lpr_exec_image_t *image, uint64_t *out_offset, uint64_t *out_size);
 int lpr_exec_image_find_symbol(const lpr_exec_image_t *image, const char *symbol, uint64_t *out_value);
+/* file_offset is the image offset of bytes[0]; image supplies .eh_frame. */
 int lpr_exec_patch_syscalls(
+    const lpr_exec_image_t *image,
+    uint64_t file_offset,
     unsigned char *bytes,
     uint64_t size,
     uint64_t *out_patched);

@@ -84,6 +84,8 @@ target_include_directories(lpr_scanner PRIVATE
   "${REPO_ROOT}/userland/libipc/include")
 
 add_library(lpr_runtime SHARED
+  "${LPR_RUNTIME}/lpr_clock.c"
+  "${LPR_RUNTIME}/lpr_clock_copy.S"
   "${LPR_RUNTIME}/lpr_signal.c"
   "${LPR_RUNTIME}/lpr_vsyscall.c"
   "${LPR_RUNTIME}/lpr_zpoline.c"

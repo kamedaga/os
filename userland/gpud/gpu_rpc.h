@@ -20,6 +20,8 @@ struct gpud_gpu_rpc {
     struct ph_ipc_packet incoming;
     struct ph_ipc_packet attachment;
     int error, event_started, event_notification;
+    /* Native-only first-failure site; never sent to the sandbox or clients. */
+    unsigned int failure_line;
 };
 
 int gpud_gpu_rpc_start_events(struct gpud_gpu_rpc *rpc);
@@ -34,6 +36,15 @@ int gpud_gpu_rpc_take_mapping(struct gpud_gpu_rpc *rpc,
     uint64_t correlation, uint64_t exchange_id, struct pacha_ipc_fd *fd);
 int gpud_gpu_rpc_take_dma_buf(struct gpud_gpu_rpc *rpc,
     uint64_t correlation, uint64_t exchange_id, struct pacha_ipc_fd *fd);
+/* Typed object control: Linux CPU access flags and exporter errno, independent
+ * of the lifetime of the exporting DRM open-file description. */
+int gpud_gpu_rpc_prime_cpu_sync(struct gpud_gpu_rpc *rpc,
+    uint64_t correlation, uint64_t token, uint64_t flags);
+int gpud_gpu_rpc_prime_export_sync_file(struct gpud_gpu_rpc *,uint64_t,
+    uint64_t,uint64_t,uint64_t,uint64_t *);
+int gpud_gpu_rpc_prime_import_sync_file(struct gpud_gpu_rpc *,uint64_t,
+    uint64_t,uint64_t,uint64_t);
+int gpud_gpu_rpc_release_sync_file(struct gpud_gpu_rpc *,uint64_t,uint64_t);
 int gpud_gpu_rpc_release_mapping(struct gpud_gpu_rpc *rpc,
     uint64_t correlation, uint64_t mapping_id);
 

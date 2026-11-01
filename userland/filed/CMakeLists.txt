@@ -22,6 +22,7 @@ set(FILED_EXTRA_SOURCES
   "${CMAKE_CURRENT_SOURCE_DIR}/src/pager.c"
   "${CMAKE_CURRENT_SOURCE_DIR}/src/native_thread.c"
   "${CMAKE_CURRENT_SOURCE_DIR}/src/manifest.c"
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/code_ranges.c"
   "${CMAKE_CURRENT_SOURCE_DIR}/src/manifest_storage.c"
   "${CMAKE_CURRENT_SOURCE_DIR}/src/exec_payload.c"
   "${CMAKE_CURRENT_SOURCE_DIR}/src/dispatch/identity.c"

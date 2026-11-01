@@ -946,6 +946,81 @@ test "futex block profile records the leave boundary before a nonreturning park"
     try std.testing.expect(profile.recorded);
 }
 
+// K retains VMA metadata, F excludes ordinary futex registration, and AS
+// pins the resident writable RAM backing through the scheduler's T-owned CAS
+// and ownership publication. No borrowed VMA survives this scope or a park.
+fn futexPiAttempt(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, frame: *TrapFrame, operation: runtime_abi.FutexPiOperation) scheduler.FutexPiAttempt {
+    futex_waiters_lock.lock();
+    defer futex_waiters_lock.unlock();
+    if (!lockFutexUserAddressSpace(h, proc)) return .{ .done = .bad_memory };
+    defer unlockFutexUserAddressSpace(h, proc);
+    const va = frame.rdi;
+    const vma = state.vmaEntryForVaConst(proc, va) orelse return .{ .done = .bad_memory };
+    if (!vma.prot.write or vma.device_backing) return .{ .done = .bad_memory };
+    // No cross-process shared-key authority is provided by this operation.
+    // An unflagged request on private backing is still a private-key mutex
+    // (musl probes exactly this form). PRIVATE explicitly scopes any mapping.
+    if ((frame.r10 & runtime_abi.futex_pi_private_key) == 0 and vma.flags.shared)
+        return .{ .done = .unsupported };
+    var iterator = futexKeyIterator(proc, va);
+    while (iterator.next()) |waiter| {
+        if (scheduler.waitTokenIsCurrent(proc, waiter.thread_index, waiter.thread_generation, waiter.wait_token))
+            return .{ .done = .invalid };
+    }
+    const observed = readUserU32UnderFutexAndAddressSpaceLocks(h, proc, va) orelse return .{ .done = .bad_memory };
+    const cas = h.resident_cmpxchg_user_u32_with_address_space_locked orelse return .{ .done = .unsupported };
+    return scheduler.futexPiOperation(proc, .{
+        .principal = @intFromEnum(proc),
+        .address = va,
+        .backing_index = vma.vmo.index,
+        .backing_generation = vma.vmo.generation,
+        .backing_offset = vma.vmo_offset + (va - vma.start_va),
+    }, operation, observed, cas);
+}
+
+fn futexPi(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, frame: *TrapFrame) u64 {
+    const operation = std.enums.fromInt(runtime_abi.FutexPiOperation, frame.rsi) orelse return @intFromEnum(runtime_abi.FutexPiResult.invalid);
+    if (frame.rdi == 0 or (frame.rdi & 3) != 0 or (frame.r10 & ~runtime_abi.futex_pi_private_key) != 0)
+        return @intFromEnum(runtime_abi.FutexPiResult.invalid);
+    const deadline_ms = frame.rdx;
+    while (true) {
+        const now_ms = if (realtime_clock.monotonicNs()) |ns| ns / 1_000_000 else scheduler.lapic_tick_count;
+        const expired = operation == .lock and deadline_ms != 0 and now_ms >= deadline_ms;
+        // A past deadline still permits immediate ownership. Never publish a
+        // waiter once expired, and never turn zero remaining into infinity.
+        const attempt_op = if (expired) runtime_abi.FutexPiOperation.try_lock else operation;
+        switch (futexPiAttempt(h, state, proc, frame, attempt_op)) {
+            .done => |result| return @intFromEnum(if (expired and result == .interrupted_or_busy) runtime_abi.FutexPiResult.timed_out else result),
+            .retry => continue,
+            .need_storage => {
+                // Preparation can allocate. It must happen after F and AS
+                // drop, and the complete word/key admission is then repeated.
+                const allocator = if (@import("builtin").is_test)
+                    slot_storage.hostTestAllocator()
+                else
+                    @import("../memory/identity_allocator.zig").allocator(h.free_list);
+                if (!scheduler.prepareFutexPiStorage(allocator)) return @intFromEnum(runtime_abi.FutexPiResult.allocation);
+            },
+            .wait => |wait| {
+                var remaining: u64 = 0;
+                if (deadline_ms != 0) {
+                    const park_ms = if (realtime_clock.monotonicNs()) |ns| ns / 1_000_000 else scheduler.lapic_tick_count;
+                    if (park_ms >= deadline_ms) {
+                        scheduler.expireFutexPiWait(wait.generation, wait.token);
+                        // Consume the claimed timeout or an earlier handoff.
+                        // A nonzero fallback also avoids an infinite park if
+                        // a pending signal rejects this completed reservation.
+                        remaining = 1;
+                    } else remaining = deadline_ms - park_ms;
+                }
+                if (h.block_current_thread_for_event(frame, true, false, wait.token, remaining, @intFromEnum(runtime_abi.FutexPiResult.timed_out), h.before_current_thread_leave)) return frame.rax;
+                scheduler.cancelCurrentWaitToken(wait.generation, wait.token);
+                return @intFromEnum(runtime_abi.FutexPiResult.interrupted_or_busy);
+            },
+        }
+    }
+}
+
 fn futexWait(h: anytype, proc: kernel.PrincipalId, frame: *TrapFrame) u64 {
     if (comptime lock_profile.enabled) lock_profile.futexCall(.wait, @intFromEnum(proc), kernel.principalLabel(proc));
     const validation_profile = if (comptime lock_profile.enabled) lock_profile.stageBegin() else {};
@@ -979,6 +1054,10 @@ fn futexWait(h: anytype, proc: kernel.PrincipalId, frame: *TrapFrame) u64 {
         futex_waiters_lock.lock();
         if (comptime lock_profile.enabled) lock_profile.stageEnd(.futex_lock, lock_stage);
         wake_trace.record(.futex_lock, user_va, 0, thread_index);
+        if (scheduler.futexPiHasAddress(proc, user_va)) {
+            futex_waiters_lock.unlock();
+            return sc.syscall_err_invalid;
+        }
         // K-free WAIT needs the same mapping through comparison and F
         // publication. F -> A is the established order; A is released before
         // storage growth or park, which can allocate or switch context.
@@ -1219,6 +1298,14 @@ fn futexWakeWaitWithOps(comptime Ops: type, h: anytype, proc: kernel.PrincipalId
         const lock_stage = if (comptime lock_profile.enabled) lock_profile.stageBegin() else {};
         futex_waiters_lock.lock();
         if (comptime lock_profile.enabled) lock_profile.stageEnd(.futex_lock, lock_stage);
+        // Reject both keys before either outbound wake or inbound wait can
+        // change state. PI handoff must never be consumed by ordinary WAKE.
+        if (scheduler.futexPiHasAddress(proc, wake_va) or
+            scheduler.futexPiHasAddress(proc, wait_va))
+        {
+            futex_waiters_lock.unlock();
+            return sc.syscall_err_invalid;
+        }
         if (wait_va != 0 and (wait_va & 3) == 0 and generation != null) {
             // Keep A under F until this waiter's token and key are published.
             // The outbound scheduler transfer below runs only after A drops.
@@ -1663,6 +1750,8 @@ fn futexWakeOpWithWake(comptime wake: anytype, h: anytype, proc: kernel.Principa
         // selections also orders competing WAKE_OP and REQUEUE operations.
         futex_waiters_lock.lock();
         defer futex_waiters_lock.unlock();
+        if (scheduler.futexPiHasAddress(proc, first) or scheduler.futexPiHasAddress(proc, second))
+            return 0 -% sc.syscall_err_invalid;
         const old = blk: {
             if (!lockFutexUserAddressSpace(h, proc)) return 0 -% sc.syscall_err_map;
             defer unlockFutexUserAddressSpace(h, proc);
@@ -1838,6 +1927,7 @@ fn futexWakeCollectLocked(
     max_count: u64,
     handoff_target: ?*?kernel.ThreadWakeTarget,
 ) u64 {
+    if (scheduler.futexPiHasAddress(proc, user_va)) return 0 -% sc.syscall_err_invalid;
     if (max_count == 0) return 0;
     const hint_stage = if (comptime lock_profile.enabled) lock_profile.stageBegin() else {};
     const empty = futexKeyKnownEmpty(proc, user_va);
@@ -2351,6 +2441,8 @@ fn futexRequeueWithWake(
     if (comptime lock_profile.enabled) lock_profile.stageEnd(.futex_lock, lock_stage);
     defer futex_waiters_lock.unlock();
     const hint_stage = if (comptime lock_profile.enabled) lock_profile.stageBegin() else {};
+    if (scheduler.futexPiHasAddress(proc, source_va) or scheduler.futexPiHasAddress(proc, target_va))
+        return 0 -% sc.syscall_err_invalid;
     const empty = futexKeyKnownEmpty(proc, source_va);
     if (comptime lock_profile.enabled) lock_profile.stageEnd(.futex_hint, hint_stage);
     if (empty) return 0;
@@ -2361,7 +2453,6 @@ fn futexRequeueWithWake(
     var requeued: u64 = 0;
     var iterator = futexKeyIterator(proc, source_va);
     while (iterator.next()) |waiter| {
-
         if (woke < max_wake) {
             switch (wake(
                 waiter.thread_index,
@@ -2439,6 +2530,7 @@ pub fn dispatch(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId
         sc.syscall_clock_page_open => clockPageOpen(state, proc, h.free_list),
         sc.syscall_yield => yieldThread(scheduler.handoffToBestReadyThreadWithRax, h, frame),
         sc.syscall_nanosleep => nanosleep(h, proc, frame),
+        sc.syscall_futex_pi => futexPi(h, state, proc, frame),
         sc.syscall_futex_wait => futexWait(h, proc, frame),
         sc.syscall_futex_wake => futexWakeAndHandoff(h, proc, frame),
         sc.syscall_futex_wake_wait => futexWakeWait(h, proc, frame),
@@ -2523,3 +2615,29 @@ pub const WaitTestSupport = if (@import("builtin").is_test) struct {
         resetFutexTestStorage();
     }
 } else struct {};
+
+// PI frontend fixtures replace only resident RAM access; admission and both
+// futex domains enter the production functions under the real F/T locks.
+pub const PiFrontendTestSupport = if (@import("builtin").is_test) struct {
+    pub const attempt = futexPiAttempt;
+    pub const wake = futexWakeCollect;
+    pub const requeue = futexRequeueWithWake;
+    pub const normal = testSetFutexSlot;
+    pub const normalValue = testFutexValue;
+    pub const reset = resetFutexTestStorage;
+    pub fn locked() bool {
+        return futex_waiters_lock.value != 0;
+    }
+} else struct {};
+
+test "futex PI frontend mapping authority and stale versus live ordinary waiters" {
+    try @import("../futex_pi_runtime_test.zig").mappings(PiFrontendTestSupport);
+}
+
+test "futex PI frontend ordinary mixed WAKE REQUEUE return negative errors atomically" {
+    try @import("../futex_pi_runtime_test.zig").mixed(PiFrontendTestSupport);
+}
+
+test "futex PI frontend changed VMA backing cannot consume old ownership queue" {
+    try @import("../futex_pi_runtime_test.zig").identity(PiFrontendTestSupport);
+}

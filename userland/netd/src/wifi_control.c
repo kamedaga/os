@@ -1,3 +1,4 @@
+#include "path_profile.h"
 /* SPDX-License-Identifier: MIT */
 #include "wifi_control.h"
 #include "wifi_files.h"
@@ -23,6 +24,8 @@ static struct {
     int reply_error;
     char session[17], seen[33], pending_id[33];
     char status[8192], response[8256], reply_text[8192];
+    /* Single-owner scratch; keep diagnostic replies off the native stack. */
+    char perf_reply[8192];
 } wifi;
 
 static void wipe(void *memory, size_t size)
@@ -147,8 +150,29 @@ static unsigned receive_request(uint64_t now_ms)
     } else if (!strcmp(operation, "disconnect\n")) {
         error = acknowledged("DISCONNECT");
         if (!error) { wifi.ipv4_ready = 0; transition = NETD_WIFI_NETWORK_DISCONNECT; }
+    } else if (!strcmp(operation,"power-save-off\n") || !strcmp(operation,"power-save-on\n")) {
+        error=acknowledged(!strcmp(operation,"power-save-off\n")?"NET_PERF_PS_OFF":"NET_PERF_PS_ON");
+    } else if (!strcmp(operation,"signal\n")) {
+        char *reply=wifi.perf_reply;memset(reply,0,sizeof(wifi.perf_reply));size_t bytes=0;
+        error=command("SIGNAL_POLL",reply,sizeof(wifi.perf_reply),&bytes);
+        complete(error,error?"":reply);return 0;
+    } else if (!strcmp(operation,"tcp-buffers-large\n") || !strcmp(operation,"tcp-buffers-default\n")) {
+        char *reply=wifi.perf_reply;memset(reply,0,sizeof(wifi.perf_reply));
+        error=netd_libuinet_perf_buffers(!strcmp(operation,"tcp-buffers-large\n"),reply,sizeof(wifi.perf_reply));
+        complete(error,error?"":reply);return 0;
+#if NETD_PATH_PROFILE
+    } else if (!strcmp(operation,"trace-start\n") || !strcmp(operation,"trace-stop\n")) {
+        int starting=!strcmp(operation,"trace-start\n");
+        error=acknowledged(starting?"NET_PERF_TRACE_START":"NET_PERF_TRACE_STOP");
+        if(!error)error=netd_path_control(starting?"start":"stop",NULL,0);
+    } else if (!strcmp(operation,"trace-core\n") || !strcmp(operation,"trace-netd\n")) {
+        char *reply=wifi.perf_reply;memset(reply,0,sizeof(wifi.perf_reply));size_t bytes=0;
+        if(!strcmp(operation,"trace-core\n"))error=command("NET_PERF_TRACE_DUMP",reply,sizeof(wifi.perf_reply),&bytes);
+        else {int n=netd_path_control("dump",reply,sizeof(wifi.perf_reply));error=n<0?n:0;}
+        complete(error,error?"":reply);return 0;
+#endif
     } else error = -EINVAL;
-    if (error || wifi.pending == NONE) complete(error, error ? "" : "Disconnected.\n");
+    if (error || wifi.pending == NONE) complete(error, error ? "" : (!strcmp(operation,"disconnect\n")?"Disconnected.\n":"OK\n"));
     return transition;
 }
 

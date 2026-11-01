@@ -3,6 +3,7 @@
 #define PACHA_GPUD_BOOT_CONFIG_H
 
 #include <stdint.h>
+#include "../../../../kobox2/linux-sandbox/kobox/boot/pci_metadata.h"
 
 enum {
     GPUD_BOOT_CONFIG_MAGIC = 0x47505544424f4f54ull,
@@ -23,6 +24,8 @@ struct gpud_boot_config {
     uint64_t control_channel_fd, ready_channel_fd;
     /* Private owner-to-gpud policy, never a PCI ID or sandbox-supplied hint. */
     uint64_t backend;
+    /* Current-boot metadata only; companion capabilities stay with seed0root. */
+    struct kobox_linux_pci_topology pci_topology;
     char package_root[64];
     /* Optional SEND-only RAM log endpoint; zero preserves serial fallback. */
     uint64_t log_endpoint_fd;
@@ -33,6 +36,6 @@ struct gpud_boot_config {
     uint8_t sandbox_sha256[32];
 };
 
-_Static_assert(sizeof(struct gpud_boot_config) == 232, "gpud private bootstrap config");
+_Static_assert(sizeof(struct gpud_boot_config) == 768, "gpud private bootstrap config");
 
 #endif

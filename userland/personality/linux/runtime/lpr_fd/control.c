@@ -159,6 +159,11 @@ static uint32_t lpr_backend_rights(uint8_t ops_id, uint64_t linux_flags)
     const uint32_t writable = access != LPR_LINUX_O_RDONLY ? LPR_FD_RIGHT_WRITE : 0;
     switch (ops_id) {
     case LPR_FD_OPS_FILED:
+        /* O_PATH is a pathname reference, not an O_RDONLY file.  It may be
+         * used as a dirfd and queried, but must not acquire local read, write,
+         * mmap or ioctl authority merely because its access-mode bits are 0. */
+        if (linux_flags & LPR_LINUX_O_PATH)
+            return common;
         return common | readable | writable | LPR_FD_RIGHT_MMAP | LPR_FD_RIGHT_IOCTL;
     case LPR_FD_OPS_DEVICE:
     case LPR_FD_OPS_INSTALL_DISK:

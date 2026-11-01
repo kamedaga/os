@@ -32,6 +32,7 @@ struct gpud_package {
     struct ph_package_identity identity;
     struct ph_device_authority device;
     pacha_fd_t device_fd;
+    uint64_t device_rights;
 };
 
 /* Loads the fixed verified VirGL closure through filed and converts immutable
@@ -45,6 +46,9 @@ int gpud_package_open_at(struct gpud_package *package, pacha_fd_t filed_fd,
 /* Creates the per-generation resource grant after controller generation is
  * known. The logical IDs are private owner policy, never native FD numbers. */
 int gpud_package_bind(struct gpud_package *package, uint64_t generation);
+/* Native delegation policy after verified root-module selection, before GOP
+ * release. A missing CPU right fails closed rather than widening the FD. */
+int gpud_package_enable_port_io(struct gpud_package *package);
 /* Retire only the generation-specific grant VMO after sandbox/resource
  * cleanup. Immutable module and sandbox inputs remain cached for restart. */
 int gpud_package_unbind(struct gpud_package *package, uint64_t generation);

@@ -59,6 +59,7 @@ done
   -Iuserland/personality/include -Iuserland/storage/include \
   -Iuserland/personality/linux/decoder \
   userland/filed/tests/map_rights_test.c userland/filed/src/exec/linux_lpr/elf.c \
+  userland/filed/src/code_ranges.c \
   -o .artifacts/fs-cutover-filed-tests/map-rights-test
 .artifacts/fs-cutover-filed-tests/map-rights-test
 "${CC:-/usr/bin/clang}" -std=c11 -D_GNU_SOURCE -Wall -Wextra -Werror \

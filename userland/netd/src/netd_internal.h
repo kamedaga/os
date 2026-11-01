@@ -27,5 +27,6 @@ void netd_packet_io_pump_once(void);
 int netd_packet_io_dhcp_start(struct netd_runtime *runtime);
 int netd_packet_io_dhcp_restart(struct netd_runtime *runtime);
 void netd_packet_io_discard_rx(void);
+uint64_t netd_packet_io_rx_drops(void);
 void netd_packet_io_dhcp_disable(void);
 const struct netd_dhcp_client *netd_packet_io_dhcp_status(void);

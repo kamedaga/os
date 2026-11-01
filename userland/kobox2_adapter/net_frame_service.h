@@ -13,6 +13,9 @@ struct ph_net_frame_service {
     int (*info)(void *, struct kobox_linux_net_info *);
     int (*read)(void *, struct kobox_linux_net_frame *, size_t, size_t *);
     int (*write)(void *, const void *, size_t);
+    int (*bind_wake)(void *, int (*)(void *), void *);
+    int (*rx_stats)(void *, struct kobox_linux_net_rx_stats *);
+    pacha_fd_t rx_wake_fd;
     int (*wifi_request)(void *, const void *, size_t, void *, size_t, size_t *);
     int (*wifi_configure)(void *, const void *, size_t);
     int (*wifi_events)(void *, uint32_t *);
@@ -25,5 +28,7 @@ struct ph_net_frame_service {
 
 int ph_net_frame_service_init(struct ph_net_frame_service *net, void *core,
     uint64_t generation, struct ph_lifecycle_service *service);
+/* Only after modules_run returned with successful Linux port cleanup. */
+int ph_net_frame_service_finish(struct ph_net_frame_service *net);
 
 #endif

@@ -6,6 +6,8 @@
 #include <stddef.h>
 
 struct netd_runtime;
+struct pacha_service_wait_set;
+struct kobox_linux_net_rx_stats;
 
 struct netd_nic_diagnostic {
     unsigned step, loaded, pci_bound;
@@ -23,5 +25,9 @@ int netd_kobox2_wifi_command(const void *command, size_t length,
 int netd_kobox2_wifi_configuration(const void *configuration, size_t length);
 int netd_kobox2_wifi_take_events(uint32_t *events);
 const struct netd_nic_diagnostic *netd_kobox2_nic_diagnostic(void);
+int netd_kobox2_nic_collect_wait_sources(struct pacha_service_wait_set *set);
+int netd_kobox2_nic_rx_pending(void);
+const struct kobox_linux_net_rx_stats *netd_kobox2_nic_rx_stats(void);
+uint64_t netd_kobox2_nic_rx_drops(void);
 
 #endif

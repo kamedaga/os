@@ -40,6 +40,10 @@
 #ifndef PH_SANDBOX_AMDGPU
 #define PH_SANDBOX_AMDGPU 0
 #endif
+#ifndef PH_SANDBOX_I915
+#define PH_SANDBOX_I915 0
+#endif
+#define PH_SANDBOX_PCI_GPU (PH_SANDBOX_AMDGPU || PH_SANDBOX_I915)
 #ifndef PH_SANDBOX_BLOCK
 #define PH_SANDBOX_BLOCK 0
 #endif
@@ -51,8 +55,8 @@
 #endif
 #define PH_SANDBOX_VIRTIO_GPU \
     (PH_SANDBOX_DEVICE && !PH_SANDBOX_USB_HID && !PH_SANDBOX_NET && \
-     !PH_SANDBOX_AMDGPU && !PH_SANDBOX_BLOCK && !PH_SANDBOX_FS && !PH_SANDBOX_AUDIO)
-#define PH_SANDBOX_GPU (PH_SANDBOX_VIRTIO_GPU || PH_SANDBOX_AMDGPU)
+     !PH_SANDBOX_PCI_GPU && !PH_SANDBOX_BLOCK && !PH_SANDBOX_FS && !PH_SANDBOX_AUDIO)
+#define PH_SANDBOX_GPU (PH_SANDBOX_VIRTIO_GPU || PH_SANDBOX_PCI_GPU)
 #if PH_SANDBOX_DEVICE
 #include "device.h"
 #include "device_grant.h"
@@ -70,7 +74,7 @@ static struct ph_bootstrap_receiver bundle;
 static struct ph_package package;
 static struct ph_module_package modules;
 static struct ph_lifecycle lifecycle;
-#if PH_SANDBOX_AMDGPU || PH_SANDBOX_WIFI
+#if PH_SANDBOX_PCI_GPU || PH_SANDBOX_WIFI
 static struct kobox_linux_firmware_file firmware_files[KOBOX_FIRMWARE_MAX_FILES];
 static size_t firmware_count;
 #endif
@@ -102,9 +106,9 @@ static struct kobox_linux_device_port_config *storage_ports;
 static size_t storage_device_count;
 #endif
 
-#if PH_SANDBOX_NET || PH_SANDBOX_AMDGPU || PH_SANDBOX_BLOCK || PH_SANDBOX_FS || PH_SANDBOX_AUDIO
+#if PH_SANDBOX_NET || PH_SANDBOX_PCI_GPU || PH_SANDBOX_BLOCK || PH_SANDBOX_FS || PH_SANDBOX_AUDIO
 
-#if PH_SANDBOX_AMDGPU
+#if PH_SANDBOX_PCI_GPU
 static void report_gpu_irq_ready(void);
 #endif
 
@@ -123,7 +127,7 @@ static void report_device_progress(void *context, unsigned phase,
     /* Diagnostics cannot wait on a full channel while holding Linux's
      * module-init task; the owner consumes these packets concurrently. */
     (void)ph_ipc_send(ipc, &progress);
-#if PH_SANDBOX_AMDGPU
+#if PH_SANDBOX_PCI_GPU
     if (phase == KOBOX_MODULE_PROGRESS_LIFECYCLE_READY && !status)
         report_gpu_irq_ready();
 #endif
@@ -175,7 +179,7 @@ static struct ph_device_grant device_grant;
 static struct ph_device device;
 #endif
 static uint64_t irq_cookie_sequence;
-#if PH_SANDBOX_AMDGPU
+#if PH_SANDBOX_PCI_GPU
 static void report_gpu_irq_ready(void) {
     uint64_t received, dispatched, acknowledged;
     if (!ph_irq_snapshot(&device.irq, &received, &dispatched, &acknowledged))
@@ -217,10 +221,23 @@ static void prepare_device(const struct kobox_linux_boot_layout *layout, void *c
 #else
     const struct ph_device_config config = {.device_fd = device_grant.fd,
                                             .generation = device_grant.generation,
+#if PH_SANDBOX_I915
+                                            .segment = ((const struct ph_sandbox_config *)PH_SANDBOX_CONFIG_ADDRESS)->pci_topology.segment,
+                                            .bus = ((const struct ph_sandbox_config *)PH_SANDBOX_CONFIG_ADDRESS)->pci_topology.bus,
+                                            .devfn = ((const struct ph_sandbox_config *)PH_SANDBOX_CONFIG_ADDRESS)->pci_topology.devfn,
+#endif
                                             .image = &ph_core,
                                             .memory = layout->task.memory,
                                             .irq_cookie_sequence = &irq_cookie_sequence};
     PH_OK(ph_device_init(&device, &config));
+#if PH_SANDBOX_I915
+    ph_port_io_start(ph_pci_port_io, &device.pci);
+    const struct kobox_linux_pci_topology *topology =
+        &((const struct ph_sandbox_config *)PH_SANDBOX_CONFIG_ADDRESS)->pci_topology;
+    PH_CHECK(kobox_pci_metadata_valid(topology) && topology->metadata_count == 2);
+    device.pci.host.metadata = topology->metadata;
+    device.pci.host.metadata_count = topology->metadata_count;
+#endif
 #if PH_SANDBOX_USB_HID || PH_SANDBOX_NET || PH_SANDBOX_BLOCK || PH_SANDBOX_AUDIO || PH_SANDBOX_FS
     pci_device_launch = (struct kobox_linux_device_port_config){
         .size = sizeof(pci_device_launch),
@@ -272,7 +289,7 @@ static void run_service(void *context) {
         bootstrap_ipc.generation, &ps2_service));
     PH_OK(ph_lifecycle_start_service(&lifecycle, &bootstrap_ipc, &ps2_service));
 #endif
-#if PH_SANDBOX_AMDGPU
+#if PH_SANDBOX_PCI_GPU
     /* Firmware class reports the names requested by the unmodified Linux
      * driver, including failed lookups. The staged-file log alone cannot
      * establish which blobs the GPU actually requested. */
@@ -291,6 +308,16 @@ static void run_service(void *context) {
         }
     }
     PH_CHECK(firmware_loader_count == 1 && drm_debug_count == 1);
+#if PH_SANDBOX_I915
+    /* A board VBT is immutable launch data, not a physical-memory grant.
+     * Let upstream validate the measured firmware file instead of teaching
+     * the hosted PCI layer to expose unrelated BIOS/ACPI memory. */
+    for (size_t file = 0; file < firmware_count; ++file)
+        if (!strcmp(firmware_files[file].name, "i915/nec-xc750dag.vbt"))
+            for (size_t i = 0; i < modules.count; ++i)
+                if (!strcmp(modules.modules[i].name, "i915"))
+                    modules.modules[i].parameters = "vbt_firmware=i915/nec-xc750dag.vbt";
+#endif
 #endif
 #if PH_SANDBOX_DEVICE
 #if PH_SANDBOX_FS
@@ -333,16 +360,21 @@ static void run_service(void *context) {
 #else
     PH_OK(ph_lifecycle_start_service(&lifecycle, &bootstrap_ipc, &service));
 #endif
-#elif PH_SANDBOX_AMDGPU
+#elif PH_SANDBOX_PCI_GPU
     struct ph_lifecycle_service service;
     PH_OK(ph_gpu_sessions_init(
         &gpu_sessions, bootstrap_ipc.generation, GPUD_GPU_NATIVE_SESSION_LIMIT));
     PH_OK(ph_gpu_queue_init_profile(&gpu_queue, &gpu_sessions, client_id,
-        gpu_channel_id, KB2_GPU_PROFILE_AMDGPU, &kb2_vq_x86_64_atomics, &service));
+        gpu_channel_id, PH_SANDBOX_I915 ? KB2_GPU_PROFILE_I915 : KB2_GPU_PROFILE_AMDGPU,
+        &kb2_vq_x86_64_atomics, &service));
     gpu_queue.service.query.pci = &device.pci;
-    /* The physical GPU retains the sensor/time abort even while its common
-     * DRM file service is answering render-node requests. */
+#if PH_SANDBOX_AMDGPU
+    /* AMDGPU's sensor monitor uses AMD private ioctls, so it must never
+     * run against a different driver's render node. */
     PH_OK(ph_lifecycle_start_monitored_service(&lifecycle, &bootstrap_ipc, &service));
+#else
+    PH_OK(ph_lifecycle_start_service(&lifecycle, &bootstrap_ipc, &service));
+#endif
 #else
     struct ph_lifecycle_service service;
     PH_OK(ph_gpu_sessions_init(
@@ -409,7 +441,7 @@ static void run_service(void *context) {
 #endif
     launch.progress = report_device_progress;
     launch.progress_context = &bootstrap_ipc;
-#elif PH_SANDBOX_AMDGPU
+#elif PH_SANDBOX_PCI_GPU
     launch.device = &device_launch;
     launch.firmware = firmware_files;
     launch.firmware_count = firmware_count;
@@ -426,7 +458,12 @@ static void run_service(void *context) {
     memcpy(&run, &symbol, sizeof(run));
     int result = run(&launch, &report);
     ph_lifecycle_finish(&lifecycle);
-#if PH_SANDBOX_NET || PH_SANDBOX_AMDGPU || PH_SANDBOX_BLOCK || PH_SANDBOX_FS || PH_SANDBOX_AUDIO
+#if PH_SANDBOX_NET
+    /* Failed Linux cleanup must not close/reuse a callback's native FD. In
+     * that terminal case process teardown reclaims it with the whole port. */
+    if (!report.cleanup_result) PH_OK(ph_net_frame_service_finish(&net_frames));
+#endif
+#if PH_SANDBOX_NET || PH_SANDBOX_PCI_GPU || PH_SANDBOX_BLOCK || PH_SANDBOX_FS || PH_SANDBOX_AUDIO
     if (result) {
         /* The native owner has no serial console on a live machine. Report
          * the upstream module-launch errno before fatal process exit. */
@@ -463,7 +500,7 @@ static void run_service(void *context) {
 #if PH_SANDBOX_DEVICE
 #if PH_SANDBOX_USB_HID || PH_SANDBOX_NET || PH_SANDBOX_BLOCK || PH_SANDBOX_AUDIO || PH_SANDBOX_FS
     PH_CHECK(report.pci_bound && report.pci_detached);
-#elif PH_SANDBOX_AMDGPU
+#elif PH_SANDBOX_PCI_GPU
     PH_CHECK(report.device.bound && report.device.primary_major &&
              report.device.render_major && report.device.render_opened &&
              report.device.drm_queried && report.device.render_closed &&
@@ -494,6 +531,9 @@ static void run_service(void *context) {
         PH_OK(ph_device_grant_close(&storage_grants[i], storage_grants[i].generation));
     }
 #else
+#if PH_SANDBOX_I915
+    ph_port_io_stop();
+#endif
     PH_OK(ph_device_finish(&device, device_grant.generation));
     PH_OK(ph_device_grant_close(&device_grant, device_grant.generation));
 #endif
@@ -552,11 +592,11 @@ void ph_main(void) {
     PH_CHECK(config->ram_bytes >= (384ul << 20) && config->ram_bytes <= (2ul << 30));
     ph_core.ram_size = config->ram_bytes;
 #endif
-#if PH_SANDBOX_VIRTIO_GPU
+#if PH_SANDBOX_GPU
     /* World geometry needs multiple concurrent 128 MiB GEM buffers. This
      * budget belongs to the GPU core, independently of guest RAM/JVM heap. */
     ph_core.ram_size = 1ul << 30;
-    ph_log("virtio-gpu core RAM budget=1024 MiB\n");
+    ph_log("GPU core RAM budget=1024 MiB\n");
 #endif
 #if PH_SANDBOX_FS
     PH_CHECK(config->fs_channel_id && config->fs_owner_channel_id &&
@@ -579,21 +619,21 @@ void ph_main(void) {
               policy->minor == 0));
     block_write_policy = *policy;
 #endif
-    PH_CHECK(((PH_SANDBOX_USB_HID || PH_SANDBOX_NET || PH_SANDBOX_AMDGPU ||
+    PH_CHECK(((PH_SANDBOX_USB_HID || PH_SANDBOX_NET || PH_SANDBOX_PCI_GPU ||
                PH_SANDBOX_BLOCK || PH_SANDBOX_FS || PH_SANDBOX_AUDIO || PH_SANDBOX_PS2) ?
               config->artifact_count >= 2 &&
               config->artifact_count <= PH_BOOTSTRAP_MAX_ARTIFACTS :
               config->artifact_count == (PH_SANDBOX_DEVICE ? 13u : 2u)) &&
              config->resource_count == (PH_SANDBOX_FS ? config->storage_device_count :
                 (PH_SANDBOX_DEVICE || PH_SANDBOX_PS2) ? 1u : 0u));
-#if PH_SANDBOX_AMDGPU || PH_SANDBOX_WIFI || PH_SANDBOX_USB_HID
+#if PH_SANDBOX_PCI_GPU || PH_SANDBOX_WIFI || PH_SANDBOX_USB_HID
     PH_CHECK(config->log_endpoint_fd == 0 ||
              config->log_endpoint_fd == PH_SANDBOX_LOG_FD);
     ph_boot_set_log_fd((pacha_fd_t)config->log_endpoint_fd);
 #else
     PH_CHECK(!config->log_endpoint_fd);
 #endif
-#if PH_SANDBOX_AMDGPU || PH_SANDBOX_WIFI
+#if PH_SANDBOX_PCI_GPU || PH_SANDBOX_WIFI
     PH_CHECK(config->firmware_address == PH_SANDBOX_FIRMWARE_ADDRESS &&
              config->firmware_size >= sizeof(struct ph_firmware_bundle) &&
              config->firmware_size <=
@@ -608,7 +648,7 @@ void ph_main(void) {
              !memcmp(config->firmware_sha256, absent_sha256, 32));
 #endif
     PH_OK(ph_ipc_init(&bootstrap_ipc, PH_SANDBOX_CHANNEL_FD, config->identity.generation));
-#if PH_SANDBOX_NET || PH_SANDBOX_AMDGPU || PH_SANDBOX_BLOCK || PH_SANDBOX_FS || PH_SANDBOX_AUDIO
+#if PH_SANDBOX_NET || PH_SANDBOX_PCI_GPU || PH_SANDBOX_BLOCK || PH_SANDBOX_FS || PH_SANDBOX_AUDIO
     ph_set_failure_reporter(report_device_fatal);
     ph_set_exception_reporter(report_device_exception);
 #endif

@@ -32,6 +32,50 @@ int64_t lpr_filed_io(uint32_t op, uint64_t fd, uint64_t buf, uint64_t count, uin
         -LPR_LINUX_EBADF;
 }
 
+int64_t lpr_filed_poll_events(uint64_t fd, uint32_t events)
+{
+    if (fd > LPR_LINUX_FD_MAX) return -LPR_LINUX_EBADF;
+    lpr_fd_pin_t pin;
+    if (lpr_fd_table_pin(&lpr_control_fd_table, (uint32_t)fd, &pin) != 0)
+        return -LPR_LINUX_EBADF;
+    int64_t result = -LPR_LINUX_EBADF;
+    if (pin.ops_id == LPR_FD_OPS_FILED && pin.state != 0) {
+        result = lpr_filed_endpoint_ready();
+        if (result == 0) {
+            const lpr_filed_backend_t *file = pin.state;
+            kb2_fs_request_t request = {
+                .opcode = KB2_FILESYSTEM_OP_POLL,
+                .handle = file->handle,
+                .mask = events,
+            };
+            kb2_fs_response_t response;
+            result = lpr_fs_call(
+                &request, 0, 0, 0, 0, 0, 0, &response, -1, 0);
+            if (result > UINT32_MAX) result = -LPR_LINUX_EIO;
+        }
+    }
+    lpr_fd_unpin(&pin);
+    return result;
+}
+
+int lpr_filed_poll_needs_rescan(uint64_t fd)
+{
+    if (fd > LPR_LINUX_FD_MAX) return 0;
+    lpr_fd_pin_t pin;
+    if (lpr_fd_table_pin(&lpr_control_fd_table, (uint32_t)fd, &pin) != 0)
+        return 0;
+    int rescan = 0;
+    if (pin.ops_id == LPR_FD_OPS_FILED && pin.state != 0) {
+        const lpr_filed_backend_t *file = pin.state;
+        const uint32_t type = file->mode & LPR_LINUX_S_IFMT;
+        /* Zero is retained only for legacy/internal handles whose opening
+         * metadata predates classification.  Rescanning is conservative. */
+        rescan = type == 0 || type == LPR_LINUX_S_IFIFO;
+    }
+    lpr_fd_unpin(&pin);
+    return rescan;
+}
+
 int64_t lpr_fs_iov(uint64_t handle, uint64_t iov_raw, uint64_t iov_count, int writing)
 {
     if (iov_count > 1024u) return -LPR_LINUX_EINVAL;

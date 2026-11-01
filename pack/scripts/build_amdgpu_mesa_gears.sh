@@ -5,6 +5,8 @@ set -euo pipefail
 
 repo="$(cd "$(dirname "$0")/../.." && pwd)"
 output="${1:-$repo/.artifacts/amdgpu-mesa-gears-linux.elf}"
+driver="${MESA_GEARS_DRM_DRIVER:-amdgpu}"
+case "$driver" in amdgpu|i915) ;; *) echo 'Unsupported gears DRM driver' >&2; exit 2;; esac
 case "$output" in
     /*) ;;
     *) output="$repo/$output" ;;
@@ -34,6 +36,7 @@ bwrap --unshare-user --uid 0 --gid 0 --ro-bind "$toolchain" / \
     --ro-bind "$repo/tests/amdgpu_mesa_gears.c" /tmp/gears.c \
     --bind "$output_dir" /tmp/out \
     /usr/bin/gcc -std=c11 -O2 -Wall -Wextra -Werror \
+    "-DMESA_GEARS_DRM_DRIVER=\"$driver\"" \
     -I/tmp/mesa/include -I/usr/include/libdrm \
     /tmp/gears.c /tmp/runtime/libEGL.so.1.0.0 \
     /tmp/runtime/libGLESv2.so.2.0.0 /tmp/runtime/libgbm.so.1.0.0 \

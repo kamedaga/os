@@ -383,7 +383,7 @@ int main(void)
     alarm(30); lpr_state.thread_count = 8;
     pthread_t host; assert(!pthread_create(&host, NULL, server, NULL));
     pthread_t threads[3];
-    struct caller first = {.handle = 1}, second = {.handle = 2}, large = {.handle = 3, .bytes = 1024 * 1024};
+    struct caller first = {.handle = 1}, second = {.handle = 2}, large = {.handle = 3, .bytes = 4 * 1024 * 1024};
     hold_first = 1;
     assert(!pthread_create(&threads[0], NULL, call, &first)); await_seen(1);
     assert(!pthread_create(&threads[1], NULL, call, &second));
@@ -391,8 +391,8 @@ int main(void)
     assert(!pthread_create(&threads[2], NULL, call, &large));
     assert(!pthread_join(threads[2], NULL) && !large.status && !__atomic_load_n(&first.done, __ATOMIC_ACQUIRE));
     assert(peer_count == 2 && detaches == 1 && unmaps == 2);
-    struct caller pressure[2] = {{.handle = 12, .bytes = 1024 * 1024},
-        {.handle = 13, .bytes = 1024 * 1024}};
+    struct caller pressure[2] = {{.handle = 12, .bytes = 4 * 1024 * 1024},
+        {.handle = 13, .bytes = 4 * 1024 * 1024}};
     pthread_mutex_lock(&peer_lock); lease_limit = 1; released &= ~(1ull << 12); pthread_mutex_unlock(&peer_lock);
     assert(!pthread_create(&threads[1], NULL, call, &pressure[0])); await_seen(12);
     assert(!pthread_create(&threads[2], NULL, call, &pressure[1]));
@@ -548,7 +548,7 @@ int main(void)
     for (unsigned i = 1; i <= 3; ++i) {
         cleanup_failure = i;
         unsigned before_detach = detaches;
-        struct caller oversized_cleanup = {.handle = 40 + i, .bytes = 1024 * 1024};
+        struct caller oversized_cleanup = {.handle = 40 + i, .bytes = 4 * 1024 * 1024};
         call(&oversized_cleanup);
         assert(oversized_cleanup.status == -LPR_LINUX_EIO && seen[40 + i] == 1 &&
             detaches == before_detach + 1 && peers[peer_count - 1].metadata &&
@@ -561,6 +561,46 @@ int main(void)
         fork_reset();
     }
     puts("LPR_FS_TEMPORARY_LEASE_LOCAL_CLEANUP_FAILURE_PINNED_NO_REPLAY_PASS");
+    /* Repeated calls reuse one charged queue without replay or splitting.
+     * An increase retires the old idle lease; fork/drop still release all. */
+    unsigned reuse_peers = peer_count, reuse_detaches = detaches;
+    struct caller reuse = {.handle = 45, .bytes = 128 * 1024};
+    call(&reuse); assert(!reuse.status);
+    assert(peer_count == reuse_peers + 2 && detaches == reuse_detaches);
+    reuse.handle = 46; call(&reuse); assert(!reuse.status);
+    assert(peer_count == reuse_peers + 2 && detaches == reuse_detaches);
+    reuse.handle = 47; reuse.bytes = 1024 * 1024;
+    call(&reuse); assert(!reuse.status);
+    assert(peer_count == reuse_peers + 3 && detaches == reuse_detaches + 1);
+    reuse.handle = 48; call(&reuse); assert(!reuse.status);
+    assert(peer_count == reuse_peers + 3 && detaches == reuse_detaches + 1);
+    struct caller reuse_parallel[2] = {{.handle = 55, .bytes = 128 * 1024},
+        {.handle = 56, .bytes = 128 * 1024}};
+    pthread_mutex_lock(&peer_lock); hold_first = 55; pthread_mutex_unlock(&peer_lock);
+    assert(!pthread_create(&threads[0], NULL, call, &reuse_parallel[0])); await_seen(55);
+    assert(!pthread_create(&threads[1], NULL, call, &reuse_parallel[1]));
+    assert(!pthread_join(threads[1], NULL) && !reuse_parallel[1].status);
+    assert(!__atomic_load_n(&reuse_parallel[0].done, __ATOMIC_ACQUIRE));
+    pthread_mutex_lock(&peer_lock); hold_first = 0; pthread_cond_broadcast(&peer_event); pthread_mutex_unlock(&peer_lock);
+    assert(!pthread_join(threads[0], NULL) && !reuse_parallel[0].status);
+    assert(peer_count == reuse_peers + 3 && seen[55] == 1 && seen[56] == 1);
+    assert(seen[45] == 1 && seen[46] == 1 && seen[47] == 1 && seen[48] == 1);
+    assert(!lpr_filed_session_drop() && detaches == reuse_detaches + 3);
+    fork_reset();
+    puts("LPR_FS_BOUNDED_REUSE_GROWTH_RETIREMENT_AND_SINGLE_OPERATION_PASS");
+    struct caller cached = {.handle = 49, .bytes = 128 * 1024};
+    call(&cached); assert(!cached.status);
+    unsigned cached_closes = closes;
+    fork_reset(); assert(closes == cached_closes);
+    cached.handle = 50; call(&cached); assert(!cached.status);
+    cleanup_failure = 1;
+    cached.handle = 51; cached.bytes = 1024 * 1024;
+    unsigned before_grow = peer_count;
+    call(&cached);
+    assert(cached.status == -LPR_LINUX_EIO && peer_count == before_grow && !seen[51]);
+    cleanup_failure = 0;
+    assert(!lpr_filed_session_drop()); fork_reset();
+    puts("LPR_FS_REUSE_FORK_AND_GROWTH_CLEANUP_FAILURE_INVENTORY_PASS");
     pthread_mutex_lock(&peer_lock); stop_server = 1; pthread_cond_broadcast(&peer_event); pthread_mutex_unlock(&peer_lock);
     assert(!pthread_join(host, NULL));
     puts("LPR_FS_SESSION_LIFETIME_UNIT_PASS");

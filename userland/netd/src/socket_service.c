@@ -348,7 +348,8 @@ static int netd_socket_dispatch(
             return -22;
         }
         size_t sent = 0;
-        int status = netd_netlink_socket_is_handle(req->handle) ? -95 :
+        int status = netd_netlink_socket_is_handle(req->handle) ?
+            netd_netlink_socket_send(req, &sent) :
             netd_libuinet_socket_send(
             req->handle,
             req->data,
@@ -412,7 +413,7 @@ static int netd_socket_dispatch(
     case NETD_OP_BIND:
         if (page == NULL) return -22;
         if (netd_netlink_socket_is_handle(((const netd_netlink_bind_t *)page)->handle))
-            return netd_netlink_socket_bind((const netd_netlink_bind_t *)page);
+            return netd_netlink_socket_bind((netd_netlink_bind_t *)page);
         {
             netd_inet_bind_t *req = (netd_inet_bind_t *)page;
             *out_result = 0;
@@ -726,7 +727,13 @@ int netd_socket_service_poll(void)
         return 0;
     }
 
-    for (unsigned i = 0; i < 32; i++) {
+    /* One request can synchronously transmit many frames. Returning after
+     * each request lets the main loop drain RX and run TCP timers before
+     * servicing the next one; otherwise ACKs can sit in the bounded NIC
+     * queue throughout an entire burst of socket sends. Returning busy at
+     * the budget boundary preserves progress without sleeping on a queued
+     * request or introducing a timer-driven polling loop. */
+    for (unsigned i = 0; i < 1; i++) {
         struct pacha_ipc_fd fds[PACHA_IPC_MAX_TRANSFER_FDS];
         struct pacha_ipc_msg request;
         memset(fds, 0, sizeof(fds));

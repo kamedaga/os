@@ -17,6 +17,7 @@ const mtrr = @import("arch/x86_64/mtrr.zig");
 const page_size: u64 = 4096;
 const four_gib: u64 = @import("arch/x86_64/physical_layout.zig").low_memory_limit;
 const page_mask: u64 = 0x000f_ffff_ffff_f000;
+const force_coherent_bit: u64 = @as(u64, 1) << 60;
 const read_bit: u64 = @as(u64, 1) << 61;
 const write_bit: u64 = @as(u64, 1) << 62;
 const present_bit: u64 = 1;
@@ -449,7 +450,11 @@ fn mapPage(domain: *const Domain, iova_address: IovaAddress, paddr: u64, readabl
     const leaf = walk(domain, address, true) orelse return false;
     const refs = refcounts(leaf.metadata.refcounts_paddr);
     if (refs[leaf.index] == std.math.maxInt(u16)) return false;
-    const desired = pte(paddr, 0, readable, writable);
+    // DMA grants promise coherent access to CPU RAM, including WB aliases.
+    // Leaf FC forces translated NoSnoop requests to snoop those caches; the
+    // IOMMU control Coherent bit covers table reads, not device data traffic.
+    // Keep FC off intermediate entries, where it is not a leaf attribute.
+    const desired = pte(paddr, 0, readable, writable) | force_coherent_bit;
     const existing = leaf.table[leaf.index];
     if (existing != 0 and existing != desired) return false;
     if (existing == 0) leaf.table[leaf.index] = desired;
@@ -1347,9 +1352,18 @@ test "AMD IOMMU map unmap and failed drain pin pages" {
     try std.testing.expect(reserveIova(device, IovaAddress.fromInt(address), 1));
     try std.testing.expect(mapPages(device, IovaAddress.fromInt(address), &.{page}, true, false));
     try std.testing.expectEqual(page, pageAddress(walk(domainAt(0), address, false).?.table[0]));
+    const coherent: u64 = @as(u64, 1) << 60;
+    try std.testing.expectEqual(page | present_bit | read_bit | coherent, walk(domainAt(0), address, false).?.table[0]);
+    var table_paddr = domainAt(0).root_paddr;
+    inline for (.{ 39, 30, 21 }) |shift| {
+        const entry = pageAt(table_paddr)[@as(usize, @intCast((address >> shift) & 511))];
+        try std.testing.expectEqual(@as(u64, 0), entry & coherent);
+        table_paddr = pageAddress(entry);
+    }
     try std.testing.expect(unmapRangeForDevice(device, IovaAddress.fromInt(address), page_size));
     try std.testing.expectEqual(@as(u64, 0), walk(domainAt(0), address, false).?.table[0]);
     try std.testing.expect(mapPages(device, IovaAddress.fromInt(address), &.{page}, true, true));
+    try std.testing.expectEqual(page | present_bit | read_bit | write_bit | coherent, walk(domainAt(0), address, false).?.table[0]);
     const root_entry = &pageAt(domainAt(0).root_paddr)[@as(usize, @intCast((address >> 39) & 511))];
     try setDeviceDmaEnabled(device, false);
     try std.testing.expectEqual(@as(u64, 3), (root_entry.* >> 9) & 7);

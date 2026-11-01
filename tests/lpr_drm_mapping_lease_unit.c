@@ -14,6 +14,12 @@ static uint64_t high_closed;
 lpr_state_t lpr_state;
 static unsigned char wire_page[4096];
 static uint64_t request_id;
+static int cpu_testing, cpu_status, cpu_calls, cpu_bad_fd, cpu_bad_reply;
+static uint64_t cpu_flags, cpu_rights = UINT64_MAX;
+int64_t lpr_sync_file_create_signaled(void) { assert(0); return -1; }
+int lpr_linux_sync_file_fd_active(uint64_t fd) { (void)fd; assert(0); return 0; }
+pacha_fd_t lpr_sync_file_duplicate_wait(uint64_t fd) { (void)fd; assert(0); return -1; }
+
 static atomic_uint unmap_race_stage;
 static int unmap_failure;
 static int64_t map_failure, remap_failure;
@@ -45,8 +51,14 @@ static int64_t fixture_prepare_request(uint64_t nr, uint64_t fd, uint64_t messag
     }
     assert(nr == PACHAOS_SYSCALL_IPC_CALL && fd == LPR_GPUD_DRM_ENDPOINT_FD);
     struct pacha_ipc_msg *msg = (void *)(uintptr_t)message;
-    assert(msg->fd_count == 2 && msg->fds[1].fd == 81);
+    assert(cpu_testing ? msg->fd_count == 1 : (msg->fd_count == 2 && msg->fds[1].fd == 81));
     request_id = msg->word3;
+    if (cpu_testing) {
+        const pacha_service_envelope_t *h = (void *)wire_page;
+        const gpud_drm_prime_cpu_sync_request_t *r = lpr_gpud_drm_payload(wire_page);
+        assert(h->op == GPUD_DRM_OP_PRIME_CPU_SYNC && h->payload_size == sizeof(*r));
+        assert(r->token == 123 && r->flags == cpu_flags); ++cpu_calls;
+    }
     return 92;
 }
 static lpr_dmabuf_backend_t dmabuf = {
@@ -57,6 +69,12 @@ lpr_dmabuf_backend_t *lpr_dmabuf_backend(uint64_t fd)
 int lpr_native_fd_info(uint64_t fd, struct pacha_fd_info *info)
 {
     assert(fd == 90 || fd == 81);
+    if (cpu_testing) {
+        if (cpu_bad_fd) return 0;
+        *info = (struct pacha_fd_info){.kind=fd==90?PACHA_FD_KIND_VMO:PACHA_FD_KIND_CHANNEL,
+            .size=fd==90?4096:0,.rights=fd==90?cpu_rights:GPUD_DRM_PRIME_OWNER_RIGHTS};
+        return 1;
+    }
     *info = (struct pacha_fd_info){
         .kind = fd == 90 ? PACHA_FD_KIND_VMO : PACHA_FD_KIND_CHANNEL,
         .rights = PACHA_FD_RIGHT_DUP | PACHA_FD_RIGHT_CLOSE |
@@ -72,7 +90,7 @@ static int64_t fixture_finish_request(uint64_t nr, uint64_t fd, uint64_t min,
         msg->word0 = PACHA_SERVICE_REPLY_MAGIC;
         msg->word3 = request_id;
         ((pacha_service_envelope_t *)wire_page)->magic = PACHA_SERVICE_REPLY_MAGIC;
-        ((pacha_service_envelope_t *)wire_page)->status = 0;
+        ((pacha_service_envelope_t *)wire_page)->status = cpu_testing ? cpu_status : 0;
         return 0;
     }
     assert(nr == PACHA_FD_SYSCALL_DUP && fd == 90 && min == 16);
@@ -175,8 +193,58 @@ static void check_native_replacements(void)
     assert(closes == before + 3);
 }
 
+static void cpu_sync_case(void) {
+    cpu_testing=1; dmabuf.token=123; dmabuf.lease_fd.raw=81;
+    uint64_t flags=1;
+    assert(lpr_dmabuf_ioctl(4,0x40086200,0)==-LPR_LINUX_EFAULT);
+    const uint64_t valid[]={1,2,3,5,6,7};
+    for(unsigned i=0;i<6;++i) {
+        flags=cpu_flags=valid[i];
+        assert(!lpr_dmabuf_ioctl(4,0x40086200,(uintptr_t)&flags));
+    }
+    assert(cpu_calls==6);
+    const uint64_t invalid[]={0,4,8,UINT64_C(1)<<32|1,UINT64_MAX};
+    for(unsigned i=0;i<5;++i) {
+        flags=invalid[i];
+        assert(lpr_dmabuf_ioctl(4,0x40086200,(uintptr_t)&flags)==-LPR_LINUX_EINVAL);
+    }
+    flags=1; dmabuf.token=0;
+    assert(lpr_dmabuf_ioctl(4,0x40086200,(uintptr_t)&flags)==-LPR_LINUX_EOPNOTSUPP);
+    dmabuf.token=123; dmabuf.writable=0; flags=2;
+    assert(lpr_dmabuf_ioctl(4,0x40086200,(uintptr_t)&flags)==-LPR_LINUX_EACCES);
+    dmabuf.writable=1; cpu_bad_fd=1;
+    assert(lpr_dmabuf_ioctl(4,0x40086200,(uintptr_t)&flags)==-LPR_LINUX_EBADF);
+    cpu_bad_fd=0; cpu_rights=PACHA_FD_RIGHT_MAP_READ;
+    assert(lpr_dmabuf_ioctl(4,0x40086200,(uintptr_t)&flags)==-LPR_LINUX_EACCES);
+    cpu_rights=UINT64_MAX; assert(cpu_calls==6);
+    const int errors[]={-LPR_LINUX_EINTR,-LPR_LINUX_EAGAIN,-LPR_LINUX_EIO};
+    for(unsigned i=0;i<3;++i) {
+        cpu_status=errors[i]; flags=cpu_flags=7;
+        assert(lpr_dmabuf_ioctl(4,0x40086200,(uintptr_t)&flags)==errors[i]);
+    }
+    cpu_bad_reply=1; cpu_status=0;
+    assert(lpr_dmabuf_ioctl(4,0x40086200,(uintptr_t)&flags)==-LPR_DRM_ERR_PROTOCOL);
+    cpu_bad_reply=0;
+    lpr_dma_buf_sync_file_t exported={.flags=3,.fd=-1};
+    assert(lpr_dmabuf_ioctl(4,LPR_LINUX_DMA_BUF_IOCTL_EXPORT_SYNC_FILE,(uintptr_t)&exported)==-LPR_LINUX_EOPNOTSUPP);
+    assert(exported.fd==-1); /* No completed fence may be fabricated. */
+    cpu_testing=cpu_status=0; dmabuf.token=0; dmabuf.lease_fd.raw=-1;
+    puts("LPR DMA_BUF_IOCTL_SYNC: flags64, rights, token0 refusal, IPC and errno PASS");
+}
+
 int main(void)
 {
+    struct pacha_fd_info mapping_lease = {.kind = PACHA_FD_KIND_CHANNEL,
+        .rights = PACHA_FD_RIGHT_CLOSE,
+        .flags = PACHA_FD_FLAG_CLOEXEC | PACHA_FD_FLAG_INHERIT};
+    assert(lpr_drm_mapping_lease_info_valid(&mapping_lease));
+    mapping_lease.rights = GPUD_DRM_PRIME_OWNER_RIGHTS;
+    assert(!lpr_drm_mapping_lease_info_valid(&mapping_lease));
+    mapping_lease.rights = PACHA_FD_RIGHT_CLOSE;
+    mapping_lease.flags &= ~PACHA_FD_FLAG_INHERIT;
+    assert(!lpr_drm_mapping_lease_info_valid(&mapping_lease));
+    assert(!lpr_drm_mapping_lease_info_valid(NULL));
+    cpu_sync_case();
     pacha_fd_t high_local, high_remote;
     pair_base = 0x80000000ull;
     assert(!lpr_native_wait_pair(&high_local, &high_remote));
@@ -259,6 +327,19 @@ int64_t lpr_ipc_message(uint64_t nr, uint64_t endpoint,
 {
     if (nr != PACHA_IPC_SYSCALL_CALL) return test_lpr_ipc_noncall(nr, endpoint, request, reply, timeout, flags, sent);
 
+    if (cpu_testing) {
+        assert(endpoint==81 && timeout==UINT64_MAX && flags==PACHA_WAIT_UNINTERRUPTIBLE);
+        const struct pacha_ipc_msg *call=(void *)(uintptr_t)request;
+        struct pacha_ipc_msg *response=(void *)(uintptr_t)reply;
+        assert(call->word0==GPUD_DRM_PRIME_CPU_SYNC_REQUEST_MAGIC && call->word1==123 &&
+            call->word2==cpu_flags && !call->word3 && !call->fd_count);
+        ++cpu_calls; *sent=1;
+        response->word0=GPUD_DRM_PRIME_CPU_SYNC_REPLY_MAGIC;
+        response->word1=(uint64_t)(int64_t)cpu_status;
+        response->word2=cpu_bad_reply?124:123;
+        response->word3=cpu_flags;
+        return 0;
+    }
     assert(nr == PACHAOS_SYSCALL_IPC_CALL && request && reply);
     assert(timeout == UINT64_MAX && flags == PACHA_WAIT_UNINTERRUPTIBLE);
     *sent = 0;

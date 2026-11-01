@@ -19,6 +19,50 @@ pub const MemoryType = enum(u8) {
     wb = 6,
 };
 
+pub const CacheVendor = enum { unknown, intel, amd };
+
+fn cacheVendorFromCpuid(ebx: u32, ecx: u32, edx: u32) CacheVendor {
+    if (ebx == 0x756e_6547 and edx == 0x4965_6e69 and ecx == 0x6c65_746e)
+        return .intel; // GenuineIntel
+    if (ebx == 0x6874_7541 and edx == 0x6974_6e65 and ecx == 0x444d_4163)
+        return .amd; // AuthenticAMD
+    return .unknown;
+}
+
+fn cacheControlFromCr0(value: u64) u2 {
+    return @truncate(value >> 29); // CR0.NW (29), CR0.CD (30).
+}
+
+test "MMIO WC snapshot identifies only complete architectural vendor strings" {
+    try std.testing.expectEqual(CacheVendor.intel, cacheVendorFromCpuid(0x756e_6547, 0x6c65_746e, 0x4965_6e69));
+    try std.testing.expectEqual(CacheVendor.amd, cacheVendorFromCpuid(0x6874_7541, 0x444d_4163, 0x6974_6e65));
+    try std.testing.expectEqual(CacheVendor.unknown, cacheVendorFromCpuid(0, 0, 0));
+    try std.testing.expectEqual(CacheVendor.unknown, cacheVendorFromCpuid(0x756e_6547, 0x444d_4163, 0x4965_6e69));
+    try std.testing.expectEqual(CacheVendor.unknown, cacheVendorFromCpuid(0x756e_6547, 0x6c65_746f, 0x4965_6e69));
+}
+
+test "MMIO WC snapshot rejects disabled or no write through cache modes" {
+    const base = CacheSnapshot{
+        .pat = 6 | (@as(u64, 7) << 16),
+        .default_type = mtrr_enabled,
+        .physical_bits = 39,
+        .vendor = .intel,
+    };
+    try std.testing.expect(base.valid());
+    try std.testing.expectEqual(@as(u2, 0), cacheControlFromCr0((1 << 31) | (1 << 16)));
+    for ([_]u64{ 1 << 29, 1 << 30, (1 << 29) | (1 << 30) }, 1..) |cr0, mode| {
+        var invalid = base;
+        invalid.cache_control = cacheControlFromCr0(cr0);
+        try std.testing.expectEqual(@as(u2, @intCast(mode)), invalid.cache_control);
+        try std.testing.expect(!invalid.valid());
+        try std.testing.expect(!base.matches(&invalid));
+    }
+    var invalid = base;
+    invalid.amd_syscfg = amd_tom2_enable | amd_tom2_force_wb;
+    invalid.amd_top_mem2 = 0x8_0000_0000;
+    try std.testing.expect(!invalid.valid());
+}
+
 /// Immutable boot-time proof for UC_MINUS BAR mappings. Fixed MTRRs are not
 /// needed: admission excludes every address below 1 MiB. No MSR is written.
 pub const CacheSnapshot = struct {
@@ -27,13 +71,14 @@ pub const CacheSnapshot = struct {
     capability: u64 = 0,
     default_type: u64 = 0,
     physical_bits: u8 = 0,
-    amd_pat_mtrr_semantics: bool = false,
+    vendor: CacheVendor = .unknown,
+    cache_control: u2 = 0,
     amd_syscfg: u64 = 0,
     amd_top_mem2: u64 = 0,
     ranges: [256]Range = [_]Range{.{}} ** 256,
 
     fn tom2DefaultWb(self: *const CacheSnapshot) bool {
-        return self.amd_pat_mtrr_semantics and
+        return self.vendor == .amd and
             self.default_type & mtrr_enabled != 0 and
             self.amd_syscfg & (amd_tom2_enable | amd_tom2_force_wb) ==
                 (amd_tom2_enable | amd_tom2_force_wb) and
@@ -55,13 +100,15 @@ pub const CacheSnapshot = struct {
     }
 
     pub fn valid(self: *const CacheSnapshot) bool {
-        if (self.physical_bits < 32 or self.physical_bits > 52 or
+        // Effective PAT/MTRR tables require normal caching (CD=NW=0).
+        // Capture observes this on each CPU; it never changes CR0 to obtain it.
+        if (self.cache_control != 0 or self.physical_bits < 32 or self.physical_bits > 52 or
             (self.pat & 0xff) != 6 or ((self.pat >> 16) & 0xff) != 7 or
             ((self.pat >> 24) & 0xff) != 0 or
             self.default_type & mtrr_enabled == 0 or self.default_type & ~@as(u64, 0xcff) != 0 or
             !validType(@truncate(self.default_type), self.capability)) return false;
         if (self.default_type & (1 << 10) != 0 and self.capability & (1 << 8) == 0) return false;
-        if (self.amd_syscfg != 0 and !self.amd_pat_mtrr_semantics) return false;
+        if (self.amd_syscfg != 0 and self.vendor != .amd) return false;
         if (self.amd_syscfg & (amd_tom2_enable | amd_tom2_force_wb) ==
             (amd_tom2_enable | amd_tom2_force_wb))
         {
@@ -88,7 +135,7 @@ pub const CacheSnapshot = struct {
         if (!self.valid() or !other.valid() or
             self.capability != other.capability or self.default_type != other.default_type or
             self.physical_bits != other.physical_bits or
-            self.amd_pat_mtrr_semantics != other.amd_pat_mtrr_semantics or
+            self.vendor != other.vendor or
             (self.amd_syscfg & (amd_tom2_enable | amd_tom2_force_wb)) !=
                 (other.amd_syscfg & (amd_tom2_enable | amd_tom2_force_wb)) or
             self.amd_top_mem2 != other.amd_top_mem2) return false;
@@ -244,7 +291,7 @@ test "MMIO WC snapshot AMD TOM2 WB default applies only to unmatched pages insid
         .capability = 1,
         .default_type = mtrr_enabled, // Firmware's ordinary default is UC.
         .physical_bits = 46,
-        .amd_pat_mtrr_semantics = true,
+        .vendor = .amd,
         .amd_syscfg = amd_tom2_enable | amd_tom2_force_wb,
         .amd_top_mem2 = 0x8_0000_0000,
     };
@@ -278,7 +325,7 @@ test "MMIO WC snapshot AMD TOM2 WB default applies only to unmatched pages insid
     other.default_type &= ~mtrr_enabled;
     try std.testing.expect(!other.valid());
     other = snapshot;
-    other.amd_pat_mtrr_semantics = false;
+    other.vendor = .unknown;
     try std.testing.expect(!other.valid());
     other = snapshot;
     other.amd_top_mem2 = 0x1_0000_0000;
@@ -293,9 +340,10 @@ test "MMIO WC snapshot AMD TOM2 WB default applies only to unmatched pages insid
 
 pub fn captureCacheSnapshot(out: *CacheSnapshot) bool {
     out.* = .{};
+    out.cache_control = cacheControlFromCr0(readCr0());
+    if (out.cache_control != 0) return false;
     const vendor = cpuid(0);
-    out.amd_pat_mtrr_semantics = vendor.ebx == 0x6874_7541 and
-        vendor.edx == 0x6974_6e65 and vendor.ecx == 0x444d_4163; // AuthenticAMD
+    out.vendor = cacheVendorFromCpuid(vendor.ebx, vendor.ecx, vendor.edx);
     const features = cpuid(1).edx;
     if (features & (1 << 12) == 0 or features & (1 << 16) == 0) return false;
     out.physical_bits = reportedPhysicalAddressBits();
@@ -308,7 +356,7 @@ pub fn captureCacheSnapshot(out: *CacheSnapshot) bool {
     const leaf1 = cpuid(1);
     const family: u32 = ((leaf1.eax >> 8) & 0xf) +
         (if (((leaf1.eax >> 8) & 0xf) == 0xf) (leaf1.eax >> 20) & 0xff else 0);
-    if (out.amd_pat_mtrr_semantics and family >= 0xf and
+    if (out.vendor == .amd and family >= 0xf and
         leaf1.ecx & (@as(u32, 1) << 31) == 0)
     {
         out.amd_syscfg = rdmsr(amd_syscfg_msr);
@@ -335,6 +383,7 @@ fn patWithWcSlot4(value: u64) u64 {
 /// online set. No live translation changes type; firmware/bootloader tables
 /// are no longer active. Linux similarly initializes PAT for ioremap_wc.
 pub fn ensureWcPatSlot4() bool {
+    if (cacheControlFromCr0(readCr0()) != 0) return false;
     if ((cpuid(1).edx & (1 << 16)) == 0) return false;
     const current = rdmsr(0x277);
     if ((current & 0xff) != 6 or ((current >> 16) & 0xff) != 7 or
@@ -385,6 +434,12 @@ fn rdmsr(msr: u32) u64 {
         : [msr] "{ecx}" (msr),
     );
     return (@as(u64, high) << 32) | low;
+}
+
+fn readCr0() u64 {
+    return asm volatile ("mov %%cr0, %[value]"
+        : [value] "=r" (-> u64),
+    );
 }
 
 fn reportedPhysicalAddressBits() u8 {

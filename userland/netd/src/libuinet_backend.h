@@ -26,6 +26,7 @@ int netd_libuinet_collect_runtime_wait_sources(
 enum netd_libuinet_state netd_libuinet_state(void);
 uint64_t netd_libuinet_rx_frames(void);
 uint64_t netd_libuinet_rx_drops(void);
+int netd_libuinet_format_rx_stats(char *text, size_t capacity);
 
 int netd_libuinet_socket_open(
     uint64_t domain,
@@ -53,3 +54,13 @@ int netd_libuinet_socket_collect_wait_sources(struct pacha_service_wait_set *wai
 void netd_libuinet_socket_reap_hangups(
     const struct pacha_service_wait_set *wait_set);
 int netd_filed_close_handle(uint64_t handle);
+
+int netd_libuinet_perf_buffers(int large, char *reply, size_t capacity);
+
+/* Event-loop snapshot: only the primary attached link and applied IPv4. */
+struct netd_interface_snapshot {
+    uint32_t mtu;
+    uint8_t mac[6], carrier, admin_up, has_address;
+    uint8_t address[4], netmask[4], broadcast[4];
+};
+int netd_libuinet_interface_snapshot(struct netd_interface_snapshot *out);

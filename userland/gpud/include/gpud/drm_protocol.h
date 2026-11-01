@@ -6,6 +6,7 @@
 #include "gpud/drm_kms_abi.h"
 #include "gpud/drm_virtgpu_abi.h"
 #include "gpud/drm_amdgpu_abi.h"
+#include "gpud/drm_i915_abi.h"
 
 enum {
     GPUD_DRM_SERVICE_ID = PACHA_SERVICE_ID_GPUD_DRM,
@@ -20,9 +21,10 @@ enum {
     GPUD_DRM_OP_HANDLE_POLL = 7u,
     GPUD_DRM_OP_PRIME_EXPORT = 8u,
     GPUD_DRM_OP_PRIME_IMPORT = 9u,
-    GPUD_DRM_OP_PRIME_IMPORT_SYNC_FILE = 10u,
-    GPUD_DRM_OP_PRIME_RELEASE = 11u,
-    GPUD_DRM_OP_PRIME_ACQUIRE = 12u,
+    GPUD_DRM_OP_PRIME_CPU_SYNC = 10u,
+    GPUD_DRM_OP_PRIME_IMPORT_SYNC_FILE = 11u,
+    GPUD_DRM_OP_PRIME_RELEASE = 12u,
+    GPUD_DRM_OP_PRIME_ACQUIRE = 13u,
 
     GPUD_DRM_PAGE_BYTES = PACHA_SERVICE_PAGE_BYTES,
     GPUD_DRM_IOCTL_DATA_BYTES = 3072u,
@@ -111,7 +113,8 @@ typedef struct gpud_drm_read_request {
 
 /* Successful PRIME_EXPORT replies carry [VMO view, owner lease channel].
  * Both are mandatory: lease hangup recovers exports even after a client fault.
- * The lease is close-only, CLOEXEC and INHERIT (fork retains ownership).
+ * The lease also carries CALL authority for this object's CPU SYNC, plus
+ * DUP/TRANSFER/SET_FLAGS for SCM_RIGHTS; CLOEXEC and INHERIT preserve lifetime.
  * LPR and gpud must be deployed together; one-FD replies are not supported. */
 typedef struct gpud_drm_prime_export_request {
     uint64_t handle;
@@ -126,6 +129,28 @@ typedef struct gpud_drm_prime_import_request {
     uint32_t flags;
     uint32_t reserved0;
 } gpud_drm_prime_import_request_t;
+
+/* Linux DMA_BUF_IOCTL_SYNC: flags are the full 64-bit UAPI value. Token
+ * authority is scoped to the live PRIME export in this service generation.
+ * This operation has no DRM-file handle: dma-bufs outlive their exporter. */
+/* CPU sync is called only on the exported object's owner-lease endpoint.
+ * The public DRM endpoint cannot authorize a caller from a numeric token.
+ * Request words: magic/token/flags/0. Reply: magic/errno/token/flags.
+ * Kernel reply authority correlates simultaneous calls on a shared endpoint. */
+#define GPUD_DRM_PRIME_CPU_SYNC_REQUEST_MAGIC UINT64_C(0x4353514d52444850)
+#define GPUD_DRM_PRIME_CPU_SYNC_REPLY_MAGIC UINT64_C(0x4353504d52444850)
+#define GPUD_DRM_PRIME_OWNER_RIGHTS (PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_CALL | \
+    PACHA_FD_RIGHT_DUP | PACHA_FD_RIGHT_TRANSFER | PACHA_FD_RIGHT_SET_FLAGS)
+
+typedef struct gpud_drm_prime_cpu_sync_request {
+    uint64_t token;
+    uint64_t flags;
+} gpud_drm_prime_cpu_sync_request_t;
+
+static inline int gpud_drm_cpu_sync_flags_valid(uint64_t flags)
+{
+    return (flags & UINT64_C(3)) && !(flags & ~UINT64_C(7));
+}
 
 typedef struct gpud_drm_prime_token_request {
     uint64_t token;

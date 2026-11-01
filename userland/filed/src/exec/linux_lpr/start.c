@@ -92,7 +92,8 @@ static int lpr_exec_start_plan_impl(lpr_exec_plan_t *plan, const filed_exec_path
         PACHA_FD_RIGHT_MAP_WRITE;
     uint64_t stage_start = lpr_exec_now_ns();
     uint64_t stage_start_cycles = lpr_exec_now_cycles();
-    const pacha_fd_t stack_fd = pacha_vmo_create(initial_bytes, stack_rights, 0);
+    const pacha_fd_t stack_fd = pacha_vmo_create(LPR_EXEC_LINUX_STACK_SIZE, stack_rights,
+        PACHA_VMO_CREATE_ZERO_ON_DEMAND);
     lpr_exec_metric("start_stack_vmo", stage_start, lpr_exec_now_ns());
     lpr_exec_metric_cycles("start_stack_vmo", stage_start_cycles, lpr_exec_now_cycles());
     if (stack_fd < 16) {
@@ -105,7 +106,7 @@ static int lpr_exec_start_plan_impl(lpr_exec_plan_t *plan, const filed_exec_path
         initial_bytes,
         PACHA_PROT_READ | PACHA_PROT_WRITE,
         PACHA_MMAP_SHARED,
-        0);
+        LPR_EXEC_LINUX_STACK_SIZE - initial_bytes);
     lpr_exec_metric("start_stack_mmap", stage_start, lpr_exec_now_ns());
     lpr_exec_metric_cycles("start_stack_mmap", stage_start_cycles, lpr_exec_now_cycles());
     if (stack == NULL) {
@@ -114,10 +115,10 @@ static int lpr_exec_start_plan_impl(lpr_exec_plan_t *plan, const filed_exec_path
     }
     stage_start = lpr_exec_now_ns();
     stage_start_cycles = lpr_exec_now_cycles();
-    /* Keep the Linux stack limit at 8 MiB, but only back its initial
-     * argv/env/auxv slice. Batch installation reserves both adjacent pieces
-     * atomically; collisions leave no partial mapping behind. Address choice
-     * is loader policy, while the kernel enforces mapping authority/ranges. */
+    /* One lazy VMO keeps the entire Linux stack one VMA. Splitting the
+     * initialized slice into a separate mapping makes pthread_getattr_np
+     * mistake that boundary for the end of the main stack. Only argv/env/
+     * auxv pages are populated here; the rest remains zero-on-demand. */
     uint64_t stack_base = 0;
     int stack_map_status = -22;
     for (unsigned attempt = 0; attempt < 16; ++attempt) {
@@ -131,25 +132,15 @@ static int lpr_exec_start_plan_impl(lpr_exec_plan_t *plan, const filed_exec_path
         const uint64_t lazy_bytes =
             LPR_EXEC_LINUX_STACK_SIZE - initial_bytes;
         stack_base = reservation_base + lazy_bytes;
-        const struct pacha_process_map_batch_entry maps[2] = {
-            {
-                .vmo_fd = 0,
-                .target_va = reservation_base,
-                .size = lazy_bytes,
-                .prot = PACHA_PROT_READ | PACHA_PROT_WRITE,
-                .vmo_offset = 0,
-                .flags = PACHA_PROCESS_MAP_PRIVATE | PACHA_PROCESS_MAP_ANONYMOUS,
-            },
-            {
-                .vmo_fd = (uint64_t)(uint32_t)stack_fd,
-                .target_va = stack_base,
-                .size = initial_bytes,
-                .prot = PACHA_PROT_READ | PACHA_PROT_WRITE,
-                .vmo_offset = 0,
-                .flags = PACHA_PROCESS_MAP_PRIVATE,
-            },
+        const struct pacha_process_map_batch_entry mapping = {
+            .vmo_fd = (uint64_t)(uint32_t)stack_fd,
+            .target_va = reservation_base,
+            .size = LPR_EXEC_LINUX_STACK_SIZE,
+            .prot = PACHA_PROT_READ | PACHA_PROT_WRITE,
+            .vmo_offset = 0,
+            .flags = PACHA_PROCESS_MAP_PRIVATE,
         };
-        stack_map_status = pacha_process_map_batch(plan->process_fd, maps, 2);
+        stack_map_status = pacha_process_map_batch(plan->process_fd, &mapping, 1);
         if (stack_map_status != -22) break;
     }
     lpr_exec_metric("start_stack_map_child", stage_start, lpr_exec_now_ns());

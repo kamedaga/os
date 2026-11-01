@@ -10,6 +10,7 @@ struct netd_kobox2_frame_client {
     struct ph_net_frame_shared *shared;
     uint64_t generation, next_correlation;
     pacha_fd_t vmo_fd;
+    pacha_fd_t rx_wake_fd;
 };
 
 int netd_kobox2_frame_open(struct netd_kobox2_frame_client *client,

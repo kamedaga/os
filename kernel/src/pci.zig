@@ -118,6 +118,176 @@ pub fn bootFunctionCount() usize {
     return device_apertures.len;
 }
 
+// Legacy VGA ports are global aliases, not an endpoint BAR. The initial
+// contract admits only a single root-bus VGA with no bridge forwarding or
+// competing I/O aperture. K pins ownership and config_lock pins the decode
+// evidence through the byte operation; no routing/configuration is changed.
+fn legacyVgaIoTransaction(entries: []const DeviceApertures, resource: u64,
+    port: u64, width: u64, writing: bool, value: u64, io: anytype) ?u8
+{
+    if (width != 1 or (writing and value > 255)) return null;
+    if (writing) {
+        if (port != 0x3c2 and port != 0x3c4 and port != 0x3c5) return null;
+    } else if (port != 0x3c5 and port != 0x3cc) return null;
+    var target: ?DeviceApertures = null;
+    var vga_count: usize = 0;
+    for (entries) |entry| {
+        const loc = locationFromResourceId(entry.resource_id) orelse return null;
+        if (io.readConfig(loc, 0, 4) != entry.vendor_device or
+            io.readConfig(loc, 8, 4) >> 8 != entry.class_code) return null;
+        const kind = entry.class_code >> 8;
+        if (kind == 0x0300 or kind == 0x0001) vga_count += 1;
+        if (entry.resource_id == resource) target = entry;
+        if (kind == 0x0604 and io.readConfig(loc, 0x3e, 2) & 8 != 0) return null;
+        // Bridge capture deliberately performs no BAR sizing writes. Read
+        // actual BAR encodings too: an unrecorded I/O aperture has no proven
+        // extent, so it cannot be assumed disjoint from these global ports.
+        const header = io.readConfig(loc, 0x0e, 1) & 0x7f;
+        const bar_count: usize = switch (header) { 0 => 6, 1 => 2, else => return null };
+        var index: usize = 0;
+        while (index < bar_count) : (index += 1) {
+            const raw = io.readConfig(loc, @as(u32, @intCast(0x10 + index * 4)), 4);
+            if (raw & 1 == 0) {
+                if (entry.bars[index]) |bar| if (bar.info.flags & bar_flag_io != 0) return null;
+                if (raw & 6 == 4) {
+                    // The upper address DWORD may have bit zero set; it is
+                    // not an independent I/O BAR or an authority to ports.
+                    if (index + 1 >= bar_count) return null;
+                    index += 1;
+                } else if (raw & 6 == 6) return null;
+                continue;
+            }
+            const aperture = entry.bars[index] orelse return null;
+            if (aperture.info.flags & bar_flag_io == 0) return null;
+            // A reassigned I/O BAR invalidates the boot-time conflict proof.
+            if (raw != aperture.low) return null;
+            const end = aperture.info.end() orelse return null;
+            if (aperture.info.start <= port and port <= end) return null;
+        }
+    }
+    const owner = target orelse return null;
+    const loc = locationFromResourceId(owner.resource_id) orelse return null;
+    if (vga_count != 1 or !owner.claimed or owner.class_code != 0x030000 or loc.bus != 0 or
+        io.readConfig(loc, 0x0e, 1) & 0x7f != 0 or io.readConfig(loc, 4, 2) & 1 == 0) return null;
+    if (writing) {
+        io.writeByte(@intCast(port), @intCast(value));
+        return 0;
+    }
+    return io.readByte(@intCast(port));
+}
+
+const NativeLegacyVgaIo = struct {
+    fn readConfig(_: @This(), loc: Location, offset: u32, width: u32) u32 {
+        return readLegacyConfig(NativeConfigIo{}, loc, @intCast(offset), width);
+    }
+    fn readByte(_: @This(), port: u16) u8 { return inb(port); }
+    fn writeByte(_: @This(), port: u16, value: u8) void { outb(port, value); }
+};
+
+pub fn legacyVgaIo(resource: u64, port: u64, width: u64, writing: bool, value: u64) ?u8 {
+    // The syscall holds K first, matching the existing K -> config lock order.
+    const flags = lockConfig();
+    defer unlockConfig(flags);
+    return legacyVgaIoTransaction(device_apertures, resource, port, width, writing, value, NativeLegacyVgaIo{});
+}
+
+test "PCI legacy VGA byte IO proves ownership identity decode and global conflicts before access" {
+    const Mock = struct {
+        entries: []const DeviceApertures,
+        command: u32 = 1,
+        header: u32 = 0,
+        forwarding: u32 = 0,
+        identity_bad: bool = false,
+        class_bad: bool = false,
+        bar_bad: bool = false,
+        unrecorded_bridge_io: bool = false,
+        accesses: usize = 0,
+        fn readConfig(self: *@This(), loc: Location, offset: u32, _: u32) u32 {
+            for (self.entries) |entry| {
+                if (entry.resource_id != resourceIdFromLocation(loc)) continue;
+                return switch (offset) {
+                    0 => entry.vendor_device ^ @as(u32, @intFromBool(self.identity_bad)),
+                    8 => (entry.class_code ^ @as(u32, @intFromBool(self.class_bad))) << 8,
+                    4 => self.command,
+                    0x0e => if (entry.class_code >> 8 == 0x0604) 1 else self.header,
+                    0x3e => self.forwarding,
+                    else => blk: {
+                        if (offset < 0x10 or offset >= 0x28) break :blk 0;
+                        if (offset == 0x10 and entry.class_code >> 8 == 0x0604 and self.unrecorded_bridge_io)
+                            break :blk 0x3c1;
+                        const index = (offset - 0x10) / 4;
+                        if (entry.bars[index]) |bar| break :blk bar.low ^ @as(u32, @intFromBool(self.bar_bad));
+                        if (index > 0) if (entry.bars[index - 1]) |bar|
+                            if (bar.low & 7 == 4) break :blk bar.high;
+                        break :blk 0;
+                    },
+                };
+            }
+            return 0xffffffff;
+        }
+        fn readByte(self: *@This(), _: u16) u8 { self.accesses += 1; return 0xa5; }
+        fn writeByte(self: *@This(), _: u16, _: u8) void { self.accesses += 1; }
+    };
+    const resource = resourceIdFromLocation(.{ .bus = 0, .device = 2, .function = 0 });
+    const base = DeviceApertures{ .resource_id = resource, .vendor_device = 0x9a498086,
+        .class_code = 0x030000, .claimed = true };
+    var entries = [_]DeviceApertures{base};
+    var io = Mock{ .entries = &entries };
+    for ([_]u64{ 0x3c5, 0x3cc }) |port|
+        try std.testing.expectEqual(@as(?u8, 0xa5), legacyVgaIoTransaction(&entries, resource, port, 1, false, 0, &io));
+    for ([_]u64{ 0x3c2, 0x3c4, 0x3c5 }) |port|
+        try std.testing.expectEqual(@as(?u8, 0), legacyVgaIoTransaction(&entries, resource, port, 1, true, 255, &io));
+    io.accesses = 0;
+    for ([_]u64{ 0x60, 0x3bc, 0x3bf, 0x3c2, 0x3c4, 0x103cc }) |port|
+        try std.testing.expectEqual(@as(?u8, null), legacyVgaIoTransaction(&entries, resource, port, 1, false, 0, &io));
+    try std.testing.expectEqual(@as(?u8, null), legacyVgaIoTransaction(&entries, resource, 0x3cc, 1, true, 0, &io));
+    try std.testing.expectEqual(@as(?u8, null), legacyVgaIoTransaction(&entries, resource, 0x3c4, 1, true, 256, &io));
+    try std.testing.expectEqual(@as(?u8, null), legacyVgaIoTransaction(&entries, resource, 0x3cc, 2, false, 0, &io));
+    for (0..7) |scenario| {
+        entries[0] = base;
+        io = .{ .entries = &entries };
+        switch (scenario) {
+            0 => entries[0].claimed = false,
+            1 => entries[0].resource_id = resourceIdFromLocation(.{ .bus = 1, .device = 2, .function = 0 }),
+            2 => entries[0].class_code = 0x030200,
+            3 => io.command = 0,
+            4 => io.header = 1,
+            5 => io.identity_bad = true,
+            6 => io.class_bad = true,
+            else => unreachable,
+        }
+        try std.testing.expectEqual(@as(?u8, null), legacyVgaIoTransaction(&entries, entries[0].resource_id, 0x3cc, 1, false, 0, &io));
+        try std.testing.expectEqual(@as(usize, 0), io.accesses);
+    }
+    entries[0] = base;
+    entries[0].bars[0] = .{ .info = .{ .start = 0x3c0, .size = 16, .flags = bar_flag_io }, .low = 0x3c1, .high = 0 };
+    io = .{ .entries = &entries };
+    try std.testing.expectEqual(@as(?u8, null), legacyVgaIoTransaction(&entries, resource, 0x3cc, 1, false, 0, &io));
+    entries[0].bars[0].?.info.start = 0x3000;
+    entries[0].bars[0].?.low = 0x3001;
+    io.bar_bad = true;
+    try std.testing.expectEqual(@as(?u8, null), legacyVgaIoTransaction(&entries, resource, 0x3cc, 1, false, 0, &io));
+    try std.testing.expectEqual(@as(usize, 0), io.accesses);
+    io.bar_bad = false;
+    try std.testing.expectEqual(@as(?u8, 0xa5), legacyVgaIoTransaction(&entries, resource, 0x3cc, 1, false, 0, &io));
+    var pair = [_]DeviceApertures{ base, base };
+    pair[1].resource_id = resourceIdFromLocation(.{ .bus = 0, .device = 3, .function = 0 });
+    io = .{ .entries = &pair };
+    for ([_]u32{ 0x030000, 0x000100, 0x060400 }) |class_code| {
+        pair[1].class_code = class_code;
+        io.forwarding = 8;
+        try std.testing.expectEqual(@as(?u8, null), legacyVgaIoTransaction(&pair, resource, 0x3cc, 1, false, 0, &io));
+    }
+    try std.testing.expectEqual(@as(usize, 0), io.accesses);
+    io.forwarding = 0;
+    io.unrecorded_bridge_io = true;
+    try std.testing.expectEqual(@as(?u8, null), legacyVgaIoTransaction(&pair, resource, 0x3cc, 1, false, 0, &io));
+    try std.testing.expectEqual(@as(usize, 0), io.accesses);
+    io.unrecorded_bridge_io = false;
+    pair[0].bars[0] = .{ .info = .{ .start = 0x100000000, .size = 4096, .flags = bar_flag_mem | bar_flag_64bit }, .low = 4, .high = 1 };
+    try std.testing.expectEqual(@as(?u8, 0xa5), legacyVgaIoTransaction(&pair, resource, 0x3cc, 1, false, 0, &io));
+}
+
 pub fn bootFunctionClaimed(index: usize) bool {
     return index >= device_apertures.len or device_apertures[index].claimed;
 }
@@ -143,7 +313,7 @@ pub fn bootFunctionAt(index: usize) ?BootFunction {
     };
 }
 
-/// Capture firmware-assigned BARs before user drivers can enable bus mastering.
+/// Capture function identities and endpoint BARs before user drivers can enable bus mastering.
 /// The table is sized by discovery, rather than truncating at the IRQ budget.
 pub fn captureBootFunctions() bool {
     return captureBootFunctionsWith(NativeBootCapture, boot_scratch);
@@ -167,7 +337,7 @@ fn captureBootFunctionsWith(comptime Reader: type, scratch: anytype) bool {
         const functions: usize = if ((Reader.headerType(first) & 0x80) != 0) 8 else 1;
         for (0..functions) |function| {
             const loc = Location{ .bus = @intCast(bus), .device = @intCast(device), .function = @intCast(function) };
-            if (Reader.vendorId(loc) != 0xffff and Reader.classCode(loc) != 0x06) count += 1;
+            if (Reader.vendorId(loc) != 0xffff) count += 1;
         }
     };
     if (count == 0) {
@@ -194,7 +364,7 @@ fn captureBootFunctionsWith(comptime Reader: type, scratch: anytype) bool {
         const functions: usize = if ((Reader.headerType(first) & 0x80) != 0) 8 else 1;
         for (0..functions) |function| {
             const loc = Location{ .bus = @intCast(bus), .device = @intCast(device), .function = @intCast(function) };
-            if (Reader.vendorId(loc) == 0xffff or Reader.classCode(loc) == 0x06) continue;
+            if (Reader.vendorId(loc) == 0xffff) continue;
             if (index >= count or !Reader.capture(draft, resourceIdFromLocation(loc), index)) return false;
             index += 1;
         }
@@ -437,22 +607,42 @@ fn dmaBridgeWindowEnd(start: u64, end: u64, low: u32, base_high: u32, last_high:
 /// The capability grants these firmware-assigned apertures, not later BAR
 /// addresses a client writes. There is no allocator or resource policy here.
 fn captureBarAperturesInto(entries: []DeviceApertures, resource_id: u64, device_index: usize) bool {
+    return captureBarAperturesIntoWith(NativeBarCapture, entries, resource_id, device_index);
+}
+
+const NativeBarCapture = struct {
+    const read32 = readConfigU32;
+    const read16 = readConfigU16;
+    const headerType = readHeaderType;
+    const probe = probeBarInfo;
+};
+
+fn captureBarAperturesIntoWith(comptime Io: type, entries: []DeviceApertures, resource_id: u64, device_index: usize) bool {
     const loc = locationFromResourceId(resource_id) orelse return false;
     if (device_index >= entries.len or entries[device_index].resource_id != 0) return false;
     var captured = DeviceApertures{
         .resource_id = resource_id,
-        .vendor_device = readConfigU32(loc, 0),
-        .subsystem_id = readSubsystemId(loc),
-        .class_code = readConfigU32(loc, 0x08) >> 8,
+        .vendor_device = Io.read32(loc, 0),
+        // 0x2e is a subsystem ID only in the type-0 header. Bridge headers
+        // reuse it for routing fields; do not publish those as identity.
+        .subsystem_id = if ((Io.headerType(loc) & 0x7f) == 0) Io.read16(loc, 0x2e) else 0,
+        .class_code = Io.read32(loc, 0x08) >> 8,
     };
     if (@as(u16, @truncate(captured.vendor_device)) == 0xffff) return false;
+    if (captured.class_code >> 16 == 0x06) {
+        // Bridges describe platform topology. Sizing their BARs would write
+        // routing/configuration registers outside any endpoint ownership.
+        // Publish identity only; CLAIM grants config_read, never control.
+        entries[device_index] = captured;
+        return true;
+    }
     for (&captured.bars, 0..) |*entry, index| {
         const bar_index: u8 = @intCast(index);
-        const info = probeBarInfo(loc, bar_index) orelse continue;
+        const info = Io.probe(loc, bar_index) orelse continue;
         entry.* = .{
             .info = info,
-            .low = readConfigU32(loc, 0x10 + bar_index * 4),
-            .high = if ((info.flags & bar_flag_64bit) != 0) readConfigU32(loc, 0x14 + bar_index * 4) else 0,
+            .low = Io.read32(loc, 0x10 + bar_index * 4),
+            .high = if ((info.flags & bar_flag_64bit) != 0) Io.read32(loc, 0x14 + bar_index * 4) else 0,
         };
     }
     entries[device_index] = captured;
@@ -461,6 +651,60 @@ fn captureBarAperturesInto(entries: []DeviceApertures, resource_id: u64, device_
 
 fn apertureMatches(aperture: BarAperture, low: u32, high: u32) bool {
     return aperture.low == low and ((aperture.info.flags & bar_flag_64bit) == 0 or aperture.high == high);
+}
+
+test "PCI boot bridge catalog captures host ISA and PCI bridges without configuration writes" {
+    const Reader = struct {
+        var probes: [4]usize = @splat(0);
+        const classes = [_]u32{ 0x060000, 0x060100, 0x060400, 0x030000 };
+        fn vendorId(loc: Location) u16 {
+            return if (loc.bus == 0 and loc.device < 4 and loc.function == 0) 0x8086 else 0xffff;
+        }
+        fn headerType(loc: Location) u8 {
+            return if (loc.device == 2) 1 else 0;
+        }
+        fn read32(loc: Location, offset: u8) u32 {
+            return switch (offset) {
+                0 => 0x12348086,
+                8 => classes[loc.device] << 8,
+                else => 0x80000000,
+            };
+        }
+        fn read16(loc: Location, offset: u8) u16 {
+            std.debug.assert(loc.device != 2 and offset == 0x2e);
+            return 0x6140;
+        }
+        fn probe(loc: Location, index: u8) ?BarInfo {
+            // A real BAR probe writes both Command and the BAR itself. The
+            // metadata path must never reach this operation for any bridge.
+            probes[loc.device] += 1;
+            return if (index == 0) .{ .start = 0x80000000, .size = 0x1000, .flags = bar_flag_mem } else null;
+        }
+        fn capture(entries: []DeviceApertures, id: u64, index: usize) bool {
+            return captureBarAperturesIntoWith(@This(), entries, id, index);
+        }
+    };
+    var buffer: [8192]u8 align(4096) = undefined;
+    var owner: boot_scratch.Arena = .{};
+    try owner.install(&buffer);
+    const previous = device_apertures;
+    defer device_apertures = previous;
+    Reader.probes = @splat(0);
+    try std.testing.expect(captureBootFunctionsWith(Reader, &owner));
+    try std.testing.expectEqual(@as(usize, 4), bootFunctionCount());
+    for (0..3) |i| {
+        try std.testing.expectEqual(Reader.classes[i], bootFunctionAt(i).?.class_code);
+        try std.testing.expectEqual(@as(usize, 0), Reader.probes[i]);
+        for (0..6) |bar| {
+            try std.testing.expect(device_apertures[i].bars[bar] == null);
+            try std.testing.expect(authorizedBarInfo(device_apertures[i].resource_id, @intCast(bar)) == null);
+        }
+    }
+    try std.testing.expectEqual(@as(u16, 0), bootFunctionAt(2).?.subsystem_id);
+    try std.testing.expectEqual(@as(u16, 0x6140), bootFunctionAt(0).?.subsystem_id);
+    try std.testing.expectEqual(@as(usize, 6), Reader.probes[3]);
+    try std.testing.expect(device_apertures[3].bars[0] != null);
+    try owner.seal();
 }
 
 /// Live queries do not size-probe or temporarily disable a running device.

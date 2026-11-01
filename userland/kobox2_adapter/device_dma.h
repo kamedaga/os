@@ -35,6 +35,9 @@ struct ph_dma {
     struct kobox_linux_dma_host host;
     struct ph_dma_config config;
     atomic_uint lock;
+#if defined(PH_DMA_LATENCY) && PH_DMA_LATENCY
+    uint64_t latency_live; /* Mapping FDs; protected by this DMA object lock. */
+#endif
     unsigned int admitted;
     unsigned int enabled;
     unsigned int drained;

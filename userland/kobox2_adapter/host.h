@@ -181,6 +181,10 @@ _Noreturn void ph_fail(const char *file, unsigned line, uint64_t result);
 void ph_set_failure_reporter(void (*reporter)(const char *, unsigned, uint64_t));
 void ph_set_exception_reporter(void (*reporter)(const struct pacha_native_fault_frame *));
 void ph_report_exception(const struct pacha_native_fault_frame *frame);
+/* Stop waits for any in-flight port callback before its context is revoked. */
+#include "port_io.h"
+void ph_port_io_start(ph_port_io_fn operation, void *context);
+void ph_port_io_stop(void);
 
 #define PH_CHECK(condition) do { \
     if (!(condition)) { \

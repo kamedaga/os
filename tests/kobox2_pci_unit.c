@@ -22,6 +22,8 @@ static size_t last_length;
 static unsigned long export_refusal_reason, export_refusal_bar;
 static unsigned long export_refusal_first, export_refusal_last;
 static long export_refusal_status;
+static long pio_result;
+static unsigned pio_calls;
 
 void ph_boot_log_gpu_bar_export_failure(unsigned long reason, long status,
     unsigned long bar, unsigned long protection, unsigned long cache,
@@ -37,6 +39,11 @@ void ph_boot_log_gpu_bar_export_failure(unsigned long reason, long status,
 
 long pacha_syscall3(uint64_t number, uint64_t fd, uint64_t output, uint64_t words) {
     ++calls;
+    if (number == PACHA_CAPSULE_SYSCALL_IO_READ) {
+        assert(fd == DEVICE_FD && output == 0x3cc && words == 1);
+        ++pio_calls;
+        return pio_result;
+    }
     assert(number == PACHA_CAPSULE_SYSCALL_QUERY && fd == DEVICE_FD && words == 11);
     *(struct pacha_capsule_info *)(uintptr_t)output = device;
     return query_result;
@@ -46,6 +53,11 @@ long pacha_syscall4(uint64_t number, uint64_t fd, uint64_t offset,
     uint64_t output, uint64_t width) {
     ++calls;
     assert(fd == DEVICE_FD);
+    if (number == PACHA_CAPSULE_SYSCALL_IO_WRITE) {
+        assert(offset == 0x3c2 && output == 1 && width == 0xa5);
+        ++pio_calls;
+        return pio_result;
+    }
     if (number == PACHA_CAPSULE_SYSCALL_PCI_BAR_INFO) {
         assert(offset < 6 && width == 4);
         if (!native_bars[offset].size) return PACHA_SYSCALL_ERR_INVALID;
@@ -275,6 +287,42 @@ int main(void) {
     assert(!host->memory_unmap(&pci, (void *)BASE, 4096));
     assert(!ph_pci_revoke(&pci, 7));
     assert(!ph_pci_destroy(&pci));
+
+    /* Root VGA retains only implicit legacy decode. Optional I/O BARs stay
+     * hidden; the syscall remains the authority for each actual byte. */
+    defaults();
+    config.bus = 0;
+    configuration[1] = 1;
+    configuration[2] = 0x03000000;
+    configuration[4] = 0xf001;
+    configuration[5] = 0;
+    native_bars[0] = (struct pacha_capsule_bar_info){0};
+    assert(!ph_pci_init(&pci, &config) && pci.legacy_vga_io);
+    assert(configuration[1] & 1);
+    assert(!pci.host.config_read(&pci, 0x10, 4, &value) && !value);
+    assert(!pci.host.config_read(&pci, 4, 2, &value) && (value & 1));
+    assert(!pci.host.config_write(&pci, 4, 2, 7) && configuration[1] == 7);
+    pio_result = 0xa5;
+    assert(ph_pci_port_io(&pci, 0x3cc, false, 0) == 0xa5);
+    pio_result = -PACHA_SYSCALL_ERR_NOT_READY;
+    assert(ph_pci_port_io(&pci, 0x3cc, false, 0) == -PACHA_SYSCALL_ERR_NOT_READY);
+    pio_result = 0;
+    assert(!ph_pci_port_io(&pci, 0x3c2, true, 0xa5));
+    pio_result = PACHA_SYSCALL_ERR_NOT_READY;
+    assert(ph_pci_port_io(&pci, 0x3c2, true, 0xa5) < 0);
+    before = pio_calls;
+    assert(!ph_pci_revoke(&pci, 7));
+    assert(ph_pci_port_io(&pci, 0x3cc, false, 0) == -ENODEV);
+    assert(before == pio_calls);
+    assert(!ph_pci_destroy(&pci));
+    defaults();
+    configuration[2] = 0x03000000; // No firmware IO enable: do not invent it.
+    assert(!ph_pci_init(&pci, &config) && !pci.legacy_vga_io);
+    assert(ph_pci_port_io(&pci, 0x3cc, false, 0) == -ENODEV);
+    assert(before == pio_calls);
+    assert(!ph_pci_revoke(&pci, 7));
+    assert(!ph_pci_destroy(&pci));
+    config.bus = 2;
 
     defaults();
     configuration[4] = 0xf001;

@@ -54,6 +54,44 @@ const Fixture = struct {
     }
 };
 
+test "platform PCI bridge claims expose only config reads across dup transfer and close" {
+    var fixture = try Fixture.init();
+    defer fixture.deinit();
+    const state = fixture.state;
+    const p0 = kernel.processPrincipalFromIndex(0).?;
+    const p1 = kernel.processPrincipalFromIndex(1).?;
+    const claimRights = @import("syscall/capsule.zig").bootPciClaimRights;
+    const expected = kernel.FdRights{ .inspect = true, .dup = true, .transfer = true, .set_flags = true, .close = true, .query = true, .config_read = true };
+    const forbidden = [_]kernel.FdRights{
+        .{ .config_write = true },   .{ .derive_mmio = true },
+        .{ .derive_dma = true },     .{ .derive_irq = true },
+        .{ .bus_master = true },     .{ .mmio_map_read = true },
+        .{ .mmio_map_write = true }, .{ .dma_read = true },
+        .{ .dma_write = true },      .{ .irq_ack = true },
+    };
+    for ([_]u32{ 0x060000, 0x060100, 0x060400 }) |class| {
+        const rights = claimRights(class);
+        try std.testing.expectEqual(@as(u64, @bitCast(expected)), @as(u64, @bitCast(rights)));
+        const fd = try state.createDeviceFd(p0, 0x5043490000000100, rights, .{}, 16);
+        try std.testing.expect(state.deviceObjectForFd(p0, fd, .{ .query = true, .config_read = true }) != null);
+        const copy = try state.dupFd(p0, fd, 16, rights, .{});
+        const moved = try state.transferFd(p0, p1, copy, 16, rights, .{}, .move);
+        for (forbidden) |operation| {
+            try std.testing.expect(state.deviceObjectForFd(p0, fd, operation) == null);
+            try std.testing.expect(state.deviceObjectForFd(p1, moved, operation) == null);
+            try std.testing.expectError(kernel.KernelError.InvalidState, state.dupFd(p0, fd, 16, operation, .{}));
+            try std.testing.expectError(kernel.KernelError.InvalidState, state.transferFd(p1, p0, moved, 16, operation, .{}, .copy));
+        }
+        try state.closeFd(p0, fd);
+        try std.testing.expect(state.deviceObjectForFd(p1, moved, .{ .config_read = true }) != null);
+        try state.closeFd(p1, moved);
+    }
+    const endpoint = claimRights(0x030000);
+    try std.testing.expect(endpoint.config_write and endpoint.derive_mmio and
+        endpoint.derive_dma and endpoint.derive_irq and endpoint.bus_master);
+    try std.testing.expectEqual(@as(usize, 0), platform.TestSupport.ioOperations());
+}
+
 test "platform actual FD transfer attenuation typed IRQ event matching and last close" {
     var fixture = try Fixture.init();
     defer fixture.deinit();

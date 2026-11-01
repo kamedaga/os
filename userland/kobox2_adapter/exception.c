@@ -3,6 +3,26 @@
 #include "host.h"
 
 static kobox_linux_exception_fn linux_exception_dispatch;
+static atomic_uint port_io_lock;
+static ph_port_io_fn port_io_operation;
+static void *port_io_context;
+
+void ph_port_io_start(ph_port_io_fn operation, void *context) {
+    ph_lock(&port_io_lock);
+    PH_CHECK(operation && !port_io_operation);
+    port_io_context = context;
+    port_io_operation = operation;
+    ph_unlock(&port_io_lock);
+}
+
+void ph_port_io_stop(void) {
+    /* The same lock pins context through the native syscall; closing this
+     * admission completes only after the last operation has returned. */
+    ph_lock(&port_io_lock);
+    port_io_operation = NULL;
+    port_io_context = NULL;
+    ph_unlock(&port_io_lock);
+}
 
 int ph_exceptions_install(kobox_linux_exception_fn dispatch) {
     PH_CHECK(dispatch != NULL && linux_exception_dispatch == NULL);
@@ -23,6 +43,23 @@ struct ph_fault_record {
     uint64_t vector, error_code, address;
     uint64_t mask;                          /* Notification mask at the fault. */
 };
+
+static bool port_io_fault(struct ph_fault_record *record) {
+    if (record->vector != 13 || record->error_code) return false;
+    ph_lock(&port_io_lock);
+    bool handled = false;
+    if (port_io_operation) {
+        /* A synchronous #GP points at the faulting instruction. Read only
+         * its first byte: decoding must not fault across an executable page
+         * boundary on this exception stack. Prefixes remain unsupported. */
+        const uint8_t opcode = *(const volatile uint8_t *)(uintptr_t)record->frame.rip;
+        handled = ph_scalar_port_io(opcode, record->vector, record->error_code,
+            &record->frame.rax, record->frame.rdx, &record->frame.rip,
+            port_io_operation, port_io_context);
+    }
+    ph_unlock(&port_io_lock);
+    return handled;
+}
 _Static_assert(sizeof(struct pacha_native_signal_frame) == PACHA_PROCESS_SIGNAL_FRAME_SIZE,
     "ordinary frame size");
 _Static_assert(sizeof(struct pacha_native_fault_frame) == PACHA_PROCESS_FAULT_FRAME_SIZE,
@@ -119,6 +156,7 @@ void ph_exception(struct pacha_native_fault_frame *native) {
 /* On the fiber stack, masked, after the native fault was completed. */
 _Noreturn void ph_fault_resume(struct ph_fault_record *record) {
     struct pacha_native_signal_frame *saved = &record->frame;
+    const bool port_handled = port_io_fault(record);
     struct kobox_linux_exception_frame exception = {
         .size = sizeof(exception),
         .ip = saved->rip,
@@ -138,7 +176,7 @@ _Noreturn void ph_fault_resume(struct ph_fault_record *record) {
 
     /* Linux may switch fibers in here; this continues on whichever thread
      * resumes it, which is why the mask came from the record. */
-    if (linux_exception_dispatch(&exception) != KOBOX_EXCEPTION_RESUME) {
+    if (!port_handled && linux_exception_dispatch(&exception) != KOBOX_EXCEPTION_RESUME) {
         struct pacha_native_fault_frame native = {
             .signal = *saved,
             .vector = record->vector,

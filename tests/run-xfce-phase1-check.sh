@@ -205,6 +205,8 @@ grep -Fxq '::respawn:/sbin/pacha-boot-session' "${xfce_root}/etc/inittab"
 grep -Fq '/etc/pacha_boot_profile' "${xfce_root}/sbin/pacha-boot-session"
 grep -Fq 'console-shell' "${xfce_root}/sbin/pacha-boot-session"
 grep -Fq '/bin/bash --noprofile --norc -i' "${xfce_root}/sbin/pacha-boot-session"
+grep -Fq '/usr/bin/xauth -b -f /root/.Xauthority info' \
+  "${xfce_root}/sbin/pacha-boot-session"
 grep -Fq '/usr/bin/startx /root/.xinitrc' "${xfce_root}/sbin/pacha-boot-session"
 
 printf 'XFCE_PHASE1_CHECK=PASS packages=%s root=%s route=init-boot-session-startx-startxfce4\n' \

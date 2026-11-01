@@ -159,7 +159,9 @@ int ph_gpu_query_dispatch(struct ph_gpu_query *query,
     const int mode_map =
         query->plan.command_set_id == KB2_GPU_DRM_MODE_SET_ID &&
         query->plan.command_id == KB2_GPU_DRM_MODE_COMMAND_MAP_DUMB;
-    const int map = mode_map ||
+    const int i915_map = query->plan.command_set_id == KB2_GPU_DRM_I915_SET_ID &&
+        query->plan.command_id == KB2_GPU_DRM_I915_COMMAND_GEM_MMAP_OFFSET;
+    const int map = mode_map || i915_map ||
         (query->plan.command_set_id == KB2_GPU_DRM_VIRTGPU_SET_ID &&
          query->plan.command_id == KB2_GPU_DRM_VIRTGPU_COMMAND_MAP) ||
         (query->plan.command_set_id == KB2_GPU_DRM_AMDGPU_SET_ID &&
@@ -173,7 +175,7 @@ int ph_gpu_query_dispatch(struct ph_gpu_query *query,
             .bo_handle = map ? query->plan.mapping_handle : query->plan.prime_handle,
         };
         size_t page_count = 1;
-        if (query->profile_kind == KB2_GPU_PROFILE_AMDGPU) {
+        if (query->profile_kind != KB2_GPU_PROFILE_VIRGL) {
             uint64_t length = 0;
             int found = query->api.gem_size(file, resource.bo_handle, &length);
             if (found || !length || length % PH_PAGE_SIZE) {
@@ -193,7 +195,7 @@ int ph_gpu_query_dispatch(struct ph_gpu_query *query,
         size_t bytes = page_count * sizeof(uint64_t);
         int error = allocate_aux(query, bytes);
         if (error) {
-            if (query->profile_kind == KB2_GPU_PROFILE_AMDGPU)
+            if (query->profile_kind != KB2_GPU_PROFILE_VIRGL)
                 ph_boot_log_gpu_map_failure(2, error,
                     resource.bo_handle, bytes);
             return error;
@@ -209,15 +211,30 @@ int ph_gpu_query_dispatch(struct ph_gpu_query *query,
         sizeof(query->reply) - KB2_PROTOCOL_MESSAGE_ENVELOPE_SIZE, &size,
         &query->result);
     if (result) {
-        if (query->profile_kind == KB2_GPU_PROFILE_AMDGPU && map)
+        if (query->profile_kind != KB2_GPU_PROFILE_VIRGL && map)
             ph_boot_log_gpu_map_failure(3, result,
                 query->plan.mapping_handle, query->plan.aux_size);
         return result;
     }
+    if(query->result.sync_file_token) {
+        kb2_gpu_attachment_completion_t exported;
+        if(query->result.mapping_id ||
+            query->result.attachment_class!=KB2_GPU_ATTACHMENT_SYNC_FILE ||
+            kb2_gpu_attachment_completion_decode(query->reply+KB2_PROTOCOL_MESSAGE_ENVELOPE_SIZE,
+                size,query->session_id,query->generation,&exported) ||
+            exported.attachment.object_class!=KB2_GPU_ATTACHMENT_SYNC_FILE ||
+            exported.attachment.exchange_id!=query->result.sync_file_token ||
+            exported.attachment.rights!=KB2_GPU_SPAN_RIGHT_READ ||
+            exported.argument_id!=2 || exported.attachment.role!=1 ||
+            exported.attachment.ownership!=KB2_GPU_ATTACHMENT_MOVE) return -EPROTO;
+    }
     if (query->result.mapping_id &&
         query->result.attachment_class == KB2_GPU_ATTACHMENT_MEMORY) {
         kb2_gpu_virtgpu_map_completion_t completion;
-        kb2_protocol_status_t decoded =
+        kb2_protocol_status_t decoded = i915_map ?
+            kb2_gpu_i915_map_completion_decode(
+                query->reply + KB2_PROTOCOL_MESSAGE_ENVELOPE_SIZE,size,
+                query->session_id,query->generation,&completion) :
             query->plan.command_set_id == KB2_GPU_DRM_AMDGPU_SET_ID ?
             kb2_gpu_amdgpu_map_completion_decode(
                 query->reply + KB2_PROTOCOL_MESSAGE_ENVELOPE_SIZE, size,
@@ -387,9 +404,33 @@ int ph_gpu_query_init_profile(struct ph_gpu_query *query, uint64_t generation,
     struct ph_lifecycle_service *service) {
     if (!query || query->generation || !generation || !service ||
         (profile_kind != KB2_GPU_PROFILE_VIRGL &&
-         profile_kind != KB2_GPU_PROFILE_AMDGPU)) return -EINVAL;
+         profile_kind != KB2_GPU_PROFILE_AMDGPU &&
+         profile_kind != KB2_GPU_PROFILE_I915)) return -EINVAL;
     struct kobox_drm_query_api api = {0};
     void *symbol = ph_image_lookup(&ph_core, "kobox_linux_drm_version");
+    if (profile_kind == KB2_GPU_PROFILE_I915) {
+        void *intel=ph_image_lookup(&ph_core,"kobox_linux_drm_i915_execbuffer");
+        if(!intel) return -EINVAL;
+        memcpy(&api.i915_execbuffer,&intel,sizeof(api.i915_execbuffer));
+        intel=ph_image_lookup(&ph_core,"kobox_linux_drm_i915_context");
+        if(!intel) return -EINVAL;
+        memcpy(&api.i915_context,&intel,sizeof(api.i915_context));
+        intel = ph_image_lookup(&ph_core, "kobox_linux_drm_i915_bo");
+        if (!intel) return -EINVAL;
+        memcpy(&api.i915_bo, &intel, sizeof(api.i915_bo));
+        intel = ph_image_lookup(&ph_core, "kobox_linux_drm_i915_get_aperture");
+        if (!intel) return -EINVAL;
+        memcpy(&api.i915_get_aperture, &intel, sizeof(api.i915_get_aperture));
+        intel = ph_image_lookup(&ph_core, "kobox_linux_drm_i915_context_getparam");
+        if (!intel) return -EINVAL;
+        memcpy(&api.i915_context_getparam, &intel, sizeof(api.i915_context_getparam));
+        intel = ph_image_lookup(&ph_core, "kobox_linux_drm_i915_getparam");
+        if (!intel) return -ENOENT;
+        memcpy(&api.i915_getparam, &intel, sizeof(api.i915_getparam));
+        intel = ph_image_lookup(&ph_core, "kobox_linux_drm_i915_query");
+        if (!intel) return -ENOENT;
+        memcpy(&api.i915_query, &intel, sizeof(api.i915_query));
+    }
     if (!symbol) return -ENOENT;
     memcpy(&api.version, &symbol, sizeof(api.version));
     symbol = ph_image_lookup(&ph_core, "kobox_linux_drm_get_cap");
@@ -526,6 +567,9 @@ int ph_gpu_query_init_profile(struct ph_gpu_query *query, uint64_t generation,
     symbol = ph_image_lookup(&ph_core, "kobox_linux_drm_service_prime_export");
     if (!symbol) return -ENOENT;
     memcpy(&api.prime_export, &symbol, sizeof(api.prime_export));
+    symbol = ph_image_lookup(&ph_core, "kobox_linux_drm_service_prime_cpu_sync");
+    if (!symbol) return -ENOENT;
+    memcpy(&api.prime_cpu_sync, &symbol, sizeof(api.prime_cpu_sync));
     symbol = ph_image_lookup(&ph_core, "kobox_linux_drm_service_prime_import");
     if (!symbol) return -ENOENT;
     memcpy(&api.prime_import, &symbol, sizeof(api.prime_import));
@@ -567,6 +611,29 @@ int ph_gpu_query_init_profile(struct ph_gpu_query *query, uint64_t generation,
     if (!symbol) return -ENOENT;
     memcpy(&api.virtgpu_wait, &symbol, sizeof(api.virtgpu_wait));
     }
+    if(profile_kind==KB2_GPU_PROFILE_I915) {
+        symbol=ph_image_lookup(&ph_core,"kobox_linux_drm_service_i915_map");
+        if(!symbol) return -ENOENT;
+        memcpy(&api.i915_map,&symbol,sizeof(api.i915_map));
+    }
+    symbol=ph_image_lookup(&ph_core,"kobox_linux_drm_service_syncobj_export_file");
+    if(!symbol) return -ENOENT;
+    memcpy(&api.syncobj_export_file,&symbol,sizeof(api.syncobj_export_file));
+    symbol=ph_image_lookup(&ph_core,"kobox_linux_drm_service_syncobj_import_file");
+    if(!symbol) return -ENOENT;
+    memcpy(&api.syncobj_import_file,&symbol,sizeof(api.syncobj_import_file));
+    symbol=ph_image_lookup(&ph_core,"kobox_linux_drm_service_prime_export_file");
+    if(!symbol) return -ENOENT;
+    memcpy(&api.prime_export_file,&symbol,sizeof(api.prime_export_file));
+    symbol=ph_image_lookup(&ph_core,"kobox_linux_drm_service_prime_import_file");
+    if(!symbol) return -ENOENT;
+    memcpy(&api.prime_import_file,&symbol,sizeof(api.prime_import_file));
+    symbol=ph_image_lookup(&ph_core,"kobox_linux_drm_service_release_sync_file");
+    if(!symbol) return -ENOENT;
+    memcpy(&api.release_sync_file,&symbol,sizeof(api.release_sync_file));
+    symbol=ph_image_lookup(&ph_core,"kobox_linux_drm_i915_create_ext");
+    if(!symbol) return -ENOENT;
+    memcpy(&api.i915_create_ext,&symbol,sizeof(api.i915_create_ext));
     symbol = ph_image_lookup(&ph_core, "kobox_linux_drm_service_map");
     if (!symbol) return -ENOENT;
     memcpy(&api.virtgpu_map, &symbol, sizeof(api.virtgpu_map));

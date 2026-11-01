@@ -1,31 +1,33 @@
 const std = @import("std");
 
-pub const syscall_capsule_first: u64 = 89;
-pub const syscall_capsule_query: u64 = 89;
-pub const syscall_capsule_platform_enumerate: u64 = 90;
-pub const syscall_capsule_platform_claim: u64 = 91;
+pub const syscall_capsule_first: u64 = 91;
+pub const syscall_capsule_query: u64 = 91;
+pub const syscall_capsule_platform_enumerate: u64 = 92;
+pub const syscall_capsule_platform_claim: u64 = 93;
 // IO_READ returns an unsigned byte or a NEGATIVE status, so a destructive
 // port read never precedes a potentially failing user-memory copyout.
-pub const syscall_capsule_io_read: u64 = 92;
-pub const syscall_capsule_io_write: u64 = 93;
-pub const syscall_capsule_derive_mmio: u64 = 94;
-pub const syscall_capsule_derive_dma_buffer: u64 = 95;
-pub const syscall_capsule_derive_dma_mapping: u64 = 96;
-pub const syscall_capsule_derive_dma_mapping_pages: u64 = 97;
-pub const syscall_capsule_derive_dma_mapping_from_buffer: u64 = 98;
-pub const syscall_capsule_dma_set_enabled: u64 = 99;
-pub const syscall_capsule_derive_irq: u64 = 100;
-pub const syscall_capsule_irq_route: u64 = 101;
-pub const syscall_capsule_irq_set_mask: u64 = 102;
-pub const syscall_capsule_irq_poll: u64 = 103;
-pub const syscall_capsule_irq_quiesce: u64 = 104;
-pub const syscall_capsule_irq_retire: u64 = 105;
-pub const syscall_capsule_pci_enumerate: u64 = 106;
-pub const syscall_capsule_pci_claim: u64 = 107;
-pub const syscall_capsule_pci_config_read: u64 = 108;
-pub const syscall_capsule_pci_config_write: u64 = 109;
-pub const syscall_capsule_pci_bar_info: u64 = 110;
-pub const syscall_capsule_dma_pool_create: u64 = 111;
+// Platform FDs use READ/WRITE; PCI FDs use CPU_READ/CPU_WRITE and only the
+// kernel-verified singleton root VGA legacy resource, with byte-width access.
+pub const syscall_capsule_io_read: u64 = 94;
+pub const syscall_capsule_io_write: u64 = 95;
+pub const syscall_capsule_derive_mmio: u64 = 96;
+pub const syscall_capsule_derive_dma_buffer: u64 = 97;
+pub const syscall_capsule_derive_dma_mapping: u64 = 98;
+pub const syscall_capsule_derive_dma_mapping_pages: u64 = 99;
+pub const syscall_capsule_derive_dma_mapping_from_buffer: u64 = 100;
+pub const syscall_capsule_dma_set_enabled: u64 = 101;
+pub const syscall_capsule_derive_irq: u64 = 102;
+pub const syscall_capsule_irq_route: u64 = 103;
+pub const syscall_capsule_irq_set_mask: u64 = 104;
+pub const syscall_capsule_irq_poll: u64 = 105;
+pub const syscall_capsule_irq_quiesce: u64 = 106;
+pub const syscall_capsule_irq_retire: u64 = 107;
+pub const syscall_capsule_pci_enumerate: u64 = 108;
+pub const syscall_capsule_pci_claim: u64 = 109;
+pub const syscall_capsule_pci_config_read: u64 = 110;
+pub const syscall_capsule_pci_config_write: u64 = 111;
+pub const syscall_capsule_pci_bar_info: u64 = 112;
+pub const syscall_capsule_dma_pool_create: u64 = 113;
 pub const syscall_capsule_last: u64 = syscall_capsule_dma_pool_create;
 pub const syscall_capsule_count: usize = @intCast(syscall_capsule_last - syscall_capsule_first + 1);
 

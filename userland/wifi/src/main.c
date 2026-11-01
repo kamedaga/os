@@ -370,7 +370,7 @@ static int request(int dir, const char *session, const char *id, const char *com
 
 static void usage(void)
 {
-    fputs("Usage: wifi status | scan | disconnect\n"
+    fputs("Usage: wifi status | scan | disconnect | reconnect\n"
         "       wifi connect SSID [--wpa2|--wpa3|--open] [--country XX]\n"
         "Password is read from a terminal; default: WPA2/WPA3 transition.\n", stderr);
 }
@@ -407,7 +407,7 @@ int main(int argc, char **argv)
             if (security_set++) { usage(); return 2; }
             security = mode;
         }
-    } else if (argc != 2 || (strcmp(command, "scan") && strcmp(command, "status") && strcmp(command, "disconnect"))) {
+    } else if (argc != 2 || (strcmp(command, "scan") && strcmp(command, "status") && strcmp(command, "disconnect") && strcmp(command, "reconnect"))) {
         usage(); return 2;
     }
     if (geteuid() != OWNER_UID) { fputs("wifi: root privileges required\n", stderr); return 1; }
@@ -443,7 +443,7 @@ int main(int argc, char **argv)
         wipe(config, sizeof(config));
         if (result) goto done;
     }
-    if (strcmp(command, "status")) result = request(dir, session, id, command);
+    if (strcmp(command, "status")) result = request(dir, session, id, !strcmp(command, "reconnect") ? "connect" : command);
     if (!result && (!strcmp(command, "status") || !strcmp(command, "scan"))) {
         char *text = NULL;
         result = read_file(dir, !strcmp(command, "status") ? "status" : "scan-results", &text,

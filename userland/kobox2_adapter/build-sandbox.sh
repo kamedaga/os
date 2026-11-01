@@ -18,6 +18,7 @@ net=0
 wifi=0
 audio=0
 amdgpu=0
+i915=0
 block=0
 filesystem=0
 ps2=0
@@ -44,6 +45,7 @@ for argument in "$@"; do
     --wifi) net=1; wifi=1 ;;
     --virtio-sound) audio=1 ;;
     --amdgpu) amdgpu=1 ;;
+    --i915) i915=1 ;;
     --cache-preflight) cache_preflight=1 ;;
     --no-clock-page) no_clock_page=1 ;;
     --tail-trace) tail_trace=1 ;;
@@ -61,16 +63,16 @@ sources=("$adapter/sandbox_main.c" "$adapter/runtime.c" "$adapter/entry.S"
   "$protocol/src/closure_manifest.c" "$protocol/src/resource_grant.c" "$protocol/src/sha256.c")
 link_inputs=()
 extra_dependencies=()
-if (( usb_hid + net + amdgpu + audio > 1 )); then
+if (( usb_hid + net + amdgpu + i915 + audio > 1 )); then
   echo 'select one sandbox device profile' >&2; exit 2
 fi
-if (( block == 1 && (net == 1 || amdgpu == 1 || audio == 1) )); then
+if (( block == 1 && (net == 1 || amdgpu == 1 || i915 == 1 || audio == 1) )); then
   echo 'block service needs USB or NVMe PCI profile' >&2; exit 2
 fi
-if (( filesystem == 1 && (block == 1 || net == 1 || amdgpu == 1 || audio == 1 || usb_hid == 1 || device == 0) )); then
+if (( filesystem == 1 && (block == 1 || net == 1 || amdgpu == 1 || i915 == 1 || audio == 1 || usb_hid == 1 || device == 0) )); then
   echo 'filesystem service requires its storage PCI profile' >&2; exit 2
 fi
-if [[ ( "$usb_hid" == 1 || "$net" == 1 || "$amdgpu" == 1 || "$audio" == 1 || "$block" == 1 ) && "$device" != 1 ]]; then
+if [[ ( "$usb_hid" == 1 || "$net" == 1 || "$amdgpu" == 1 || "$i915" == 1 || "$audio" == 1 || "$block" == 1 ) && "$device" != 1 ]]; then
   echo 'hosted PCI profile requires a granted PCI device' >&2; exit 2
 fi
 if [[ "$cache_preflight" == 1 && "$amdgpu" != 1 ]]; then
@@ -78,13 +80,13 @@ if [[ "$cache_preflight" == 1 && "$amdgpu" != 1 ]]; then
 fi
 flags=(-DPH_SANDBOX_DEVICE="$device" -DPH_SANDBOX_USB_HID="$usb_hid"
   -DPH_SANDBOX_AUDIO="$audio" -DPH_SANDBOX_NET="$net" -DPH_SANDBOX_AMDGPU="$amdgpu"
-  -DPH_SANDBOX_WIFI="$wifi"
+  -DPH_SANDBOX_WIFI="$wifi" -DPH_SANDBOX_I915="$i915"
   -DPH_SANDBOX_BLOCK="$block"
   -DPH_SANDBOX_FS="$filesystem"
   -DPH_SANDBOX_PS2="$ps2"
   -DPH_CACHE_PREFLIGHT="$cache_preflight")
 if (( ps2 )); then
-  if (( usb_hid + net + amdgpu + audio + block + filesystem )); then
+  if (( usb_hid + net + amdgpu + i915 + audio + block + filesystem )); then
     echo 'PS/2 selects its own platform controller profile' >&2; exit 2
   fi
   sources+=("$adapter/ps2_native.c" "$adapter/usb_input_service.c"
@@ -167,7 +169,7 @@ ph_wifi_program_end:
 .section .note.GNU-stack,"",@progbits
 EOF
     fi
-  elif [[ "$amdgpu" == 1 ]]; then
+  elif [[ "$amdgpu" == 1 || "$i915" == 1 ]]; then
     sources+=("$adapter/firmware_bundle.c" "$repo_root/userland/libpacha/src/log.c")
   elif [[ "$block" == 1 ]]; then
     :
@@ -188,7 +190,7 @@ EOF
   if [[ "$block" == 1 ]]; then
     sources+=("$adapter/block_service.c" "$protocol/src/block_device.c")
   fi
-  if [[ "$amdgpu" == 1 ]]; then
+  if [[ "$amdgpu" == 1 || "$i915" == 1 ]]; then
     sources+=("$adapter/gpu_query.c" "$sandbox/boot/drm_query.c"
       "$adapter/gpu_session_service.c" "$gpud/gpu_sessions.c"
       "$protocol/src/gpu_session.c" "$adapter/gpu_queue.c"

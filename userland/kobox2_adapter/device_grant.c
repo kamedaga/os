@@ -79,17 +79,17 @@ int ph_device_grant_take(struct ph_device_grant *out, struct ph_bootstrap_receiv
     struct ph_bootstrap_item *item = &bundle->items[2 + bundle->artifact_count + index];
     uint64_t fd = item->capability.fd;
     if (fd < 16 || fd >= PACHA_THREAD_SELF_FD || item->size ||
-        item->capability.rights != PH_DEVICE_FUNCTION_RIGHTS ||
+        item->capability.rights != PH_DEVICE_ADMITTED_RIGHTS ||
         item->capability.flags != PACHA_FD_FLAG_CLOEXEC || item->capability.transfer_flags) return -EACCES;
     struct pacha_fd_info info = {0};
     result = native_error(pacha_syscall2(PACHA_FD_SYSCALL_GET_INFO, fd, (uintptr_t)&info));
     if (result) return result;
-    if (info.rights != PH_DEVICE_FUNCTION_RIGHTS || info.flags != PACHA_FD_FLAG_CLOEXEC) return -EACCES;
+    if (info.rights != PH_DEVICE_ADMITTED_RIGHTS || info.flags != PACHA_FD_FLAG_CLOEXEC) return -EACCES;
     struct pacha_capsule_info capsule = {0};
     long words = pacha_syscall3(PACHA_CAPSULE_SYSCALL_QUERY, fd, (uintptr_t)&capsule, 11);
     if (words != 11) return words ? native_error(words) : -EPROTO;
     if (capsule.kind != PACHA_CAPSULE_KIND_DEVICE || capsule.device != authority->native_device ||
-        capsule.rights != PH_DEVICE_FUNCTION_RIGHTS) return -EACCES;
+        capsule.rights != PH_DEVICE_ADMITTED_RIGHTS) return -EACCES;
     if (capsule.flags & PACHA_CAPSULE_DMA_QUARANTINED || !(capsule.flags & PACHA_CAPSULE_DMA_TRANSLATED))
         return -ENODEV;
     *out = (struct ph_device_grant){.generation = authority->generation, .object_id = authority->object_id,

@@ -34,14 +34,16 @@ static inline int lpr_dmabuf_install(pacha_fd_t native_fd, pacha_fd_t lease_fd, 
     lpr_dmabuf_backend_t *backend = lpr_backend_state_alloc(sizeof(*backend));
     if (backend == 0) return -LPR_LINUX_ENOMEM;
     *backend = (lpr_dmabuf_backend_t){
-        .active = 1, .writable = 1, .flags = (uint32_t)flags,
+        .active = 1,
+        .writable = (flags & LPR_LINUX_O_ACCMODE) != LPR_LINUX_O_RDONLY,
+        .flags = (uint32_t)flags,
         .token = token, .size = size,
         .native.raw = native_fd, .lease_fd.raw = lease_fd,
     };
     const lpr_fd_install_t install = {
         .ops_id = LPR_FD_OPS_DMABUF,
         .fd_flags = (flags & LPR_LINUX_O_CLOEXEC) ? LPR_FD_ENTRY_CLOEXEC : 0,
-        .access_mode = LPR_LINUX_O_RDWR,
+        .access_mode = (uint16_t)(flags & LPR_LINUX_O_ACCMODE),
         .rights = LPR_FD_RIGHT_IOCTL | LPR_FD_RIGHT_MMAP | LPR_FD_RIGHT_STAT | LPR_FD_RIGHT_DUP,
         .backend_state = backend, .backend_state_bytes = sizeof(*backend),
     };

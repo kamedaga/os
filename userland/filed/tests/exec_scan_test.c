@@ -7,7 +7,10 @@
 #include <string.h>
 #include <patch_scan.h>
 
-int lpr_exec_patch_syscalls(unsigned char *, uint64_t, uint64_t *);
+/* Mirrors lpr_exec_image_t in src/exec/linux_lpr/internal.h. */
+typedef struct lpr_exec_image { unsigned char *bytes; uint64_t size; } lpr_exec_image_t;
+int lpr_exec_patch_syscalls(const lpr_exec_image_t *, uint64_t, unsigned char *,
+                            uint64_t, uint64_t *);
 
 int main(int argc, char **argv)
 {
@@ -24,13 +27,14 @@ int main(int argc, char **argv)
     lpr_patch_scan_result_t scan;
     assert(lpr_patch_scan_syscalls(expected, sizeof(expected), 0, &scan) == 0);
     uint64_t patched = 999;
-    assert(lpr_exec_patch_syscalls(code, sizeof(code), &patched) == 0);
+    const lpr_exec_image_t no_elf = { expected, sizeof(expected) };
+    assert(lpr_exec_patch_syscalls(&no_elf, 0, code, sizeof(code), &patched) == 0);
     assert(patched == 1 && !memcmp(code, expected, sizeof(code)));
 
     unsigned char ambiguous[] = {0x06, 0x0f, 0x05, 0xc3};
     unsigned char original[sizeof(ambiguous)];
     memcpy(original, ambiguous, sizeof(original));
-    assert(lpr_exec_patch_syscalls(ambiguous, sizeof(ambiguous), &patched) == -8);
+    assert(lpr_exec_patch_syscalls(&no_elf, 0, ambiguous, sizeof(ambiguous), &patched) == -8);
     assert(patched == 0 && !memcmp(ambiguous, original, sizeof(original)));
 
     for (int arg = 1; arg < argc; ++arg) {
@@ -58,7 +62,9 @@ int main(int argc, char **argv)
             memcpy(actual, image + section->sh_offset, section->sh_size);
             memcpy(oracle, actual, section->sh_size);
             assert(lpr_patch_scan_syscalls(oracle, section->sh_size, 0, &scan) == 0);
-            assert(lpr_exec_patch_syscalls(actual, section->sh_size, &patched) == 0);
+            const lpr_exec_image_t file_image = { image, (uint64_t)length };
+            assert(lpr_exec_patch_syscalls(&file_image, section->sh_offset, actual,
+                                           section->sh_size, &patched) == 0);
             assert(patched == scan.patched_sites && !memcmp(actual, oracle, section->sh_size));
             printf("exec section %u: %llu syscall sites PASS\n", i, (unsigned long long)patched);
             ++tested;

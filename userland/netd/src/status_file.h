@@ -10,6 +10,7 @@ struct netd_dhcp_client;
 struct netd_dhcp_lease;
 
 void netd_status_file_bind_dhcp(const struct netd_dhcp_client *client);
+void netd_status_file_network_metrics(const struct netd_boot_config *cfg);
 void netd_status_file_publish(const struct netd_boot_config *cfg,
     const char *state, uint64_t stage, int status);
 void netd_status_file_progress(const struct netd_boot_config *cfg,

@@ -89,11 +89,11 @@ static int config_read(void *context, uint32_t offset, uint32_t width, uint32_t 
     struct ph_pci *pci = context;
     int result = config_read_raw(pci, offset, width, out);
     if (result) return result;
-    /* The host exposes MMIO, not port I/O. Hide an optional I/O BAR from
-     * Linux's resource scan, including its all-ones sizing probe; otherwise
-     * pci_enable_device() rejects the unclaimable I/O resource. */
+    /* BAR resources remain MMIO-only. The VGA legacy alias is independent;
+     * hide optional I/O BARs, including all-ones sizing probes, so Linux
+     * cannot claim ports absent from its granted resource interface. */
     if (hidden_io_bar(pci, offset)) *out = 0;
-    if (offset == 0x04 && pci->hidden_io_bars) *out &= ~1u;
+    if (offset == 0x04 && pci->hidden_io_bars && !pci->legacy_vga_io) *out &= ~1u;
     return 0;
 }
 
@@ -102,10 +102,11 @@ static int config_write(void *context, uint32_t offset, uint32_t width, uint32_t
 
     if (!pci->admitted) return -ENODEV;
     if (!config_range(offset, width)) return -EINVAL;
-    /* Never permit the guest to re-enable decoding for a BAR it cannot use.
-     * Ignore writes to that BAR without changing its physical assignment. */
+    /* Ordinary MMIO profiles cannot re-enable I/O decode. A root VGA must
+     * retain its separately checked implicit legacy alias; its optional I/O
+     * BAR still stays immutable and hidden from Linux's resource scan. */
     if (hidden_io_bar(pci, offset)) return 0;
-    if (offset == 0x04 && pci->hidden_io_bars) value &= ~1u;
+    if (offset == 0x04 && pci->hidden_io_bars && !pci->legacy_vga_io) value &= ~1u;
     return native_status(pacha_syscall4(PACHA_CAPSULE_SYSCALL_PCI_CONFIG_WRITE,
         pci->config.device_fd, offset, (uintptr_t)&value, width));
 }
@@ -189,6 +190,17 @@ static int discover_bars(struct ph_pci *pci) {
     int result = config_read_raw(pci, 0x0e, 1, &header);
     if (result) return result;
     if (header & 0x7f) return -EOPNOTSUPP; /* Endpoint, not a PCI bridge. */
+    uint32_t class_revision, command;
+    result = config_read_raw(pci, 8, 4, &class_revision);
+    if (result) return result;
+    result = config_read_raw(pci, 4, 2, &command);
+    if (result) return result;
+    /* A standard root VGA has implicit legacy ports independent of its I/O
+     * BAR. Retain firmware's enabled decode so unmodified vgaarb can own it;
+     * the kernel revalidates the entire route for every byte transaction.
+     * Do not expose/enable the unrelated optional I/O BAR to Linux. */
+    pci->legacy_vga_io = !pci->config.segment && !pci->config.bus &&
+        (class_revision >> 8) == 0x030000 && (command & 1u);
 
     for (unsigned int bar = 0; bar < KOBOX_PCI_MEMORY_WINDOWS; ++bar) {
         struct pacha_capsule_bar_info *info = &pci->bars[bar];
@@ -222,7 +234,7 @@ static int discover_bars(struct ph_pci *pci) {
     }
     if (!pci->host.window_count)
         return pci->hidden_io_bars ? -EOPNOTSUPP : -ENODEV;
-    if (pci->hidden_io_bars) {
+    if (pci->hidden_io_bars && !pci->legacy_vga_io) {
         uint32_t command;
         result = config_read_raw(pci, 0x04, 2, &command);
         if (result) return result;
@@ -236,6 +248,16 @@ static int discover_bars(struct ph_pci *pci) {
         }
     }
     return 0;
+}
+
+long ph_pci_port_io(void *context, uint16_t port, bool writing, uint8_t value) {
+    struct ph_pci *pci = context;
+    if (!pci || !pci->admitted || !pci->legacy_vga_io) return -ENODEV;
+    if (!writing) return pacha_syscall3(PACHA_CAPSULE_SYSCALL_IO_READ,
+        pci->config.device_fd, port, 1);
+    const long result = pacha_syscall4(PACHA_CAPSULE_SYSCALL_IO_WRITE,
+        pci->config.device_fd, port, 1, value);
+    return result ? -EIO : 0;
 }
 
 int ph_pci_init(struct ph_pci *pci, const struct ph_pci_config *config) {

@@ -37,7 +37,7 @@ static void elf_snapshot_test(void)
     memcpy(identity+KB2_FILESYSTEM_SNAPSHOT_STAT_STATX_OFFSET+
         KB2_FILESYSTEM_STATX_SIZE_OFFSET,&file_size,sizeof(file_size));
     filed_rx_manifest_t m={0};
-    assert(!filed_rx_manifest_build(raw,size,0,uuid,identity,scanner,&m));
+    assert(!filed_rx_manifest_build(raw,size,0,uuid,identity,scanner,NULL,&m));
     memcpy(actual,raw,size);
     assert(!filed_rx_manifest_apply(&m,0,actual,size,0,raw,size));
     assert(actual[512]==0xff && actual[513]==0xd0);
@@ -48,20 +48,20 @@ static void elf_snapshot_test(void)
 
     /* The ELF optimization must not hide an ambiguous executable sequence. */
     memset(raw+256,0,code_size-256);raw[512]=0x0f;raw[513]=0x05;
-    assert(filed_rx_manifest_build(raw,size,0,uuid,identity,scanner,&m)==-EIO);
+    assert(filed_rx_manifest_build(raw,size,0,uuid,identity,scanner,NULL,&m)==-EIO);
     assert(!m.patches && !m.page_hashes);
     memcpy(raw,saved,size);
 
     /* Mid-file and partial-file snapshots retain the ordinary raw scanner. */
-    assert(!filed_rx_manifest_build(raw+4096,4096,4096,uuid,identity,scanner,&m));
+    assert(!filed_rx_manifest_build(raw+4096,4096,4096,uuid,identity,scanner,NULL,&m));
     memcpy(actual,raw+4096,4096);
     assert(!filed_rx_manifest_apply(&m,0,actual,4096,0,raw+4096,4096));
     assert(actual[5000-4096]==0xff && actual[5001-4096]==0xd0);
     filed_rx_manifest_free(&m);
-    assert(!filed_rx_manifest_build(raw,size-1,0,uuid,identity,scanner,&m));
+    assert(!filed_rx_manifest_build(raw,size-1,0,uuid,identity,scanner,NULL,&m));
     assert(m.patch_count==4);filed_rx_manifest_free(&m);
     loads[0].p_flags=PF_R;memcpy(raw+sizeof(eh),loads,sizeof(loads));
-    assert(!filed_rx_manifest_build(raw,size,0,uuid,identity,scanner,&m));
+    assert(!filed_rx_manifest_build(raw,size,0,uuid,identity,scanner,NULL,&m));
     assert(m.patch_count==4);filed_rx_manifest_free(&m);
     loads[0].p_flags=PF_R|PF_X;memcpy(raw,saved,size);
 
@@ -75,14 +75,14 @@ static void elf_snapshot_test(void)
             .sh_addr=800,.sh_offset=800,.sh_size=128}};
     memcpy(raw,&eh,sizeof(eh));memcpy(raw+eh.e_shoff,sections,sizeof(sections));
     raw[820]=0x0f;raw[821]=0x05;
-    assert(!filed_rx_manifest_build(raw,size,0,uuid,identity,scanner,&m));
+    assert(!filed_rx_manifest_build(raw,size,0,uuid,identity,scanner,NULL,&m));
     memcpy(actual,raw,size);
     assert(!filed_rx_manifest_apply(&m,0,actual,size,0,raw,size));
     assert(actual[512]==0xff && actual[513]==0xd0);
     assert(!memcmp(actual+768,raw+768,size-768));
     filed_rx_manifest_free(&m);
     raw[256]=0x06; /* Invalid legacy PUSH ES in long mode, within code. */
-    assert(filed_rx_manifest_build(raw,size,0,uuid,identity,scanner,&m)==-EIO);
+    assert(filed_rx_manifest_build(raw,size,0,uuid,identity,scanner,NULL,&m)==-EIO);
     assert(!m.patches && !m.page_hashes);raw[256]=0x90;
     /* Assembly can put non-instruction bytes between functions in .text.
      * Preserve that data and a SYSCALL-shaped immediate while patching an
@@ -93,7 +93,7 @@ static void elf_snapshot_test(void)
     const uint8_t immediate[]={0x48,0xb8,0x0f,0x05,0,0,0,0,0,0};
     memcpy(mixed+590,immediate,sizeof(immediate));
     mixed[700]=0x0f;mixed[701]=0x05;
-    assert(!filed_rx_manifest_build(mixed,size,0,uuid,identity,scanner,&m));
+    assert(!filed_rx_manifest_build(mixed,size,0,uuid,identity,scanner,NULL,&m));
     memcpy(actual,mixed,size);
     assert(!filed_rx_manifest_apply(&m,0,actual,size,0,mixed,size));
     for (size_t i=0;i<size;++i)
@@ -104,21 +104,21 @@ static void elf_snapshot_test(void)
     /* Losing the linear stream cannot turn an ambiguous candidate into a
      * success. No partially validated manifest may escape on this failure. */
     memset(mixed+444,0,256);
-    assert(filed_rx_manifest_build(mixed,size,0,uuid,identity,scanner,&m)==-EIO);
+    assert(filed_rx_manifest_build(mixed,size,0,uuid,identity,scanner,NULL,&m)==-EIO);
     assert(!m.patches && !m.page_hashes);
     eh.e_shoff=UINT64_MAX;memcpy(raw,&eh,sizeof(eh));
-    assert(filed_rx_manifest_build(raw,size,0,uuid,identity,scanner,&m)==-ENOEXEC);
+    assert(filed_rx_manifest_build(raw,size,0,uuid,identity,scanner,NULL,&m)==-ENOEXEC);
     eh.e_shoff=7000;memcpy(raw,&eh,sizeof(eh));
     sections[1].sh_addr=4096;memcpy(raw+eh.e_shoff,sections,sizeof(sections));
-    assert(filed_rx_manifest_build(raw,size,0,uuid,identity,scanner,&m)==-ENOEXEC);
+    assert(filed_rx_manifest_build(raw,size,0,uuid,identity,scanner,NULL,&m)==-ENOEXEC);
     memcpy(raw,saved,size);
 
     /* Malformed complete ELF images must not get an exemption. */
     eh.e_phoff=UINT64_MAX;memcpy(raw,&eh,sizeof(eh));
-    assert(filed_rx_manifest_build(raw,size,0,uuid,identity,scanner,&m)==-ENOEXEC);
+    assert(filed_rx_manifest_build(raw,size,0,uuid,identity,scanner,NULL,&m)==-ENOEXEC);
     memcpy(raw,saved,size);
     loads[1].p_filesz=UINT64_MAX;memcpy(raw+sizeof(eh),loads,sizeof(loads));
-    assert(filed_rx_manifest_build(raw,size,0,uuid,identity,scanner,&m)==-ENOEXEC);
+    assert(filed_rx_manifest_build(raw,size,0,uuid,identity,scanner,NULL,&m)==-ENOEXEC);
     puts("RX ELF snapshot: executable patch, data/guards preserved, range fallback, invalid ELF/ambiguous code rejected: PASS");
 }
 
@@ -138,7 +138,7 @@ int main(void)
         scanner[32]={3};
     filed_rx_manifest_t manifest={0},decoded={0};
     assert(!filed_rx_manifest_build(raw,length,4096,uuid,identity,scanner,
-        &manifest));
+        NULL,&manifest));
     assert(manifest.patch_count>=6 && manifest.page_count==2);
     uint8_t *encoded=NULL;size_t encoded_length=0;
     assert(!filed_rx_manifest_encode(&manifest,&encoded,&encoded_length));

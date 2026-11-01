@@ -7,8 +7,15 @@
 #include "gpu_event_message.h"
 #include "gpu_queue_message.h"
 #include "gpu_session_service.h"
+#include <kobox2/gpu_sync_file.h>
 
 struct ph_gpu_queue {
+    kb2_gpu_sync_file_request_t sync_file;
+    uint64_t sync_file_exported;
+    int sync_file_result;
+    uint64_t cpu_sync_token, cpu_sync_flags;
+    int cpu_sync_result;
+
     struct ph_gpu_session_service service;
     struct gpud_gpu_channel channel;
     kb2_vq_atomic_ops_t atomics;

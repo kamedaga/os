@@ -362,7 +362,9 @@ static void lpr_apply_site(uint8_t *bytes, uint64_t size, uint64_t candidate,
  * pass rather than acquiring a fixed capacity limit. */
 static int lpr_plan_local(const ZydisDecoder *decoder, const uint8_t *bytes,
                           uint64_t size, uint8_t *plan,
-                          uint64_t *out_skipped)
+                          uint64_t *out_skipped,
+                          lpr_patch_scan_ambiguous_fn ambiguous,
+                          void *context)
 {
     lpr_decode_cache_t decode_cache = {0};
     uint64_t candidate_index = 0;
@@ -373,7 +375,8 @@ static int lpr_plan_local(const ZydisDecoder *decoder, const uint8_t *bytes,
         if (candidate == UINT64_MAX) return 0;
         const lpr_candidate_class_t classification = lpr_classify_candidate(
             decoder, bytes, size, candidate, 0, &decode_cache);
-        if (classification == LPR_CANDIDATE_AMBIGUOUS) return -1;
+        if (classification == LPR_CANDIDATE_AMBIGUOUS &&
+            (ambiguous == 0 || !ambiguous(context, candidate))) return -1;
         if (classification == LPR_CANDIDATE_SITE) {
             if (lpr_site_has_decodable_successor(
                     decoder, bytes, size, candidate, &decode_cache))
@@ -439,6 +442,8 @@ static void lpr_apply_plan(uint8_t *bytes, uint64_t size,
 
 static int lpr_apply_local_second_pass(const ZydisDecoder *decoder,
                                        uint8_t *bytes, uint64_t size,
+                                       lpr_patch_scan_ambiguous_fn ambiguous,
+                                       void *context,
                                        lpr_patch_scan_result_t *result)
 {
     uint64_t search = 0;
@@ -447,7 +452,8 @@ static int lpr_apply_local_second_pass(const ZydisDecoder *decoder,
         if (candidate == UINT64_MAX) return 0;
         const lpr_candidate_class_t classification = lpr_classify_candidate(
             decoder, bytes, size, candidate, 0, 0);
-        if (classification == LPR_CANDIDATE_AMBIGUOUS) return -1;
+        if (classification == LPR_CANDIDATE_AMBIGUOUS &&
+            (ambiguous == 0 || !ambiguous(context, candidate))) return -1;
         if (classification == LPR_CANDIDATE_SITE &&
             lpr_site_has_decodable_successor(
                 decoder, bytes, size, candidate, 0))
@@ -485,6 +491,15 @@ static int lpr_apply_full_second_pass(const ZydisDecoder *decoder,
 int lpr_patch_scan_syscalls(uint8_t *bytes, uint64_t size, uint64_t flags,
                             lpr_patch_scan_result_t *result)
 {
+    return lpr_patch_scan_syscalls_resolved(bytes, size, flags, 0, 0, result);
+}
+
+int lpr_patch_scan_syscalls_resolved(uint8_t *bytes, uint64_t size,
+                                     uint64_t flags,
+                                     lpr_patch_scan_ambiguous_fn ambiguous,
+                                     void *context,
+                                     lpr_patch_scan_result_t *result)
+{
     if (bytes == 0 || result == 0) return -1;
     result->patched_sites = 0;
     result->skipped_sites = 0;
@@ -505,7 +520,8 @@ int lpr_patch_scan_syscalls(uint8_t *bytes, uint64_t size, uint64_t flags,
     const int start_is_boundary = (flags & LPR_PATCH_SCAN_START_BOUNDARY) != 0;
     const int plan_status = start_is_boundary
         ? lpr_plan_full(&decoder, bytes, size, plan, &skipped)
-        : lpr_plan_local(&decoder, bytes, size, plan, &skipped);
+        : lpr_plan_local(&decoder, bytes, size, plan, &skipped,
+                         ambiguous, context);
     if (plan_status != 0) {
         result->failed_sites = 1;
         return -1;
@@ -517,7 +533,8 @@ int lpr_patch_scan_syscalls(uint8_t *bytes, uint64_t size, uint64_t flags,
     }
     const int apply_status = start_is_boundary
         ? lpr_apply_full_second_pass(&decoder, bytes, size, result)
-        : lpr_apply_local_second_pass(&decoder, bytes, size, result);
+        : lpr_apply_local_second_pass(&decoder, bytes, size, ambiguous,
+                                      context, result);
     if (apply_status != 0) {
         result->failed_sites = 1;
         return -1;

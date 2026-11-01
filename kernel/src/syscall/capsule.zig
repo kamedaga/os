@@ -25,6 +25,42 @@ fn statusFromKernelError(err: kernel.KernelError) u64 {
     };
 }
 
+pub fn bootPciClaimRights(class_code: u32) kernel.FdRights {
+    // A bridge is observable topology, not a device-driver grant. Build this
+    // allowlist independently so future endpoint rights cannot leak here.
+    if (class_code >> 16 == 0x06) return .{
+        .inspect = true,
+        .dup = true,
+        .transfer = true,
+        .set_flags = true,
+        .close = true,
+        .query = true,
+        .config_read = true,
+    };
+    return .{
+        .inspect = true,
+        .dup = true,
+        .transfer = true,
+        .set_flags = true,
+        .close = true,
+        .query = true,
+        .config_read = true,
+        .config_write = true,
+        .derive_mmio = true,
+        .derive_dma = true,
+        .derive_irq = true,
+        .mmio_map_read = true,
+        .mmio_map_write = true,
+        .cpu_read = true,
+        .cpu_write = true,
+        .dma_read = true,
+        .dma_write = true,
+        .irq_wait = true,
+        .irq_ack = true,
+        .bus_master = true,
+    };
+}
+
 fn u32Arg(value: u64) ?u32 {
     if (value > @as(u64, std.math.maxInt(u32))) return null;
     return @intCast(value);
@@ -610,9 +646,21 @@ pub fn platformPortIo(state: *const kernel.KernelState, proc: kernel.PrincipalId
 {
     const invalid: u64 = if (writing) sc.syscall_err_invalid else @bitCast(-@as(i64, @intCast(sc.syscall_err_invalid)));
     const fd = u32Arg(raw_fd) orelse return invalid;
-    const rights: kernel.FdRights = if (writing) .{ .write = true } else .{ .read = true };
-    const view = state.fdPayloadWithRightsConst(proc, fd, rights) orelse return invalid;
-    const grant = switch (view.payload.*) { .platform_device => |dev| dev.grant, else => return invalid };
+    const view = state.fdPayloadWithRightsConst(proc, fd, .{}) orelse return invalid;
+    const grant = switch (view.payload.*) {
+        .platform_device => |dev| blk: {
+            if (if (writing) !view.rights.write else !view.rights.read) return invalid;
+            break :blk dev.grant;
+        },
+        .device => |dev| {
+            // CPU access rights do not authorize arbitrary ports: PCI proves
+            // the global legacy resource and current decode for this owner.
+            if (if (writing) !view.rights.cpu_write else !view.rights.cpu_read) return invalid;
+            if (iommu.deviceQuarantined(dev.device)) return invalid;
+            return if (pci.legacyVgaIo(dev.device, port, width, writing, value)) |byte| byte else invalid;
+        },
+        else => return invalid,
+    };
     if (!platform_device.ioAllowed(grant, port, width, writing, view.rights.controller_write, value)) return invalid;
     if (writing) {
         platform_device.ioWrite(@intCast(port), @intCast(value));
@@ -1205,28 +1253,8 @@ pub fn dispatch(
             const index: usize = @intCast(frame.rdi);
             const function = pci.bootFunctionAt(index) orelse break :blk sc.syscall_err_invalid;
             if (pci.bootFunctionClaimed(index)) break :blk sc.syscall_err_invalid;
-            const fd = state.createDeviceFd(proc, function.resource_id, .{
-                .inspect = true,
-                .dup = true,
-                .transfer = true,
-                .set_flags = true,
-                .close = true,
-                .query = true,
-                .config_read = true,
-                .config_write = true,
-                .derive_mmio = true,
-                .derive_dma = true,
-                .derive_irq = true,
-                .mmio_map_read = true,
-                .mmio_map_write = true,
-                .cpu_read = true,
-                .cpu_write = true,
-                .dma_read = true,
-                .dma_write = true,
-                .irq_wait = true,
-                .irq_ack = true,
-                .bus_master = true,
-            }, .{}, first_dynamic_fd) catch |err| break :blk statusFromKernelError(err);
+            const fd = state.createDeviceFd(proc, function.resource_id, bootPciClaimRights(function.class_code), .{}, first_dynamic_fd) catch |err|
+                break :blk statusFromKernelError(err);
             pci.markBootFunctionClaimed(index);
             break :blk fd;
         },

@@ -51,6 +51,7 @@ pub const Hooks = struct {
     futex_lock_address_space: ?*const fn (kernel.PrincipalId) bool = null,
     futex_unlock_address_space: ?*const fn (kernel.PrincipalId) void = null,
     resident_read_user_u32_with_address_space_locked: ?*const fn (kernel.PrincipalId, u64) ?u32 = null,
+    resident_cmpxchg_user_u32_with_address_space_locked: ?*const fn (kernel.PrincipalId, u64, u32, u32) ?u32 = null,
     resident_atomic_user_u32_with_address_space_locked: ?*const fn (kernel.PrincipalId, u64, @import("kernel_abi_root").runtime_abi.FutexAtomicOperation, u32) ?u32 = null,
     iovec_snapshot: ?*const IovecSnapshot = null,
     pending_signal_frame_snapshot: ?*const process_syscalls.ProcessCloneUserFrame = null,
@@ -505,7 +506,7 @@ fn lifecycleAdmissionRejectedResult(nr: u64) u64 {
     // performed no I/O, so +NOT_READY would falsely report two bytes written
     // (or read) while a remote STOP owns the process lifecycle gate.
     return switch (nr) {
-        sc.syscall_fd_read, sc.syscall_fd_write, sc.syscall_fd_readv, sc.syscall_fd_writev, sc.syscall_getrandom, sc.syscall_futex_wake_op => 0 -% sc.syscall_err_not_ready,
+        sc.syscall_fd_read, sc.syscall_fd_write, sc.syscall_fd_readv, sc.syscall_fd_writev, sc.syscall_getrandom, sc.syscall_futex_wake_op, sc.syscall_capsule_io_read => 0 -% sc.syscall_err_not_ready,
         else => sc.syscall_err_not_ready,
     };
 }
@@ -538,6 +539,19 @@ fn preflightUserBuffers(h: anytype, proc: kernel.PrincipalId, frame: *TrapFrame,
     // timer or IPC state changes. Pager pages stay resident after supply;
     // a later failed copy can therefore only follow a concurrent VMA change.
     switch (nr) {
+        sc.syscall_futex_pi => {
+            // Reject malformed operations before a write probe can fault in
+            // backing or resolve COW. The PI handler never accepts MMIO.
+            if (frame.rdi == 0 or (frame.rdi & 3) != 0 or
+                frame.rsi > @intFromEnum(abi.runtime_abi.FutexPiOperation.unlock) or
+                (frame.r10 & ~abi.runtime_abi.futex_pi_private_key) != 0)
+                return sc.syscall_err_invalid;
+            return probeBuffer(h, proc, frame, frame.rdi, 4, true);
+        },
+        sc.syscall_vm_query => {
+            if (frame.rdx != abi.vm_abi.mapping_info_size) return sc.syscall_err_invalid;
+            return probeBuffer(h, proc, frame, frame.rsi, abi.vm_abi.mapping_info_size, true);
+        },
         sc.syscall_madvise => {
             const vm = abi.vm_abi;
             if (frame.rdx != vm.madvise_populate_read and frame.rdx != vm.madvise_populate_write) return null;
@@ -796,7 +810,7 @@ test "pager preflight populate validates access and preserves retry address" {
 
 test "lifecycle admission does not report byte progress for a rejected syscall" {
     const not_ready: u64 = 0 -% sc.syscall_err_not_ready;
-    for ([_]u64{ sc.syscall_fd_read, sc.syscall_fd_write, sc.syscall_fd_readv, sc.syscall_fd_writev, sc.syscall_getrandom, sc.syscall_futex_wake_op }) |nr| {
+    for ([_]u64{ sc.syscall_fd_read, sc.syscall_fd_write, sc.syscall_fd_readv, sc.syscall_fd_writev, sc.syscall_getrandom, sc.syscall_futex_wake_op, sc.syscall_capsule_io_read }) |nr| {
         try std.testing.expectEqual(not_ready, lifecycleAdmissionRejectedResult(nr));
     }
     for ([_]u64{ sc.syscall_process_signal_ctl, sc.syscall_fd_close, sc.syscall_ipc_notify, sc.syscall_futex_wait }) |nr| {
@@ -844,7 +858,7 @@ fn dispatchCompactSyscallBody(frame: *TrapFrame) u64 {
     // still distinguish an unperformed wake from a committed wake count.
     if (frame.rax == sc.syscall_futex_wake_wait) frame.rdx = std.math.maxInt(u64);
     const base_hooks = getHooks();
-    if (!base_hooks.kernel_state_ready.*) return sc.syscall_err_not_ready;
+    if (!base_hooks.kernel_state_ready.*) return lifecycleAdmissionRejectedResult(frame.rax);
     if (comptime lock_profile.enabled) runtime_nr_profile.record(frame.rax);
     if (frame.rax == sc.syscall_clock_read) {
         // Scalar time reads touch no capability, user mapping or KernelState

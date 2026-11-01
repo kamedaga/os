@@ -16,6 +16,16 @@
     PACHA_FD_RIGHT_DERIVE_DMA | PACHA_FD_RIGHT_DMA_READ | PACHA_FD_RIGHT_DMA_WRITE | \
     PACHA_FD_RIGHT_BUS_MASTER | PACHA_FD_RIGHT_DERIVE_IRQ | PACHA_FD_RIGHT_IRQ_WAIT | PACHA_FD_RIGHT_IRQ_ACK)
 
+/* Optional native CPU byte-I/O authority, separate from the PCI wire rights.
+ * Only the verified i915 owner selects it; ordinary device grants stay exact. */
+#define PH_DEVICE_VGA_FUNCTION_RIGHTS (PH_DEVICE_FUNCTION_RIGHTS | \
+    PACHA_FD_RIGHT_CPU_READ | PACHA_FD_RIGHT_CPU_WRITE)
+#if defined(PH_SANDBOX_I915) && PH_SANDBOX_I915
+#define PH_DEVICE_ADMITTED_RIGHTS PH_DEVICE_VGA_FUNCTION_RIGHTS
+#else
+#define PH_DEVICE_ADMITTED_RIGHTS PH_DEVICE_FUNCTION_RIGHTS
+#endif
+
 /* Independent native launch-owner policy. native_device comes from the
  * parent's queried capability, not peer claims. It is an OS-local identity,
  * never a GPU wire object ID. CAPSULE_QUERY.object_id is not usable for device

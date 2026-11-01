@@ -5,6 +5,9 @@
 #include <pacha/syscall.h>
 #include <errno.h>
 #include <string.h>
+#if defined(PH_DMA_LATENCY) && PH_DMA_LATENCY
+#include "dma_latency.h"
+#endif
 
 static int prepare(void *context, struct ph_ipc_packet *packet) {
     struct ph_net_frame_service *net = context;
@@ -12,7 +15,7 @@ static int prepare(void *context, struct ph_ipc_packet *packet) {
         return -EPROTO;
     if (packet->operation == PH_NET_FRAME_ATTACH) {
         struct pacha_fd_info info = {0};
-        if (net->shared || packet->fd_count != 1 ||
+        if (net->shared || packet->fd_count != 2 ||
             packet->value != PH_NET_FRAME_SHARED_BYTES ||
             pacha_syscall2(PACHA_FD_SYSCALL_GET_INFO,
                 packet->fds[0].fd, (uintptr_t)&info) ||
@@ -21,11 +24,19 @@ static int prepare(void *context, struct ph_ipc_packet *packet) {
             (info.rights & (PACHA_FD_RIGHT_MAP_READ | PACHA_FD_RIGHT_MAP_WRITE)) !=
                 (PACHA_FD_RIGHT_MAP_READ | PACHA_FD_RIGHT_MAP_WRITE))
             return -EPROTO;
+        struct pacha_fd_info wake = {0};
+        if (pacha_syscall2(PACHA_FD_SYSCALL_GET_INFO,
+                packet->fds[1].fd, (uintptr_t)&wake) ||
+            wake.kind != PACHA_FD_KIND_EVENT ||
+            (wake.rights & (PACHA_FD_RIGHT_WRITE | PACHA_FD_RIGHT_CLOSE)) !=
+                (PACHA_FD_RIGHT_WRITE | PACHA_FD_RIGHT_CLOSE)) return -EPROTO;
         long mapped = pacha_syscall6(PACHA_VM_SYSCALL_MMAP,
             packet->fds[0].fd, 0, PH_NET_FRAME_SHARED_BYTES,
             PACHA_PROT_READ | PACHA_PROT_WRITE, PACHA_MMAP_SHARED, 0);
         if (mapped < 4096) return -ENOMEM;
         net->shared = (void *)(uintptr_t)mapped;
+        net->rx_wake_fd = (pacha_fd_t)packet->fds[1].fd;
+        packet->fds[1].fd = PH_IPC_NO_FD;
     } else if (packet->operation == PH_NET_FRAME_INFO ||
                packet->operation == PH_NET_WIFI_REQUEST ||
                packet->operation == PH_NET_WIFI_CONFIG ||
@@ -58,6 +69,16 @@ static int prepare(void *context, struct ph_ipc_packet *packet) {
     return 0;
 }
 
+static int wake_rx(void *context) {
+    struct ph_net_frame_service *net = context;
+    const uint64_t one = 1;
+    long result = pacha_syscall3(PACHA_FD_SYSCALL_WRITE,
+        net->rx_wake_fd, (uintptr_t)&one, sizeof(one));
+    /* A native admission error is not evidence that a hint was published.
+     * Count it as failure; the unchanged health timer still drains RX. */
+    return result == (long)sizeof(one) ? 0 : -EIO;
+}
+
 static int dispatch(void *context, void *linux_service) {
     struct ph_net_frame_service *net = context;
     struct ph_net_frame_shared *shared = net->shared;
@@ -66,6 +87,7 @@ static int dispatch(void *context, void *linux_service) {
     if (!shared || !net->operation || !linux_service) return -EPROTO;
     if (net->operation == PH_NET_FRAME_INFO) {
         result = net->info(linux_service, &shared->info);
+        if (!result) result = net->rx_stats(linux_service, &shared->rx_stats);
         shared->count = 0;
     } else if (net->operation == PH_NET_FRAME_READ) {
         result = net->read(linux_service, shared->frames, PH_NET_FRAME_BATCH, &count);
@@ -79,6 +101,12 @@ static int dispatch(void *context, void *linux_service) {
         }
         shared->count = (uint32_t)count;
     } else if (net->operation == PH_NET_WIFI_REQUEST) {
+#if defined(PH_DMA_LATENCY) && PH_DMA_LATENCY
+        int diagnostic=ph_dma_latency_request(net->wifi_snapshot,net->wifi_size,
+            shared->wifi_bytes,sizeof(shared->wifi_bytes),&count);
+        if(diagnostic) result=diagnostic>0?0:diagnostic;
+        else
+#endif
         result = net->wifi_request ? net->wifi_request(linux_service,
             net->wifi_snapshot, net->wifi_size, shared->wifi_bytes,
             sizeof(shared->wifi_bytes), &count) : -EOPNOTSUPP;
@@ -95,6 +123,7 @@ static int dispatch(void *context, void *linux_service) {
         result = net->wifi_events ? net->wifi_events(linux_service, &events) : -EOPNOTSUPP;
         shared->wifi_events = events;
     } else if (net->operation == PH_NET_FRAME_ATTACH) {
+        result = net->bind_wake(linux_service, wake_rx, net);
         shared->count = 0;
     } else {
         return -EPROTO;
@@ -128,7 +157,16 @@ static int stop(void *context) {
     if (pacha_syscall2(PACHA_VM_SYSCALL_MUNMAP,
             (uintptr_t)net->shared, PH_NET_FRAME_SHARED_BYTES)) return -EIO;
     net->shared = NULL;
+    /* Linux still owns the RX work callback until port_close joins it.
+     * Keep its FD alive; finish closes it after successful module cleanup. */
     return 0;
+}
+
+int ph_net_frame_service_finish(struct ph_net_frame_service *net) {
+    if (net->rx_wake_fd < 16) return 0;
+    int result = (int)pacha_syscall1(PACHA_FD_SYSCALL_CLOSE, net->rx_wake_fd);
+    if (!result) net->rx_wake_fd = -1;
+    return result;
 }
 
 int ph_net_frame_service_init(struct ph_net_frame_service *net, void *core,
@@ -137,11 +175,16 @@ int ph_net_frame_service_init(struct ph_net_frame_service *net, void *core,
     void *info = ph_image_lookup(core, "kobox_linux_net_port_info");
     void *read = ph_image_lookup(core, "kobox_linux_net_port_read");
     void *write = ph_image_lookup(core, "kobox_linux_net_port_write");
-    if (!info || !read || !write) return -ENOENT;
+    void *bind = ph_image_lookup(core, "kobox_linux_net_port_bind_wake");
+    void *stats = ph_image_lookup(core, "kobox_linux_net_port_rx_stats");
+    if (!info || !read || !write || !bind || !stats) return -ENOENT;
     memset(net, 0, sizeof(*net));
     memcpy(&net->info, &info, sizeof(info));
     memcpy(&net->read, &read, sizeof(read));
     memcpy(&net->write, &write, sizeof(write));
+    memcpy(&net->bind_wake, &bind, sizeof(bind));
+    memcpy(&net->rx_stats, &stats, sizeof(stats));
+    net->rx_wake_fd = -1;
 #if PH_SANDBOX_WIFI
     void *wifi_request = ph_image_lookup(core, "kobox_linux_net_wifi_request");
     void *wifi_configure = ph_image_lookup(core, "kobox_linux_net_wifi_configure");

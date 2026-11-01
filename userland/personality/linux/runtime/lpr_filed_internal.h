@@ -38,6 +38,7 @@
 #include <inputd/ipc_protocol.h>
 #include <stddef.h>
 #include <stdint.h>
+#include "lpr_vfs/open_flags.h"
 
 #define LPR_FD_TABLE_INITIAL_SIZE 256ull
 int lpr_user_range_plausible(uint64_t ptr, uint64_t bytes);
@@ -48,20 +49,6 @@ int lpr_user_range_plausible(uint64_t ptr, uint64_t bytes);
 #define LPR_LINUX_AT_EMPTY_PATH 0x1000ull
 #define LPR_LINUX_AT_EACCESS 0x200ull
 #define LPR_LINUX_AT_REMOVEDIR 0x200ull
-#define LPR_LINUX_O_ACCMODE 00000003ull
-#define LPR_LINUX_O_RDONLY 00000000ull
-#define LPR_LINUX_O_WRONLY 00000001ull
-#define LPR_LINUX_O_RDWR 00000002ull
-#define LPR_LINUX_O_CREAT 00000100ull
-#define LPR_LINUX_O_EXCL 00000200ull
-#define LPR_LINUX_O_NOCTTY 00000400ull
-#define LPR_LINUX_O_TRUNC 00001000ull
-#define LPR_LINUX_O_APPEND 00002000ull
-#define LPR_LINUX_O_NONBLOCK 00004000ull
-#define LPR_LINUX_O_LARGEFILE 00100000ull
-#define LPR_LINUX_O_DIRECTORY 00200000ull
-#define LPR_LINUX_O_NOFOLLOW 00400000ull
-#define LPR_LINUX_O_CLOEXEC 02000000ull
 #define LPR_LINUX_MFD_CLOEXEC 0x0001ull
 #define LPR_LINUX_MFD_ALLOW_SEALING 0x0002ull
 #define LPR_LINUX_DMA_BUF_SYNC_READ (1u << 0)
@@ -873,6 +860,8 @@ int64_t lpr_filed_endpoint_ready(void);
 int64_t lpr_filed_fd_binding(uint64_t fd);
 int64_t lpr_filed_exec_self( filed_exec_path_t *exec, const lpr_exec_transaction_t *transaction, pacha_fd_t *out_process_fd, pacha_fd_t *out_thread_fd, pacha_fd_t *out_manifest_fd);
 int64_t lpr_filed_io(uint32_t op, uint64_t fd, uint64_t buf, uint64_t count, uint64_t offset);
+int64_t lpr_filed_poll_events(uint64_t fd, uint32_t events);
+int lpr_filed_poll_needs_rescan(uint64_t fd);
 int64_t lpr_filed_open_handle_at( uint64_t dirfd, const char *path, uint64_t flags, uint64_t mode, uint64_t *out_handle, uint64_t *out_kind);
 int64_t lpr_filed_utimens_handle(uint64_t handle, uint64_t times_raw);
 int64_t lpr_install_stdio_fd_from_tty(uint64_t tty_fd, uint64_t target_fd);

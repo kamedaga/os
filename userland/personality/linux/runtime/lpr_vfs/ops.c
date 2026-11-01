@@ -1,6 +1,7 @@
 #include "../lpr_filed_internal.h"
 #include "../lpr_fd/allocate.h"
 #include <pacha/native_syscall_retry.h>
+#include "../lpr_clock.h"
 
 uint64_t lpr_open_rights(uint64_t flags)
 {
@@ -167,7 +168,12 @@ int64_t lpr_linux_memfd_create(uint64_t name_raw, uint64_t flags)
     const uint64_t open_flags = LPR_LINUX_O_RDWR |
         ((flags & LPR_LINUX_MFD_CLOEXEC) ? LPR_LINUX_O_CLOEXEC : 0);
     const int fd = lpr_fd_alloc(response.handle, open_flags);
-    if (fd < 0) (void)lpr_filed_close_handle(response.handle);
+    if (fd < 0) {
+        (void)lpr_filed_close_handle(response.handle);
+    } else {
+        lpr_filed_backend_t *file = lpr_filed_backend((uint64_t)(uint32_t)fd);
+        if (file != 0) file->mode = LPR_LINUX_S_IFREG | 0600u;
+    }
     return fd;
 }
 
@@ -492,6 +498,7 @@ static int64_t lpr_linux_proc_self_fd_open(const char *path, uint64_t flags)
         return -LPR_LINUX_EIO;
     }
     reopened->reserved1 = source->reserved1;
+    reopened->mode = source->mode;
     return fd;
 }
 
@@ -595,6 +602,13 @@ int64_t lpr_linux_openat_once(
      * imposed another complete IPC/scheduling round trip on every open. */
     uint32_t opened_mode = route_stat[KB2_FILESYSTEM_STATX_MODE_OFFSET] |
         (uint32_t)route_stat[KB2_FILESYSTEM_STATX_MODE_OFFSET + 1] << 8;
+    lpr_filed_backend_t *opened_file =
+        lpr_filed_backend((uint64_t)(uint32_t)fd);
+    if (opened_file == 0) {
+        (void)lpr_linux_close((uint64_t)(uint32_t)fd);
+        return -LPR_LINUX_EIO;
+    }
+    opened_file->mode = (uint16_t)opened_mode;
     uint32_t major = 0, minor = 0;
     for (unsigned i = 0; i < 4; ++i) {
         major |= (uint32_t)route_stat[KB2_FILESYSTEM_STATX_RDEV_MAJOR_OFFSET + i] << (8 * i);
@@ -694,6 +708,7 @@ int64_t lpr_linux_openat(uint64_t dirfd, uint64_t path_raw, uint64_t flags, uint
 {
     /* Linux namei follows symlinks within its namespace. Personality path
      * concatenation cannot reproduce mount, dirfd or symlink escape rules. */
+    lpr_linux_legacy_open_how(&flags, &mode);
     return lpr_linux_openat_once(dirfd, path_raw, flags, mode, 0, wait_not_ready);
 }
 
@@ -921,6 +936,12 @@ void lpr_timespec_subtract(
 int64_t lpr_pacha_clock_gettime(uint64_t clock_id, struct pachaos_timespec *out)
 {
     lpr_memset(out, 0, sizeof(*out));
+    uint64_t fast_ns;
+    if (clock_id == LPR_LINUX_CLOCK_MONOTONIC && !lpr_clock_monotonic(&fast_ns)) {
+        out->tv_sec = fast_ns / UINT64_C(1000000000);
+        out->tv_nsec = fast_ns % UINT64_C(1000000000);
+        return 0;
+    }
     struct pacha_native_result result;
     do {
         /* This helper writes LPR-owned storage. Read the existing scalar

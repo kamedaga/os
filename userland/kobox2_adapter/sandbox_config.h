@@ -5,6 +5,7 @@
 #include "bootstrap.h"
 #include "device_authority.h"
 #include "platform_authority.h"
+#include "../../kobox2/linux-sandbox/kobox/boot/pci_metadata.h"
 
 /* Private launch policy copied read-only before starting the native thread;
  * never accept expected package/device identity from the data channel. */
@@ -38,6 +39,7 @@ struct ph_sandbox_config {
     /* ph_device_authority[] lives in a separately authenticated read-only
      * launch blob; storage does not infer additional authority from PCI IDs. */
     uint64_t storage_devices_address, storage_device_count;
+    struct kobox_linux_pci_topology pci_topology;
 };
 
 #endif

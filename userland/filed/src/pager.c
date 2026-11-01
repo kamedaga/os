@@ -156,6 +156,47 @@ static int pager_read_exact(filed_runtime_t *rt,
     return 0;
 }
 
+struct pager_code_reader { filed_runtime_t *rt; struct filed_pager_record *record; };
+
+static int pager_code_read(void *raw,uint64_t file_offset,uint8_t *destination,
+    size_t length)
+{
+    struct pager_code_reader *reader=raw;
+    return pager_read_exact(reader->rt,reader->record,file_offset,destination,length);
+}
+
+/* Load FDE ranges under the identity `before`. -EAGAIN: identity changed.
+ * Without a change cookie, two complete loads must agree, as for raw. */
+static int pager_code_ranges(filed_runtime_t *rt,struct filed_pager_record *record,
+    uint64_t size,const uint8_t before[KB2_FILESYSTEM_SNAPSHOT_STAT_SIZE],
+    filed_rx_code_ranges_t *out)
+{
+    struct pager_code_reader reader={rt,record};
+    int status=filed_rx_code_ranges_load(pager_code_read,&reader,size,out);
+    uint8_t after[KB2_FILESYSTEM_SNAPSHOT_STAT_SIZE];
+    int identity_status=pager_identity(rt,record,after);
+    if (!identity_status && memcmp(before,after,sizeof(after))) identity_status=-EAGAIN;
+    if (status || identity_status) {
+        if (!status) filed_rx_code_ranges_free(out);
+        return identity_status ? identity_status : status;
+    }
+    if (pager_le32(before+KB2_FILESYSTEM_SNAPSHOT_METADATA_FLAGS_OFFSET)&
+            KB2_FILESYSTEM_SNAPSHOT_VALID) return 0;
+    filed_rx_code_ranges_t again;
+    status=filed_rx_code_ranges_load(pager_code_read,&reader,size,&again);
+    identity_status=pager_identity(rt,record,after);
+    if (!identity_status && memcmp(before,after,sizeof(after))) identity_status=-EAGAIN;
+    const int different=!status && (again.count!=out->count ||
+        memcmp(again.starts,out->starts,out->count*sizeof(uint64_t)) ||
+        memcmp(again.ends,out->ends,out->count*sizeof(uint64_t)));
+    if (!status) filed_rx_code_ranges_free(&again);
+    if (status || identity_status || different) {
+        filed_rx_code_ranges_free(out);
+        return identity_status ? identity_status : different ? -EAGAIN : status;
+    }
+    return 0;
+}
+
 static int pager_manifest_refresh(struct filed_pager *pager,
     struct filed_pager_record *record)
 {
@@ -227,7 +268,21 @@ static int pager_manifest_refresh(struct filed_pager *pager,
         }
         status=filed_rx_manifest_build(raw,(size_t)available,
             record->file_offset,rt->bootstrap.root_uuid,before,
-            pager->scanner_hash,manifest);
+            pager->scanner_hash,NULL,manifest);
+        if (status==-EIO) {
+            /* Only an ambiguous candidate reaches the FDE map, so ordinary
+             * images never read .eh_frame. The map comes from the same
+             * identity as raw; the check below retries if it changed. */
+            filed_rx_code_ranges_t code;
+            const int code_status=pager_code_ranges(rt,record,size,before,&code);
+            if (code_status==-EAGAIN) { free(raw);free(manifest);continue; }
+            if (!code_status) {
+                status=filed_rx_manifest_build(raw,(size_t)available,
+                    record->file_offset,rt->bootstrap.root_uuid,before,
+                    pager->scanner_hash,&code,manifest);
+                filed_rx_code_ranges_free(&code);
+            }
+        }
         free(raw);
         if (status) { free(manifest);return status; }
         status=pager_identity(rt,record,after);

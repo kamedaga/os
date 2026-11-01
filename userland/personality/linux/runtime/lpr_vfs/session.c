@@ -17,7 +17,7 @@ struct lpr_fs_session {
     void *mapping;
     pacha_fd_t vmo, doorbell, wake_read, wake_write, remote;
     int attached, remote_retired, retirement_failed;
-    int temporary;
+    int temporary, reusable;
     uint64_t client;
     struct lpr_fs_request *requests;
     volatile uint32_t queue_lock, epoch;
@@ -33,6 +33,11 @@ static uint32_t terminal;
 /* HELLO can reserve authority before even local metadata can be allocated.
  * Filed retains that reservation; a lost cancellation ACK closes admission. */
 static uint32_t reservation_fault;
+
+/* One charged reusable arena per process, bounded independently of request
+ * size. Larger calls keep exact temporary leases. No operation is split:
+ * filed's Linux f_pos_lock still covers one READ/WRITE, including dup/fork. */
+#define LPR_FS_REUSE_MAX (2u * 1024u * 1024u + 4096u)
 
 int lpr_fs_session_terminal(void)
 {
@@ -253,6 +258,21 @@ static void fault_session(struct lpr_fs_session *s)
     wake_epoch(&s->epoch);
 }
 
+/* Removed from session under session_lock with zero references; caller holds
+ * management_lock until authenticated retirement and local cleanup finish.
+ * A failure retains inventory and closes admission, exactly like a temporary
+ * lease failure. Drop joins management_lock before reclaiming that inventory. */
+static int retire_idle_session(struct lpr_fs_session *s)
+{
+    int status = retire_remote(s);
+    if (!status) status = free_session(s, 1);
+    lpr_state_lock(&session_lock);
+    if (status) { s->next = retired; retired = s; }
+    wake_epoch(&inventory_epoch);
+    lpr_state_unlock(&session_lock);
+    return status;
+}
+
 static int acquire_session(uint64_t minimum, struct lpr_fs_session **out)
 {
     int establishing = 0;
@@ -289,7 +309,23 @@ static int acquire_session(uint64_t minimum, struct lpr_fs_session **out)
             if (establishing) lpr_state_unlock(&management_lock);
             return 0;
         }
-        int additional = session != 0;
+        int additional = session != 0, has_reusable = 0;
+        struct lpr_fs_session *idle = 0;
+        for (struct lpr_fs_session *q = session; q; q = q->next) {
+            if (q->reusable) {
+                has_reusable = 1;
+                if (!q->references) idle = q;
+            }
+        }
+        if (establishing && idle) {
+            struct lpr_fs_session **cursor = &session;
+            while (*cursor != idle) cursor = &(*cursor)->next;
+            *cursor = idle->next;
+            lpr_state_unlock(&session_lock);
+            int status = retire_idle_session(idle);
+            if (status) { lpr_state_unlock(&management_lock); return status; }
+            continue;
+        }
         lpr_state_unlock(&session_lock);
         if (!establishing) {
             lpr_state_lock(&management_lock);
@@ -297,13 +333,16 @@ static int acquire_session(uint64_t minimum, struct lpr_fs_session **out)
             continue;
         }
         struct lpr_fs_session *s = 0;
-        /* Establish the negotiated base independently of the first syscall's
-         * size. Oversized calls get distinct authenticated temporary leases,
-         * not an ever-growing cache of transport mappings. */
+        /* Grow only by retiring an idle reusable arena first. If it is busy,
+         * an oversized concurrent call takes a temporary lease instead: two
+         * reusable arenas must never silently accumulate. Filed continues to
+         * charge every live arena against its global admission budget. */
         int status = initialize(additional ? minimum : 0, &s);
         lpr_state_lock(&session_lock);
         if (s) {
-            s->temporary = additional;
+            s->reusable = additional && !has_reusable &&
+                s->channel.config.arena_bytes <= LPR_FS_REUSE_MAX;
+            s->temporary = additional && !s->reusable;
             s->next = session;
             session = s;
         }

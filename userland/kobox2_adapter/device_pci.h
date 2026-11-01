@@ -3,6 +3,7 @@
 #define PACHA_KOBOX_DEVICE_PCI_H
 
 #include <pacha/abi.h>
+#include <stdbool.h>
 #include "boot/pci_host.h"
 #include <pacha/capsule.h>
 
@@ -30,6 +31,7 @@ struct ph_pci {
     struct pacha_capsule_bar_info bars[KOBOX_PCI_MEMORY_WINDOWS];
     uint64_t native_device;
     uint8_t hidden_io_bars;
+    bool legacy_vga_io;
     unsigned int admitted;
 };
 
@@ -45,6 +47,7 @@ struct ph_pci {
 int ph_pci_init(struct ph_pci *pci, const struct ph_pci_config *config);
 int ph_pci_revoke(struct ph_pci *pci, uint64_t generation);
 int ph_pci_destroy(struct ph_pci *pci);
+long ph_pci_port_io(void *context, uint16_t port, bool writing, uint8_t value);
 /* Consume private PFNs, validate one authorized BAR, then replace them with
  * BAR-relative offsets. No physical address is exposed to the client. */
 long ph_pci_export_pages(struct ph_pci *pci, uint64_t *pages, size_t count,

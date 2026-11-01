@@ -281,6 +281,7 @@ int lpr_fd_transfer_prepare(
         }
         item->object = ticket |
             ((uint64_t)filed->reserved1 << 32u);
+        item->provider_data = filed->mode;
         item->flags = filed->flags & ~(uint32_t)LPR_LINUX_O_CLOEXEC;
         item->capability_count = 1;
         capability_fds[0] = lease_fd;
@@ -411,22 +412,14 @@ int lpr_fd_transfer_prepare(
         const pacha_fd_t native_fd =
             lpr_transfer_duplicate_capability(dmabuf->native.raw);
         if (native_fd < 0) return native_fd;
-        pacha_fd_t lease_fd = -1;
-        pacha_fd_t remote_lease_fd = -1;
-        int status = lpr_native_wait_pair(&lease_fd, &remote_lease_fd);
-        if (status == 0)
-            status = (int)lpr_drm_prime_transfer_acquire(
-                dmabuf->token, remote_lease_fd);
-        if (status != 0) {
-            (void)lpr_close_native_fd_if_open(
-                (uint64_t)native_fd);
-            if (lease_fd >= 16)
-                (void)lpr_close_native_fd_if_open(
-                    (uint64_t)lease_fd);
-            if (remote_lease_fd >= 16)
-                (void)lpr_close_native_fd_if_open(
-                    (uint64_t)remote_lease_fd);
-            return status;
+        /* Preserve the object's authenticated CPU-sync endpoint. A fresh
+         * close-only channel registered by token would not prove ownership.
+         * Native dup retains the peer until every transferred holder closes. */
+        const pacha_fd_t lease_fd =
+            lpr_transfer_duplicate_capability(dmabuf->lease_fd.raw);
+        if (lease_fd < 0) {
+            (void)lpr_close_native_fd_if_open((uint64_t)native_fd);
+            return lease_fd;
         }
         item->object = dmabuf->token;
         item->flags = dmabuf->flags & ~(uint32_t)LPR_LINUX_O_CLOEXEC;
@@ -485,7 +478,8 @@ int lpr_fd_transfer_stage_batch(
     for (; prepared_count < item_count; ++prepared_count) {
         const struct unix_transfer_item *item = &items[prepared_count];
         if (item->object == 0 ||
-            (item->provider != LPR_FD_OPS_TTY && item->provider_data != 0) ||
+            (item->provider != LPR_FD_OPS_TTY &&
+             item->provider != LPR_FD_OPS_FILED && item->provider_data != 0) ||
             (item->rights & ~known_rights) != 0 ||
             item->capability_first != next_capability ||
             item->capability_count > capability_count - next_capability)
@@ -509,7 +503,7 @@ int lpr_fd_transfer_stage_batch(
             }
         } else if (item->provider == LPR_FD_OPS_FILED) {
             if (item->capability_count != 1 || item_capabilities[0] < 16 ||
-                (item->object >> 40u) != 0)
+                (item->object >> 40u) != 0 || item->provider_data > UINT16_MAX)
             {
                 status = -LPR_LINUX_EINVAL;
                 break;
@@ -543,9 +537,10 @@ int lpr_fd_transfer_stage_batch(
             struct pacha_fd_info lease;
             const uint64_t view_rights = PACHA_FD_RIGHT_DUP |
                 PACHA_FD_RIGHT_TRANSFER | PACHA_FD_RIGHT_CLOSE |
-                PACHA_FD_RIGHT_MAP_READ | PACHA_FD_RIGHT_MAP_WRITE;
-            const uint64_t lease_rights = PACHA_FD_RIGHT_DUP |
-                PACHA_FD_RIGHT_TRANSFER | PACHA_FD_RIGHT_CLOSE;
+                PACHA_FD_RIGHT_MAP_READ |
+                (((item->flags & LPR_LINUX_O_ACCMODE) == LPR_LINUX_O_RDWR) ?
+                    PACHA_FD_RIGHT_MAP_WRITE : 0);
+            const uint64_t lease_rights = GPUD_DRM_PRIME_OWNER_RIGHTS;
             lpr_memset(&view, 0, sizeof(view));
             lpr_memset(&lease, 0, sizeof(lease));
             if (item->capability_count != 2 || item_capabilities[0] < 16 ||
@@ -558,7 +553,8 @@ int lpr_fd_transfer_stage_batch(
                 view.rights != view_rights ||
                 lease.kind != PACHA_FD_KIND_CHANNEL || lease.size ||
                 (lease.rights & lease_rights) != lease_rights ||
-                (item->flags & LPR_LINUX_O_ACCMODE) != LPR_LINUX_O_RDWR)
+                ((item->flags & LPR_LINUX_O_ACCMODE) != LPR_LINUX_O_RDWR &&
+                 (item->flags & LPR_LINUX_O_ACCMODE) != LPR_LINUX_O_RDONLY))
             {
                 status = -LPR_LINUX_EINVAL;
                 break;
@@ -607,6 +603,7 @@ int lpr_fd_transfer_stage_batch(
             filed->active = 1;
             filed->flags = (uint32_t)linux_flags;
             filed->handle = handle;
+            filed->mode = (uint16_t)item->provider_data;
             filed->lease_handle = escrow_handle;
             filed->reserved1 = (uint8_t)(item->object >> 32u);
             filed->reserved2 |= LPR_BACKEND_TRANSFER_LEASE;
@@ -647,7 +644,7 @@ int lpr_fd_transfer_stage_batch(
             }
             lpr_dmabuf_backend_t *dmabuf = states[prepared_count];
             dmabuf->active = 1;
-            dmabuf->writable = 1;
+            dmabuf->writable = (view.rights & PACHA_FD_RIGHT_MAP_WRITE) != 0;
             dmabuf->reserved0 |= LPR_BACKEND_TRANSFER_LEASE;
             dmabuf->flags = (uint32_t)linux_flags;
             dmabuf->token = handle;

@@ -1,3 +1,4 @@
+#include "path_profile.h"
 
 #include "libuinet_backend.h"
 
@@ -2697,7 +2698,12 @@ int netd_libuinet_receive_frame(const struct netd_upper_frame *frame)
 
 #if defined(NETD_WITH_LIBUINET)
     netd_libuinet_observe_rx_frame(frame->bytes, frame->len);
+    uint64_t path_begin=NETD_PATH_NOW();
+#if NETD_PATH_PROFILE
+    uint64_t path_key=kobox_net_perf_key(frame->bytes,frame->len);
+#endif
     int status = uinet_pachaos_if_deliver(g_libuinet_if, frame->bytes, frame->len);
+    NETD_PATH_RECORD(2,path_key,path_begin,NETD_PATH_NOW(),frame->len);
     if (status == 0) {
         g_libuinet_rx_frames++;
         netd_libuinet_notify_sockets();
@@ -2754,6 +2760,71 @@ uint64_t netd_libuinet_rx_frames(void)
 uint64_t netd_libuinet_rx_drops(void)
 {
     return g_libuinet_rx_drops;
+}
+
+int netd_libuinet_format_rx_stats(char *text, size_t capacity)
+{
+#if defined(NETD_WITH_LIBUINET)
+    if (g_libuinet_state != NETD_LIBUINET_READY) return 0;
+    struct uinet_tcpstat t;
+    uinet_gettcpstat(uinet_instance_default(), &t);
+    unsigned active = 0, zero_now = 0;
+    uint64_t zero_sent = 0;
+    for (unsigned i = 0; i < NETD_SOCKET_API_MAX_SOCKETS; ++i) {
+        struct netd_libuinet_api_socket *slot = &g_libuinet_api_sockets[i];
+        if (!slot->socket || slot->type != NETD_SOCK_STREAM || slot->listening) continue;
+        struct uinet_tcp_info info = {0};
+        unsigned length = sizeof(info);
+        if (uinet_sogetsockopt(slot->socket, UINET_IPPROTO_TCP, UINET_TCP_INFO,
+                &info, &length)) continue;
+        active++;
+        zero_now += info.tcpi_rcv_space == 0;
+        zero_sent += info.tcpi_snd_zerowin;
+    }
+    int used = snprintf(text, capacity,
+        "uinet_rx_frames=%llu\nuinet_rx_drops=%llu\n"
+        "rcvtotal=%lu\nrcvbadsum=%lu\nrcvduppack=%lu\nrcvoopack=%lu\n"
+        "rcvmemdrop=%lu\nrcvshort=%lu\nrcvbadoff=%lu\n"
+        "rcvwinprobe=%lu\nrcvpackafterwin=%lu\nsndwinup=%lu\nsndacks=%lu\ndelack=%lu\n"
+        "sndrexmitpack=%lu\nactive_tcp=%u\nzero_window_now=%u\nactive_zero_sent=%llu\n",
+        (unsigned long long)g_libuinet_rx_frames, (unsigned long long)g_libuinet_rx_drops,
+        t.tcps_rcvtotal, t.tcps_rcvbadsum, t.tcps_rcvduppack, t.tcps_rcvoopack,
+        t.tcps_rcvmemdrop, t.tcps_rcvshort, t.tcps_rcvbadoff, t.tcps_rcvwinprobe,
+        t.tcps_rcvpackafterwin, t.tcps_sndwinup, t.tcps_sndacks, t.tcps_delack, t.tcps_sndrexmitpack,
+        active, zero_now, (unsigned long long)zero_sent);
+    if (used < 0 || (size_t)used >= capacity) return used;
+    static unsigned cursor;
+    unsigned emitted = 0;
+    for (unsigned visit = 0; visit < NETD_SOCKET_API_MAX_SOCKETS && emitted < 8; ++visit) {
+        struct netd_libuinet_api_socket *slot = &g_libuinet_api_sockets[cursor];
+        cursor = (cursor + 1) % NETD_SOCKET_API_MAX_SOCKETS;
+        if (!slot->socket || slot->type != NETD_SOCK_STREAM || slot->listening) continue;
+        struct uinet_tcp_info info = {0};
+        struct uinet_in_conninfo conn = {0};
+        unsigned length = sizeof(info);
+        if (uinet_sogetsockopt(slot->socket, UINET_IPPROTO_TCP, UINET_TCP_INFO,
+                &info, &length)) continue;
+        uinet_sogetconninfo(slot->socket, &conn);
+        unsigned port = conn.inc_ie.ie_fport;
+        port = ((port & 255u) << 8) | (port >> 8); /* Fixed x86 host, network port. */
+        int sndbuf=0,rcvbuf=0;unsigned optlen=sizeof(int);
+        (void)uinet_sogetsockopt(slot->socket,UINET_SOL_SOCKET,UINET_SO_SNDBUF,&sndbuf,&optlen);
+        optlen=sizeof(int);(void)uinet_sogetsockopt(slot->socket,UINET_SOL_SOCKET,UINET_SO_RCVBUF,&rcvbuf,&optlen);
+        int added = snprintf(text + used, capacity - (size_t)used,
+            "socket_%llu=peer_port:%u,recv:%llu,polls:%llu,notified:%u,"
+            "rcv_space:%u,rcv_next:%u,zero_sent:%u,state:%u,sndbuf:%d,rcvbuf:%d,snd_ws:%u,rcv_ws:%u,rtt_us:%u,cwnd:%u\n",
+            (unsigned long long)slot->handle, port, (unsigned long long)slot->recv_bytes,
+            (unsigned long long)slot->poll_calls, slot->notify_pending, info.tcpi_rcv_space,
+            info.tcpi_rcv_nxt, info.tcpi_snd_zerowin, info.tcpi_state,sndbuf,rcvbuf,info.tcpi_snd_wscale,info.tcpi_rcv_wscale,info.tcpi_rtt,info.tcpi_snd_cwnd);
+        if (added < 0 || (size_t)added >= capacity - (size_t)used) break;
+        used += added;
+        emitted++;
+    }
+    return used;
+#else
+    (void)text; (void)capacity;
+    return 0;
+#endif
 }
 
 int netd_libuinet_socket_open(
@@ -3083,6 +3154,28 @@ int netd_libuinet_socket_accept(uint64_t handle, pacha_fd_t notify_fd,
 #endif
 }
 
+#if defined(NETD_WITH_LIBUINET)
+/* uinet_sosend/soreceive expose the raw FreeBSD socket error and residual.
+ * Unlike kern_sendit/kern_recvit they do not convert an interrupted partial
+ * operation to success. Losing that progress makes a retry duplicate TX
+ * bytes (or discard RX bytes), while TCP checksums remain perfectly valid. */
+static int netd_libuinet_io_result(int status, size_t attempted,
+    int64_t residual, size_t *transferred)
+{
+    *transferred = 0;
+    if (residual < 0 || (uint64_t)residual > attempted) return -EIO;
+    const size_t completed = attempted - (size_t)residual;
+    /* FreeBSD's private ERESTART is -1; it is intentionally not a Linux
+     * errno or a new wire status. Match its socket syscall wrapper here. */
+    if (completed && (status == UINET_EWOULDBLOCK || status == UINET_EAGAIN ||
+        status == UINET_EINTR || status == -1)) status = 0;
+    if (status == -1) return -EINTR;
+    if (status) return -netd_libuinet_errno_to_linux(status);
+    *transferred = completed;
+    return 0;
+}
+#endif
+
 int netd_libuinet_socket_send(uint64_t handle, const void *data, size_t len, uint64_t flags, uint32_t addr_be, uint16_t port_be, size_t *out_sent)
 {
     (void)flags;
@@ -3119,13 +3212,8 @@ int netd_libuinet_socket_send(uint64_t handle, const void *data, size_t len, uin
     uio.uio_resid = (int64_t)len;
 
     int status = uinet_sosend(slot->socket, send_addr, &uio, 0);
-    if (status == UINET_EWOULDBLOCK || status == UINET_EAGAIN) {
-        return -11;
-    }
-    if (status != 0) {
-        return -netd_libuinet_errno_to_linux(status);
-    }
-    *out_sent = len - (size_t)uio.uio_resid;
+    status = netd_libuinet_io_result(status, len, uio.uio_resid, out_sent);
+    if (status) return status;
     slot->send_calls++;
     slot->send_bytes += (uint64_t)*out_sent;
     if (g_libuinet_trace && slot->type == NETD_SOCK_STREAM && *out_sent != 0 && slot->send_calls <= 8u) {
@@ -3211,14 +3299,13 @@ int netd_libuinet_socket_recv(uint64_t handle, void *data, size_t capacity,
         receive_flags |= NETD_UINET_MSG_PEEK;
     if ((flags & NETD_LINUX_MSG_DONTWAIT) != 0)
         receive_flags |= UINET_MSG_DONTWAIT;
+    uint64_t path_receive_begin=NETD_PATH_NOW();
     int status = uinet_soreceive(slot->socket, &peer, &uio, &receive_flags);
-    if (status == UINET_EWOULDBLOCK || status == UINET_EAGAIN) {
+    status = netd_libuinet_io_result(status, read_size, uio.uio_resid,
+        out_received);
+    if (status) {
         if (peer != NULL) uinet_free_sockaddr(peer);
-        return -11;
-    }
-    if (status != 0) {
-        if (peer != NULL) uinet_free_sockaddr(peer);
-        return -netd_libuinet_errno_to_linux(status);
+        return status;
     }
     if (peer != NULL && peer->sa_family == UINET_AF_INET) {
         const struct uinet_sockaddr_in *sin =
@@ -3227,7 +3314,7 @@ int netd_libuinet_socket_recv(uint64_t handle, void *data, size_t capacity,
         *out_port_be = sin->sin_port;
     }
     if (peer != NULL) uinet_free_sockaddr(peer);
-    *out_received = read_size - (size_t)uio.uio_resid;
+    NETD_PATH_RECORD(4,slot->handle,path_receive_begin,NETD_PATH_NOW(),slot->recv_calls);
     slot->recv_calls++;
     slot->recv_bytes += (uint64_t)*out_received;
     slot->recv_idle_logged = 0;
@@ -3365,4 +3452,51 @@ int netd_libuinet_socket_close(uint64_t handle)
     (void)handle;
     return -95;
 #endif
+}
+
+int netd_libuinet_perf_buffers(int large,char *reply,size_t capacity)
+{
+#if defined(NETD_WITH_LIBUINET)
+ if(!g_libuinet_initialized || g_libuinet_state!=NETD_LIBUINET_READY)return -EAGAIN;
+ static unsigned long saved[2];static int have_saved;
+ const char *names[2]={"net.inet.tcp.sendspace","net.inet.tcp.recvspace"};
+ unsigned long old[2];size_t retval=0;
+ for(unsigned i=0;i<2;i++){size_t size=sizeof(old[i]);
+  int e=uinet_sysctlbyname(uinet_instance_default(),names[i],(char *)&old[i],&size,NULL,0,&retval,0);
+  if(e||size!=sizeof(old[i]))return -EIO;
+ }
+ if(!have_saved){memcpy(saved,old,sizeof(saved));have_saved=1;}
+ unsigned long target[2]={large?512UL*1024:saved[0],large?512UL*1024:saved[1]};
+ for(unsigned i=0;i<2;i++){
+  int e=uinet_sysctlbyname(uinet_instance_default(),names[i],NULL,NULL,(char *)&target[i],sizeof(target[i]),&retval,0);
+  if(e){if(i && uinet_sysctlbyname(uinet_instance_default(),names[0],NULL,NULL,(char *)&old[0],sizeof(old[0]),&retval,0))return -EREMOTEIO;return -EIO;}
+ }
+ int n=snprintf(reply,capacity,"tcp_sendspace=%lu\ntcp_recvspace=%lu\nnew_sockets_only=1\n",target[0],target[1]);
+ return n<0||(size_t)n>=capacity?-ENOSPC:0;
+#else
+ (void)large;(void)reply;(void)capacity;return -EOPNOTSUPP;
+#endif
+}
+
+int netd_libuinet_interface_snapshot(struct netd_interface_snapshot *out)
+{
+    if (!out) return -22;
+    memset(out, 0, sizeof(*out));
+    const struct netd_link_info *link = netd_link_current();
+    if (!link) return 0;
+    out->mtu = link->mtu;
+    memcpy(out->mac, link->mac, 6);
+    out->carrier = link->carrier;
+#if defined(NETD_WITH_LIBUINET)
+    out->admin_up = g_libuinet_if != NULL &&
+        g_libuinet_state == NETD_LIBUINET_READY && g_ipv4_admitted;
+    if (out->admin_up) {
+        memcpy(out->address, g_applied_network.address, 4);
+        memcpy(out->netmask, g_applied_network.netmask, 4);
+        memcpy(out->broadcast, g_applied_network.broadcast, 4);
+        out->has_address = (out->address[0] | out->address[1] |
+            out->address[2] | out->address[3]) != 0;
+    }
+#endif
+    return 1;
 }

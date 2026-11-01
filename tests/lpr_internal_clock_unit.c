@@ -9,6 +9,11 @@ static struct pacha_native_result invoke(uint64_t, uint64_t, uint64_t,
 #define PACHA_NATIVE_SYSCALL_TEST_INVOKE invoke
 #include "../userland/personality/linux/runtime/lpr_vfs/ops.c"
 
+static int fast_available;
+static uint64_t fast_value;
+int lpr_clock_monotonic(uint64_t *ns)
+{ if (!fast_available) return 1; *ns = fast_value; return 0; }
+
 static unsigned calls, transient;
 static uint64_t expected_clock, nanoseconds;
 static long failure;
@@ -52,5 +57,11 @@ int main(void)
     assert(lpr_pacha_clock_gettime(expected_clock, &out) ==
         pacha_kernel_status_to_errno(failure));
     assert(!out.tv_sec && !out.tv_nsec);
+    fast_available = 1; fast_value = UINT64_C(12345678901); calls = 0;
+    assert(!lpr_pacha_clock_gettime(1, &out) && !calls);
+    assert(out.tv_sec == 12 && out.tv_nsec == 345678901);
+    expected_clock = 0; failure = 0; nanoseconds = 987; calls = 0;
+    assert(!lpr_pacha_clock_gettime(0, &out) && calls == 1);
+    assert(!out.tv_sec && out.tv_nsec == 987);
     puts("LPR internal scalar clock: PASS");
 }

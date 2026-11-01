@@ -1,0 +1,130 @@
+/* Exercise real deadline/remaining-zero branches, preserving successful results. */
+#include <assert.h>
+#include <stdio.h>
+#include <string.h>
+#include "../userland/personality/linux/runtime/lpr_wait.c"
+#include "../userland/personality/linux/runtime/lpr_vfs/ops.c"
+#define lpr_linux_dispatch_pending_signals_with_result unused_dispatch_pending_signals_with_result
+#include "../userland/personality/linux/runtime/lpr_signal.c"
+#undef lpr_linux_dispatch_pending_signals_with_result
+static struct lpr_linux_user_frame user_frame;
+const struct lpr_linux_user_frame *lpr_current_linux_user_frame(void) { return &user_frame; }
+
+int64_t lpr_pacha_status_to_errno(int64_t s) { return pacha_kernel_status_to_errno(s); }
+static uint64_t now_ns;
+static int64_t native_result;
+static unsigned waits, probes, kernel_pending, deliveries, event_drains, socket_marks;
+static uint64_t returned_events;
+static unsigned two_ready;
+lpr_state_t lpr_state;
+static lpr_thread_record_t retained_record;
+static unsigned retained_mode, retained_flags[8], retained_calls, stale_once;
+static unsigned char retained_memory[8192] __attribute__((aligned(4096)));
+int64_t lpr_pacha_syscall6(uint64_t n,uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
+{ (void)a;(void)b;(void)d;(void)e;(void)f; assert(n==PACHAOS_SYSCALL_MMAP && c==sizeof(retained_memory));return (uintptr_t)retained_memory; }
+int lpr_thread_current_record(lpr_thread_record_t **out)
+{ *out=retained_mode?&retained_record:NULL; return retained_mode?0:-1; }
+void *lpr_memset(void *p, int c, size_t n) { return memset(p,c,n); }
+int64_t lpr_pacha_syscall4(uint64_t n,uint64_t a,uint64_t b,uint64_t c,uint64_t flags)
+{ if(b) ((struct pacha_pollfd *)(uintptr_t)a)[0].revents=returned_events; if(two_ready && b>1)((struct pacha_pollfd *)(uintptr_t)a)[1].revents=PACHA_FD_EVENT_WRITABLE; assert(n==PACHA_FD_SYSCALL_WAIT_MANY); if(retained_mode){assert(retained_calls<8);retained_flags[retained_calls++]=flags;if(stale_once && flags==PACHA_FD_WAIT_SET_REUSE){stale_once=0;return PACHA_FD_WAIT_SET_INVALIDATED;}}else assert(flags==0); ++waits; if(c!=PACHA_FD_WAIT_FOREVER)now_ns+=c*1000000; return native_result; }
+int64_t lpr_pacha_syscall3(uint64_t n,uint64_t a,uint64_t b,uint64_t c)
+{ (void)n;(void)a;(void)b;(void)c; return -1; }
+int64_t lpr_pacha_syscall2(uint64_t n,uint64_t a,uint64_t b)
+{ if(n==PACHAOS_SYSCALL_PROCESS_SIGNAL_CTL){ assert(a==PACHAOS_PROCESS_SIGNAL_CTL_DELIVER_PENDING_FRAME && user_frame.rax==0); ++probes; if(kernel_pending){kernel_pending=0;++deliveries;} return 0; } assert(n==PACHAOS_SYSCALL_CLOCK_GETTIME); (void)a; struct pachaos_timespec *t=(void *)(uintptr_t)b; t->tv_sec=now_ns/1000000000; t->tv_nsec=now_ns%1000000000; return 0; }
+int64_t lpr_pacha_syscall1(uint64_t n,uint64_t a)
+{ assert(n==PACHAOS_SYSCALL_NANOSLEEP); const struct pachaos_timespec *t=(void *)(uintptr_t)a; now_ns+=t->tv_sec*1000000000+t->tv_nsec; ++waits; return native_result; }
+int64_t lpr_close_native_fd_if_open(uint64_t fd) { (void)fd;return 0; }
+int lpr_linux_socket_fd_active(uint64_t fd) { return fd==42; }
+void lpr_linux_socket_mark_readable(uint64_t fd) { assert(fd==42); ++socket_marks; }
+void lpr_eventfd_drain_wait(uint64_t fd) { assert(fd==42); ++event_drains; }
+int64_t lpr_unix_poll_block(lpr_wait_graph_t *g,const lpr_wait_deadline_t *d,int64_t (*block)(lpr_wait_graph_t *,const lpr_wait_deadline_t *))
+{ return block(g,d); }
+int64_t lpr_linux_dispatch_pending_signals_with_result(int64_t result) { (void)result;return 0; }
+int main(void)
+{
+ /* A returned event is not topology: repeated waits reuse registrations.
+  * Source close invalidation forces replacement; fork identity and changed
+  * write minima cannot inherit an old registration. */
+ retained_mode=1; native_result=PACHA_SYSCALL_ERR_NOT_READY; lpr_supervisor_token=101;
+ lpr_wait_graph_t retained; lpr_wait_graph_init(&retained);
+ retained.leaf_count=1; retained.leaves[0].fd=42;
+ retained.leaves[0].events=PACHA_FD_EVENT_READABLE;
+ assert(lpr_wait_native_retained_fds(retained.leaves, retained.leaf_count, PACHA_FD_WAIT_FOREVER, 0)==PACHA_SYSCALL_ERR_NOT_READY);
+ retained.leaves[0].revents=PACHA_FD_EVENT_READABLE;
+ assert(lpr_wait_native_retained_fds(retained.leaves, retained.leaf_count, PACHA_FD_WAIT_FOREVER, 0)==PACHA_SYSCALL_ERR_NOT_READY);
+ stale_once=1;
+ assert(lpr_wait_native_retained_fds(retained.leaves, retained.leaf_count, PACHA_FD_WAIT_FOREVER, 0)==PACHA_SYSCALL_ERR_NOT_READY);
+ retained.leaves[0].min_write_bytes=7;
+ assert(lpr_wait_native_retained_fds(retained.leaves, retained.leaf_count, PACHA_FD_WAIT_FOREVER, 0)==PACHA_SYSCALL_ERR_NOT_READY);
+ lpr_supervisor_token=102;
+ assert(lpr_wait_native_retained_fds(retained.leaves, retained.leaf_count, PACHA_FD_WAIT_FOREVER, 0)==PACHA_SYSCALL_ERR_NOT_READY);
+ assert(retained_calls==6 && retained_flags[0]==PACHA_FD_WAIT_SET_REPLACE &&
+   retained_flags[1]==PACHA_FD_WAIT_SET_REUSE && retained_flags[2]==PACHA_FD_WAIT_SET_REUSE &&
+   retained_flags[3]==PACHA_FD_WAIT_SET_REPLACE && retained_flags[4]==PACHA_FD_WAIT_SET_REPLACE &&
+   retained_flags[5]==PACHA_FD_WAIT_SET_REPLACE);
+ retained_mode=0; native_result=0;
+ for(unsigned signal=0;signal<2;++signal)
+ for(unsigned interrupted=0;interrupted<2;++interrupted){
+  lpr_native_pending_hint_active=1; lpr_native_pending_hint=0; lpr_state.thread_count=1;
+  native_result=interrupted?PACHA_SYSCALL_ERR_NOT_READY:0;
+  for(unsigned leaves=0;leaves<2;++leaves){
+   now_ns=waits=probes=deliveries=0; kernel_pending=signal; unsigned observed=0;
+   lpr_wait_graph_t g; lpr_wait_graph_init(&g);
+   g.leaf_count=leaves; g.leaves[0].fd=42; g.relative_deadline_ns=1000000;
+   assert(lpr_wait_graph_block(&g,0,&observed)==0);
+   assert(waits==1 && observed==interrupted);
+   /* Pre-fix ordinary result with hint zero skips the pending query. */
+   lpr_linux_deliver_native_pending_frame(0); assert(probes==0 && kernel_pending==signal);
+   lpr_linux_deliver_native_pending_frame_after_wait(0,&observed);
+   assert(probes==interrupted && observed==0);
+   assert(deliveries==(signal && interrupted) && kernel_pending==(signal && !interrupted));
+  }
+  now_ns=waits=probes=deliveries=0; kernel_pending=signal; unsigned observed=0;
+  struct pachaos_timespec req={0,1000000},rem={99,99};
+  assert(lpr_linux_nanosleep((uintptr_t)&req,(uintptr_t)&rem,&observed)==0);
+  assert(waits==1 && observed==interrupted);
+  if(interrupted)assert(rem.tv_sec==0 && rem.tv_nsec==0);
+  /* Pre-fix ordinary result with hint zero skips the pending query. */
+   lpr_linux_deliver_native_pending_frame(0); assert(probes==0 && kernel_pending==signal);
+   lpr_linux_deliver_native_pending_frame_after_wait(0,&observed);
+  assert(probes==interrupted);
+  assert(deliveries==(signal && interrupted) && kernel_pending==(signal && !interrupted));
+ }
+ /* Completion uses output events, never the independent byte minimum. */
+ for(unsigned native=0;native<2;++native)
+ for(unsigned ready=0;ready<2;++ready){
+  lpr_wait_graph_t g; lpr_wait_graph_init(&g);
+  g.leaf_count=1; g.leaves[0].fd=42;
+  g.leaves[0].events=PACHA_FD_EVENT_READABLE;
+  g.leaves[0].min_write_bytes=ready?0:PACHA_FD_EVENT_READABLE;
+  g.logical_fds[0]=42;
+  g.drain_modes[0]=native?LPR_WAIT_DRAIN_NATIVE:LPR_WAIT_DRAIN_EVENT;
+  g.relative_deadline_ns=1000000;
+  returned_events=ready?PACHA_FD_EVENT_READABLE:0; native_result=ready;
+  event_drains=socket_marks=0;
+  unsigned observed=0;
+  assert(lpr_wait_graph_block(&g,0,&observed)==0);
+  assert(event_drains==(!native && ready));
+  assert(socket_marks==(native && ready));
+ }
+ /* Regression: NOT_READY=2 is also a two-ready successful completion. */
+ for(unsigned retained_case=0;retained_case<2;++retained_case){
+  retained_mode=retained_case; retained_calls=0; memset(&retained_record,0,sizeof retained_record);
+  lpr_wait_graph_t g; lpr_wait_graph_init(&g);
+  g.leaf_count=2;g.leaves[0].fd=42;g.leaves[1].fd=43;
+  g.leaves[0].events=PACHA_FD_EVENT_READABLE;g.leaves[1].events=PACHA_FD_EVENT_WRITABLE;
+  returned_events=PACHA_FD_EVENT_READABLE;two_ready=1;native_result=2;
+  unsigned observed=0;assert(lpr_wait_graph_block(&g,0,&observed)==0);assert(observed==0);
+ }
+ puts("uninterruptible wait wait graph deadline and relative nanosleep zero preserve result/local NOT_READY PASS");
+}
+
+#include "lpr_ipc_mock.h"
+int64_t lpr_ipc_message(uint64_t nr, uint64_t fd, uint64_t send, uint64_t receive,
+    uint64_t timeout, uint64_t flags, int *committed) {
+    if (nr==PACHAOS_SYSCALL_IPC_RECV) { assert(fd==42); return PACHA_SYSCALL_ERR_NOT_READY; }
+    return test_lpr_ipc_noncall(nr, fd, send, receive, timeout, flags, committed);
+}
+
+int64_t lpr_deliver_pending_frame(const struct lpr_linux_user_frame *f, uint64_t fp) { (void)f;(void)fp; ++probes;if(kernel_pending){kernel_pending=0;++deliveries;}return 0;}
+int lpr_clock_monotonic(uint64_t *t) { *t=now_ns;return 0; }

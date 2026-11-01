@@ -19,6 +19,10 @@
 #include <xf86drm.h>
 #include <xf86drmMode.h>
 
+#ifndef MESA_GEARS_DRM_DRIVER
+#define MESA_GEARS_DRM_DRIVER "amdgpu"
+#endif
+
 enum { MAX_SCANOUT_BUFFERS = 8, DEFAULT_SECONDS = 60, MAX_SECONDS = 90,
        GEAR_COUNT = 3, VERTICES_PER_SEGMENT = 24 };
 
@@ -423,12 +427,15 @@ static int graphics(struct gears *g)
     const char *renderer = (const char *)glGetString(GL_RENDERER);
     printf("MESA_GEARS_RENDERER %s\n", renderer ? renderer : "(null)");
     fflush(stdout);
-    /* Mesa may retry in software. A real AMD DRM node plus an AMD renderer
-     * are both required; software and host-virtual renderers are failures. */
-    if (!renderer || (!strcasestr(renderer, "radeon") &&
-                      !strcasestr(renderer, "amdgpu")) ||
+    /* Match the actual DRM driver and renderer. A loader retry in software
+     * must never turn this physical-GPU verification into a false success. */
+    const bool intel = strcmp(MESA_GEARS_DRM_DRIVER, "i915") == 0;
+    if (!renderer || (intel ? !strcasestr(renderer, "intel") :
+                     (!strcasestr(renderer, "radeon") &&
+                      !strcasestr(renderer, "amdgpu"))) ||
         strcasestr(renderer, "llvmpipe") || strcasestr(renderer, "softpipe") ||
-        strcasestr(renderer, "virgl") || strcasestr(renderer, "swrast"))
+        strcasestr(renderer, "virgl") || strcasestr(renderer, "swrast") ||
+        strcasestr(renderer, "d3d12") || strcasestr(renderer, "zink"))
         return fail("hardware-renderer");
     if (program(g) || meshes(g)) return -1;
     printf("MESA_GEARS_SCENE gears=3 geometry=extruded teeth=20,10,10 view=oblique depth=16\n");
@@ -654,12 +661,12 @@ int main(int argc, char **argv)
         char *end = NULL;
         unsigned long parsed = strtoul(argv[2], &end, 10);
         if (!end || *end || parsed < 1 || parsed > MAX_SECONDS) {
-            fputs("usage: amdgpu-mesa-gears [--seconds 1..90]\n", stderr);
+            fputs("usage: mesa-gears [--seconds 1..90]\n", stderr);
             return 2;
         }
         seconds = (unsigned)parsed;
     } else if (argc != 1) {
-        fputs("usage: amdgpu-mesa-gears [--seconds 1..90]\n", stderr);
+        fputs("usage: mesa-gears [--seconds 1..90]\n", stderr);
         return 2;
     }
     struct gears g = {.fd = -1, .display = EGL_NO_DISPLAY,
@@ -674,9 +681,9 @@ int main(int argc, char **argv)
         goto done;
     }
     drmVersionPtr version = drmGetVersion(g.fd);
-    if (!version || !version->name || strcmp(version->name, "amdgpu")) {
+    if (!version || !version->name || strcmp(version->name, MESA_GEARS_DRM_DRIVER)) {
         if (version) drmFreeVersion(version);
-        (void)fail("amdgpu-driver");
+        (void)fail("drm-driver-identity");
         goto done;
     }
     drmFreeVersion(version);
@@ -688,8 +695,8 @@ int main(int argc, char **argv)
     if (pipeline(&g) || graphics(&g)) goto done;
     uint64_t start = monotonic_ns();
     if (!start || draw(&g, 0.0f, 1)) goto done;
-    printf("MESA_GEARS_DISPLAY_READY renderer=amdgpu mode=%ux%u\n",
-           g.mode.hdisplay, g.mode.vdisplay);
+    printf("MESA_GEARS_DISPLAY_READY driver=%s mode=%ux%u\n",
+           MESA_GEARS_DRM_DRIVER, g.mode.hdisplay, g.mode.vdisplay);
     fflush(stdout);
     unsigned frames = 1;
     uint64_t last_report = start;

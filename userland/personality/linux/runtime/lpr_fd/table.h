@@ -48,7 +48,7 @@ typedef struct lpr_native_fd {
 
 typedef struct lpr_filed_backend {
     uint8_t active;
-    uint16_t reserved0;
+    uint16_t mode;
     uint8_t reserved1;
     uint32_t flags;
     uint64_t handle;
@@ -214,7 +214,7 @@ typedef struct lpr_socket_backend {
     int32_t last_error;
     uint32_t local_addr_be;
     uint16_t local_port_be;
-    uint16_t reserved0;
+    uint16_t local_addr_mapped;
     uint32_t peer_addr_be;
     uint16_t peer_port_be;
     uint16_t reserved1;

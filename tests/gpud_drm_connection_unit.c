@@ -30,7 +30,14 @@ static unsigned char page[GPUD_DRM_PAGE_BYTES];
 static unsigned char auxiliary[GPUD_DRM_AUX_REUSE_BYTES];
 static uint64_t auxiliary_size = sizeof(auxiliary), auxiliary_rights;
 static int auxiliary_map_failure, gpu_calls, output_request, fence_request, fence_waits;
-static int resources_request;
+static int resources_request, i915_query_request, i915_exec_request, i915_exec_error, i915_wait_request;
+static int cpu_rpc_calls, cpu_rpc_error, cpu_deny_rights;
+int gpud_gpu_rpc_prime_cpu_sync(struct gpud_gpu_rpc *rpc, uint64_t correlation,
+    uint64_t token, uint64_t flags) {
+    assert(rpc->ipc->generation==9 && correlation && token==4097 && gpud_drm_cpu_sync_flags_valid(flags));
+    ++cpu_rpc_calls; return cpu_rpc_error;
+}
+
 static struct pacha_ipc_msg queued;
 static struct pacha_ipc_fd queued_fds[PACHA_IPC_MAX_TRANSFER_FDS];
 static int maps, unmaps, closes, replies, ready_fd, hungup_fd, map_failure, unmap_failure, close_failure;
@@ -209,6 +216,7 @@ static long protocol_oracle2(uint64_t nr, uint64_t a, uint64_t b)
             PACHA_FD_KIND_CHANNEL,
             .size = a == 20 ? GPUD_DRM_PAGE_BYTES : a == 23 ? auxiliary_size : 0,
             .rights = a == 23 ? auxiliary_rights : UINT64_MAX};
+        if (cpu_deny_rights && a==20) info->rights=PACHA_FD_RIGHT_CLOSE;
         return 0;
     }
     if (nr == PACHA_VM_SYSCALL_MUNMAP) {
@@ -260,7 +268,50 @@ int gpud_gpu_rpc_call(struct gpud_gpu_rpc *r, unsigned int q,
         .status = KB2_GPU_STATUS_OK, .length = 8, .data = result,
         .record_schema_id = output_request ? KB2_GPU_DRM_VIRTGPU_RECORD_GET_CAPS_RESULT :
             KB2_GPU_DRM_VIRTGPU_RECORD_EXECBUFFER_RESULT};
-    if (resources_request) {
+    if (i915_wait_request) {
+        kb2_gpu_command_t command;
+        assert(!kb2_gpu_command_decode(b+KB2_PROTOCOL_MESSAGE_ENVELOPE_SIZE,envelope.payload_length,
+            envelope.generation,KB2_GPU_PROFILE_I915,KB2_GPU_QUEUE_EXECUTION,NULL,0,&command));
+        assert(command.command_id==KB2_GPU_DRM_I915_COMMAND_GEM_WAIT);
+        size_t bytes;const unsigned char *input=kb2_gpu_command_inline_data(&command,&bytes);assert(bytes==16);
+        memcpy(result,input,16);memset(result+8,0,8);
+        const int32_t error=-62;memcpy(result+16,&error,4);
+        completion.record_schema_id=KB2_GPU_DRM_I915_RECORD_GEM_WAIT_RESULT;completion.length=24;
+    } else if (i915_exec_request) {
+        const kb2_gpu_region_t region={.region_id=PH_GPU_QUERY_OUTPUT_REGION,.rights=3,.length=sizeof(auxiliary)};
+        kb2_gpu_command_t command;
+        assert(!kb2_gpu_command_decode(b+KB2_PROTOCOL_MESSAGE_ENVELOPE_SIZE,envelope.payload_length,
+            envelope.generation,KB2_GPU_PROFILE_I915,KB2_GPU_QUEUE_EXECUTION,&region,1,&command));
+        assert(command.command_id==KB2_GPU_DRM_I915_COMMAND_EXECBUFFER && command.counts[1]==2);
+        unsigned char *shared=r->mapping+GPUD_GPU_AUX_OFFSET;
+        assert(!memcmp(shared,auxiliary,96));
+        const uint64_t offsets[2]={0x34567000,0x45678000};
+        for(unsigned i=0;i<2;++i) memcpy(shared+i*40+16,&offsets[i],8);
+        completion.record_schema_id=KB2_GPU_DRM_I915_RECORD_EXEC_RESULT;completion.length=8;
+        memcpy(result,&i915_exec_error,4);
+    } else if (i915_query_request) {
+        kb2_gpu_command_t command;
+        const kb2_gpu_region_t region={.region_id=PH_GPU_QUERY_OUTPUT_REGION,
+            .rights=KB2_GPU_SPAN_RIGHT_READ | KB2_GPU_SPAN_RIGHT_WRITE,.length=sizeof(auxiliary)};
+        assert(!kb2_gpu_command_decode(b+KB2_PROTOCOL_MESSAGE_ENVELOPE_SIZE,
+            envelope.payload_length,envelope.generation,KB2_GPU_PROFILE_I915,
+            KB2_GPU_QUEUE_EXECUTION,&region,1,&command));
+        assert(command.command_set_id==KB2_GPU_DRM_I915_SET_ID &&
+            command.command_id==KB2_GPU_DRM_I915_COMMAND_QUERY);
+        const size_t bytes=i915_query_request==1?48:64;
+        unsigned char *shared=r->mapping+GPUD_GPU_AUX_OFFSET;
+        assert(!memcmp(shared,auxiliary,bytes));
+        gpud_drm_i915_query_item_wire_t items[2];memcpy(items,shared,sizeof(items));
+        assert(items[0].query_id==1 && items[1].query_id==999);
+        assert(items[0].length==(i915_query_request==1?0:16));
+        assert(items[0].data_offset==(i915_query_request==1?0:48));
+        items[0].length=16;items[1].length=-EINVAL;
+        memcpy(shared,items,sizeof(items));
+        if(i915_query_request==2) memset(shared+48,0x5a,16);
+        completion.record_schema_id=KB2_GPU_DRM_I915_RECORD_QUERY_RESULT;
+        completion.length=16;const uint32_t count=2;const uint64_t blob=i915_query_request==1?0:16;
+        memcpy(result,&count,4);memcpy(result+8,&blob,8);
+    } else if (resources_request) {
         kb2_gpu_command_t command;
         assert(!kb2_gpu_command_decode(b + KB2_PROTOCOL_MESSAGE_ENVELOPE_SIZE,
             envelope.payload_length, envelope.generation, KB2_GPU_PROFILE_AMDGPU,
@@ -385,6 +436,96 @@ static void auxiliary_call(struct gpud_drm_service *service, uint64_t handle, in
         for (size_t i = 0; i < 12; ++i) assert(auxiliary[i] == (i < 4 ? 0x5a : 0));
     }
 }
+static void i915_wait_and_forgery_call(struct gpud_drm_service *service,uint64_t handle)
+{
+    pacha_service_envelope_t *header=(void *)page;
+    *header=(pacha_service_envelope_t){.magic=PACHA_SERVICE_REQUEST_MAGIC,.header_size=sizeof(*header),
+        .service_id=GPUD_DRM_SERVICE_ID,.op=GPUD_DRM_OP_HANDLE_IOCTL,.request_id=30+gpu_calls,
+        .flags=PACHA_SERVICE_FLAG_PAGE_PAYLOAD,.payload_size=sizeof(gpud_drm_ioctl_request_t)};
+    gpud_drm_ioctl_request_t *request=(void *)(page+sizeof(*header));
+    *request=(gpud_drm_ioctl_request_t){.handle=handle,.request=GPUD_DRM_IOCTL_I915_GEM_WAIT,
+        .arg_size=16,.data_size=16};
+    const uint32_t input[4]={1,0,1000000000,0};memcpy(request->data,input,sizeof(input));
+    queued=(struct pacha_ipc_msg){.word0=PACHA_SERVICE_REQUEST_MAGIC,.word3=header->request_id};
+    queued_fds[0]=(struct pacha_ipc_fd){.fd=22};ready_fd=21;
+    const uint32_t saved=service->profile_kind;service->profile_kind=KB2_GPU_PROFILE_I915;i915_wait_request=1;
+    assert(!gpud_drm_service_reap_hangups(service) && !gpud_drm_service_receive(service));
+    assert(header->status==-62 && request->data_size==24 && header->reply_payload_size==sizeof(*request));
+    int64_t remaining;memcpy(&remaining,request->data+8,8);assert(!remaining);
+    i915_wait_request=0;
+    /* A prior valid error payload cannot authorize copyout of an invalid
+     * request which forges the completed-size marker. */
+    *header=(pacha_service_envelope_t){.magic=PACHA_SERVICE_REQUEST_MAGIC,.header_size=sizeof(*header),
+        .service_id=GPUD_DRM_SERVICE_ID,.op=GPUD_DRM_OP_HANDLE_IOCTL,.request_id=30+gpu_calls,
+        .flags=PACHA_SERVICE_FLAG_PAGE_PAYLOAD,.payload_size=sizeof(gpud_drm_ioctl_request_t)};
+    *request=(gpud_drm_ioctl_request_t){.handle=handle,.request=GPUD_DRM_IOCTL_I915_EXECBUFFER,
+        .arg_size=64,.data_size=8};const int32_t fake=-EINVAL;memcpy(request->data,&fake,4);
+    queued.word3=header->request_id;ready_fd=21;const int before=gpu_calls;
+    assert(!gpud_drm_service_reap_hangups(service) && !gpud_drm_service_receive(service));
+    assert(header->status==-EINVAL && !header->reply_payload_size && !service->ioctl_reply_on_error && gpu_calls==before);
+    service->profile_kind=saved;
+}
+static void i915_exec_call(struct gpud_drm_service *service,uint64_t handle,int error)
+{
+    pacha_service_envelope_t *header=(void *)page;
+    *header=(pacha_service_envelope_t){.magic=PACHA_SERVICE_REQUEST_MAGIC,.header_size=sizeof(*header),
+        .service_id=GPUD_DRM_SERVICE_ID,.op=GPUD_DRM_OP_HANDLE_IOCTL,.request_id=30+gpu_calls,
+        .flags=PACHA_SERVICE_FLAG_PAGE_PAYLOAD,.payload_size=sizeof(gpud_drm_ioctl_request_t)};
+    gpud_drm_ioctl_request_t *request=(void *)(page+sizeof(*header));
+    *request=(gpud_drm_ioctl_request_t){.handle=handle,.request=GPUD_DRM_IOCTL_I915_EXECBUFFER,
+        .arg_size=64,.data_size=32,.aux_size=96};
+    const uint32_t input[8]={2,2,0,256,(1u<<11)|(1u<<18)|(1u<<19),0,91,0};
+    memcpy(request->data,input,sizeof(input));
+    const gpud_i915_exec_object_wire_t objects[2]={{.handle=1,.offset=0x11111000},
+        {.handle=2,.offset=0x22222000,.flags=4}};
+    const uint32_t fences[4]={7,1,8,2};
+    memset(auxiliary,0xa5,128);memcpy(auxiliary,objects,sizeof(objects));memcpy(auxiliary+80,fences,16);
+    queued=(struct pacha_ipc_msg){.word0=PACHA_SERVICE_REQUEST_MAGIC,
+        .word1=GPUD_DRM_REQUEST_BOUND_AUX,.word3=header->request_id};
+    queued_fds[0]=(struct pacha_ipc_fd){.fd=22};ready_fd=21;
+    const uint32_t saved_profile=service->profile_kind;service->profile_kind=KB2_GPU_PROFILE_I915;
+    i915_exec_request=1;i915_exec_error=error;
+    const uint64_t before=service->exec_submits;
+    assert(!gpud_drm_service_reap_hangups(service) && !gpud_drm_service_receive(service));
+    if(header->status!=error || service->request_aux || request->data_size!=8)
+        fprintf(stderr,"i915 exec service: expected=%d status=%lld data=%llu aux=%p calls=%d\n",
+            error,(long long)header->status,(unsigned long long)request->data_size,service->request_aux,
+            gpu_calls);
+    assert(header->status==error && !service->request_aux && request->data_size==8);
+    assert(service->exec_submits==before+!error);
+    const uint64_t offsets[2]={0x34567000,0x45678000};
+    for(unsigned i=0;i<2;++i) {uint64_t offset;memcpy(&offset,auxiliary+i*40+16,8);assert(offset==offsets[i]);}
+    assert(!memcmp(auxiliary+80,fences,16));for(unsigned i=96;i<128;++i) assert(auxiliary[i]==0xa5);
+    i915_exec_request=0;service->profile_kind=saved_profile;
+}
+static void i915_query_call(struct gpud_drm_service *service,uint64_t handle,int fill)
+{
+    pacha_service_envelope_t *header=(void *)page;
+    *header=(pacha_service_envelope_t){.magic=PACHA_SERVICE_REQUEST_MAGIC,
+        .header_size=sizeof(*header),.service_id=GPUD_DRM_SERVICE_ID,
+        .op=GPUD_DRM_OP_HANDLE_IOCTL,.request_id=30+gpu_calls,
+        .flags=PACHA_SERVICE_FLAG_PAGE_PAYLOAD,.payload_size=sizeof(gpud_drm_ioctl_request_t)};
+    gpud_drm_ioctl_request_t *request=(void *)(page+sizeof(*header));
+    *request=(gpud_drm_ioctl_request_t){.handle=handle,.request=GPUD_DRM_IOCTL_I915_QUERY,
+        .arg_size=16,.data_size=16,.aux_size=fill?64:48};
+    const gpud_drm_i915_query_wire_t wire={.count=2,.blob_bytes=fill?16:0};
+    memcpy(request->data,&wire,sizeof(wire));
+    const gpud_drm_i915_query_item_wire_t items[2]={
+        {.query_id=1,.length=fill?16:0,.data_offset=fill?48:0},{.query_id=999}};
+    memset(auxiliary,0xa5,64);memcpy(auxiliary,items,sizeof(items));
+    queued=(struct pacha_ipc_msg){.word0=PACHA_SERVICE_REQUEST_MAGIC,
+        .word1=GPUD_DRM_REQUEST_BOUND_AUX,.word3=header->request_id};
+    queued_fds[0]=(struct pacha_ipc_fd){.fd=22};ready_fd=21;
+    const uint32_t saved_profile=service->profile_kind;
+    service->profile_kind=KB2_GPU_PROFILE_I915;i915_query_request=fill?2:1;
+    assert(!gpud_drm_service_reap_hangups(service));
+    assert(!gpud_drm_service_receive(service));
+    assert(!header->status && !service->request_aux);
+    gpud_drm_i915_query_item_wire_t returned[2];memcpy(returned,auxiliary,sizeof(returned));
+    assert(returned[0].length==16 && returned[1].length==-EINVAL);
+    if(fill) for(unsigned i=48;i<64;++i) assert(auxiliary[i]==0x5a);
+    i915_query_request=0;service->profile_kind=saved_profile;
+}
 static void resources_call(struct gpud_drm_service *service)
 {
     observed_phases = 0;
@@ -450,8 +591,72 @@ static void *resources_stack(void *argument)
 }
 #endif
 
+static void prime_cpu_authority(void) {
+    static struct gpud_drm_service s;
+    struct ph_ipc ipc={.generation=9};
+    s.endpoint_fd=16; s.backend_client=1; s.files.generation=9; s.gpu.ipc=&ipc;
+    s.primes[0]=(struct gpud_drm_prime){.token=4097,.length=GPUD_DRM_PAGE_BYTES,.view_fd=20,.cpu_rights=3};
+    s.object_leases[0]=(struct gpud_drm_object_lease){.object_id=4097,.fd=21,.prime_owner=1};
+    pacha_service_envelope_t header={.op=GPUD_DRM_OP_PRIME_CPU_SYNC,
+        .payload_size=sizeof(gpud_drm_prime_cpu_sync_request_t)};
+    gpud_drm_prime_cpu_sync_request_t cpu={4097,3};
+    struct gpud_drm_reply_transfer transfer={0}; uint64_t result=0;
+    s.received.fd_count=1;
+    assert(dispatch_request(&s,&header,&cpu,&result,&transfer,0)==-EACCES && !cpu_rpc_calls);
+    s.received.fd_count=0;
+    const uint64_t valid[]={1,2,3,5,6,7};
+    for(unsigned i=0;i<6;++i) {
+        queued=(struct pacha_ipc_msg){.word0=GPUD_DRM_PRIME_CPU_SYNC_REQUEST_MAGIC,
+            .word1=4097,.word2=valid[i]}; ready_fd=21;
+        assert(!receive_prime_cpu_sync(&s));
+        assert(last_reply.word0==GPUD_DRM_PRIME_CPU_SYNC_REPLY_MAGIC &&
+            !last_reply.word1 && last_reply.word2==4097 && last_reply.word3==valid[i]);
+    }
+    assert(cpu_rpc_calls==6);
+    s.primes[0].cpu_rights=1; /* Cached DMA-BUF and root VMO are still RW. */
+    const uint64_t denied[]={2,3,6,7};
+    for(unsigned i=0;i<4;++i) {
+        queued=(struct pacha_ipc_msg){.word0=GPUD_DRM_PRIME_CPU_SYNC_REQUEST_MAGIC,.word1=4097,.word2=denied[i]};
+        ready_fd=21;
+        assert(!receive_prime_cpu_sync(&s) && (int64_t)last_reply.word1==-EACCES);
+    }
+    assert(cpu_rpc_calls==6);
+    s.primes[0].cpu_rights=3;
+    queued=(struct pacha_ipc_msg){.word0=GPUD_DRM_PRIME_CPU_SYNC_REQUEST_MAGIC,.word1=8193,.word2=3};ready_fd=21;
+    assert(!receive_prime_cpu_sync(&s) && (int64_t)last_reply.word1==-EINVAL && cpu_rpc_calls==6);
+    queued.word1=4097; queued.word2=UINT64_C(1)<<32|1; ready_fd=21;
+    assert(!receive_prime_cpu_sync(&s) && (int64_t)last_reply.word1==-EINVAL && cpu_rpc_calls==6);
+    queued.word2=3; ipc.generation=8; ready_fd=21;
+    assert(!receive_prime_cpu_sync(&s) && (int64_t)last_reply.word1==-ESTALE && cpu_rpc_calls==6);
+    ipc.generation=9; cpu_deny_rights=1; ready_fd=21;
+    assert(!receive_prime_cpu_sync(&s) && (int64_t)last_reply.word1==-EACCES && cpu_rpc_calls==6);
+    cpu_deny_rights=0;
+    const int errors[]={-EINTR,-EAGAIN,-EIO};
+    s.primes[0].owner_closed=1; /* The object endpoint/lease still owns it. */
+    for(unsigned i=0;i<3;++i) {
+        cpu_rpc_error=errors[i]; ready_fd=21;
+        assert(!receive_prime_cpu_sync(&s) && (int64_t)last_reply.word1==errors[i]);
+    }
+    assert(cpu_rpc_calls==9);
+    s.correlation=UINT64_MAX; ready_fd=21;
+    assert(!receive_prime_cpu_sync(&s) && (int64_t)last_reply.word1==-EOVERFLOW && cpu_rpc_calls==9);
+    s.object_leases[0].prime_owner=0; ready_fd=21;
+    assert(receive_prime_cpu_sync(&s)==-EAGAIN && cpu_rpc_calls==9);
+    cpu_rpc_error=cpu_deny_rights=ready_fd=0;
+    memset(&s,0,sizeof(s));
+    assert(!gpud_drm_files_init(&s.files,9,2));
+    uint64_t handle;
+    assert(!gpud_drm_file_open_begin(&s.files,9,&handle));
+    assert(!gpud_drm_file_open_finish(&s.files,9,handle,7,0));
+    s.profile_kind=KB2_GPU_PROFILE_I915; s.log_endpoint_fd=29;
+    gpud_drm_ioctl_request_t map={.handle=handle,.request=GPUD_DRM_IOCTL_MODE_MAP_DUMB};
+    assert(ioctl_request(&s,&map)==-EINVAL && !s.files.terminal_error && !s.files.files[0].in_flight);
+    puts("GPUD CPU SYNC: dedicated lease proof, public/token forgery refusal, rights/generation/errno; I915 malformed MAP_DUMB rejects before native dispatch PASS");
+}
+
 int main(void)
 {
+    prime_cpu_authority();
 #if defined(GPUD_DRM_STACK_BUDGET)
     struct gpud_drm_service *service = resources_service();
     pthread_attr_t attributes;
@@ -605,6 +810,12 @@ int main(void)
     auxiliary_call(&service, handle, 0);
     assert(gpu_calls == 10 && maps == before_maps + 1 && unmaps == before + 1);
     auxiliary_size = sizeof(auxiliary);
+    i915_query_call(&service,handle,0);
+    i915_query_call(&service,handle,1);
+    i915_exec_call(&service,handle,0);
+    i915_exec_call(&service,handle,-ENOMEM);
+    i915_exec_call(&service,handle,-EINTR);
+    i915_wait_and_forgery_call(&service,handle);
     unmap_failure = 1;
     assert(retire_connection(&service.connections) == -EIO && service.connections->aux == auxiliary);
     unmap_failure = 0;
@@ -613,6 +824,9 @@ int main(void)
     free(service.pollfds);
     puts("GPUD page connection: bind, actual HELLO reuse/correlation, cleanup failures PASS");
     puts("GPUD auxiliary connection: real execbuffer/caps codecs, copy/zero, fallback, lifetime PASS");
+    puts("GPUD I915 QUERY duplex: actual service bind, private command codec, probe/fill and per-item errno copyback PASS");
+    puts("GPUD I915 EXEC: real service/codec, input/output offsets on success and driver errors, actual accepted-submit accounting PASS");
+    puts("GPUD I915 WAIT: final error payload retains remaining time; stale/forged completion marker rejected PASS");
 #endif
 }
 

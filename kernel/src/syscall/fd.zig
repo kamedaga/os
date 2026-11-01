@@ -2202,6 +2202,52 @@ pub fn closeProcessFdsWithWakes(h: anytype, state: *kernel.KernelState, proc: ke
     }
 }
 
+// Only this process's authoritative VMA metadata is observed. K is held by
+// dispatch; AS/shared-VM exclusion keeps split/remap publication indivisible.
+// This does not enumerate direct BAR mappings outside the VMA model.
+fn queryVma(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, cursor: u64, out_va: u64, record_size: u64) u64 {
+    if (record_size != 40 or out_va == 0 or out_va > std_rc.math.maxInt(u64) - 40)
+        return sc.syscall_err_invalid;
+    var bytes: [40]u8 = undefined;
+    {
+        if (!user_vm.lockVmTransaction(proc)) return sc.syscall_err_invalid;
+        defer user_vm.unlockVmTransaction(proc);
+        const table = state.getVmaTableConst(proc) orelse return sc.syscall_err_invalid;
+        // A lower-bound walk also finds a containing VMA: a node ending at
+        // cursor is already consumed, so only its right subtree can qualify.
+        var node = table.address_index.root;
+        var selected: ?*const kernel.VmaEntry = null;
+        while (node) |entry| {
+            if (entry.endVa() > cursor) {
+                selected = entry;
+                node = entry.references.?.address_node.child[0];
+            } else node = entry.references.?.address_node.child[1];
+        }
+        const entry = selected orelse return sc.syscall_err_empty;
+        const prot: u64 = (if (entry.prot.read) vm_abi.prot_read else 0) |
+            (if (entry.prot.write) vm_abi.prot_write else 0) |
+            (if (entry.prot.exec) vm_abi.prot_exec else 0);
+        const flags: u64 = (if (entry.flags.private) vm_abi.mmap_private else 0) |
+            (if (entry.flags.shared) vm_abi.mmap_shared else 0) |
+            (if (entry.flags.anonymous) vm_abi.mmap_anonymous else 0) |
+            (if (entry.flags.noreserve) vm_abi.mmap_noreserve else 0) |
+            (@as(u64, entry.prot.pkey) << vm_abi.mmap_pkey_shift);
+        std_rc.mem.writeInt(u64, bytes[0..8], entry.start_va, .little);
+        std_rc.mem.writeInt(u64, bytes[8..16], entry.size_bytes, .little);
+        std_rc.mem.writeInt(u64, bytes[16..24], prot, .little);
+        std_rc.mem.writeInt(u64, bytes[24..32], flags, .little);
+        std_rc.mem.writeInt(u64, bytes[32..40], entry.vmo_offset, .little);
+    }
+    // Usercopy can fault and reenter VM resolution. Only scalar bytes survive
+    // the transaction; no borrowed VMA/VMO reference crosses this boundary.
+    if (!h.copy_bytes_to_user_va(proc, out_va, &bytes)) return sc.syscall_err_invalid;
+    return sc.syscall_ok;
+}
+
+test "VM query contains next gaps end nonresident protections and checked output" {
+    try @import("../vm_query_test.zig").run(queryVma);
+}
+
 pub fn dispatch(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, frame: *TrapFrame) ?u64 {
     // Validate the wire width before narrowing, so high bits cannot alias a
     // low descriptor or turn malformed input into a kernel overflow trap.
@@ -2414,6 +2460,7 @@ pub fn dispatch(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId
             frame.r10,
             frame.r8,
         ),
+        sc.syscall_vm_query => queryVma(h, state, proc, frame.rdi, frame.rsi, frame.rdx),
         sc.syscall_mmap => mapVmoFd(state, proc, h.free_list, @intCast(frame.rdi), frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9),
         sc.syscall_munmap => blk: {
             const profile_start = smp_perf.timestamp();

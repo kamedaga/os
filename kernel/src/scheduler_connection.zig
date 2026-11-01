@@ -194,6 +194,8 @@ pub const ThreadContext = struct {
     // waking the thread in a newer, unrelated wait.
     active_wait_token: u64 = 0,
     next_wait_token: u64 = 1,
+    // Embedded body stays stable through every wait and owner generation. T owns it.
+    pi_node: @import("futex_pi_state.zig").Thread = .{ .identity = .{ .principal = 0, .index = 0, .generation = 0 } },
     // Keep profile-only notification metadata in one member: adding members
     // here permutes Zig's automatic layout of the ordinary IPC save state.
     notify_stamp: if (ipc_metric.enabled) struct {
@@ -1660,6 +1662,15 @@ fn nextThreadGeneration(current: u32) u32 {
 
 pub fn initializeStaticStorage() void {
     lock_diagnostics.assertAllQuiescent();
+    if (builtin.is_test) {
+        // Fixtures replace contexts in place. Drain the previous graph before
+        // clearing indices or permitting any old Thread body to be rewritten.
+        scheduler_state.thread_table.lock();
+        for (threadDirectory().contexts) |ctx| retirePiThreadLocked(ctx);
+        pi_records.deinit();
+        pi_manager = .{};
+        scheduler_state.thread_table.unlock();
+    } else std.debug.assert(pi_records.live == 0);
     scheduler_state.thread_table.deadlines = .{};
     scheduler_state.thread_table.retries = .{ .{}, .{} };
     scheduler_state.thread_table.retry_enqueue = 0;
@@ -2066,6 +2077,7 @@ pub fn parkApThreadForBlockPreferred(
                 pendIpcBindingLocked(&ctx.ipc_receiving);
                 ctx.wait_uninterruptible = false;
                 ctx.wait_mailbox = false;
+                cancelPiWaitLocked(ctx);
                 ctx.active_wait_token = 0;
             }
             scheduler_state.thread_table.unlock();
@@ -2765,6 +2777,8 @@ pub fn staticStorageEndAddr() usize {
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(absent_thread_context), &absent_thread_context));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(principal_self_exit_extra), &principal_self_exit_extra));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(principal_self_exit_leaf), &principal_self_exit_leaf));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(pi_records), &pi_records));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(pi_manager), &pi_manager));
     return end;
 }
 
@@ -3782,6 +3796,7 @@ fn initializeThreadContextLocked(
     // The public initializer must enforce admission too: callers cannot
     // bypass allocateThread's scan while a retiring CPU still owns this slot.
     if (threadSlotReferencedByCpu(thread_index)) return false;
+    std.debug.assert(ctx.pi_node.waiting_mutex == null and ctx.pi_node.owned_head == null);
     ctx.id = @intCast(thread_index);
     ctx.generation = slot.generation;
     ctx.allocated = true;
@@ -4905,11 +4920,188 @@ pub fn detachPrincipalIpcBindings(owner: kernel.PrincipalId) void {
     }
 }
 
+pub const PiKey = @import("futex_pi_state.zig").Key;
+pub const PiResult = @import("kernel_abi_root").runtime_abi.FutexPiResult;
+pub const PiOperation = @import("kernel_abi_root").runtime_abi.FutexPiOperation;
+pub const PiCas = *const fn (kernel.PrincipalId, u64, u32, u32) ?u32;
+pub const FutexPiAttempt = union(enum) {
+    done: PiResult,
+    wait: struct { token: u64, generation: u32 },
+    retry: void,
+    need_storage: void,
+};
+const pi_state = @import("futex_pi_state.zig");
+const pi_slots = @import("memory/slot_table.zig");
+const PiRecord = struct {
+    mutex: pi_state.Mutex = .{ .key = .{ .principal = 0, .address = 0 } },
+};
+var pi_records: pi_slots.SlotTable(PiRecord) = .{};
+var pi_manager: pi_state.Manager = .{};
+
+// T protects both directory and stable record bodies. Draft allocation is
+// outside F/AS/T; publication never allocates while the user word is pinned.
+pub fn prepareFutexPiStorage(allocator: owned_storage.Allocator) bool {
+    scheduler_state.thread_table.lock();
+    const have_free = pi_records.hasPreparedFree();
+    scheduler_state.thread_table.unlock();
+    if (have_free) return true;
+    var draft = @TypeOf(pi_records).Prepared.init(&pi_records, allocator);
+    const reserved = draft.reserve();
+    scheduler_state.thread_table.lock();
+    defer scheduler_state.thread_table.unlock();
+    defer draft.finish();
+    reserved catch return false;
+    const result = pi_records.commitPrepared(&draft, std.math.maxInt(u32));
+    if (result) |path| pi_records.retirePath(path) else |err| {
+        if (err != error.StalePreparation) return false;
+    }
+    pi_records.reclaim();
+    return pi_records.hasPreparedFree();
+}
+pub fn futexPiHasAddress(proc: kernel.PrincipalId, va: u64) bool {
+    scheduler_state.thread_table.lock();
+    defer scheduler_state.thread_table.unlock();
+    return pi_records.live != 0 and pi_manager.findAddress(@intFromEnum(proc), va) != null;
+}
+/// The frontend rechecks its absolute deadline immediately before park.
+/// Claim preserves a handoff that already won; early publication is consumed
+/// by the ordinary keyed block path instead of losing that acquired mutex.
+pub fn expireFutexPiWait(generation: u32, token: u64) void {
+    if (token == 0) return;
+    scheduler_state.thread_table.lock();
+    defer scheduler_state.thread_table.unlock();
+    const ctx = threadContextLocked(currentThread()) orelse return;
+    if (claimWaitTokenCompletionLocked(ctx.id, generation, ctx.owner_process, token) != .claimed) return;
+    _ = publishClaimedWaitLocked(ctx.id, generation, ctx.owner_process, token, @intFromEnum(PiResult.timed_out), null, null);
+}
+fn piThreadLocked(ctx: *ThreadContext) *pi_state.Thread {
+    const identity: pi_state.Identity = .{ .principal = @intFromEnum(ctx.owner_process), .index = ctx.id, .generation = ctx.generation };
+    if (!std.meta.eql(ctx.pi_node.identity, identity)) ctx.pi_node.reset(identity);
+    return &ctx.pi_node;
+}
+fn freePiRecordLocked(mutex: *pi_state.Mutex) void {
+    std.debug.assert(!mutex.attached and mutex.owner == null and mutex.head == null and mutex.tail == null);
+    const record: *PiRecord = @fieldParentPtr("mutex", mutex);
+    pi_records.remove(record, null);
+    // No mutex identity escapes T. When the last queue disappears, retire
+    // storage too; rejected PMM returns remain owned by this global table.
+    if (pi_records.live == 0) pi_records.deinit();
+}
+fn cancelPiWaitLocked(ctx: *ThreadContext) void {
+    const token = ctx.pi_node.wait_token;
+    if (token == 0) return;
+    const result = pi_manager.cancel(&ctx.pi_node, token);
+    if (result.retired) |mutex| freePiRecordLocked(mutex);
+}
+fn completePiWaiterLocked(waiter: pi_state.Waiter, result: PiResult) void {
+    const owner: kernel.PrincipalId = @enumFromInt(waiter.identity.principal);
+    if (claimWaitTokenCompletionLocked(waiter.identity.index, waiter.identity.generation, owner, waiter.wait_token) != .claimed)
+        @panic("PI detached waiter lost its completion under T");
+    _ = publishClaimedWaitLocked(waiter.identity.index, waiter.identity.generation, owner, waiter.wait_token, @intFromEnum(result), null, null);
+}
+fn retirePiThreadLocked(ctx: *ThreadContext) void {
+    cancelPiWaitLocked(ctx);
+    while (pi_manager.retireOwned(&ctx.pi_node)) |mutex| {
+        // Detach each waiter before generic completion can run cancellation.
+        // Teardown needs no F/AS or user-word access, avoiding T -> F inversion.
+        while (pi_state.Manager.popRetired(mutex)) |waiter| completePiWaiterLocked(waiter, .owner_missing);
+        freePiRecordLocked(mutex);
+    }
+}
+fn piAdmissionResult(err: pi_state.AdmissionError) PiResult {
+    return if (err == error.Deadlock) .deadlock else .invalid;
+}
+
+/// Called with K -> F -> AS held. T spans validation, resident CAS, graph
+/// commit, and completion claim. The callback must not fault/allocate/relock AS.
+/// No record or Thread pointer escapes this call; only scalar wait identity.
+pub fn futexPiOperation(proc: kernel.PrincipalId, key: PiKey, op: PiOperation, observed: u32, cas: PiCas) FutexPiAttempt {
+    const pi_abi = @import("kernel_abi_root").runtime_abi;
+    scheduler_state.thread_table.lock();
+    defer scheduler_state.thread_table.unlock();
+    const ctx = threadContextLocked(currentThread()) orelse return .{ .done = .invalid };
+    if (!ctx.allocated or ctx.owner_process != proc or !ctx.ready or ctx.stopped or
+        ctx.active_wait_token != 0 or ctx.wait_completion_claimed or
+        key.principal != @intFromEnum(proc) or key.address == 0 or (key.address & 3) != 0)
+        return .{ .done = .invalid };
+    const tid = std.math.cast(u32, @as(u64, ctx.id) + 1) orelse return .{ .done = .invalid };
+    if (tid > pi_abi.futex_pi_owner_mask) return .{ .done = .invalid };
+    if (observed & pi_abi.futex_pi_recovery != 0) return .{ .done = .unsupported };
+    const owner_tid = observed & pi_abi.futex_pi_owner_mask;
+    const existing = pi_manager.find(key);
+    // A changed mapping key must not orphan the old address-bound queue.
+    if (existing == null and pi_manager.findAddress(key.principal, key.address) != null)
+        return .{ .done = .invalid };
+    if (op == .unlock) {
+        if (owner_tid != tid) return .{ .done = .not_owner };
+        const mutex = existing orelse {
+            const previous = cas(proc, key.address, observed, 0) orelse return .{ .done = .bad_memory };
+            return if (previous == observed) .{ .done = .acquired } else .retry;
+        };
+        if (mutex.owner != piThreadLocked(ctx) or mutex.owner_generation != ctx.generation)
+            return .{ .done = .invalid };
+        const head = mutex.head orelse unreachable;
+        const next_ctx = threadContextLocked(head.identity.index) orelse return .{ .done = .invalid };
+        if (!next_ctx.allocated or next_ctx.generation != head.identity.generation or
+            next_ctx.owner_process != proc or next_ctx.active_wait_token != head.wait_token or
+            !next_ctx.wait_mailbox or next_ctx.wait_completion_claimed) return .{ .done = .invalid };
+        const next_tid = std.math.cast(u32, @as(u64, head.identity.index) + 1) orelse return .{ .done = .invalid };
+        if (next_tid > pi_abi.futex_pi_owner_mask) return .{ .done = .invalid };
+        const desired = next_tid | (if (head.queue_next != null) pi_abi.futex_pi_waiters else @as(u32, 0));
+        const previous = cas(proc, key.address, observed, desired) orelse return .{ .done = .bad_memory };
+        if (previous != observed) return .retry;
+        const handoff = pi_manager.handoff(mutex);
+        if (handoff.retired) |retired| freePiRecordLocked(retired);
+        completePiWaiterLocked(handoff.waiter, .acquired);
+        return .{ .done = .acquired };
+    }
+    if (owner_tid == 0) {
+        if (existing != null) return .{ .done = .invalid };
+        const previous = cas(proc, key.address, observed, tid) orelse return .{ .done = .bad_memory };
+        return if (previous == observed) .{ .done = .acquired } else .retry;
+    }
+    if (owner_tid == tid) return .{ .done = .deadlock };
+    const owner_ctx = threadContextLocked(owner_tid - 1) orelse return .{ .done = .owner_missing };
+    if (!owner_ctx.allocated or owner_ctx.owner_process != proc) return .{ .done = .owner_missing };
+    const owner = piThreadLocked(owner_ctx);
+    if (existing) |mutex| if (mutex.owner != owner or mutex.owner_generation != owner_ctx.generation)
+        return .{ .done = .owner_missing };
+    if (op == .try_lock) return .{ .done = .interrupted_or_busy };
+    const waiter = piThreadLocked(ctx);
+    const token = if (ctx.next_wait_token == 0) @as(u64, 1) else ctx.next_wait_token;
+    pi_state.Manager.check(owner, waiter, token) catch |err| return .{ .done = piAdmissionResult(err) };
+    const mutex = existing orelse blk: {
+        const allocation = pi_records.allocatePrepared() catch return .need_storage;
+        allocation.value.* = .{};
+        allocation.value.mutex.key = key;
+        break :blk &allocation.value.mutex;
+    };
+    const previous = cas(proc, key.address, observed, observed | pi_abi.futex_pi_waiters) orelse {
+        if (existing == null) freePiRecordLocked(mutex);
+        return .{ .done = .bad_memory };
+    };
+    if (previous != observed) {
+        if (existing == null) freePiRecordLocked(mutex);
+        return .retry;
+    }
+    // T prevents completion/exit between the pre-CAS checks and this commit.
+    // Token reservation and queue attachment cannot fail after CAS succeeds.
+    const reserved = reserveWaitTokenLocked(ctx, ctx.generation) orelse unreachable;
+    std.debug.assert(reserved == token);
+    if (existing != null) pi_manager.enqueue(mutex, waiter, token) catch unreachable else pi_manager.attach(mutex, owner, waiter, token) catch unreachable;
+    return .{ .wait = .{ .token = token, .generation = ctx.generation } };
+}
+
 pub fn reserveCurrentWaitToken(expected_generation: u32) ?u64 {
     const thread_index = currentThread();
     scheduler_state.thread_table.lock();
     defer scheduler_state.thread_table.unlock();
     const ctx = threadContextLocked(thread_index) orelse return null;
+    return reserveWaitTokenLocked(ctx, expected_generation);
+}
+
+fn reserveWaitTokenLocked(ctx: *ThreadContext, expected_generation: u32) ?u64 {
+    const thread_index = ctx.id;
     if (!ctx.allocated or ctx.generation != expected_generation or
         !ctx.ready or ctx.active_wait_token != 0 or ctx.wait_completion_claimed)
     {
@@ -4943,6 +5135,7 @@ pub fn cancelCurrentWaitToken(expected_generation: u32, token: u64) void {
     {
         return;
     }
+    cancelPiWaitLocked(ctx);
     pendIpcBindingLocked(&ctx.ipc_outgoing);
     pendIpcBindingLocked(&ctx.ipc_receiving);
     ctx.wait_uninterruptible = false;
@@ -5121,6 +5314,7 @@ fn releaseThreadLocked(thread_index: usize) bool {
     if (threadSlotReferencedByRemoteCpu(thread_index, currentCpu())) return false;
     const generation = ctx.generation;
     if (!verifiedExitThreadGeneration(thread_index, generation)) return false;
+    retirePiThreadLocked(ctx);
     detachIpcBindingsLocked(ctx);
     setWakeTickLocked(ctx, 0);
     removeCompletionRetryLocked(ctx);
@@ -5835,6 +6029,7 @@ pub fn installExecContextForCurrentThread(
         ctx.cr3 = cr3;
         ctx.fs_base = image.fs_base;
         ctx.gs_base = image.gs_base;
+        retirePiThreadLocked(ctx);
         ctx.pkru = image.pkru;
         ctx.frame = image.frame;
         ctx.entry_state.notify_sysret_continuation = false;
@@ -6888,6 +7083,13 @@ fn wakeIfTimerExpiredLocked(thread_index: usize, now_tick: u64) void {
     {
         return;
     }
+    if (ctx.pi_node.waiting_mutex != null) {
+        const token = ctx.active_wait_token;
+        const result = ctx.frame.rax; // native block supplied timed-out status
+        if (claimWaitTokenCompletionLocked(ctx.id, ctx.generation, ctx.owner_process, token) == .claimed)
+            _ = publishClaimedWaitLocked(ctx.id, ctx.generation, ctx.owner_process, token, result, null, null);
+        return;
+    }
     const wait_mailbox = ctx.wait_mailbox;
     const wait_token = ctx.active_wait_token;
     const wake_tick = ctx.wake_tick;
@@ -6940,6 +7142,12 @@ fn wakeIfWaitingGenerationInternal(
         if (!ctx.wait_mailbox or ctx.active_wait_token != 0) return false;
     } else if (ctx.ready) {
         return false;
+    }
+    if (ctx.pi_node.waiting_mutex != null) {
+        const token = ctx.active_wait_token;
+        if (claimWaitTokenCompletionLocked(ctx.id, ctx.generation, ctx.owner_process, token) != .claimed) return false;
+        _ = publishClaimedWaitLocked(ctx.id, ctx.generation, ctx.owner_process, token, resume_rax orelse ctx.frame.rax, preferred_cpu, null);
+        return true;
     }
     if (resume_rax) |value| ctx.frame.rax = value;
     ctx.wait_uninterruptible = false;
@@ -7020,6 +7228,12 @@ fn wakeIfWaitingTokenGenerationLocked(
         ctx.wait_completion_claimed)
     {
         return .stale;
+    }
+
+    if (ctx.pi_node.waiting_mutex != null) {
+        if (claimWaitTokenCompletionLocked(thread_index, generation, owner, wait_token) != .claimed) return .stale;
+        _ = publishClaimedWaitLocked(thread_index, generation, owner, wait_token, resume_rax, preferred_cpu, null);
+        return .woke;
     }
 
     if (ctx.ready) {
@@ -8342,6 +8556,7 @@ fn claimWaitTokenCompletionLocked(
     {
         return .stale;
     }
+    cancelPiWaitLocked(ctx);
     pendIpcBindingLocked(&ctx.ipc_receiving);
     ctx.wait_completion_claimed = true;
     ctx.wait_completion_publish_pending = false;
@@ -8605,9 +8820,9 @@ pub fn deliverThreadSignal(principal: kernel.PrincipalId, target: usize, generat
 }
 
 fn interruptIpcWaitLocked(ctx: *ThreadContext, blocked_resume_rax: u64) void {
-    // The IPC cancellation has effects outside T. Once claimed, failed
-    // runqueue publication must retry the completion rather than restore
-    // an ordinary wait whose call body is already pending cancellation.
+    // IPC cancellation and PI queue withdrawal are irrevocable. Once claimed,
+    // failed runqueue publication must retry the completion rather than
+    // restore an ordinary wait whose ownership edge has already been removed.
     const token = ctx.active_wait_token;
     const claim = claimWaitTokenCompletionLocked(ctx.id, ctx.generation, ctx.owner_process, token);
     if (claim != .claimed) @panic("IPC signal lost completion claim under T");
@@ -8633,7 +8848,7 @@ fn deliverSignalLocked(state: *kernel.KernelState, process_generation: ?u32, pri
     ctx.pending_signal_mask |= signal_bit;
     // Pending survives an internal wait; only its ordinary completion may wake it.
     setThreadHotPendingSignalMask(target, ctx.pending_signal_mask);
-    if (was_blocked and (ctx.ipc_outgoing != null or ctx.ipc_receiving != null)) {
+    if (was_blocked and (ctx.ipc_outgoing != null or ctx.ipc_receiving != null or ctx.pi_node.waiting_mutex != null)) {
         interruptIpcWaitLocked(ctx, blocked_resume_rax);
     } else if (was_blocked) {
         // Token invalidation and the blocked/runnable transition share this
@@ -9163,6 +9378,7 @@ pub fn blockCurrentThreadPreferred(
             pendIpcBindingLocked(&ctx.ipc_receiving);
             ctx.wait_uninterruptible = false;
             ctx.wait_mailbox = false;
+            cancelPiWaitLocked(ctx);
             ctx.active_wait_token = 0;
         }
         scheduler_state.thread_table.unlock();
@@ -12566,4 +12782,263 @@ test "native signal unregistered child can block with pending and cannot be inte
             try std.testing.expectEqual(@as(u64, 3), ctx.pending_signal_mask);
         }
     }
+}
+
+pub const PiTestSupport = if (builtin.is_test) PiSchedulerTest else struct {};
+
+const PiSchedulerTest = struct {
+    pub var word: u32 = 0;
+    var mismatch = false;
+    var bad_memory = false;
+    var cas_calls: usize = 0;
+    pub const key: PiKey = .{ .principal = @intFromEnum(default_process_principal), .address = 0x8000, .backing_index = 4, .backing_generation = 1 };
+    pub fn cas(proc: kernel.PrincipalId, address: u64, expected: u32, desired: u32) ?u32 {
+        std.debug.assert(proc == default_process_principal and address == key.address);
+        cas_calls += 1;
+        if (bad_memory) return null;
+        if (mismatch) return expected ^ 1;
+        const previous = word;
+        if (word == expected) word = desired;
+        return previous;
+    }
+    pub fn start() !void {
+        initializeStaticStorage();
+        std.debug.assert(pi_records.live == 0);
+        pi_records.deinit();
+        pi_manager = .{};
+        scheduler_state.cpu_count = 1;
+        for (4..8) |i| {
+            initial_thread_contexts[i] = .{ .id = @intCast(i), .generation = 17, .owner_process = default_process_principal, .allocated = true, .ready = true, .scheduler_entity = &initial_scheduler_entities[i], .cpu_affinity = testAffinity(1) };
+            try std.testing.expect(verifiedAddThread(i, 17, true));
+            syncHotStateFromContext(i);
+        }
+        word = 5;
+        mismatch = false;
+        bad_memory = false;
+        cas_calls = 0;
+        setTestCurrentThread(&scheduler_state.cpus[0], 4);
+    }
+    pub fn end() void {
+        scheduler_state.thread_table.lock();
+        for (4..8) |i| retirePiThreadLocked(&initial_thread_contexts[i]);
+        std.debug.assert(pi_records.live == 0);
+        pi_records.deinit();
+        scheduler_state.thread_table.unlock();
+        initializeStaticStorage();
+        for (4..8) |i| {
+            initial_thread_contexts[i] = .{ .id = @intCast(i), .scheduler_entity = &initial_scheduler_entities[i] };
+            initial_thread_hot_states[i] = .{};
+        }
+    }
+    pub fn operation(i: usize, op: PiOperation) FutexPiAttempt {
+        setTestCurrentThread(&scheduler_state.cpus[0], i);
+        return futexPiOperation(default_process_principal, key, op, word, cas);
+    }
+    pub fn queue(i: usize) !u64 {
+        var result = operation(i, .lock);
+        if (result == .need_storage) {
+            try std.testing.expect(prepareFutexPiStorage(pi_slots.hostTestAllocator()));
+            result = operation(i, .lock);
+        }
+        try std.testing.expect(result == .wait);
+        return result.wait.token;
+    }
+    fn block(i: usize, deadline: u64) !void {
+        scheduler_state.thread_table.lock();
+        defer scheduler_state.thread_table.unlock();
+        const ctx = &initial_thread_contexts[i];
+        try std.testing.expect(verifiedBlockThreadGeneration(i, ctx.generation));
+        ctx.ready = false;
+        ctx.frame.rax = @intFromEnum(PiResult.timed_out);
+        setWakeTickLocked(ctx, deadline);
+        syncHotStateFromContext(i);
+    }
+};
+
+test "PI scheduler storage admission CAS rollback unflagged owner and fast paths" {
+    try PiSchedulerTest.start();
+    defer PiSchedulerTest.end();
+    const fixture = PiSchedulerTest;
+    try std.testing.expect(fixture.operation(5, .lock) == .need_storage);
+    try std.testing.expectEqual(@as(usize, 0), fixture.cas_calls);
+    try std.testing.expect(initial_thread_contexts[5].active_wait_token == 0);
+    try std.testing.expect(!futexPiHasAddress(default_process_principal, fixture.key.address));
+    try std.testing.expect(prepareFutexPiStorage(pi_slots.hostTestAllocator()));
+    fixture.mismatch = true;
+    try std.testing.expect(fixture.operation(5, .lock) == .retry);
+    try std.testing.expectEqual(@as(usize, 0), pi_records.live);
+    try std.testing.expect(initial_thread_contexts[5].active_wait_token == 0);
+    fixture.mismatch = false;
+    try std.testing.expect(prepareFutexPiStorage(pi_slots.hostTestAllocator()));
+    fixture.bad_memory = true;
+    try std.testing.expectEqual(PiResult.bad_memory, fixture.operation(5, .lock).done);
+    try std.testing.expectEqual(@as(usize, 0), pi_records.live);
+    fixture.bad_memory = false;
+    try std.testing.expectEqual(PiResult.interrupted_or_busy, fixture.operation(5, .try_lock).done);
+    try std.testing.expectEqual(PiResult.not_owner, fixture.operation(5, .unlock).done);
+    try std.testing.expectEqual(PiResult.deadlock, fixture.operation(4, .lock).done);
+    fixture.word = 0;
+    try std.testing.expectEqual(PiResult.acquired, fixture.operation(4, .lock).done);
+    try std.testing.expectEqual(@as(u32, 5), fixture.word);
+    try std.testing.expectEqual(@as(usize, 0), pi_records.live);
+    // musl's throwaway uncontended probe requires no registered state.
+    fixture.word |= @import("kernel_abi_root").runtime_abi.futex_pi_waiters;
+    try std.testing.expectEqual(PiResult.acquired, fixture.operation(4, .unlock).done);
+    try std.testing.expectEqual(@as(u32, 0), fixture.word);
+}
+
+test "PI scheduler FIFO handoff detaches before claim and completes before park" {
+    try PiSchedulerTest.start();
+    defer PiSchedulerTest.end();
+    const fixture = PiSchedulerTest;
+    const first = try fixture.queue(5);
+    const second = try fixture.queue(6);
+    try std.testing.expect(futexPiHasAddress(default_process_principal, fixture.key.address));
+    try std.testing.expectEqual(PiResult.acquired, fixture.operation(4, .unlock).done);
+    try std.testing.expectEqual(@as(u32, 6 | 0x80000000), fixture.word);
+    try std.testing.expect(initial_thread_contexts[5].pi_node.waiting_mutex == null);
+    try std.testing.expect(!initial_thread_contexts[5].wait_mailbox);
+    try std.testing.expectEqual(@as(u64, 0), initial_thread_contexts[5].frame.rax);
+    var frame = std.mem.zeroes(TrapFrame);
+    try std.testing.expect(tryIpcCompletedWait(&frame, 999) == false);
+    setTestCurrentThread(&scheduler_state.cpus[0], 5);
+    try std.testing.expect(tryIpcCompletedWait(&frame, first));
+    try std.testing.expectEqual(PiResult.acquired, fixture.operation(5, .unlock).done);
+    try std.testing.expectEqual(@as(u32, 7), fixture.word);
+    try std.testing.expectEqual(@as(usize, 0), pi_records.live);
+    try std.testing.expect(!futexPiHasAddress(default_process_principal, fixture.key.address));
+    try std.testing.expectEqual(second, initial_thread_contexts[6].active_wait_token);
+    try std.testing.expect(!initial_thread_contexts[6].wait_mailbox);
+}
+
+test "PI scheduler generic cancellation timeout and signal remove queues under T" {
+    for (0..3) |kind| {
+        try PiSchedulerTest.start();
+        defer PiSchedulerTest.end();
+        const fixture = PiSchedulerTest;
+        const token = try fixture.queue(5);
+        if (kind == 0) {
+            setTestCurrentThread(&scheduler_state.cpus[0], 5);
+            cancelCurrentWaitToken(17, token);
+        } else {
+            try fixture.block(5, 10);
+            if (kind == 1) wakeExpiredTimers(10) else {
+                const state = try std.testing.allocator.create(kernel.KernelState);
+                defer std.testing.allocator.destroy(state);
+                state.* = .{};
+                scheduler_state.thread_table.lock();
+                _ = deliverSignalLocked(state, 1, default_process_principal, 5, &initial_thread_contexts[5], 2, @intFromEnum(PiResult.interrupted_or_busy));
+            }
+            try std.testing.expect(initial_thread_contexts[5].ready);
+            try std.testing.expectEqual(@as(u64, if (kind == 1) @intFromEnum(PiResult.timed_out) else @intFromEnum(PiResult.interrupted_or_busy)), initial_thread_contexts[5].frame.rax);
+        }
+        try std.testing.expectEqual(@as(usize, 0), pi_records.live);
+        try std.testing.expect(initial_thread_contexts[5].pi_node.waiting_mutex == null);
+        // Last cancellation leaves only a sticky userspace bit, no state.
+        try std.testing.expectEqual(@as(u32, 5 | 0x80000000), fixture.word);
+        try std.testing.expectEqual(PiResult.acquired, fixture.operation(4, .unlock).done);
+    }
+}
+
+test "PI scheduler owner retirement completes queues before generation reuse" {
+    try PiSchedulerTest.start();
+    defer PiSchedulerTest.end();
+    const fixture = PiSchedulerTest;
+    _ = try fixture.queue(5);
+    _ = try fixture.queue(6);
+    try fixture.block(5, 20);
+    try fixture.block(6, 20);
+    setTestCurrentThread(&scheduler_state.cpus[0], 7);
+    const previous_generation = initial_thread_contexts[4].generation;
+    try std.testing.expect(releaseThreadGeneration(4, previous_generation, default_process_principal));
+    try std.testing.expect(initial_thread_contexts[4].generation != previous_generation);
+    try std.testing.expectEqual(@as(usize, 0), pi_records.live);
+    for (5..7) |i| {
+        try std.testing.expect(initial_thread_contexts[i].ready);
+        try std.testing.expect(initial_thread_contexts[i].pi_node.waiting_mutex == null);
+        try std.testing.expectEqual(@as(u64, @intFromEnum(PiResult.owner_missing)), initial_thread_contexts[i].frame.rax);
+    }
+    try std.testing.expect(!futexPiHasAddress(default_process_principal, fixture.key.address));
+    // Word cleanup is intentionally absent from T-only retirement.
+    try std.testing.expectEqual(@as(u32, 5 | 0x80000000), fixture.word);
+}
+
+test "PI scheduler expire before park preserves a handoff winner" {
+    for (0..2) |handoff_wins| {
+        try PiSchedulerTest.start();
+        defer PiSchedulerTest.end();
+        const token = try PiSchedulerTest.queue(5);
+        if (handoff_wins == 1) try std.testing.expectEqual(PiResult.acquired, PiSchedulerTest.operation(4, .unlock).done);
+        setTestCurrentThread(&scheduler_state.cpus[0], 5);
+        expireFutexPiWait(16, token); // stale generation cannot win
+        if (handoff_wins == 0) try std.testing.expect(initial_thread_contexts[5].wait_mailbox);
+        expireFutexPiWait(17, token);
+        var frame = std.mem.zeroes(TrapFrame);
+        try std.testing.expect(tryIpcCompletedWait(&frame, token));
+        try std.testing.expectEqual(@as(u64, if (handoff_wins == 1) @intFromEnum(PiResult.acquired) else @intFromEnum(PiResult.timed_out)), frame.rax);
+        try std.testing.expectEqual(@as(usize, 0), pi_records.live);
+        try std.testing.expect(initial_thread_contexts[5].pi_node.waiting_mutex == null);
+    }
+}
+
+const PiStorageTest = struct {
+    live: usize = 0,
+    fail_acquire: bool = false,
+    reject_return: bool = false,
+    fn allocator(self: *@This()) owned_storage.Allocator {
+        return .{ .context = self, .acquire = acquire, .release = release };
+    }
+    fn acquire(context: *anyopaque, pages: usize) ?owned_storage.MappedExtent {
+        const self: *@This() = @ptrCast(@alignCast(context));
+        if (self.fail_acquire) return null;
+        const backend = pi_slots.hostTestAllocator();
+        const grant = backend.acquire(backend.context, pages) orelse return null;
+        self.live += 1;
+        return grant;
+    }
+    fn release(context: *anyopaque, grant: owned_storage.PhysicalExtent) bool {
+        const self: *@This() = @ptrCast(@alignCast(context));
+        if (self.reject_return) return false;
+        const backend = pi_slots.hostTestAllocator();
+        if (!backend.release(backend.context, grant)) return false;
+        self.live -= 1;
+        return true;
+    }
+};
+
+test "PI scheduler pool failure and rejected returns retain exact ownership" {
+    try PiSchedulerTest.start();
+    defer PiSchedulerTest.end();
+    var backend: PiStorageTest = .{ .fail_acquire = true };
+    try std.testing.expect(!prepareFutexPiStorage(backend.allocator()));
+    try std.testing.expectEqual(@as(usize, 0), backend.live);
+    try std.testing.expectEqual(@as(usize, 0), pi_records.live);
+    try std.testing.expect(initial_thread_contexts[5].active_wait_token == 0);
+    backend.fail_acquire = false;
+    try std.testing.expect(prepareFutexPiStorage(backend.allocator()));
+    const token = try PiSchedulerTest.queue(5);
+    backend.reject_return = true;
+    cancelCurrentWaitToken(17, token);
+    try std.testing.expectEqual(@as(usize, 0), pi_records.live);
+    try std.testing.expectEqual(@as(u64, 0), pi_records.capacity);
+    try std.testing.expect(backend.live > 0);
+    backend.reject_return = false;
+    scheduler_state.thread_table.lock();
+    pi_records.reclaim();
+    scheduler_state.thread_table.unlock();
+    try std.testing.expectEqual(@as(usize, 0), backend.live);
+}
+
+test "PI scheduler fixture reset drains live queues before rewriting contexts" {
+    try PiSchedulerTest.start();
+    defer PiSchedulerTest.end();
+    _ = try PiSchedulerTest.queue(5);
+    _ = try PiSchedulerTest.queue(6);
+    const previous_cas = PiSchedulerTest.cas_calls;
+    initializeStaticStorage();
+    try std.testing.expectEqual(previous_cas, PiSchedulerTest.cas_calls);
+    try std.testing.expectEqual(@as(usize, 0), pi_records.live);
+    try std.testing.expectEqual(@as(u64, 0), pi_records.capacity);
+    for (4..8) |i| try std.testing.expect(initial_thread_contexts[i].pi_node.waiting_mutex == null and initial_thread_contexts[i].pi_node.owned_head == null);
+    for (5..7) |i| try std.testing.expectEqual(@as(u64, @intFromEnum(PiResult.owner_missing)), initial_thread_contexts[i].frame.rax);
 }

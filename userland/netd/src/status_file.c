@@ -7,6 +7,8 @@
 #include "dhcp.h"
 #include "kobox2_nic.h"
 #include "link.h"
+#include "libuinet_backend.h"
+#include "../../kobox2_adapter/net_frame_wire.h"
 #include "netd/boot_config.h"
 #include "filed_client/client.h"
 #include "pacha/capsule.h"
@@ -27,6 +29,71 @@
 #define NETD_DHCP_HEADER "# generated from DHCP on this live boot\n"
 #define NETD_DNS_HEADER "# generated from live network policy\n"
 static uint64_t policy_publication;
+#ifndef NETD_RX_DIAGNOSTICS
+#define NETD_RX_DIAGNOSTICS 0
+#endif
+
+static int status_file_write(pacha_fd_t endpoint, const char *path,
+    const char *text, size_t length, uint64_t flags, int *created);
+
+void netd_status_file_network_metrics(const struct netd_boot_config *cfg)
+{
+#if NETD_RX_DIAGNOSTICS
+    if (!cfg) return;
+    const struct kobox_linux_net_rx_stats *s = netd_kobox2_nic_rx_stats();
+    char text[4096];
+    int length = snprintf(text, sizeof(text),
+        "tsc=%llu\nnet_port_drops=%llu\nnetd_rx_drops=%llu\n"
+        "queued=%llu\nhigh_water=%llu\npackets=%llu\nbytes=%llu\n"
+        "drop_full=%llu\ndrop_oversize=%llu\ndrop_gso=%llu\ndrop_policy=%llu\ndrop_copy=%llu\n"
+        "wake_edges=%llu\nwake_writes=%llu\nwake_errors=%llu\ntx_packets=%llu\ntx_errors=%llu\n"
+        "features_before=0x%llx\nfeatures_active=0x%llx\ngso_seen=%llu\nmeasurement_control=%llu\n"
+        "wireless=%llu\npower_save=%llu\n",
+        (unsigned long long)netd_metrics_read_tsc(),
+        (unsigned long long)netd_kobox2_nic_rx_drops(),
+        (unsigned long long)netd_packet_io_rx_drops(),
+        (unsigned long long)s->queued, (unsigned long long)s->high_water,
+        (unsigned long long)s->packets, (unsigned long long)s->bytes,
+        (unsigned long long)s->drop_full, (unsigned long long)s->drop_oversize,
+        (unsigned long long)s->drop_gso, (unsigned long long)s->drop_policy,
+        (unsigned long long)s->drop_copy, (unsigned long long)s->wake_edges,
+        (unsigned long long)s->wake_writes, (unsigned long long)s->wake_errors,
+        (unsigned long long)s->tx_packets, (unsigned long long)s->tx_errors,
+        (unsigned long long)s->features_before, (unsigned long long)s->features_active,
+        (unsigned long long)s->gso_seen, (unsigned long long)s->measurement_control,
+        (unsigned long long)s->wireless, (unsigned long long)s->power_save);
+    if (length < 0 || (size_t)length >= sizeof(text)) return;
+    int added = netd_libuinet_format_rx_stats(text + length, sizeof(text) - (size_t)length);
+    if (added < 0 || (size_t)added >= sizeof(text) - (size_t)length) return;
+    /* One bounded snapshot per second, never a log or IPC per packet.
+     * Publish whole snapshots so a concurrent collector cannot combine two
+     * epochs or mistake a truncated file for zero counters. */
+    char temporary[96];
+    int named = snprintf(temporary, sizeof(temporary), "/tmp/netd-rx-stats.%llu.tmp",
+        (unsigned long long)++policy_publication);
+    if (named < 0 || (size_t)named >= sizeof(temporary)) return;
+    pacha_fd_t endpoint = (pacha_fd_t)cfg->filed_endpoint_fd;
+    int created = 0;
+    int status = status_file_write(endpoint, temporary, text,
+        (size_t)length + (size_t)added, O_CREAT | O_EXCL | O_NOFOLLOW, &created);
+    kb2_fs_response_t response;
+    if (!status) {
+        kb2_fs_request_t request = {.opcode = KB2_FILESYSTEM_OP_RENAMEAT2};
+        status = filedfs_call(endpoint, &request, temporary, "/tmp/netd-rx-stats",
+            NULL, 0, NULL, 0, &response, NULL, 0, NULL, NULL);
+        if (!status && response.result < 0) status = (int)response.result;
+    }
+    if (status && created) {
+        kb2_fs_request_t request = {.opcode = KB2_FILESYSTEM_OP_UNLINKAT};
+        (void)filedfs_call(endpoint, &request, temporary, NULL,
+            NULL, 0, NULL, 0, &response, NULL, 0, NULL, NULL);
+    }
+#else
+    /* Publishing files is an explicit measurement-build option, not a
+     * permanent periodic filesystem cost of the normal network service. */
+    (void)cfg;
+#endif
+}
 
 enum { NETD_STATUS_LOG_LINES = 40, NETD_STATUS_LOG_LINE_BYTES = 80 };
 static char progress_log[NETD_STATUS_LOG_LINES][NETD_STATUS_LOG_LINE_BYTES];

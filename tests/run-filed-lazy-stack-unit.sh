@@ -6,8 +6,9 @@ mkdir -p .artifacts/filed-tests
 "${CC:-/usr/bin/clang}" -std=c11 -Wall -Wextra -Werror \
   -fsanitize=address,undefined -fno-omit-frame-pointer \
   -ffunction-sections -fdata-sections -Wl,--gc-sections \
+  -Ikobox2/protocol/include -Ikobox2/protocol/generated/include \
   -Iuserland/filed/include -Iuserland/filed/src -Iuserland/koboxd/include \
-  -Iuserland/libipc/include -Iuserland/libpacha/include \
+  -Iuserland/storage/include -Iuserland/libipc/include -Iuserland/libpacha/include \
   -Iuserland/personality/include -I_kobox/include -I_kobox/src \
   tests/filed_lazy_stack_unit.c userland/filed/src/exec/linux_lpr/start.c \
   -o .artifacts/filed-tests/lazy-stack-unit

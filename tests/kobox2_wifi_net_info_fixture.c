@@ -41,6 +41,15 @@ int kobox_wifi_net_info_fixture(void)
 	REQUIRE(info.association_sequence == 0 && info.carrier == 1 && info.mtu == 1500);
 	REQUIRE(!memcmp(info.mac, test_mac, 6));
 #if KOBOX_BOOT_WIFI
+    static struct wireless_dev test_wireless;
+    struct kobox_linux_net_rx_stats rx_stats;
+    test_device.ieee80211_ptr = &test_wireless;
+    test_wireless.ps = true;
+    REQUIRE(!kobox_linux_net_port_rx_stats(&test_port, &rx_stats));
+    REQUIRE(rx_stats.wireless == 1 && rx_stats.power_save == 1);
+    test_wireless.ps = false;
+    REQUIRE(!kobox_linux_net_port_rx_stats(&test_port, &rx_stats));
+    REQUIRE(rx_stats.wireless == 1 && rx_stats.power_save == 0);
 	test_port.wireless = true;
 	test_port.wifi = (void *)&test_port;
 	REQUIRE(!kobox_linux_net_port_info(&test_port, &info));

@@ -40,10 +40,7 @@ test "runtime scalar identity scheduler handoff and futex need no K retirement" 
         runtime_abi.syscall_futex_wake, runtime_abi.syscall_futex_wake_wait,
         runtime_abi.syscall_futex_requeue, runtime_abi.syscall_futex_wake_op }) |nr|
         try std.testing.expect(!needsKernelStateLock(nr));
-    for ([_]u64{ runtime_abi.syscall_system_info, runtime_abi.syscall_clock_read,
-        runtime_abi.syscall_clock_gettime,
-        runtime_abi.syscall_clock_page_open, runtime_abi.syscall_getrandom,
-        runtime_abi.syscall_power_control }) |nr|
+    for ([_]u64{ runtime_abi.syscall_system_info, runtime_abi.syscall_clock_read, runtime_abi.syscall_clock_gettime, runtime_abi.syscall_clock_page_open, runtime_abi.syscall_futex_pi, runtime_abi.syscall_getrandom, runtime_abi.syscall_power_control }) |nr|
         try std.testing.expect(needsKernelStateLock(nr));
 }
 
@@ -52,4 +49,3 @@ test "pager stateful calls retain K through FD and VMO loans" {
     for (pager_abi.syscall_pager_port_create..pager_abi.syscall_pager_fail + 1) |nr|
         try std.testing.expect(needsKernelStateLock(nr));
 }
-

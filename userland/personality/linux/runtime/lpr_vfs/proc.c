@@ -1,4 +1,5 @@
 #include "../lpr_filed_internal.h"
+#include "maps.h"
 
 typedef struct lpr_cpuid_result {
     uint32_t eax;
@@ -204,6 +205,7 @@ static int64_t lpr_proc_snapshot_finish(
         return -LPR_LINUX_EIO;
     }
     snapshot->reserved1 = seal_state;
+    snapshot->mode = LPR_LINUX_S_IFREG | 0600u;
     (void)path;
     (void)lpr_linux_close(staging_fd);
     return fd;
@@ -507,6 +509,7 @@ typedef struct lpr_proc_root_entry {
 typedef enum {
     LPR_PROC_PID_NONE = 0,
     LPR_PROC_PID_DIR,
+    LPR_PROC_PID_MAPS,
     LPR_PROC_PID_COMM,
     LPR_PROC_PID_CMDLINE,
     LPR_PROC_PID_STAT,
@@ -559,6 +562,7 @@ static int lpr_proc_pid_from_path(
 static lpr_proc_pid_kind_t lpr_proc_pid_kind(const char *leaf)
 {
     if (leaf[0] == '\0') return LPR_PROC_PID_DIR;
+    if (lpr_strcmp(leaf, "maps") == 0) return LPR_PROC_PID_MAPS;
     if (lpr_strcmp(leaf, "comm") == 0) return LPR_PROC_PID_COMM;
     if (lpr_strcmp(leaf, "cmdline") == 0) return LPR_PROC_PID_CMDLINE;
     if (lpr_strcmp(leaf, "stat") == 0) return LPR_PROC_PID_STAT;
@@ -768,12 +772,37 @@ static int64_t lpr_proc_write_pid_stat(
     return status;
 }
 
+static int64_t lpr_proc_write_maps(uint64_t fd, unsigned *wait_not_ready)
+{
+    uint64_t cursor = 0;
+    for (;;) {
+        pacha_vm_mapping_info_t record;
+        const int64_t raw = lpr_pacha_syscall3(PACHA_VM_SYSCALL_QUERY,
+            cursor, (uint64_t)(uintptr_t)&record, sizeof(record));
+        if (raw == PACHA_SYSCALL_ERR_EMPTY || raw == -PACHA_SYSCALL_ERR_EMPTY)
+            return 0;
+        if (raw) return lpr_pacha_status_to_errno(raw);
+        char line[80];
+        uint64_t next = 0;
+        const int64_t length = lpr_proc_maps_line(&record, cursor, line, &next);
+        if (length < 0) return length;
+        const int64_t status = lpr_proc_write_all(fd, line, (uint64_t)length,
+            wait_not_ready);
+        if (status) return status;
+        cursor = next;
+    }
+}
+
 static int64_t lpr_proc_pid_snapshot_open(
     const char *path,
     uint64_t pid,
     lpr_proc_pid_kind_t kind,
     uint64_t flags, unsigned *wait_not_ready __attribute__((unused)))
 {
+    /* This native operation inspects only the current address space. Never
+     * return our mappings for another process merely because it exists. */
+    if (kind == LPR_PROC_PID_MAPS && pid != (uint64_t)lpr_linux_getpid())
+        return -LPR_LINUX_EACCES;
     lprs_process_query_t info;
     lpr_memset(&info, 0, sizeof(info));
     const int query_status = lpr_supervisor_query_process(pid, &info);
@@ -783,6 +812,9 @@ static int64_t lpr_proc_pid_snapshot_open(
     if (staging_fd < 0) return staging_fd;
     int64_t status = 0;
     switch (kind) {
+    case LPR_PROC_PID_MAPS:
+        status = lpr_proc_write_maps((uint64_t)staging_fd, wait_not_ready);
+        break;
     case LPR_PROC_PID_COMM:
         status = lpr_proc_write_pid_comm((uint64_t)staging_fd, &info, wait_not_ready);
         break;
@@ -951,7 +983,16 @@ static enum lpr_proc_global_kind lpr_proc_global_kind(const char *path)
 int lpr_linux_proc_snapshot_access(const char *path, uint64_t mode,
     uint64_t flags, int64_t *status)
 {
-    if (lpr_proc_global_kind(path) == LPR_PROC_NONE) return 0;
+    if (lpr_proc_global_kind(path) == LPR_PROC_NONE) {
+        uint64_t pid = 0;
+        const char *leaf = 0;
+        if (!path || !lpr_proc_pid_from_path(path, &pid, &leaf) ||
+            lpr_strcmp(leaf, "maps")) return 0;
+        if (pid != (uint64_t)lpr_linux_getpid()) {
+            *status = -LPR_LINUX_EACCES;
+            return 1;
+        }
+    }
     if ((mode & ~7u) || (flags & ~(0x100u | 0x200u | 0x1000u)))
         *status = -LPR_LINUX_EINVAL;
     else

@@ -1,10 +1,41 @@
 /* SPDX-License-Identifier: MIT */
 #include "kobox2_frame_client.h"
+#include "path_profile.h"
+#include <stdio.h>
 
 #include <pacha/ipc.h>
 #include <errno.h>
 #include <string.h>
 #include <stdatomic.h>
+
+#if NETD_PATH_PROFILE
+/* Netd's single event-loop thread owns every record; no per-packet I/O. */
+static struct {uint64_t key,begin,end,detail;unsigned stage;} path_rows[64];
+static unsigned path_count;
+static int path_enabled;
+void netd_path_record(unsigned stage,uint64_t key,uint64_t begin,uint64_t end,uint64_t detail)
+{
+ if(!path_enabled || path_count==64 || (stage<=3 && (key&63)))return;
+ if(stage>3 && (detail&63))return;
+ unsigned i=path_count++;path_rows[i].key=key;path_rows[i].begin=begin;
+ path_rows[i].end=end;path_rows[i].detail=detail;path_rows[i].stage=stage;
+}
+int netd_path_control(const char *operation,char *reply,size_t capacity)
+{
+ if(!strcmp(operation,"start")){path_count=0;path_enabled=1;return 0;}
+ if(!strcmp(operation,"stop")){path_enabled=0;return 0;}
+ if(strcmp(operation,"dump"))return -EINVAL;
+ if(path_enabled)return -EBUSY;
+ size_t used=0;
+ for(unsigned i=0;i<path_count;i++){
+  int n=snprintf(reply+used,capacity-used,"netd stage=%u key=%llx begin=%llu end=%llu detail=%llu\n",
+   path_rows[i].stage,(unsigned long long)path_rows[i].key,(unsigned long long)path_rows[i].begin,
+   (unsigned long long)path_rows[i].end,(unsigned long long)path_rows[i].detail);
+  if(n<0||(size_t)n>=capacity-used)return -ENOSPC;used+=(size_t)n;
+ }
+ return (int)used;
+}
+#endif
 
 static int wait_reply(struct ph_ipc *ipc, pacha_fd_t process_fd,
     uint64_t operation, uint64_t correlation)
@@ -47,10 +78,13 @@ static int request(struct netd_kobox2_frame_client *client,
         .generation = client->generation, .correlation = correlation,
         .value = attach_fd >= 16 ? PH_NET_FRAME_SHARED_BYTES : 0};
     if (attach_fd >= 16) {
-        packet.fd_count = 1;
+        packet.fd_count = 2;
         packet.fds[0] = (struct pacha_ipc_fd){.fd = (uint64_t)attach_fd,
             .rights = PACHA_FD_RIGHT_INSPECT | PACHA_FD_RIGHT_CLOSE |
                 PACHA_FD_RIGHT_MAP_READ | PACHA_FD_RIGHT_MAP_WRITE,
+            .flags = PACHA_FD_FLAG_CLOEXEC};
+        packet.fds[1] = (struct pacha_ipc_fd){.fd = (uint64_t)client->rx_wake_fd,
+            .rights = PACHA_FD_RIGHT_INSPECT | PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_WRITE,
             .flags = PACHA_FD_FLAG_CLOEXEC};
     }
     int result = ph_ipc_send(ipc, &packet);
@@ -84,6 +118,14 @@ int netd_kobox2_frame_open(struct netd_kobox2_frame_client *client,
     client->vmo_fd = fd;
     client->shared = mapped;
     client->generation = generation;
+    client->rx_wake_fd = pacha_eventfd_create(0, PACHA_FD_RIGHT_INSPECT |
+        PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_TRANSFER | PACHA_FD_RIGHT_READ |
+        PACHA_FD_RIGHT_WRITE | PACHA_FD_RIGHT_WAIT | PACHA_FD_RIGHT_POLL, 0);
+    if (client->rx_wake_fd < 16) {
+        int error = client->rx_wake_fd < 0 ? client->rx_wake_fd : -ENOMEM;
+        (void)netd_kobox2_frame_close(client);
+        return error;
+    }
     client->shared->magic = PH_NET_FRAME_SHARED_MAGIC;
     client->shared->generation = generation;
     int result = request(client, ipc, process_fd, PH_NET_FRAME_ATTACH, fd);
@@ -105,11 +147,18 @@ int netd_kobox2_frame_read(struct netd_kobox2_frame_client *client,
     size_t *count)
 {
     if (!frames || !count) return -EINVAL;
+    uint64_t path_begin=NETD_PATH_NOW();
     int result = request(client, ipc, process_fd, PH_NET_FRAME_READ, -1);
+    uint64_t path_end=NETD_PATH_NOW();
     if (result) return result;
     if (client->shared->count > PH_NET_FRAME_BATCH) return -EPROTO;
     *frames = client->shared->frames;
     *count = client->shared->count;
+#if NETD_PATH_PROFILE
+    for(size_t i=0;i<*count;i++)netd_path_record(1,kobox_net_perf_key((*frames)[i].bytes,(*frames)[i].length),path_begin,path_end,*count);
+#else
+    (void)path_begin;(void)path_end;
+#endif
     return 0;
 }
 
@@ -121,7 +170,13 @@ int netd_kobox2_frame_write(struct netd_kobox2_frame_client *client,
     client->shared->count = 1;
     client->shared->frames[0].length = length;
     memcpy(client->shared->frames[0].bytes, frame, length);
+    uint64_t path_begin=NETD_PATH_NOW();
     int result = request(client, ipc, process_fd, PH_NET_FRAME_WRITE, -1);
+#if NETD_PATH_PROFILE
+    netd_path_record(3,kobox_net_perf_key(frame,length),path_begin,NETD_PATH_NOW(),length);
+#else
+    (void)path_begin;
+#endif
     if (!result && client->shared->count != 1) return -EPROTO;
     return result;
 }
@@ -183,6 +238,10 @@ int netd_kobox2_frame_close(struct netd_kobox2_frame_client *client)
         result = pacha_munmap(client->shared, PH_NET_FRAME_SHARED_BYTES);
     if (client->vmo_fd >= 16) {
         int closed = pacha_fd_close(client->vmo_fd);
+        if (!result) result = closed;
+    }
+    if (client->rx_wake_fd >= 16) {
+        int closed = pacha_fd_close(client->rx_wake_fd);
         if (!result) result = closed;
     }
     *client = (struct netd_kobox2_frame_client){0};

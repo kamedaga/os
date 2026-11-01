@@ -125,6 +125,7 @@ static int adopt_device(struct gpud_package *package, pacha_fd_t filed_fd, pacha
         (info.flags & PACHA_CAPSULE_DMA_QUARANTINED))
         return error ? error : -13;
     package->device_fd = device_fd;
+    package->device_rights = PH_DEVICE_FUNCTION_RIGHTS;
     package->device = (struct ph_device_authority){
         .object_id = 1, .native_device = info.device, .slot_id = 1, .node_id = 1};
     return 0;
@@ -349,9 +350,23 @@ fail:
     return error;
 }
 
+int gpud_package_enable_port_io(struct gpud_package *package) {
+    if (!package || !package->device_fd || package->identity.generation) return -22;
+    struct pacha_capsule_info info = {0};
+    int error = pacha_capsule_query(package->device_fd, &info);
+    const uint64_t required = PH_DEVICE_VGA_FUNCTION_RIGHTS | PACHA_FD_RIGHT_TRANSFER;
+    if (error || info.kind != PACHA_CAPSULE_KIND_DEVICE ||
+        info.device != package->device.native_device || (info.rights & required) != required ||
+        info.flags & PACHA_CAPSULE_DMA_QUARANTINED) return error ? error : -13;
+    package->device_rights = PH_DEVICE_VGA_FUNCTION_RIGHTS;
+    return 0;
+}
+
 int gpud_package_bind(struct gpud_package *package, uint64_t generation) {
     if (!package || !package->device_fd || !package->manifest_size || !generation ||
-        package->items[1].capability.fd)
+        package->items[1].capability.fd ||
+        (package->device_rights != PH_DEVICE_FUNCTION_RIGHTS &&
+         package->device_rights != PH_DEVICE_VGA_FUNCTION_RIGHTS))
         return -22;
     package->identity.generation = generation;
     package->device.generation = generation;
@@ -376,7 +391,7 @@ int gpud_package_bind(struct gpud_package *package, uint64_t generation) {
         return error;
     package->items[package->artifact_count + 2] = (struct ph_bootstrap_item){
         .capability = {.fd = (uint64_t)package->device_fd,
-            .rights = PH_DEVICE_FUNCTION_RIGHTS, .flags = PACHA_FD_FLAG_CLOEXEC}};
+            .rights = package->device_rights, .flags = PACHA_FD_FLAG_CLOEXEC}};
     return 0;
 }
 

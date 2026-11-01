@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: MIT */
 #include "gpu_queue.h"
+#include "boot.h"
 
 #include <errno.h>
 #include <string.h>
@@ -48,11 +49,16 @@ static int notify_fence_event(void *context) {
     return -EIO;
 }
 
-static int channel_fault(struct ph_gpu_queue *queue) {
+static int channel_fault_at(struct ph_gpu_queue *queue, unsigned long line) {
+    ph_boot_log_gpu_protocol_failure(line, queue->active_lane,
+        queue->service.opcode, queue->service.query.correlation,
+        queue->service.query.plan.command_set_id,
+        queue->service.query.plan.command_id);
     if (queue->bound)
         kb2_vq_channel_fault(&queue->channel.channel);
     return -EPROTO;
 }
+#define channel_fault(queue) channel_fault_at((queue), __LINE__)
 
 static int overlaps(uint64_t address, uint64_t length,
                     uint64_t start, uint64_t end) {
@@ -236,6 +242,42 @@ static int next_request(void *context) {
     uint32_t queue_class = queue->active_lane == GPUD_GPU_QUEUE_CONTROL ?
         KB2_GPU_QUEUE_CONTROL : queue->active_lane == GPUD_GPU_QUEUE_DISPLAY ?
         KB2_GPU_QUEUE_DISPLAY : KB2_GPU_QUEUE_EXECUTION;
+    /* A DMA-BUF is an object capability, not a DRM file session. Its sync
+     * request remains valid after the exporting file has closed. Snapshot
+     * the complete typed control request before entering Linux. */
+    kb2_protocol_message_envelope_t envelope;
+    if (kb2_protocol_message_envelope_decode(query->request, queue->request.readable,
+            &envelope)) return channel_fault(queue);
+    if(kb2_gpu_sync_file_request_size(envelope.opcode)) {
+        if(queue_class!=KB2_GPU_QUEUE_CONTROL || envelope.flags ||
+            envelope.protocol_id!=KB2_GPU_PROTOCOL_ID || envelope.generation!=generation ||
+            !envelope.correlation_id || envelope.correlation_id<=query->correlation ||
+            envelope.payload_length!=queue->request.readable-KB2_PROTOCOL_MESSAGE_ENVELOPE_SIZE ||
+            kb2_gpu_sync_file_request_decode(query->request+KB2_PROTOCOL_MESSAGE_ENVELOPE_SIZE,
+                envelope.payload_length,envelope.opcode,&queue->sync_file)) return channel_fault(queue);
+        query->correlation=envelope.correlation_id;
+        query->reply_size=0;query->terminal_after_completion=0;
+        queue->sync_file_exported=0;queue->sync_file_result=-EINVAL;
+        return 0;
+    }
+    if (envelope.opcode == KB2_GPU_OPCODE_DMA_BUF_CPU_SYNC) {
+        if (queue_class != KB2_GPU_QUEUE_CONTROL || envelope.flags ||
+            envelope.protocol_id != KB2_GPU_PROTOCOL_ID || envelope.generation != generation ||
+            !envelope.correlation_id || envelope.correlation_id <= query->correlation ||
+            envelope.payload_length != KB2_GPU_DMA_BUF_CPU_SYNC_REQUEST_SIZE ||
+            queue->request.readable != KB2_PROTOCOL_MESSAGE_ENVELOPE_SIZE +
+                KB2_GPU_DMA_BUF_CPU_SYNC_REQUEST_SIZE)
+            return channel_fault(queue);
+        const unsigned char *body = query->request + KB2_PROTOCOL_MESSAGE_ENVELOPE_SIZE;
+        queue->cpu_sync_token = ph_gpu_event_load_u64(body + KB2_GPU_DMA_BUF_CPU_SYNC_REQUEST_TOKEN_OFFSET);
+        queue->cpu_sync_flags = ph_gpu_event_load_u64(body + KB2_GPU_DMA_BUF_CPU_SYNC_REQUEST_FLAGS_OFFSET);
+        if (!queue->cpu_sync_token) return channel_fault(queue);
+        query->correlation = envelope.correlation_id;
+        query->reply_size = 0;
+        query->terminal_after_completion = 0;
+        queue->cpu_sync_result = -EINVAL;
+        return 0;
+    }
     int result = ph_gpu_session_prepare(&queue->service, queue_class, queue->request.readable);
     if (result)
         return channel_fault(queue);
@@ -354,6 +396,34 @@ static int dispatch(void *context, void *linux_service) {
             return -ENODEV;
         return queue->service.unmap(linux_service, queue->release_mapping_id);
     }
+    if(queue->sync_file.opcode) {
+        const kb2_gpu_sync_file_request_t *r=&queue->sync_file;
+        const struct kobox_drm_query_api *api=&queue->service.query.api;
+        int error=-ENODEV;
+        if(linux_service) {
+            if(r->opcode==KB2_GPU_OPCODE_DMA_BUF_EXPORT_SYNC_FILE && api->prime_export_file)
+                error=(r->flags && r->flags<=3) ? api->prime_export_file(linux_service,
+                    r->token,(uint32_t)r->flags,r->session_id,queue->service.query.correlation,
+                    &queue->sync_file_exported) : -EINVAL;
+            else if(r->opcode==KB2_GPU_OPCODE_DMA_BUF_IMPORT_SYNC_FILE && api->prime_import_file)
+                error=(r->flags && r->flags<=3) ? api->prime_import_file(linux_service,
+                    r->token,(uint32_t)r->flags,r->sync_file_token) : -EINVAL;
+            else if(r->opcode==KB2_GPU_OPCODE_SYNC_FILE_RELEASE && api->release_sync_file)
+                error=api->release_sync_file(linux_service,r->token);
+        }
+        queue->sync_file_result=error;
+        return 0; /* Backend errno is payload, not terminal channel failure. */
+    }
+    if (queue->cpu_sync_token) {
+        if (!linux_service || !queue->service.query.api.prime_cpu_sync)
+            queue->cpu_sync_result = -ENODEV;
+        else
+            queue->cpu_sync_result = queue->service.query.api.prime_cpu_sync(
+                linux_service, queue->cpu_sync_token, queue->cpu_sync_flags);
+        /* An exporter error is the result of this ioctl, not a protocol
+         * failure. Publish it without killing unrelated DRM sessions. */
+        return 0;
+    }
     return ph_gpu_session_dispatch(&queue->service, linux_service);
 }
 
@@ -397,14 +467,38 @@ static int complete(void *context, struct ph_ipc *ipc) {
     struct ph_gpu_query *query = &queue->service.query;
     uint64_t generation = query->generation;
     kb2_vq_t *lane = &queue->channel.lanes[queue->active_lane];
-    int result = ph_gpu_query_publish_attachment(query, ipc);
+    if(queue->sync_file.opcode) {
+        const size_t bytes=kb2_gpu_sync_file_response_size(queue->sync_file.opcode);
+        const kb2_protocol_message_envelope_t envelope={.protocol_id=KB2_GPU_PROTOCOL_ID,
+            .opcode=queue->sync_file.opcode,.generation=generation,
+            .correlation_id=query->correlation,.payload_length=bytes};
+        query->reply_size=KB2_PROTOCOL_MESSAGE_ENVELOPE_SIZE+bytes;
+        if(kb2_protocol_message_envelope_encode(query->reply,query->reply_size,&envelope) ||
+            kb2_gpu_sync_file_response_encode(query->reply+KB2_PROTOCOL_MESSAGE_ENVELOPE_SIZE,
+                bytes,&queue->sync_file,queue->sync_file_result,queue->sync_file_exported))
+            return channel_fault(queue);
+    }
+    if (queue->cpu_sync_token) {
+        const kb2_protocol_message_envelope_t envelope = {
+            .protocol_id = KB2_GPU_PROTOCOL_ID, .opcode = KB2_GPU_OPCODE_DMA_BUF_CPU_SYNC,
+            .generation = generation, .correlation_id = query->correlation,
+            .payload_length = KB2_GPU_DMA_BUF_CPU_SYNC_RESPONSE_SIZE};
+        query->reply_size = KB2_PROTOCOL_MESSAGE_ENVELOPE_SIZE + KB2_GPU_DMA_BUF_CPU_SYNC_RESPONSE_SIZE;
+        if (kb2_protocol_message_envelope_encode(query->reply, query->reply_size, &envelope))
+            return channel_fault(queue);
+        unsigned char *body = query->reply + KB2_PROTOCOL_MESSAGE_ENVELOPE_SIZE;
+        ph_gpu_event_store_u64(body + KB2_GPU_DMA_BUF_CPU_SYNC_RESPONSE_TOKEN_OFFSET, queue->cpu_sync_token);
+        ph_gpu_event_store_u64(body + KB2_GPU_DMA_BUF_CPU_SYNC_RESPONSE_FLAGS_OFFSET, queue->cpu_sync_flags);
+        ph_gpu_event_store_u64(body + KB2_GPU_DMA_BUF_CPU_SYNC_RESPONSE_RESULT_OFFSET, (uint64_t)(int64_t)queue->cpu_sync_result);
+    }
+    int result = (queue->cpu_sync_token || queue->sync_file.opcode) ? 0 : ph_gpu_query_publish_attachment(query, ipc);
     if (result)
         return result;
-    if (queue->active_lane != GPUD_GPU_QUEUE_CONTROL)
+    if (!queue->cpu_sync_token && !queue->sync_file.opcode && queue->active_lane != GPUD_GPU_QUEUE_CONTROL)
         memcpy((unsigned char *)queue->mapping + GPUD_GPU_OUTPUT_OFFSET,
                query->output,
                sizeof(query->output));
-    if (query->aux_size && query->plan.aux_output) {
+    if (!queue->cpu_sync_token && !queue->sync_file.opcode && query->aux_size && query->plan.aux_output) {
         if (!query->aux || query->aux_size > GPUD_GPU_AUX_CAPACITY)
             return channel_fault(queue);
         memcpy((unsigned char *)queue->mapping + GPUD_GPU_AUX_OFFSET,
@@ -445,6 +539,16 @@ static int release_request(void *context) {
     if (queue->release_mapping_id) {
         queue->release_mapping_id = 0;
         queue->release_correlation = 0;
+        return 0;
+    }
+    if(queue->sync_file.opcode) {
+        memset(&queue->sync_file,0,sizeof(queue->sync_file));
+        queue->sync_file_exported=0;queue->sync_file_result=0;
+        return 0;
+    }
+    if (queue->cpu_sync_token) {
+        queue->cpu_sync_token = queue->cpu_sync_flags = 0;
+        queue->cpu_sync_result = 0;
         return 0;
     }
     int session_result = ph_gpu_session_service_release(&queue->service);

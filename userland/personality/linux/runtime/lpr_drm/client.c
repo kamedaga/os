@@ -34,6 +34,7 @@ static int64_t amdgpu_info_failure(uint32_t query, uint32_t bytes,
 
 enum {
     LPR_DRM_IOCTL_VERSION = 0xc0406400u,
+    LPR_DRM_ERR_PROTOCOL = 71,
     LPR_UDMABUF_CREATE = 0x40187542u,
     LPR_DRM_IOCTL_SYNCOBJ_WAIT = 0xc02864c3u,
     LPR_DRM_IOCTL_SYNCOBJ_RESET = 0xc01064c4u,
@@ -1329,16 +1330,52 @@ int64_t lpr_dmabuf_ioctl(uint64_t fd, uint64_t request, uint64_t arg)
     const uint32_t command = (uint32_t)request;
     if (dmabuf == 0) return -LPR_LINUX_EBADF;
     if (arg == 0) return -LPR_LINUX_EFAULT;
+    /* CPU coherency uses a different UAPI layout from the sync-file ioctls:
+     * all 64 flag bits must be checked before narrowing anything. */
+    if (request == UINT64_C(0x40086200)) { /* DMA_BUF_IOCTL_SYNC */
+        const uint64_t flags = *(const uint64_t *)(uintptr_t)arg;
+        if (!gpud_drm_cpu_sync_flags_valid(flags)) return -LPR_LINUX_EINVAL;
+        if (!dmabuf->token) return -LPR_LINUX_EOPNOTSUPP;
+        if ((flags & 2) && !dmabuf->writable) return -LPR_LINUX_EACCES;
+        struct pacha_fd_info info;
+        if (!lpr_native_fd_info(dmabuf->native.raw, &info) ||
+            info.kind != PACHA_FD_KIND_VMO || info.size != dmabuf->size)
+            return -LPR_LINUX_EBADF;
+        const uint64_t rights = ((flags & 1) ? PACHA_FD_RIGHT_MAP_READ : 0) |
+            ((flags & 2) ? PACHA_FD_RIGHT_MAP_WRITE : 0);
+        if ((info.rights & rights) != rights) return -LPR_LINUX_EACCES;
+        struct pacha_fd_info lease;
+        if (dmabuf->lease_fd.raw < 16 ||
+            !lpr_native_fd_info(dmabuf->lease_fd.raw, &lease) ||
+            lease.kind != PACHA_FD_KIND_CHANNEL ||
+            !(lease.rights & PACHA_FD_RIGHT_CALL)) return -LPR_LINUX_EACCES;
+        struct pacha_ipc_msg call = {.word0 = GPUD_DRM_PRIME_CPU_SYNC_REQUEST_MAGIC,
+            .word1 = dmabuf->token, .word2 = flags};
+        struct pacha_ipc_fd received[PACHA_IPC_MAX_TRANSFER_FDS];
+        struct pacha_ipc_msg reply = {.fds = received, .fd_capacity = PACHA_IPC_MAX_TRANSFER_FDS};
+        int sent = 0;
+        const int64_t native = lpr_ipc_message(PACHA_IPC_SYSCALL_CALL,
+            dmabuf->lease_fd.raw, (uintptr_t)&call, (uintptr_t)&reply,
+            UINT64_MAX, PACHA_WAIT_UNINTERRUPTIBLE, &sent);
+        if (native) return lpr_pacha_status_to_errno(native);
+        if (reply.fd_count || reply.word0 != GPUD_DRM_PRIME_CPU_SYNC_REPLY_MAGIC ||
+            reply.word2 != dmabuf->token || reply.word3 != flags ||
+            (int64_t)reply.word1 > 0 || (int64_t)reply.word1 < -4095) {
+            for (uint32_t i = 0; i < reply.fd_count; ++i)
+                (void)lpr_close_native_fd_if_open(reply.fds[i].fd);
+            return -LPR_DRM_ERR_PROTOCOL;
+        }
+        return (int64_t)reply.word1;
+    }
     lpr_dma_buf_sync_file_t *sync =
         (lpr_dma_buf_sync_file_t *)(uintptr_t)arg;
     if (!lpr_dma_buf_sync_flags_valid(sync->flags))
         return -LPR_LINUX_EINVAL;
 
     if (command == (uint32_t)LPR_LINUX_DMA_BUF_IOCTL_EXPORT_SYNC_FILE) {
-        const int64_t sync_fd = lpr_sync_file_create_signaled();
-        if (sync_fd < 0) return sync_fd;
-        sync->fd = (int32_t)sync_fd;
-        return 0;
+        /* A PRIME reservation may still contain in-flight GPU work. Never
+         * manufacture a completed sync_file before exporting its real fence. */
+        return -LPR_LINUX_EOPNOTSUPP;
     }
     if (command != (uint32_t)LPR_LINUX_DMA_BUF_IOCTL_IMPORT_SYNC_FILE)
         return -LPR_LINUX_ENOTTY;
@@ -1396,19 +1433,19 @@ static int64_t lpr_drm_prime_export(uint64_t drm_handle, uint32_t gem_handle, ui
     const pacha_fd_t native_fd = received[0];
     const uint64_t view_rights = PACHA_FD_RIGHT_DUP |
         PACHA_FD_RIGHT_TRANSFER | PACHA_FD_RIGHT_CLOSE |
-        PACHA_FD_RIGHT_MAP_READ | PACHA_FD_RIGHT_MAP_WRITE;
+        PACHA_FD_RIGHT_MAP_READ | ((flags & GPUD_DRM_RDWR) ? PACHA_FD_RIGHT_MAP_WRITE : 0);
     if (received_count != 2 || native_fd < 16 || token == 0 || !lpr_native_fd_info((uint64_t)native_fd, &info) ||
         info.kind != PACHA_FD_KIND_VMO || !info.size || (info.size & 4095u) ||
         info.rights != view_rights || info.flags != PACHA_FD_FLAG_CLOEXEC ||
         !lpr_native_fd_info((uint64_t)(uint32_t)received[1], &lease) ||
         lease.kind != PACHA_FD_KIND_CHANNEL || lease.size ||
-        lease.rights != PACHA_FD_RIGHT_CLOSE ||
+        lease.rights != GPUD_DRM_PRIME_OWNER_RIGHTS ||
         lease.flags != (PACHA_FD_FLAG_CLOEXEC | PACHA_FD_FLAG_INHERIT)) {
         for (uint32_t i = 0; i < received_count; ++i)
             (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)received[i]);
         return -LPR_LINUX_EIO;
     }
-    const uint64_t linux_flags = LPR_LINUX_O_RDWR |
+    const uint64_t linux_flags = ((flags & GPUD_DRM_RDWR) ? LPR_LINUX_O_RDWR : 0) |
         ((flags & GPUD_DRM_CLOEXEC) != 0 ? LPR_LINUX_O_CLOEXEC : 0);
     const int linux_fd = lpr_dmabuf_install(native_fd, received[1], token, info.size, linux_flags);
     if (linux_fd < 0) {
@@ -1783,6 +1820,11 @@ static int lpr_drm_prepare_amdgpu_gem_op(uint32_t command, uint64_t arg,
     return 0;
 }
 
+#include "i915_query.h"
+#include "i915_context.h"
+#include "i915_create.h"
+#include "i915_exec.h"
+
 int64_t lpr_drm_ioctl(uint64_t fd, uint64_t request, uint64_t arg, unsigned *wait_not_ready __attribute__((unused)))
 {
 #if defined(LPR_DRM_STARTUP_PROFILE) && LPR_DRM_STARTUP_PROFILE
@@ -1798,6 +1840,15 @@ int64_t lpr_drm_ioctl(uint64_t fd, uint64_t request, uint64_t arg, unsigned *wai
         return command == LPR_UDMABUF_CREATE ?
             lpr_udmabuf_create(drm->handle, arg, wait_not_ready) : -LPR_LINUX_ENOTTY;
     }
+    if(command==GPUD_DRM_IOCTL_I915_GEM_CREATE_EXT) return lpr_i915_create_ext_ioctl(drm->handle,arg);
+    if (command == GPUD_DRM_IOCTL_I915_EXECBUFFER || command == GPUD_DRM_IOCTL_I915_EXECBUFFER_WR)
+        return lpr_i915_exec_ioctl(drm->handle,command,arg);
+    if (command == GPUD_DRM_IOCTL_I915_CONTEXT_CREATE ||
+        command == GPUD_DRM_IOCTL_I915_CONTEXT_CREATE_EXT ||
+        command == GPUD_DRM_IOCTL_I915_CONTEXT_SETPARAM)
+        return lpr_i915_context_ioctl(drm->handle, command, arg);
+    if (command == GPUD_DRM_IOCTL_I915_QUERY)
+        return lpr_i915_query_ioctl(drm->handle, arg);
     if (command == GPUD_DRM_IOCTL_PRIME_HANDLE_TO_FD) {
         gpud_drm_prime_handle_t *prime = (gpud_drm_prime_handle_t *)(uintptr_t)arg;
         const int64_t prime_fd = lpr_drm_prime_export(drm->handle, prime->handle, prime->flags);
@@ -1856,6 +1907,7 @@ int64_t lpr_drm_ioctl(uint64_t fd, uint64_t request, uint64_t arg, unsigned *wai
     uint32_t amdgpu_info_query = 0;
     uint32_t amdgpu_info_capacity = 0;
     uint64_t amdgpu_gem_op_pointer = 0;
+    uint64_t i915_getparam_pointer = 0;
     enum {
         LPR_DRM_WIRE_GENERIC,
         LPR_DRM_WIRE_VERSION,
@@ -1882,8 +1934,32 @@ int64_t lpr_drm_ioctl(uint64_t fd, uint64_t request, uint64_t arg, unsigned *wai
         LPR_DRM_WIRE_AMDGPU_GEM_OP,
         LPR_DRM_WIRE_AMDGPU_CS,
         LPR_DRM_WIRE_KMS_QUERY,
+        LPR_DRM_WIRE_I915_GETPARAM,
     } wire_kind = LPR_DRM_WIRE_GENERIC;
-    if (kms_query) {
+    if(command==GPUD_DRM_IOCTL_I915_GEM_MMAP_OFFSET) {
+        gpud_drm_i915_mmap_offset_t input;
+        lpr_memcpy(&input,(const void *)(uintptr_t)arg,sizeof(input));
+        if(!input.handle || input.pad || input.extensions || (input.flags!=1 && input.flags!=2)) {
+            lpr_destroy_tty_wire_page(page_fd,page);
+            return input.extensions || (input.flags!=1 && input.flags!=2) ? -LPR_LINUX_EOPNOTSUPP : -LPR_LINUX_EINVAL;
+        }
+        input.offset=0;
+        ioctl->arg_size=sizeof(input);ioctl->data_size=sizeof(input);
+        lpr_memcpy(ioctl->data,&input,sizeof(input));
+    } else if (command == GPUD_DRM_IOCTL_I915_GETPARAM) {
+        gpud_drm_i915_getparam_t input;
+        lpr_memcpy(&input, (const void *)(uintptr_t)arg, sizeof(input));
+        if (!input.value_pointer) {
+            lpr_destroy_tty_wire_page(page_fd, page);
+            return -LPR_LINUX_EFAULT;
+        }
+        const gpud_drm_i915_getparam_wire_t wire = {.parameter = input.parameter};
+        i915_getparam_pointer = input.value_pointer;
+        ioctl->arg_size = sizeof(input);
+        ioctl->data_size = sizeof(wire);
+        lpr_memcpy(ioctl->data, &wire, sizeof(wire));
+        wire_kind = LPR_DRM_WIRE_I915_GETPARAM;
+    } else if (kms_query) {
         lpr_memcpy(kms_snapshot, (const void *)(uintptr_t)arg, kms_shape.scalar_size);
         int result = lpr_kms_query_prepare(ioctl, &kms_shape, kms_snapshot,
             reusable_aux, &aux_fd, &aux_mapping, &aux_map_size);
@@ -2547,7 +2623,11 @@ int64_t lpr_drm_ioctl(uint64_t fd, uint64_t request, uint64_t arg, unsigned *wai
     }
     if (status != 0 && wire_kind == LPR_DRM_WIRE_AMDGPU_INFO)
         (void)amdgpu_info_failure(amdgpu_info_query, amdgpu_info_capacity, "rpc", status, wait_not_ready);
-    if (status == 0 && wire_kind == LPR_DRM_WIRE_VERSION) {
+    if (status == 0 && wire_kind == LPR_DRM_WIRE_I915_GETPARAM) {
+        gpud_drm_i915_getparam_wire_t wire;
+        lpr_memcpy(&wire, ioctl->data, sizeof(wire));
+        lpr_memcpy((void *)(uintptr_t)i915_getparam_pointer, &wire.value, sizeof(wire.value));
+    } else if (status == 0 && wire_kind == LPR_DRM_WIRE_VERSION) {
         lpr_drm_version_t *version = (lpr_drm_version_t *)(uintptr_t)arg;
         const gpud_drm_version_wire_t *wire = (const gpud_drm_version_wire_t *)ioctl->data;
         version->major = wire->major;
@@ -2751,6 +2831,9 @@ int64_t lpr_drm_ioctl(uint64_t fd, uint64_t request, uint64_t arg, unsigned *wai
         const gpud_drm_crtc_queue_sequence_t *wire =
             (const gpud_drm_crtc_queue_sequence_t *)ioctl->data;
         user->sequence = wire->sequence;
+    } else if (wire_kind == LPR_DRM_WIRE_GENERIC &&
+        command == GPUD_DRM_IOCTL_I915_GEM_WAIT) {
+        status = lpr_i915_wait_copyout(ioctl, status, arg);
     } else if (status == 0 && wire_kind == LPR_DRM_WIRE_GENERIC) {
         lpr_memcpy((void *)(uintptr_t)arg, ioctl->data, ioctl->data_size);
     }
@@ -2768,6 +2851,15 @@ int64_t lpr_drm_ioctl(uint64_t fd, uint64_t request, uint64_t arg, unsigned *wai
         profile_end);
 #endif
     return status;
+}
+
+/* A mapping lease only keeps pages pinned. CPU-sync CALL authority belongs
+ * to the separately exported PRIME owner endpoint, never to a DRM mmap. */
+static int lpr_drm_mapping_lease_info_valid(const struct pacha_fd_info *lease)
+{
+    return lease && lease->kind == PACHA_FD_KIND_CHANNEL && !lease->size &&
+        lease->rights == PACHA_FD_RIGHT_CLOSE &&
+        lease->flags == (PACHA_FD_FLAG_CLOEXEC | PACHA_FD_FLAG_INHERIT);
 }
 
 int64_t lpr_drm_mmap(
@@ -2807,14 +2899,12 @@ int64_t lpr_drm_mmap(
     struct pacha_fd_info lease;
     const uint64_t view_rights = PACHA_FD_RIGHT_CLOSE |
         PACHA_FD_RIGHT_MAP_READ | PACHA_FD_RIGHT_MAP_WRITE;
-    const uint32_t lease_flags = PACHA_FD_FLAG_CLOEXEC | PACHA_FD_FLAG_INHERIT;
     if (received_count != 2 || mapping_length < length ||
         !lpr_native_fd_info((uint64_t)(uint32_t)received[0], &view) ||
         view.kind != PACHA_FD_KIND_VMO || view.size != mapping_length ||
         view.rights != view_rights || view.flags != PACHA_FD_FLAG_CLOEXEC ||
         !lpr_native_fd_info((uint64_t)(uint32_t)received[1], &lease) ||
-        lease.kind != PACHA_FD_KIND_CHANNEL || lease.size ||
-        lease.rights != PACHA_FD_RIGHT_CLOSE || lease.flags != lease_flags) {
+        !lpr_drm_mapping_lease_info_valid(&lease)) {
         for (uint32_t i = 0; i < received_count; ++i)
             (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)received[i]);
         return -LPR_LINUX_EIO;

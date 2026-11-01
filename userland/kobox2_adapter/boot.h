@@ -42,6 +42,11 @@ void ph_boot_log_irq_ready(unsigned long received,
  * to gpud or relying on a serial console during a physical probe. */
 void ph_boot_log_gpu_map_failure(unsigned long stage, long status,
     unsigned long handle, unsigned long bytes);
+/* A terminal protocol violation retires all DRM clients. Preserve its native
+ * admission site and typed request identity before lifecycle cleanup runs. */
+void ph_boot_log_gpu_protocol_failure(unsigned long line, unsigned long lane,
+    unsigned long opcode, unsigned long correlation,
+    unsigned long command_set, unsigned long command);
 /* A failed native page view otherwise loses the exact parent and page-list
  * shape before the Linux BO is released during error unwinding. */
 void ph_boot_log_gpu_page_view_failure(long status, unsigned long parent_fd,

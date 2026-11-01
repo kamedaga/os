@@ -253,6 +253,51 @@ class WifiCLI(unittest.TestCase):
         self.join_backend(thread)
         self.assertEqual(path.read_bytes(), original)
 
+    def test_reconnect_reuses_saved_config_without_terminal(self):
+        path = self.config_dir / 'wifi.conf'
+        self.write(path, 'update_config=0\n# synthetic saved configuration\n')
+        original, inode = path.read_bytes(), path.stat().st_ino
+        thread = self.backend('connect', stale_first=True)
+        result = self.run_cli('reconnect')  # No terminal/password input.
+        self.join_backend(thread)
+        self.assertEqual(result.returncode, 0)
+        self.assertIn(b'backend fixture reply', result.stdout)
+        self.assertNotIn(b'STALE', result.stdout)
+        self.assertEqual(path.read_bytes(), original)
+        self.assertEqual(path.stat().st_ino, inode)
+        self.assertFalse(list(self.config_dir.glob('*.tmp')))
+        (self.runtime / 'request').unlink()
+        thread = self.backend('connect', status=-13)
+        result = self.run_cli('reconnect')
+        self.join_backend(thread)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(path.read_bytes(), original)
+        self.assertEqual(path.stat().st_ino, inode)
+
+    def test_reconnect_rejects_changed_saved_session(self):
+        path = self.config_dir / 'wifi.conf'
+        self.write(path, 'update_config=0\n# synthetic saved configuration\n')
+        original = path.read_bytes()
+        process = subprocess.Popen([str(self.binary), 'reconnect'],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            deadline = time.monotonic() + 2
+            while not (self.runtime / 'request').exists():
+                self.assertLess(time.monotonic(), deadline)
+                time.sleep(0.005)
+            request_id, operation = (self.runtime / 'request').read_text().split()
+            self.assertEqual(operation, 'connect')
+            self.write(self.runtime / 'session', 'fedcba9876543210\n')
+            self.write(self.runtime / 'response', request_id + ' 0\nOLD_SUCCESS\n')
+            stdout, _ = process.communicate(timeout=3)
+            self.assertNotEqual(process.returncode, 0)
+            self.assertEqual(stdout, b'')
+            self.assertEqual(path.read_bytes(), original)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.communicate()
+
     def test_open_and_wpa3_config(self):
         thread = self.backend('connect')
         result = self.run_cli('connect', 'open-ssid', '--open')

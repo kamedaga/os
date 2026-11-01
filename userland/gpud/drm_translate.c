@@ -1,3 +1,6 @@
+#include <kobox2/i915_exec_shape.h>
+#include <kobox2/i915_context_shape.h>
+#include <kobox2/i915_bo_shape.h>
 /* SPDX-License-Identifier: MIT */
 #include "drm_translate.h"
 #include <gpud/drm_kms_query.h>
@@ -375,7 +378,11 @@ static int scalar_plan(struct command_plan *plan, const gpud_drm_ioctl_request_t
         write_u64(plan->data + 8, read_u64(request->data + 8));
         return 0;
     case IOCTL_GEM_CLOSE:
-        if (request->arg_size != 8 || request->data_size != 8 || read_u32(request->data + 4))
+        /* Handle zero is an invalid client ioctl, not a malformed command
+         * from gpud. Reject it before the stricter sandbox protocol boundary
+         * can retire the GPU generation used by unrelated desktop clients. */
+        if (request->arg_size != 8 || request->data_size != 8 ||
+            !read_u32(request->data) || read_u32(request->data + 4))
             return -EINVAL;
         plan->id = KB2_GPU_DRM_CORE_COMMAND_GEM_CLOSE;
         plan->record = KB2_GPU_DRM_CORE_RECORD_GEM_HANDLE_REQUEST;
@@ -1847,7 +1854,8 @@ static int encode_plan(struct gpud_drm_translation *out,
     struct gpud_drm_translation *candidate, struct command_plan *plan) {
     const uint32_t profile = binding->profile_kind ? binding->profile_kind :
         KB2_GPU_PROFILE_VIRGL;
-    if (profile != KB2_GPU_PROFILE_VIRGL && profile != KB2_GPU_PROFILE_AMDGPU)
+    if (profile != KB2_GPU_PROFILE_VIRGL && profile != KB2_GPU_PROFILE_I915 &&
+        profile != KB2_GPU_PROFILE_AMDGPU)
         return -EINVAL;
     /* PRIME and event requests use common DRM commands too. Carry the
      * binding's profile here so none of their callers emit an invalid zero
@@ -1885,7 +1893,7 @@ static int encode_plan(struct gpud_drm_translation *out,
     return 0;
 }
 
-static int amdgpu_mode_request(uint32_t request) {
+static int mode_request(uint32_t request) {
     switch (request) {
     case GPUD_DRM_IOCTL_GET_MAGIC:
     case GPUD_DRM_IOCTL_AUTH_MAGIC:
@@ -1929,6 +1937,195 @@ static int amdgpu_mode_request(uint32_t request) {
     }
 }
 
+static int i915_plan(struct command_plan *plan, struct gpud_drm_translation *out,
+    const gpud_drm_ioctl_request_t *request, uint32_t region_id) {
+    plan->set = KB2_GPU_DRM_I915_SET_ID;
+    if (request->fd_flags) return -EINVAL;
+    if(request->request==GPUD_DRM_IOCTL_I915_GEM_CREATE_EXT) {
+        if(request->arg_size!=24 || request->data_size!=24 || !read_u64(request->data) ||
+            (read_u32(request->data+8)&~1u) || read_u32(request->data+12)>64 || read_u64(request->data+16)) return -EINVAL;
+        const uint32_t count=read_u32(request->data+12);
+        if(request->aux_size!=(uint64_t)count*4 || (count && !region_id)) return -EINVAL;
+        plan->id=KB2_GPU_DRM_I915_COMMAND_GEM_CREATE_EXT;
+        plan->record=KB2_GPU_DRM_I915_RECORD_CREATE_EXT_REQUEST;plan->size=24;
+        memcpy(plan->data,request->data,24);
+        if(count) {
+            plan->arguments[1]=(kb2_gpu_argument_t){.argument_id=2,.kind=KB2_GPU_ARGUMENT_SPAN,
+                .flags=KB2_GPU_ARGUMENT_FLAG_INPUT,.record_schema_id=KB2_GPU_DRM_I915_RECORD_MEMORY_REGION,.value=1,.count=count};
+            plan->spans[0]=(kb2_gpu_span_t){.span_id=1,.region_id=region_id,.length=count*4,
+                .rights=KB2_GPU_SPAN_RIGHT_READ,.record_schema_id=KB2_GPU_DRM_I915_RECORD_MEMORY_REGION,
+                .element_count=count,.flags=KB2_GPU_SPAN_FLAG_INPUT};plan->span_count=1;
+            out->region=(kb2_gpu_region_t){.region_id=region_id,.rights=KB2_GPU_SPAN_RIGHT_READ,.length=count*4};
+        }
+        return 0;
+    }
+    if(request->request==GPUD_DRM_IOCTL_I915_GEM_MMAP_OFFSET) {
+        if(request->arg_size!=32 || request->data_size!=32 || request->aux_size ||
+            !read_u32(request->data) || read_u32(request->data+4) || read_u64(request->data+24)) return -EINVAL;
+        const uint64_t flags=read_u64(request->data+16);
+        if(flags!=1 && flags!=2) return -EOPNOTSUPP;
+        plan->id=KB2_GPU_DRM_I915_COMMAND_GEM_MMAP_OFFSET;
+        plan->record=KB2_GPU_DRM_I915_RECORD_GEM_MMAP_REQUEST;plan->size=16;
+        out->mapping_handle=read_u32(request->data);
+        out->mapping_cache_kind=flags==2 ? 1 : 2;
+        write_u32(plan->data,out->mapping_handle);write_u32(plan->data+4,3);
+        write_u32(plan->data+8,out->mapping_cache_kind);
+        return 0;
+    }
+    struct kb2_i915_bo_shape bo;
+    if (kb2_i915_bo_shape_ioctl((uint32_t)request->request, &bo)) {
+        if (request->arg_size != bo.bytes || request->data_size != bo.bytes || request->aux_size)
+            return -EINVAL;
+        plan->id = bo.command; plan->record = bo.record; plan->size = bo.bytes;
+        memcpy(plan->data, request->data, bo.bytes);
+        /* Linux ignores these output fields on input. Canonical requests
+         * contain no stale output or uninitialized caller padding. */
+        if (bo.command == KB2_GPU_DRM_I915_COMMAND_GEM_CREATE) {
+            if (read_u32(plan->data + 12)) return -EINVAL;
+            write_u32(plan->data + 8, 0);
+        } else if (bo.command == KB2_GPU_DRM_I915_COMMAND_GEM_BUSY)
+            write_u32(plan->data + 4, 0);
+        else if (bo.command == KB2_GPU_DRM_I915_COMMAND_GEM_MADVISE)
+            write_u32(plan->data + 8, 0);
+        return kb2_i915_bo_input_valid(bo.command, plan->data, bo.bytes) ? 0 : -EINVAL;
+    }
+    if(request->request==GPUD_DRM_IOCTL_I915_EXECBUFFER || request->request==GPUD_DRM_IOCTL_I915_EXECBUFFER_WR) {
+        size_t bytes;
+        if(request->arg_size!=64 || request->data_size!=32 || !region_id ||
+            !kb2_i915_exec_header(request->data,32,&bytes) || request->aux_size!=bytes) return -EINVAL;
+        plan->id=KB2_GPU_DRM_I915_COMMAND_EXECBUFFER;plan->record=KB2_GPU_DRM_I915_RECORD_EXEC_REQUEST;plan->size=32;
+        const uint64_t objects=read_u32(request->data),fences=read_u32(request->data+4);
+        plan->arguments[1]=(kb2_gpu_argument_t){.argument_id=2,.kind=KB2_GPU_ARGUMENT_SPAN,
+            .flags=KB2_GPU_ARGUMENT_FLAG_INPUT|KB2_GPU_ARGUMENT_FLAG_OUTPUT,
+            .record_schema_id=KB2_GPU_DRM_I915_RECORD_EXEC_OBJECT,.value=1,.count=objects};
+        plan->spans[0]=(kb2_gpu_span_t){.span_id=1,.region_id=region_id,.offset=0,
+            .length=objects*40,.rights=KB2_GPU_SPAN_RIGHT_READ|KB2_GPU_SPAN_RIGHT_WRITE,
+            .record_schema_id=KB2_GPU_DRM_I915_RECORD_EXEC_OBJECT,.element_count=objects,
+            .flags=KB2_GPU_SPAN_FLAG_INPUT|KB2_GPU_SPAN_FLAG_OUTPUT};
+        plan->span_count=1;
+        if(fences) {
+            plan->arguments[2]=(kb2_gpu_argument_t){.argument_id=3,.kind=KB2_GPU_ARGUMENT_SPAN,
+                .flags=KB2_GPU_ARGUMENT_FLAG_INPUT,.record_schema_id=KB2_GPU_DRM_I915_RECORD_EXEC_FENCE,
+                .value=2,.count=fences};
+            plan->spans[1]=(kb2_gpu_span_t){.span_id=2,.region_id=region_id,.offset=objects*40,
+                .length=fences*8,.rights=KB2_GPU_SPAN_RIGHT_READ,.record_schema_id=KB2_GPU_DRM_I915_RECORD_EXEC_FENCE,
+                .element_count=fences,.flags=KB2_GPU_SPAN_FLAG_INPUT};plan->span_count=2;
+        }
+        out->region=(kb2_gpu_region_t){.region_id=region_id,
+            .rights=KB2_GPU_SPAN_RIGHT_READ|KB2_GPU_SPAN_RIGHT_WRITE,.length=bytes};
+        memcpy(plan->data,request->data,32);return 0;
+    }
+    const int context_create = request->request==GPUD_DRM_IOCTL_I915_CONTEXT_CREATE ||
+        request->request==GPUD_DRM_IOCTL_I915_CONTEXT_CREATE_EXT;
+    const int context_set = request->request==GPUD_DRM_IOCTL_I915_CONTEXT_SETPARAM;
+    if (context_create || context_set) {
+        const size_t expected_arg = context_set ? 24 :
+            request->request==GPUD_DRM_IOCTL_I915_CONTEXT_CREATE ? 8 : 16;
+        plan->id=context_create ? KB2_GPU_DRM_I915_COMMAND_CONTEXT_CREATE : KB2_GPU_DRM_I915_COMMAND_CONTEXT_SETPARAM;
+        plan->record=context_create ? KB2_GPU_DRM_I915_RECORD_CONTEXT_CREATE_REQUEST : KB2_GPU_DRM_I915_RECORD_CONTEXT_SETPARAM_REQUEST;
+        plan->size=16;
+        size_t bytes;
+        if(request->arg_size!=expected_arg || request->data_size!=16 ||
+            !kb2_i915_context_header(plan->id,request->data,16,&bytes) ||
+            bytes!=request->aux_size || (bytes && !region_id) ||
+            (expected_arg==8 && (read_u32(request->data) || bytes))) return -EINVAL;
+        const uint64_t counts[]={read_u32(request->data+4),read_u32(request->data+8)};
+        const uint32_t records[]={KB2_GPU_DRM_I915_RECORD_CONTEXT_PARAM,KB2_GPU_DRM_I915_RECORD_ENGINE};
+        const uint32_t widths[]={32,4};
+        const uint64_t offsets[]={0,counts[0]*32};
+        for(unsigned i=0;i<2;++i) if(counts[i]) {
+            const size_t slot=plan->span_count++;
+            plan->arguments[slot+1]=(kb2_gpu_argument_t){.argument_id=i+2,
+                .kind=KB2_GPU_ARGUMENT_SPAN,.flags=KB2_GPU_ARGUMENT_FLAG_INPUT,
+                .record_schema_id=records[i],.value=slot+1,.count=counts[i]};
+            plan->spans[slot]=(kb2_gpu_span_t){.span_id=slot+1,.region_id=region_id,
+                .offset=offsets[i],.length=counts[i]*widths[i],.rights=KB2_GPU_SPAN_RIGHT_READ,
+                .record_schema_id=records[i],.element_count=counts[i],.flags=KB2_GPU_SPAN_FLAG_INPUT};
+        }
+        if(bytes) out->region=(kb2_gpu_region_t){.region_id=region_id,
+            .rights=KB2_GPU_SPAN_RIGHT_READ,.length=bytes};
+        memcpy(plan->data,request->data,16);
+        return 0;
+    }
+    if(request->request==GPUD_DRM_IOCTL_I915_CONTEXT_DESTROY) {
+        if(request->arg_size!=8 || request->data_size!=8 || request->aux_size ||
+            !kb2_i915_context_header(KB2_GPU_DRM_I915_COMMAND_CONTEXT_DESTROY,request->data,8,NULL)) return -EINVAL;
+        plan->id=KB2_GPU_DRM_I915_COMMAND_CONTEXT_DESTROY;
+        plan->record=KB2_GPU_DRM_I915_RECORD_CONTEXT_HANDLE;plan->size=8;
+        memcpy(plan->data,request->data,8);return 0;
+    }
+    switch (request->request) {
+    case GPUD_DRM_IOCTL_I915_GETPARAM:
+        if (request->arg_size != sizeof(gpud_drm_i915_getparam_t) ||
+            request->data_size != sizeof(gpud_drm_i915_getparam_wire_t) ||
+            request->aux_size || !read_u32(request->data) ||
+            read_u32(request->data) > INT32_MAX || read_u32(request->data + 4))
+            return -EINVAL;
+        plan->id = KB2_GPU_DRM_I915_COMMAND_GETPARAM;
+        plan->record = KB2_GPU_DRM_I915_RECORD_GETPARAM_REQUEST;
+        plan->size = KB2_GPU_DRM_I915_RECORD_GETPARAM_REQUEST_SIZE;
+        break;
+    case GPUD_DRM_IOCTL_I915_GET_APERTURE:
+        if (request->arg_size != 16 || request->data_size != 16 || request->aux_size)
+            return -EINVAL;
+        plan->id = KB2_GPU_DRM_I915_COMMAND_GET_APERTURE;
+        plan->record = KB2_GPU_DRM_I915_RECORD_APERTURE_REQUEST;
+        plan->size = KB2_GPU_DRM_I915_RECORD_APERTURE_REQUEST_SIZE;
+        memset(plan->data, 0, plan->size);
+        return 0;
+    case GPUD_DRM_IOCTL_I915_CONTEXT_GETPARAM:
+        if (request->arg_size != 24 || request->data_size != 24 || request->aux_size ||
+            read_u32(request->data + 4)) return -EINVAL;
+        if (!gpud_i915_context_scalar_parameter(read_u64(request->data + 8)))
+            return -EOPNOTSUPP;
+        plan->id = KB2_GPU_DRM_I915_COMMAND_CONTEXT_GETPARAM;
+        plan->record = KB2_GPU_DRM_I915_RECORD_CONTEXT_PARAM_REQUEST;
+        plan->size = KB2_GPU_DRM_I915_RECORD_CONTEXT_PARAM_REQUEST_SIZE;
+        break;
+    case GPUD_DRM_IOCTL_I915_QUERY: {
+        if (request->arg_size != sizeof(gpud_drm_i915_query_t) ||
+            request->data_size != sizeof(gpud_drm_i915_query_wire_t)) return -EINVAL;
+        const uint32_t count = read_u32(request->data);
+        const uint64_t blob_bytes = read_u64(request->data + 8);
+        const uint64_t item_bytes = (uint64_t)count * KB2_GPU_DRM_I915_RECORD_QUERY_ITEM_SIZE;
+        if (count > KB2_GPU_DRM_I915_MAX_QUERY_ITEMS || read_u32(request->data + 4) ||
+            item_bytes > KB2_GPU_DRM_I915_MAX_QUERY_BYTES ||
+            blob_bytes > KB2_GPU_DRM_I915_MAX_QUERY_BYTES - item_bytes ||
+            (!count && blob_bytes) || request->aux_size != item_bytes + blob_bytes ||
+            (request->aux_size && !region_id)) return -EINVAL;
+        plan->id = KB2_GPU_DRM_I915_COMMAND_QUERY;
+        plan->record = KB2_GPU_DRM_I915_RECORD_QUERY_REQUEST;
+        plan->size = KB2_GPU_DRM_I915_RECORD_QUERY_REQUEST_SIZE;
+        const uint64_t counts[] = {count, blob_bytes};
+        const uint64_t offsets[] = {0, item_bytes};
+        const uint32_t records[] = {KB2_GPU_DRM_I915_RECORD_QUERY_ITEM, KB2_GPU_DRM_I915_RECORD_BYTE};
+        const uint32_t widths[] = {KB2_GPU_DRM_I915_RECORD_QUERY_ITEM_SIZE, 1};
+        for (unsigned i = 0; i < 2; ++i) if (counts[i]) {
+            const size_t slot = plan->span_count++;
+            const uint32_t span_id = (uint32_t)slot + 1;
+            plan->arguments[slot + 1] = (kb2_gpu_argument_t){.argument_id = i + 2,
+                .kind = KB2_GPU_ARGUMENT_SPAN,
+                .flags = KB2_GPU_ARGUMENT_FLAG_INPUT | KB2_GPU_ARGUMENT_FLAG_OUTPUT,
+                .record_schema_id = records[i], .value = span_id, .count = counts[i]};
+            plan->spans[slot] = (kb2_gpu_span_t){.span_id = span_id,
+                .region_id = region_id, .offset = offsets[i], .length = counts[i] * widths[i],
+                .rights = KB2_GPU_SPAN_RIGHT_READ | KB2_GPU_SPAN_RIGHT_WRITE,
+                .record_schema_id = records[i], .element_count = counts[i],
+                .flags = KB2_GPU_SPAN_FLAG_INPUT | KB2_GPU_SPAN_FLAG_OUTPUT};
+        }
+        if (request->aux_size) out->region = (kb2_gpu_region_t){.region_id = region_id,
+            .rights = KB2_GPU_SPAN_RIGHT_READ | KB2_GPU_SPAN_RIGHT_WRITE,
+            .length = request->aux_size};
+        out->output_capacity[0] = count;
+        out->output_capacity[1] = (uint32_t)blob_bytes;
+        break;
+    }
+    default: return -EOPNOTSUPP;
+    }
+    memcpy(plan->data, request->data, plan->size);
+    return 0;
+}
+
 int gpud_drm_ioctl_encode(struct gpud_drm_translation *out,
     const struct gpud_drm_binding *binding, const gpud_drm_ioctl_request_t *request,
     uint32_t region_id) {
@@ -1938,8 +2135,20 @@ int gpud_drm_ioctl_encode(struct gpud_drm_translation *out,
     if (request->handle != binding->frontend_handle) return -EACCES;
     const uint32_t profile = binding->profile_kind ? binding->profile_kind :
         KB2_GPU_PROFILE_VIRGL;
-    if (profile != KB2_GPU_PROFILE_VIRGL && profile != KB2_GPU_PROFILE_AMDGPU)
+    if (profile != KB2_GPU_PROFILE_VIRGL && profile != KB2_GPU_PROFILE_I915 &&
+        profile != KB2_GPU_PROFILE_AMDGPU)
         return -EINVAL;
+    /* Driver-private ordinals overlap: Intel is dispatched only through its
+     * own typed catalog, never through virtio or AMD layouts. */
+    if (profile == KB2_GPU_PROFILE_I915 &&
+        (request->request & 0xffu) >= 0x40u &&
+        (request->request & 0xffu) < 0xa0u) {
+        struct gpud_drm_translation candidate = {.generation = binding->generation,
+            .frontend_handle = binding->frontend_handle, .session_id = binding->session_id};
+        struct command_plan plan = {0};
+        int error = i915_plan(&plan, &candidate, request, region_id);
+        return error ? error : encode_plan(out, binding, &candidate, &plan);
+    }
     /* AMDGPU and virtio driver ioctl ordinals overlap. Only the common DRM
      * primary-node commands below may use the shared MODE translator; never
      * route an unknown AMDGPU request through the virtio layout. */
@@ -1954,7 +2163,7 @@ int gpud_drm_ioctl_encode(struct gpud_drm_translation *out,
         request->request != IOCTL_SYNCOBJ_WAIT &&
         request->request != IOCTL_SYNCOBJ_RESET &&
         request->request != IOCTL_SYNCOBJ_SIGNAL &&
-        !amdgpu_mode_request(request->request) &&
+        !mode_request(request->request) &&
         request->request != GPUD_DRM_IOCTL_AMDGPU_INFO &&
         request->request != GPUD_DRM_IOCTL_AMDGPU_GEM_CREATE &&
         request->request != GPUD_DRM_IOCTL_AMDGPU_GEM_MMAP &&
@@ -2015,7 +2224,7 @@ int gpud_drm_ioctl_encode(struct gpud_drm_translation *out,
         request->request == GPUD_DRM_IOCTL_AMDGPU_CS) {
         result = amdgpu_cs_plan(&plan, &candidate, request, region_id);
     } else if (profile == KB2_GPU_PROFILE_AMDGPU &&
-        amdgpu_mode_request(request->request)) {
+        mode_request(request->request)) {
         result = mode_plan(&plan, &candidate, request, region_id);
     } else if (profile == KB2_GPU_PROFILE_AMDGPU &&
         request->request != IOCTL_VERSION) {

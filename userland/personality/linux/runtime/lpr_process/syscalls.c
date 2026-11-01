@@ -3,6 +3,7 @@
 #include "../lpr_unix/cache.h"
 #include "../lpr_vfs/control_cache.h"
 #include "../lpr_mlock.h"
+#include "../lpr_clock.h"
 #include "../lpr_entry_stack.h"
 #if defined(LPR_BOOT_DIAGNOSTICS) && LPR_BOOT_DIAGNOSTICS
 #include "../lpr_common/boot_diagnostic.h"
@@ -164,6 +165,7 @@ const struct lpr_linux_user_frame *lpr_fork_child_bootstrap(void)
         lpr_fork_child_return_frame.fp_state = (uint64_t)(uintptr_t)lpr_fork_child_fp_state;
     }
     lpr_mlock_after_fork_child();
+    lpr_clock_after_fork_child();
     lpr_drm_mapping_fork_child();
     if (lpr_fs_control_fork_child() != 0 || lpr_unix_cache_fork_child() != 0) {
         (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_PROCESS_EXIT, 127);
@@ -871,6 +873,7 @@ static int64_t lpr_linux_clone_frame_impl(const struct lpr_linux_user_frame *use
         lpr_fork_child_stack + sizeof(lpr_fork_child_stack));
     lpr_fork_child_transaction = &fork_transaction;
     lpr_mlock_fork_lock();
+    lpr_clock_fork_lock();
     lpr_unix_cache_fork_lock();
     lpr_fs_control_fork_lock();
     lpr_drm_mapping_fork_lock();
@@ -891,6 +894,7 @@ static int64_t lpr_linux_clone_frame_impl(const struct lpr_linux_user_frame *use
     lpr_drm_mapping_fork_unlock();
     lpr_fs_control_fork_unlock();
     lpr_unix_cache_fork_unlock();
+    lpr_clock_fork_unlock();
     lpr_mlock_vm_end();
     lpr_fork_child_transaction = 0;
     lpr_trace_clone_frame("after_syscall", &child_frame, ret);

@@ -9,6 +9,7 @@
 #include "discovery.h"
 #include "process.h"
 #include "control_poll.h"
+#include "pci_topology.h"
 #include "../kobox2_adapter/gpu_query_message.h"
 #include "../kobox2_adapter/gpu_queue_message.h"
 #include "../kobox2_adapter/sandbox_config.h"
@@ -41,10 +42,19 @@ static void log_runtime_event(const struct gpud_boot_config *config,
     int size = snprintf(line, sizeof(line), "%s status=%d", event, status);
     if (size <= 0 || (size_t)size >= sizeof(line))
         return;
-    if (config->log_endpoint_fd >= 16)
-        (void)pacha_log_emit((pacha_fd_t)config->log_endpoint_fd,
-            PACHA_LOG_SOURCE_GPUD, line, (size_t)size);
-    else
+    if (config->log_endpoint_fd >= 16) {
+        /* A burst of cache-retirement messages can fill logd's short queue.
+         * Keep terminal evidence before cleanup produces that burst. Retry
+         * only failures, with a bounded delay; a dead logger cannot hang GPU
+         * retirement or add work to the ordinary drawing path. */
+        for (unsigned int attempt = 0; attempt < 20; ++attempt) {
+            if (!pacha_log_emit((pacha_fd_t)config->log_endpoint_fd,
+                    PACHA_LOG_SOURCE_GPUD, line, (size_t)size) || status >= 0)
+                break;
+            const struct timespec delay = {.tv_nsec = 10000000};
+            (void)nanosleep(&delay, NULL);
+        }
+    } else
         printf("[gpud] %s\n", line);
 }
 
@@ -600,9 +610,31 @@ static int stop_generation(kb2_controller_t *controller,
     }
 }
 
+/* The verified closure's root module selects the private DRM namespace.
+ * Package paths are deployment policy and may change independently; a PCI
+ * ID or an ioctl ordinal cannot prove which driver owns the render file. */
+static uint32_t package_gpu_profile(const struct gpud_package *package) {
+    uint32_t profile = 0;
+    for (size_t i = 0; i < package->artifact_count; ++i) {
+        kb2_closure_manifest_artifact_t artifact;
+        if (kb2_closure_manifest_artifact(&package->decoded, i, &artifact) != KB2_PROTOCOL_OK)
+            return 0;
+        if (!(artifact.flags & KB2_CLOSURE_ARTIFACT_FLAG_ROOT)) continue;
+        if (profile) return 0;
+        if (artifact.namespace_name.length == 4 &&
+            !memcmp(artifact.namespace_name.data, "i915", 4))
+            profile = KB2_GPU_PROFILE_I915;
+        else if (artifact.namespace_name.length == 6 &&
+            !memcmp(artifact.namespace_name.data, "amdgpu", 6))
+            profile = KB2_GPU_PROFILE_AMDGPU;
+        else return 0;
+    }
+    return profile;
+}
+
 static int start_generation(const struct gpud_boot_config *config,
     kb2_controller_t *controller, struct gpud_package *package,
-    uint64_t handle_sequence, struct gpud_generation *current) {
+    uint64_t handle_sequence, uint32_t profile_kind, struct gpud_generation *current) {
     const int inspect = config->backend == GPUD_BACKEND_PCI_DRM_INSPECT;
     memset(current, 0, sizeof(*current));
     current->id = kb2_controller_generation(controller);
@@ -627,6 +659,11 @@ static int start_generation(const struct gpud_boot_config *config,
         .artifact_count = package->artifact_count, .resource_count = 1,
         .client_id = 1, .gpu_channel_id = 1,
         .device = package->device};
+    if (profile_kind == KB2_GPU_PROFILE_I915) {
+        if (!gpud_i915_topology_valid(&config->pci_topology))
+            return -EINVAL;
+        sandbox_config.pci_topology = config->pci_topology;
+    }
     struct gpud_launch_blob firmware_blob = {0};
     if (inspect) {
         if (!package->firmware || !package->firmware_size)
@@ -763,8 +800,7 @@ static int start_generation(const struct gpud_boot_config *config,
         return error;
 
     current->service.backend_client = sandbox_config.client_id;
-    current->service.profile_kind = inspect ? KB2_GPU_PROFILE_AMDGPU :
-        KB2_GPU_PROFILE_VIRGL;
+    current->service.profile_kind = profile_kind;
     current->service.log_endpoint_fd = (pacha_fd_t)config->log_endpoint_fd;
     current->service.gpu.ipc = &current->ipc;
     current->service.gpu.channel = &current->gpu_channel;
@@ -779,6 +815,20 @@ static int start_generation(const struct gpud_boot_config *config,
             &current->service, (pacha_fd_t)config->drm_endpoint_fd)))
         return error;
     return 0;
+}
+
+static int generation_failure(const struct gpud_boot_config *config,
+    const struct gpud_generation *current, const char *phase, int error) {
+    char event[128];
+    const struct gpud_drm_service *service = &current->service;
+    const int length = snprintf(event, sizeof(event),
+        "DRM owner failure phase=%s rpc_line=%u rpc_error=%d last_set=%u last_command=%u",
+        phase, service->gpu.failure_line, service->gpu.error,
+        service->ioctl_workspace.translation.command_set_id,
+        service->ioctl_workspace.translation.command_id);
+    if (length > 0 && (size_t)length < sizeof(event))
+        log_runtime_event(config, event, error);
+    return error;
 }
 
 static int serve_generation(
@@ -831,15 +881,15 @@ static int serve_generation(
         }
         int error = gpud_drm_service_pump_events(&current->service);
         if (error)
-            return error;
+            return generation_failure(config, current, "events", error);
         error = gpud_drm_service_reap_hangups(&current->service);
         if (error)
-            return error;
+            return generation_failure(config, current, "leases", error);
         error = gpud_drm_service_receive(&current->service);
         if (!error)
             continue;
         if (error != -EAGAIN)
-            return error;
+            return generation_failure(config, current, "request", error);
         uint64_t timeout = PACHA_FD_WAIT_FOREVER;
         if (inspect) {
             struct timespec now;
@@ -854,7 +904,7 @@ static int serve_generation(
         if (inspect && error == -EAGAIN)
             continue;
         if (error)
-            return error;
+            return generation_failure(config, current, "wait", error);
     }
 }
 
@@ -886,6 +936,25 @@ static int run(const struct gpud_boot_config *config) {
     if (error) {
         printf("[gpud] stage=package-open status=%d\n", error);
         log_runtime_event(config, "package verification failed", error);
+        return error;
+    }
+    const uint32_t profile_kind = config->backend == GPUD_BACKEND_VIRTIO ?
+        KB2_GPU_PROFILE_VIRGL : package_gpu_profile(&package);
+    if (!profile_kind) {
+        log_runtime_event(config, "unsupported GPU root module", -EOPNOTSUPP);
+        (void)gpud_package_close(&package);
+        return -EOPNOTSUPP;
+    }
+    if (profile_kind == KB2_GPU_PROFILE_I915 &&
+        !gpud_i915_topology_valid(&config->pci_topology)) {
+        log_runtime_event(config, "i915 platform metadata incomplete", -EINVAL);
+        (void)gpud_package_close(&package);
+        return -EINVAL;
+    }
+    if (profile_kind == KB2_GPU_PROFILE_I915 &&
+        (error = gpud_package_enable_port_io(&package))) {
+        log_runtime_event(config, "i915 CPU I/O authority missing", error);
+        (void)gpud_package_close(&package);
         return error;
     }
     printf("[gpud] package artifacts=%zu\n", package.artifact_count);
@@ -928,7 +997,7 @@ static int run(const struct gpud_boot_config *config) {
          * not call-stack scratch space. */
         static struct gpud_generation current;
         error = start_generation(
-            config, controller, &package, handle_sequence, &current);
+            config, controller, &package, handle_sequence, profile_kind, &current);
         if (error) {
             if (config->backend == GPUD_BACKEND_PCI_DRM_INSPECT) {
                 /* Startup may fail after the PCI grant reached Linux. The
@@ -1012,6 +1081,8 @@ static int run(const struct gpud_boot_config *config) {
             &current, (pacha_fd_t)config->filed_endpoint_fd, &control_fd,
             config->backend == GPUD_BACKEND_PCI_DRM_INSPECT,
             &forced, &stop_requested, config);
+        if (restart_error)
+            log_runtime_event(config, "DRM generation service failed", restart_error);
         int discovery_error = gpud_discovery_remove(&discovery,
             (pacha_fd_t)config->filed_endpoint_fd);
         if (discovery_error)

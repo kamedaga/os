@@ -1,10 +1,23 @@
 /* SPDX-License-Identifier: MIT */
 #include "gpu_rpc.h"
+#include <kobox2/gpu_sync_file.h>
 #include "../kobox2_adapter/gpu_queue_message.h"
+#include "../kobox2_adapter/gpu_event_message.h"
 
 #include <errno.h>
 #include <pacha/syscall.h>
 #include <string.h>
+
+/* Preserve the first fault before cleanup and subsequent calls can replace
+ * the useful admission site with an already-terminal error return. */
+static int rpc_failed(struct gpud_gpu_rpc *rpc, int error, unsigned int line) {
+    if (!rpc->error) {
+        rpc->error = error;
+        rpc->failure_line = line;
+    }
+    return error;
+}
+#define RPC_FAIL(rpc, error) rpc_failed((rpc), (error), __LINE__)
 
 static int now_ms(uint64_t *now) {
     uint64_t time[2];
@@ -58,7 +71,7 @@ static int wait_wake(struct gpud_gpu_rpc *rpc, uint64_t notification, uint64_t d
                 continue;
             }
             int cleanup = ph_ipc_packet_release(packet);
-            return cleanup ? cleanup : valid ? 0 : -EPROTO;
+            return cleanup ? cleanup : valid ? 0 : RPC_FAIL(rpc, -EPROTO);
         }
         if (error != -EAGAIN)
             return error;
@@ -99,7 +112,7 @@ int gpud_gpu_rpc_start_events(struct gpud_gpu_rpc *rpc) {
     };
     int error = post_event_buffer(rpc);
     if (error)
-        return rpc->error = error;
+        return RPC_FAIL(rpc, error);
     rpc->event_started = 1;
     return 0;
 }
@@ -118,14 +131,14 @@ int gpud_gpu_rpc_next_event(struct gpud_gpu_rpc *rpc,
         if (error == -EAGAIN)
             return 0;
         if (error)
-            return rpc->error = error;
+            return RPC_FAIL(rpc, error);
         const struct ph_ipc_packet *packet = &rpc->incoming;
         int valid = is_event_notification(rpc, packet);
         int cleanup = ph_ipc_packet_release(&rpc->incoming);
         if (cleanup)
-            return rpc->error = cleanup;
+            return RPC_FAIL(rpc, cleanup);
         if (!valid)
-            return rpc->error = -EPROTO;
+            return RPC_FAIL(rpc, -EPROTO);
         rpc->event_notification = 1;
     }
     kb2_vq_t *lane = &rpc->channel->lanes[GPUD_GPU_QUEUE_EVENT];
@@ -135,15 +148,15 @@ int gpud_gpu_rpc_next_event(struct gpud_gpu_rpc *rpc,
         done->used_length > GPUD_GPU_CHANNEL_PAGE ||
         kb2_vq_copy_response(lane, rpc->ipc->generation, done, 0,
             message, done->used_length))
-        return rpc->error = -EPROTO;
+        return RPC_FAIL(rpc, -EPROTO);
     const size_t used = done->used_length;
     if (kb2_vq_release(lane, rpc->ipc->generation, done))
-        return rpc->error = -EPROTO;
+        return RPC_FAIL(rpc, -EPROTO);
     *size_out = used;
     rpc->event_notification = 0;
     int error = post_event_buffer(rpc);
     if (error)
-        return rpc->error = error;
+        return RPC_FAIL(rpc, error);
     return 1;
 }
 
@@ -231,8 +244,7 @@ int gpud_gpu_rpc_release_mapping(struct gpud_gpu_rpc *rpc,
 protocol_error:
     error = -EPROTO;
 failed:
-    rpc->error = error;
-    return error;
+    return RPC_FAIL(rpc, error);
 }
 
 int gpud_gpu_rpc_call(struct gpud_gpu_rpc *rpc, unsigned int queue,
@@ -299,6 +311,92 @@ int gpud_gpu_rpc_call(struct gpud_gpu_rpc *rpc, unsigned int queue,
 protocol_error:
     error = -EPROTO;
 failed:
-    rpc->error = error;
-    return error;
+    return RPC_FAIL(rpc, error);
+}
+
+int gpud_gpu_rpc_prime_cpu_sync(struct gpud_gpu_rpc *rpc,
+    uint64_t correlation, uint64_t token, uint64_t flags)
+{
+    if (!rpc || !rpc->ipc || !correlation || !token || !(flags & 3) || (flags & ~UINT64_C(7)))
+        return -EINVAL;
+    unsigned char request[KB2_PROTOCOL_MESSAGE_ENVELOPE_SIZE + KB2_GPU_DMA_BUF_CPU_SYNC_REQUEST_SIZE];
+    unsigned char reply[GPUD_GPU_CONTROL_REPLY_CAPACITY];
+    const kb2_protocol_message_envelope_t envelope = {
+        .protocol_id = KB2_GPU_PROTOCOL_ID, .opcode = KB2_GPU_OPCODE_DMA_BUF_CPU_SYNC,
+        .generation = rpc->ipc->generation, .correlation_id = correlation,
+        .payload_length = KB2_GPU_DMA_BUF_CPU_SYNC_REQUEST_SIZE};
+    if (kb2_protocol_message_envelope_encode(request, sizeof(request), &envelope)) return -EPROTO;
+    unsigned char *body = request + KB2_PROTOCOL_MESSAGE_ENVELOPE_SIZE;
+    ph_gpu_event_store_u64(body + KB2_GPU_DMA_BUF_CPU_SYNC_REQUEST_TOKEN_OFFSET, token);
+    ph_gpu_event_store_u64(body + KB2_GPU_DMA_BUF_CPU_SYNC_REQUEST_FLAGS_OFFSET, flags);
+    size_t size = 0;
+    int error = gpud_gpu_rpc_call(rpc, GPUD_GPU_QUEUE_CONTROL, request, sizeof(request),
+        reply, sizeof(reply), &size);
+    if (error) return error;
+    kb2_protocol_message_envelope_t decoded;
+    if (size != KB2_PROTOCOL_MESSAGE_ENVELOPE_SIZE + KB2_GPU_DMA_BUF_CPU_SYNC_RESPONSE_SIZE ||
+        kb2_protocol_message_envelope_decode(reply, size, &decoded) ||
+        decoded.protocol_id != envelope.protocol_id || decoded.opcode != envelope.opcode ||
+        decoded.generation != envelope.generation || decoded.correlation_id != correlation ||
+        decoded.flags || decoded.payload_length != KB2_GPU_DMA_BUF_CPU_SYNC_RESPONSE_SIZE ||
+        rpc->attachment.fd_count) return RPC_FAIL(rpc, -EPROTO);
+    body = reply + KB2_PROTOCOL_MESSAGE_ENVELOPE_SIZE;
+    const int64_t result = (int64_t)ph_gpu_event_load_u64(body + KB2_GPU_DMA_BUF_CPU_SYNC_RESPONSE_RESULT_OFFSET);
+    if (ph_gpu_event_load_u64(body + KB2_GPU_DMA_BUF_CPU_SYNC_RESPONSE_TOKEN_OFFSET) != token ||
+        ph_gpu_event_load_u64(body + KB2_GPU_DMA_BUF_CPU_SYNC_RESPONSE_FLAGS_OFFSET) != flags ||
+        result > 0 || result < -4095) return RPC_FAIL(rpc, -EPROTO);
+    return (int)result;
+}
+
+static int sync_file_control(struct gpud_gpu_rpc *rpc,uint64_t correlation,
+    const kb2_gpu_sync_file_request_t *value,uint64_t *exported)
+{
+    if(!rpc || !rpc->ipc || !correlation || !exported ||
+        !kb2_gpu_sync_file_request_valid(value)) return -EINVAL;
+    unsigned char request[KB2_PROTOCOL_MESSAGE_ENVELOPE_SIZE+KB2_GPU_DMA_BUF_EXPORT_SYNC_FILE_REQUEST_SIZE];
+    unsigned char reply[GPUD_GPU_CONTROL_REPLY_CAPACITY];
+    const size_t bytes=kb2_gpu_sync_file_request_size(value->opcode);
+    const kb2_protocol_message_envelope_t envelope={.protocol_id=KB2_GPU_PROTOCOL_ID,
+        .opcode=value->opcode,.generation=rpc->ipc->generation,.correlation_id=correlation,
+        .payload_length=bytes};
+    if(kb2_protocol_message_envelope_encode(request,KB2_PROTOCOL_MESSAGE_ENVELOPE_SIZE+bytes,&envelope) ||
+        kb2_gpu_sync_file_request_encode(request+KB2_PROTOCOL_MESSAGE_ENVELOPE_SIZE,bytes,value)) return -EPROTO;
+    size_t size=0;
+    int error=gpud_gpu_rpc_call(rpc,GPUD_GPU_QUEUE_CONTROL,request,
+        KB2_PROTOCOL_MESSAGE_ENVELOPE_SIZE+bytes,reply,sizeof(reply),&size);
+    if(error) return error;
+    kb2_protocol_message_envelope_t decoded;
+    int result;uint64_t token;
+    if(size!=KB2_PROTOCOL_MESSAGE_ENVELOPE_SIZE+kb2_gpu_sync_file_response_size(value->opcode) ||
+        kb2_protocol_message_envelope_decode(reply,size,&decoded) ||
+        decoded.protocol_id!=envelope.protocol_id || decoded.opcode!=envelope.opcode ||
+        decoded.generation!=envelope.generation || decoded.correlation_id!=correlation ||
+        decoded.flags || decoded.payload_length!=size-KB2_PROTOCOL_MESSAGE_ENVELOPE_SIZE ||
+        rpc->attachment.fd_count || kb2_gpu_sync_file_response_decode(
+            reply+KB2_PROTOCOL_MESSAGE_ENVELOPE_SIZE,decoded.payload_length,value,&result,&token))
+        return RPC_FAIL(rpc, -EPROTO);
+    if(!result) *exported=token;
+    return result;
+}
+
+int gpud_gpu_rpc_prime_export_sync_file(struct gpud_gpu_rpc *rpc,uint64_t correlation,
+    uint64_t token,uint64_t flags,uint64_t session,uint64_t *exported)
+{
+    const kb2_gpu_sync_file_request_t request={.opcode=KB2_GPU_OPCODE_DMA_BUF_EXPORT_SYNC_FILE,
+        .token=token,.flags=flags,.session_id=session};
+    return sync_file_control(rpc,correlation,&request,exported);
+}
+int gpud_gpu_rpc_prime_import_sync_file(struct gpud_gpu_rpc *rpc,uint64_t correlation,
+    uint64_t token,uint64_t flags,uint64_t sync_file)
+{
+    const kb2_gpu_sync_file_request_t request={.opcode=KB2_GPU_OPCODE_DMA_BUF_IMPORT_SYNC_FILE,
+        .token=token,.flags=flags,.sync_file_token=sync_file};
+    uint64_t unused;
+    return sync_file_control(rpc,correlation,&request,&unused);
+}
+int gpud_gpu_rpc_release_sync_file(struct gpud_gpu_rpc *rpc,uint64_t correlation,uint64_t token)
+{
+    const kb2_gpu_sync_file_request_t request={.opcode=KB2_GPU_OPCODE_SYNC_FILE_RELEASE,.token=token};
+    uint64_t unused;
+    return sync_file_control(rpc,correlation,&request,&unused);
 }

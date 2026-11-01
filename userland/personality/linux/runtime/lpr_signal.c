@@ -1,3 +1,4 @@
+#include "lpr_clock.h"
 #include "lpr_filed_internal.h"
 #include <personality/lpr_signal_stack.h>
 #include "lpr_wait_trace.h"
@@ -885,6 +886,12 @@ _Noreturn void lpr_linux_fault_prepare(void *raw)
         fault->signal.size != PACHAOS_PROCESS_FAULT_FRAME_SIZE || fault->signal.signo ||
         fault->signal.xstate_features != PACHAOS_PROCESS_SIGNAL_XSTATE_FEATURE_MASK)
         lpr_linux_exit_for_signal(11);
+    const uintptr_t clock_copy = lpr_clock_copy_fault_target(fault->vector,
+        fault->error_code, fault->signal.context.rip);
+    if (clock_copy) {
+        fault->signal.context.rip = clock_copy;
+        lpr_native_signal_return(&fault->signal);
+    }
     const uintptr_t vsyscall = lpr_vsyscall_fault_target(fault->vector,
         fault->error_code, fault->signal.context.rip);
     if (vsyscall) {

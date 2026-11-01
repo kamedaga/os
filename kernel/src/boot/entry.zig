@@ -73,8 +73,7 @@ const platform_device = @import("../platform_device.zig");
 const device_interrupt_vector: u8 = platform_device.interrupt_vector;
 const device_interrupt_vector_count: u8 = pci.interrupt_vector_end_exclusive - device_interrupt_vector;
 comptime {
-    @import("std").debug.assert(x86_platform.deviceInterruptLayoutValid(device_interrupt_vector, device_interrupt_vector_count,
-        boot_static.lapic_timer_vector, boot_static.scheduler_wake_ipi_vector, unrouted_device_interrupt_vector));
+    @import("std").debug.assert(x86_platform.deviceInterruptLayoutValid(device_interrupt_vector, device_interrupt_vector_count, boot_static.lapic_timer_vector, boot_static.scheduler_wake_ipi_vector, unrouted_device_interrupt_vector));
     @import("std").debug.assert(platform_device.interrupt_vector < pci.interrupt_vector_base);
 }
 
@@ -976,6 +975,7 @@ fn wireRuntimeSubsystems(state: *kernel.KernelState, memory_stats: boot_static.M
         .futex_lock_address_space = user_vm.lockAddressSpace,
         .futex_unlock_address_space = user_vm.unlockAddressSpace,
         .resident_read_user_u32_with_address_space_locked = user_copy.readUserU32ResidentWithAddressSpaceLocked,
+        .resident_cmpxchg_user_u32_with_address_space_locked = user_copy.compareExchangeUserU32ResidentWithAddressSpaceLocked,
         .resident_atomic_user_u32_with_address_space_locked = user_copy.atomicUserU32ResidentWithAddressSpaceLocked,
         .wake_waiting_thread_for_principal = scheduler.wakeMailboxWaiter,
         .thread_wake_target_is_live = scheduler.threadWakeTargetIsLive,

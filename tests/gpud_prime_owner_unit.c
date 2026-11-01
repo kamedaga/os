@@ -68,9 +68,9 @@ static void owner_lifetime(unsigned int profile)
     uint64_t result = 0;
     /* More than the 64 PRIME slots must be reusable after client death. */
     for (unsigned i = 1; i <= 192; ++i) {
-        assert(!adopt_prime(&service, i, &transfer, &result));
+        assert(!adopt_prime(&service, i, 3, &transfer, &result));
         assert(result == i && transfer.count == 2 && transfer.prime_owner);
-        assert(transfer.fds[1].rights == PACHA_FD_RIGHT_CLOSE);
+        assert(transfer.fds[1].rights == GPUD_DRM_PRIME_OWNER_RIGHTS);
         assert(transfer.fds[1].transfer_flags & PACHA_IPC_TRANSFER_INHERIT);
         finish_reply_transfer(&transfer);
         /* A second process/mapping lease must survive original owner death. */
@@ -85,14 +85,14 @@ static void owner_lifetime(unsigned int profile)
         assert(!find_prime(&service, i));
         assert(released == (int)i && revoked == (int)i);
     }
-    assert(!adopt_prime(&service, 200, &transfer, &result));
+    assert(!adopt_prime(&service, 200, 3, &transfer, &result));
     assert(!cancel_reply_transfer(&service, &transfer));
     assert(!find_prime(&service, 200) && released == 193);
     fail_pair = 1;
-    assert(adopt_prime(&service, 201, &transfer, &result) == -EMFILE);
+    assert(adopt_prime(&service, 201, 3, &transfer, &result) == -EMFILE);
     assert(!find_prime(&service, 201) && released == 194);
     fail_pair = 0;
-    assert(!adopt_prime(&service, 202, &transfer, &result));
+    assert(!adopt_prime(&service, 202, 3, &transfer, &result));
     finish_reply_transfer(&transfer);
     assert(!prime_release_request(&service, 202));
     assert(find_prime(&service, 202) && released == 194);
@@ -101,13 +101,27 @@ static void owner_lifetime(unsigned int profile)
     assert(!find_prime(&service, 202) && released == 195);
     for (size_t i = 0; i < GPUD_DRM_OBJECT_LEASES_MAX; ++i)
         service.object_leases[i].object_id = 999;
-    assert(adopt_prime(&service, 203, &transfer, &result) == -EMFILE);
+    assert(adopt_prime(&service, 203, 3, &transfer, &result) == -EMFILE);
     assert(!find_prime(&service, 203) && released == 195);
     free(service.pollfds);
 }
 
+static void readonly_export(void) {
+    static struct gpud_drm_service s;
+    s.files.generation=1;
+    struct gpud_drm_reply_transfer transfer={.owner_fd=-1,.client_fd=-1};
+    uint64_t result=0;
+    revoked=released=closed=fail_pair=hungup=0;
+    assert(!adopt_prime(&s,4097,1,&transfer,&result));
+    assert(s.primes[0].cpu_rights==1 && !(transfer.fds[0].rights & PACHA_FD_RIGHT_MAP_WRITE));
+    assert((transfer.fds[0].rights & PACHA_FD_RIGHT_MAP_READ) &&
+        transfer.fds[1].rights==GPUD_DRM_PRIME_OWNER_RIGHTS);
+    assert(!cancel_reply_transfer(&s,&transfer));
+}
+
 int main(void)
 {
+    readonly_export();
     owner_lifetime(KB2_GPU_PROFILE_VIRGL);
     owner_lifetime(KB2_GPU_PROFILE_AMDGPU);
     puts("PRIME VIRGL/AMDGPU owner death, surviving leases, 192 reuses and reply rollback: PASS");

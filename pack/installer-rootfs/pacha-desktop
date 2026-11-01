@@ -2,7 +2,19 @@
 # Explicit local desktop launch; GPU probing is never an automatic boot action.
 set -eu
 log=/run/pacha/service.log
-if [ ! -f /run/pacha/physical-gpu-ready ]; then
+gpu_ready() {
+    # LPR stat can synthesize DRM nodes before gpud is ready. Enumerate the
+    # directory entries published by gpud instead; log history is bounded.
+    gpu_primary=0 gpu_render=0
+    for gpu_node in /dev/dri/*; do
+        case "$gpu_node" in
+            /dev/dri/card0) gpu_primary=1 ;;
+            /dev/dri/renderD128) gpu_render=1 ;;
+        esac
+    done
+    [ "$gpu_primary$gpu_render" = 11 ]
+}
+if ! gpu_ready; then
     /bin/busybox grep -q 'PCI DRM inspection armed' "$log" || {
         echo 'GPU service is not armed. Check service/kernel logs and SSH readiness.' >&2
         exit 1
@@ -11,7 +23,7 @@ if [ ! -f /run/pacha/physical-gpu-ready ]; then
         printf 'probe\n' >/run/pacha/gpu-control
     fi
     count=0
-    until /bin/busybox grep -q 'PCI DRM probe ready status=0' "$log"; do
+    until gpu_ready; do
         if /bin/busybox grep -q 'PCI DRM probe stopped\|sandbox startup failed' "$log" || [ "$count" -ge 90 ]; then
             echo 'GPU initialization did not complete; see /run/pacha/service.log.' >&2
             exit 1
@@ -19,7 +31,6 @@ if [ ! -f /run/pacha/physical-gpu-ready ]; then
         sleep 1
         count=$((count+1))
     done
-    /bin/busybox touch /run/pacha/physical-gpu-ready
 fi
 export HOME=/root USER=root LOGNAME=root DISPLAY=:0 XDG_RUNTIME_DIR=/run/user/0
 export LD_LIBRARY_PATH=/usr/lib:/lib

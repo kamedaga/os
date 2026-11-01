@@ -29,7 +29,7 @@ enum {
 
 struct gpud_drm_mapping {
     uint64_t id, exchange, handle, length;
-    uint32_t rights, cache_policy, gem_handle;
+    uint32_t rights, cache_policy, gem_handle, cache_kind;
     pacha_fd_t view_fd;
     unsigned int owner_closed;
 };
@@ -37,6 +37,7 @@ struct gpud_drm_mapping {
 struct gpud_drm_prime {
     uint64_t token, length;
     pacha_fd_t view_fd;
+    uint32_t cpu_rights;
     unsigned int owner_closed;
 };
 
@@ -78,6 +79,8 @@ struct gpud_drm_service {
      * previously tested property snapshot cannot authorize later flips. */
     uint32_t kms_session_mode;
     uint64_t resource_creates, gem_closes, exec_submits;
+    /* Set only after a typed driver reply with defined error-path outputs. */
+    unsigned ioctl_reply_on_error;
     /* Bound startup diagnostics per generation, not per client, so a busy
      * renderer cannot turn the shared RAM log into a frame-by-frame trace. */
     unsigned int startup_requests_logged, active_request_sequence;

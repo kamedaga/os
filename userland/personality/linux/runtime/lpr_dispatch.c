@@ -1,3 +1,4 @@
+#include "lpr_clock.h"
 #include "lpr_linux_syscall.h"
 #include "lpr_filed_internal.h"
 #include "lpr_memory.h"
@@ -18,6 +19,7 @@
 #include <personality/linux_lpr.h>
 #include <personality/zpoline.h>
 #include <stddef.h>
+#include <errno.h>
 
 #define LPR_LINUX_PROT_READ 0x1ull
 #define LPR_LINUX_PROT_WRITE 0x2ull
@@ -2923,27 +2925,85 @@ static int64_t lpr_futex_timeout_ticks(
     return *out_ticks == 0 ? -LPR_LINUX_ETIMEDOUT : 0;
 }
 
+static int64_t lpr_futex_pi(uint64_t word, uint64_t command, uint64_t flags,
+    uint64_t timeout, unsigned *wait_not_ready)
+{
+    const uint64_t allowed_flags = LPR_LINUX_FUTEX_PRIVATE_FLAG |
+        (command == LPR_LINUX_FUTEX_LOCK_PI2 ? LPR_LINUX_FUTEX_CLOCK_REALTIME : 0);
+    if (flags & ~allowed_flags) return -LPR_LINUX_ENOSYS;
+    if (!word) return -LPR_LINUX_EFAULT;
+    if (word & 3u) return -LPR_LINUX_EINVAL;
+
+    uint64_t operation = command == LPR_LINUX_FUTEX_UNLOCK_PI ? 2u :
+        command == LPR_LINUX_FUTEX_TRYLOCK_PI ? 1u : 0u;
+    uint64_t ticks = 0;
+    uint64_t deadline_ms = 0;
+    int expired = 0;
+    if (operation == 0) {
+        const int64_t converted = lpr_futex_timeout_ticks(timeout, 1,
+            command == LPR_LINUX_FUTEX_LOCK_PI ||
+                (flags & LPR_LINUX_FUTEX_CLOCK_REALTIME) ?
+                LPR_LINUX_CLOCK_REALTIME : LPR_LINUX_CLOCK_MONOTONIC, &ticks);
+        if (converted == -LPR_LINUX_ETIMEDOUT) {
+            /* A past deadline still permits immediate acquisition. Native
+             * zero deadline means infinite, so use trylock rather than wait. */
+            operation = 1;
+            expired = 1;
+        } else if (converted) return converted;
+        if (!expired && timeout) {
+            struct pachaos_timespec now;
+            const int64_t clock_status = lpr_pacha_clock_gettime(
+                LPR_LINUX_CLOCK_MONOTONIC, &now);
+            if (clock_status) return clock_status;
+            const uint64_t fraction_ms = now.tv_nsec / 1000000ull;
+            if (now.tv_nsec >= 1000000000ull ||
+                now.tv_sec > (UINT64_MAX - fraction_ms) / 1000ull)
+                return -LPR_LINUX_EINVAL;
+            const uint64_t now_ms = now.tv_sec * 1000ull + fraction_ms;
+            if (ticks > UINT64_MAX - now_ms) return -LPR_LINUX_EINVAL;
+            /* Native pager retries reuse these registers. An absolute value
+             * in native CLOCK_MONOTONIC's millisecond domain preserves the
+             * original budget through retries and the final park boundary. */
+            deadline_ms = now_ms + ticks;
+        }
+    }
+    const int64_t raw = lpr_pacha_syscall4(PACHAOS_SYSCALL_FUTEX_PI,
+        word, operation, deadline_ms,
+        (flags & LPR_LINUX_FUTEX_PRIVATE_FLAG) ? 1u : 0u);
+    /* PI statuses describe ownership and must not pass through the generic
+     * mapper (notably status 2 is busy for TRY, interrupted for LOCK). */
+    if (raw < -10 || raw > 10) return -LPR_LINUX_EIO;
+    const int64_t status = raw < 0 ? -raw : raw;
+    switch (status) {
+    case 0: return 0;
+    case 1: return -LPR_LINUX_EINVAL;
+    case 2:
+        if (operation == 1) return expired ? -LPR_LINUX_ETIMEDOUT : -LPR_LINUX_EAGAIN;
+        if (operation == 0 && wait_not_ready) *wait_not_ready = 1;
+        return -LPR_LINUX_EINTR;
+    case 3: return -LPR_LINUX_ENOMEM;
+    case 4: return -LPR_LINUX_EFAULT;
+    case 5: return -LPR_LINUX_ETIMEDOUT;
+    case 7: return -EPERM;
+    case 8: return -EDEADLK;
+    case 9: return -LPR_LINUX_ESRCH;
+    case 10: return -LPR_LINUX_ENOSYS;
+    default: return -LPR_LINUX_EIO;
+    }
+}
+
 static int64_t lpr_sys_futex(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused)))
 {
     const uint64_t command = a1 & 0x7full;
     const uint64_t flags = a1 & ~0x7full;
-    /* This personality recognizes PI operations but cannot provide priority
-     * inheritance. Report ENOTSUP (EOPNOTSUPP on Linux), not success or an
-     * ordinary futex approximation. musl propagates the LOCK_PI probe errno
-     * through pthread_mutexattr_setprotocol; POSIX clients use ENOTSUP to
-     * select their non-PI path. This deliberately differs from Linux built
-     * without CONFIG_FUTEX_PI, which reports ENOSYS. Unknown ops still do so.
-     * Never access the word or enqueue a waiter on this unsupported path. */
-    if ((flags & ~(LPR_LINUX_FUTEX_PRIVATE_FLAG |
-                  LPR_LINUX_FUTEX_CLOCK_REALTIME)) == 0 &&
-        (command == LPR_LINUX_FUTEX_LOCK_PI ||
-         command == LPR_LINUX_FUTEX_UNLOCK_PI ||
-         command == LPR_LINUX_FUTEX_TRYLOCK_PI ||
-         command == LPR_LINUX_FUTEX_WAIT_REQUEUE_PI ||
-         command == LPR_LINUX_FUTEX_CMP_REQUEUE_PI ||
-         command == LPR_LINUX_FUTEX_LOCK_PI2)) {
-        return -LPR_LINUX_EOPNOTSUPP;
-    }
+    if (command == LPR_LINUX_FUTEX_LOCK_PI ||
+        command == LPR_LINUX_FUTEX_UNLOCK_PI ||
+        command == LPR_LINUX_FUTEX_TRYLOCK_PI ||
+        command == LPR_LINUX_FUTEX_LOCK_PI2)
+        return lpr_futex_pi(a0, command, flags, a3, wait_not_ready);
+    /* Requeue PI requires native atomic queue migration, not ordinary requeue. */
+    if (command == LPR_LINUX_FUTEX_WAIT_REQUEUE_PI ||
+        command == LPR_LINUX_FUTEX_CMP_REQUEUE_PI) return -LPR_LINUX_ENOSYS;
     const int wait_bitset = command == LPR_LINUX_FUTEX_WAIT_BITSET;
     const uint64_t allowed_flags = LPR_LINUX_FUTEX_PRIVATE_FLAG |
         (wait_bitset ? LPR_LINUX_FUTEX_CLOCK_REALTIME : 0ull);
@@ -2964,29 +3024,26 @@ static int64_t lpr_sys_futex(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
         return -LPR_LINUX_EINVAL;
     }
     if (command == LPR_LINUX_FUTEX_WAKE) {
-        /* FUTEX_WAKE returns the number of waiters woken.  Native futex wake
-         * has the same non-negative result, and this path already validates
-         * every argument for which the native call can report an error.  Do
-         * not feed a positive wake count through the status-code mapper: the
-         * small values overlap native error numbers. */
-        return lpr_pacha_syscall2(
+        /* Counts overlap positive native statuses. Mixed PI/ordinary domain
+         * errors use negative native statuses; translate only that half. */
+        const int64_t result = lpr_pacha_syscall2(
             PACHAOS_SYSCALL_FUTEX_WAKE,
             a0,
             a2);
+        return result < 0 ? lpr_linux_pacha_status_to_errno(result) : result;
     }
     if (command == LPR_LINUX_FUTEX_REQUEUE) {
         if (a4 == 0 || (a4 & 3u) != 0 || a4 == a0) {
             return -LPR_LINUX_EINVAL;
         }
-        /* The native result is the number of waiters woken plus requeued.
-         * As with FUTEX_WAKE, return it directly because small successful
-         * counts overlap native status values. */
-        return lpr_pacha_syscall4(
+        /* REQUEUE shares WAKE's signed-error/nonnegative-count contract. */
+        const int64_t result = lpr_pacha_syscall4(
             PACHAOS_SYSCALL_FUTEX_REQUEUE,
             a0,
             a2,
             a3,
             a4);
+        return result < 0 ? lpr_linux_pacha_status_to_errno(result) : result;
     }
     if (wait_bitset && (uint32_t)a5 == 0u) return -LPR_LINUX_EINVAL;
 
@@ -3287,6 +3344,15 @@ static int64_t lpr_sys_clock_gettime(uint64_t a0, uint64_t a1, uint64_t a2, uint
         break;
     default:
         return -LPR_LINUX_EINVAL;
+    }
+    uint64_t fast_ns;
+    if (native_clock == LPR_LINUX_CLOCK_MONOTONIC && !lpr_clock_monotonic(&fast_ns)) {
+        if (!lpr_user_range_plausible(a1, sizeof(struct pachaos_timespec)))
+            return -LPR_LINUX_EFAULT;
+        /* Guarded stores preserve EFAULT for unmapped/read-only/cross-page
+         * outputs without adding a validation syscall to every fast read. */
+        return lpr_clock_copy_timespec((void *)(uintptr_t)a1,
+            fast_ns / UINT64_C(1000000000), fast_ns % UINT64_C(1000000000));
     }
     int64_t native_status;
     do {

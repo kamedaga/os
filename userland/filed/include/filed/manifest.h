@@ -3,6 +3,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <kobox2/filesystem.h>
+#include "filed/code_ranges.h"
 
 enum { FILED_RX_GUARD_BYTES=320, FILED_RX_HASH_BYTES=16 };
 typedef struct filed_rx_patch {
@@ -24,10 +25,14 @@ void filed_rx_manifest_key(const uint8_t root_uuid[16],
     const uint8_t identity[KB2_FILESYSTEM_SNAPSHOT_STAT_SIZE],
     uint64_t file_offset,uint64_t length,const uint8_t scanner_hash[32],
     uint8_t key[32]);
+/* code may be NULL. With code, an ambiguous SYSCALL candidate that lies
+ * entirely outside every FDE range is data and stays unpatched; inside a
+ * range, or without code, an ambiguous candidate still fails with -EIO. */
 int filed_rx_manifest_build(const uint8_t *raw,size_t length,
     uint64_t file_offset,const uint8_t root_uuid[16],
     const uint8_t identity[KB2_FILESYSTEM_SNAPSHOT_STAT_SIZE],
-    const uint8_t scanner_hash[32],filed_rx_manifest_t *);
+    const uint8_t scanner_hash[32],const filed_rx_code_ranges_t *code,
+    filed_rx_manifest_t *);
 int filed_rx_manifest_apply(const filed_rx_manifest_t *,
     uint64_t target_offset,uint8_t *page_bytes,size_t page_length,
     uint64_t guarded_offset,const uint8_t *guarded,size_t guarded_length);

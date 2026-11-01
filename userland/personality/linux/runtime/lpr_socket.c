@@ -18,6 +18,7 @@
 
 #define LPR_LINUX_AF_UNIX 1ull
 #define LPR_LINUX_AF_INET 2ull
+#define LPR_LINUX_AF_INET6 10ull
 #define LPR_LINUX_AF_NETLINK 16ull
 #define LPR_LINUX_SOCK_STREAM 1ull
 #define LPR_LINUX_SOCK_DGRAM 2ull
@@ -210,6 +211,45 @@ typedef struct lpr_linux_sockaddr_in {
     uint32_t addr_be;
     uint8_t zero[8];
 } lpr_linux_sockaddr_in_t;
+
+typedef struct {
+    uint16_t family, port_be;
+    uint32_t flowinfo;
+    uint8_t address[16];
+    uint32_t scope_id;
+} lpr_linux_sockaddr_in6_t;
+
+/* The current network transport is IPv4. Support the standard mapped-address
+ * data path, not an invented route for native IPv6 addresses. */
+static int64_t lpr_socket_decode_address(uint64_t domain, uint64_t raw,
+    uint64_t length, int bind_any, uint32_t *address, uint16_t *port,
+    uint16_t *mapped)
+{
+    if (!raw) return -LPR_LINUX_EFAULT;
+    if (length < sizeof(uint16_t)) return -LPR_LINUX_EINVAL;
+    if (domain == LPR_LINUX_AF_INET6) {
+        const lpr_linux_sockaddr_in6_t *in = (const void *)(uintptr_t)raw;
+        if (in->family != LPR_LINUX_AF_INET6) return -LPR_LINUX_EAFNOSUPPORT;
+        if (length < sizeof(*in)) return -LPR_LINUX_EINVAL;
+        static const uint8_t prefix[12] = {0,0,0,0,0,0,0,0,0,0,0xff,0xff};
+        static const uint8_t any[16] = {0};
+        if (!lpr_memcmp(in->address, prefix, sizeof(prefix))) {
+            lpr_memcpy(address, in->address + 12, sizeof(*address));
+            *mapped = 1;
+        } else if (bind_any && !lpr_memcmp(in->address, any, sizeof(any))) {
+            *address = 0; *mapped = 0;
+        } else {
+            return bind_any ? -EADDRNOTAVAIL : -ENETUNREACH;
+        }
+        *port = in->port_be;
+        return 0;
+    }
+    const lpr_linux_sockaddr_in_t *in = (const void *)(uintptr_t)raw;
+    if (in->family != LPR_LINUX_AF_INET) return -LPR_LINUX_EAFNOSUPPORT;
+    if (length < sizeof(*in)) return -LPR_LINUX_EINVAL;
+    *address = in->addr_be; *port = in->port_be; *mapped = 0;
+    return 0;
+}
 
 typedef struct lpr_linux_sockaddr_un {
     uint16_t family;
@@ -906,13 +946,26 @@ static int64_t lpr_socket_install_endpoint(
     return fd;
 }
 
-static int64_t lpr_socket_copy_sockaddr(uint64_t addr_raw, uint64_t addrlen_raw, uint32_t addr_be, uint16_t port_be)
+static int64_t lpr_socket_copy_sockaddr(uint64_t domain, uint64_t addr_raw,
+    uint64_t addrlen_raw, uint32_t addr_be, uint16_t port_be, int mapped)
 {
     if (addr_raw == 0 || addrlen_raw == 0) {
         return -LPR_LINUX_EFAULT;
     }
     uint32_t *addrlen = (uint32_t *)(uintptr_t)addrlen_raw;
     const uint32_t requested = *addrlen;
+    if (domain == LPR_LINUX_AF_INET6) {
+        lpr_linux_sockaddr_in6_t address = {.family = LPR_LINUX_AF_INET6,
+            .port_be = port_be};
+        if (addr_be || mapped) {
+            address.address[10] = address.address[11] = 0xff;
+            lpr_memcpy(address.address + 12, &addr_be, sizeof(addr_be));
+        }
+        lpr_memcpy((void *)(uintptr_t)addr_raw, &address,
+            requested < sizeof(address) ? requested : sizeof(address));
+        *addrlen = sizeof(address);
+        return 0;
+    }
     if (requested < sizeof(lpr_linux_sockaddr_in_t)) {
         *addrlen = sizeof(lpr_linux_sockaddr_in_t);
         return -LPR_LINUX_EINVAL;
@@ -933,7 +986,7 @@ static int64_t lpr_socket_copy_sockaddr(uint64_t addr_raw, uint64_t addrlen_raw,
 int64_t lpr_linux_socket(uint64_t domain, uint64_t type, uint64_t protocol)
 {
     if (domain == LPR_LINUX_AF_UNIX) return lpr_unix_socket_create(type, protocol);
-    if (domain != LPR_LINUX_AF_INET &&
+    if (domain != LPR_LINUX_AF_INET && domain != LPR_LINUX_AF_INET6 &&
         domain != LPR_LINUX_AF_NETLINK) {
         const int64_t result = -LPR_LINUX_EAFNOSUPPORT;
         lpr_socket_trace_socket(domain, type, protocol, result);
@@ -941,10 +994,12 @@ int64_t lpr_linux_socket(uint64_t domain, uint64_t type, uint64_t protocol)
     }
     const uint64_t flags = type & (LPR_LINUX_SOCK_NONBLOCK | LPR_LINUX_SOCK_CLOEXEC);
     type &= ~(LPR_LINUX_SOCK_NONBLOCK | LPR_LINUX_SOCK_CLOEXEC);
+    if (domain == LPR_LINUX_AF_INET6 && type != LPR_LINUX_SOCK_DGRAM)
+        return -LPR_LINUX_ESOCKTNOSUPPORT;
     uint64_t netd_type = 0;
     if (type == LPR_LINUX_SOCK_STREAM) {
         netd_type = NETD_SOCK_STREAM;
-        if (domain == LPR_LINUX_AF_INET && protocol == 0) {
+        if ((domain == LPR_LINUX_AF_INET || domain == LPR_LINUX_AF_INET6) && protocol == 0) {
             protocol = LPR_LINUX_IPPROTO_TCP;
         }
     } else if (type == LPR_LINUX_SOCK_DGRAM ||
@@ -952,7 +1007,7 @@ int64_t lpr_linux_socket(uint64_t domain, uint64_t type, uint64_t protocol)
          (domain == LPR_LINUX_AF_NETLINK ||
           (domain == LPR_LINUX_AF_INET && protocol == LPR_LINUX_IPPROTO_ICMP)))) {
         netd_type = type == LPR_LINUX_SOCK_RAW ? NETD_SOCK_RAW : NETD_SOCK_DGRAM;
-        if (protocol == 0 && domain == LPR_LINUX_AF_INET) {
+        if (protocol == 0 && (domain == LPR_LINUX_AF_INET || domain == LPR_LINUX_AF_INET6)) {
             protocol = LPR_LINUX_IPPROTO_UDP;
         }
     } else {
@@ -1045,11 +1100,12 @@ int64_t lpr_linux_connect(uint64_t fd, uint64_t addr_raw, uint64_t addrlen, unsi
 
     if (lpr_socket_backend(fd)->domain == LPR_LINUX_AF_NETLINK)
         return -LPR_LINUX_EOPNOTSUPP;
-    if (addrlen < sizeof(lpr_linux_sockaddr_in_t)) return -LPR_LINUX_EINVAL;
-    const lpr_linux_sockaddr_in_t *addr = (const lpr_linux_sockaddr_in_t *)(uintptr_t)addr_raw;
-    if (addr->family != LPR_LINUX_AF_INET) {
-        return -LPR_LINUX_EAFNOSUPPORT;
-    }
+    lpr_linux_sockaddr_in_t normalized = {0};
+    const lpr_linux_sockaddr_in_t *addr = &normalized;
+    uint16_t mapped;
+    const int64_t decoded = lpr_socket_decode_address(lpr_socket_backend(fd)->domain,
+        addr_raw, addrlen, 0, &normalized.addr_be, &normalized.port_be, &mapped);
+    if (decoded) return decoded;
     void *page = 0;
     const pacha_fd_t page_fd = lpr_netd_create_page(&page);
     if (page_fd < 0) {
@@ -1115,7 +1171,7 @@ int64_t lpr_linux_bind(uint64_t fd, uint64_t addr_raw, uint64_t addrlen, unsigne
         if (addrlen < sizeof(lpr_linux_sockaddr_nl_t)) return -LPR_LINUX_EINVAL;
         const lpr_linux_sockaddr_nl_t *addr = (const lpr_linux_sockaddr_nl_t *)(uintptr_t)addr_raw;
         if (addr->family != LPR_LINUX_AF_NETLINK) return -LPR_LINUX_EAFNOSUPPORT;
-        const uint32_t pid = addr->pid != 0 ? addr->pid : (uint32_t)lpr_linux_getpid();
+        const uint32_t pid = addr->pid;
         const uint32_t groups = addr->groups;
         void *page = 0;
         const pacha_fd_t page_fd = lpr_netd_create_page(&page);
@@ -1126,18 +1182,20 @@ int64_t lpr_linux_bind(uint64_t fd, uint64_t addr_raw, uint64_t addrlen, unsigne
         request->pid = pid;
         request->groups = groups;
         const int64_t status = lpr_netd_call(NETD_OP_BIND, page_fd, 0, 0);
+        const uint32_t assigned_pid = request->pid;
         lpr_netd_destroy_page(page_fd, page);
         if (status == 0) {
-            lpr_socket_backend(fd)->local_addr_be = pid;
+            lpr_socket_backend(fd)->local_addr_be = assigned_pid;
             lpr_socket_backend(fd)->peer_addr_be = groups;
         }
         return status;
     }
-    if (addrlen < sizeof(lpr_linux_sockaddr_in_t)) return -LPR_LINUX_EINVAL;
-    const lpr_linux_sockaddr_in_t *addr = (const lpr_linux_sockaddr_in_t *)(uintptr_t)addr_raw;
-    if (addr->family != LPR_LINUX_AF_INET) {
-        return -LPR_LINUX_EAFNOSUPPORT;
-    }
+    lpr_linux_sockaddr_in_t normalized = {0};
+    const lpr_linux_sockaddr_in_t *addr = &normalized;
+    uint16_t mapped;
+    const int64_t decoded = lpr_socket_decode_address(lpr_socket_backend(fd)->domain,
+        addr_raw, addrlen, 1, &normalized.addr_be, &normalized.port_be, &mapped);
+    if (decoded) return decoded;
     void *page = 0;
     const pacha_fd_t page_fd = lpr_netd_create_page(&page);
     if (page_fd < 0) return page_fd;
@@ -1151,6 +1209,7 @@ int64_t lpr_linux_bind(uint64_t fd, uint64_t addr_raw, uint64_t addrlen, unsigne
     if (status == 0) {
         lpr_socket_backend(fd)->local_addr_be = req->addr.addr_be;
         lpr_socket_backend(fd)->local_port_be = req->addr.port_be;
+        lpr_socket_backend(fd)->local_addr_mapped = mapped;
     }
     lpr_netd_destroy_page(page_fd, page);
     return status;
@@ -1237,8 +1296,8 @@ int64_t lpr_linux_accept(uint64_t fd, uint64_t addr, uint64_t addrlen, uint64_t 
             lpr_socket_backend((uint64_t)accepted_fd)->local_addr_be = local_addr_be;
             lpr_socket_backend((uint64_t)accepted_fd)->local_port_be = local_port_be;
             if (addr != 0)
-                (void)lpr_socket_copy_sockaddr(addr, addrlen,
-                    peer_addr_be, peer_port_be);
+                (void)lpr_socket_copy_sockaddr(LPR_LINUX_AF_INET, addr, addrlen,
+                    peer_addr_be, peer_port_be, 0);
             return accepted_fd;
         }
         if (native_wait_fd >= 16)
@@ -1266,6 +1325,8 @@ static int64_t lpr_socket_non_socket_status(uint64_t fd)
     return -ENOTSOCK;
 }
 
+#include "lpr_netlink.h"
+
 int64_t lpr_linux_sendto(uint64_t fd, uint64_t buf, uint64_t len, uint64_t flags, uint64_t dest_addr, uint64_t addrlen, unsigned *wait_not_ready __attribute__((unused)))
 {
     if (lpr_unix_socket_active(fd)) return
@@ -1276,11 +1337,19 @@ int64_t lpr_linux_sendto(uint64_t fd, uint64_t buf, uint64_t len, uint64_t flags
     if (buf == 0 && len != 0) {
         return -LPR_LINUX_EFAULT;
     }
+    if (lpr_socket_backend(fd)->domain == LPR_LINUX_AF_NETLINK) {
+        const lpr_linux_iovec_t iov = {.base = buf, .len = len};
+        return lpr_netlink_send(fd, &iov, 1, flags, dest_addr, addrlen, wait_not_ready);
+    }
     if (len == 0) {
         return 0;
     }
-    if (dest_addr != 0 && addrlen < sizeof(lpr_linux_sockaddr_in_t)) {
-        return -LPR_LINUX_EINVAL;
+    lpr_linux_sockaddr_in_t normalized = {0};
+    if (dest_addr) {
+        uint16_t mapped;
+        const int64_t decoded = lpr_socket_decode_address(lpr_socket_backend(fd)->domain,
+            dest_addr, addrlen, 0, &normalized.addr_be, &normalized.port_be, &mapped);
+        if (decoded) return decoded;
     }
     uint64_t sent_total = 0;
     const uint8_t *src = (const uint8_t *)(uintptr_t)buf;
@@ -1300,11 +1369,7 @@ int64_t lpr_linux_sendto(uint64_t fd, uint64_t buf, uint64_t len, uint64_t flags
         req->length = chunk;
         req->flags = flags;
         if (dest_addr != 0) {
-            const lpr_linux_sockaddr_in_t *addr = (const lpr_linux_sockaddr_in_t *)(uintptr_t)dest_addr;
-            if (addr->family != LPR_LINUX_AF_INET) {
-                lpr_netd_destroy_page(page_fd, page);
-                return sent_total != 0 ? (int64_t)sent_total : -LPR_LINUX_EAFNOSUPPORT;
-            }
+            const lpr_linux_sockaddr_in_t *addr = &normalized;
             req->addr.addr_be = addr->addr_be;
             req->addr.port_be = addr->port_be;
             lpr_socket_backend(fd)->peer_addr_be = addr->addr_be;
@@ -1341,6 +1406,10 @@ int64_t lpr_linux_recvfrom(uint64_t fd, uint64_t buf, uint64_t len, uint64_t fla
     }
     if (buf == 0 && len != 0) {
         return -LPR_LINUX_EFAULT;
+    }
+    if (lpr_socket_backend(fd)->domain == LPR_LINUX_AF_NETLINK) {
+        const lpr_linux_iovec_t iov = {.base = buf, .len = len};
+        return lpr_netlink_receive(fd, &iov, 1, flags, src_addr, addrlen_raw, 0, wait_not_ready);
     }
     if (len == 0) {
         return 0;
@@ -1390,6 +1459,11 @@ recvfrom_retry:
                 addr->pid = 0;
                 addr->groups = lpr_socket_backend(fd)->peer_addr_be;
                 *addrlen = sizeof(*addr);
+            } else if (lpr_socket_backend(fd)->domain == LPR_LINUX_AF_INET6) {
+                (void)lpr_socket_copy_sockaddr(LPR_LINUX_AF_INET6,
+                    src_addr, addrlen_raw,
+                    req->addr.addr_be != 0 ? req->addr.addr_be : lpr_socket_backend(fd)->peer_addr_be,
+                    req->addr.port_be != 0 ? req->addr.port_be : lpr_socket_backend(fd)->peer_port_be, 1);
             } else if (*addrlen >= sizeof(lpr_linux_sockaddr_in_t)) {
                 lpr_linux_sockaddr_in_t *addr = (lpr_linux_sockaddr_in_t *)(uintptr_t)src_addr;
                 lpr_memset(addr, 0, sizeof(*addr));
@@ -1520,8 +1594,14 @@ int64_t lpr_linux_sendmsg(uint64_t fd, uint64_t msg_raw, uint64_t flags, unsigne
         lpr_fd_unpin(&socket_pin);
         return status;
     }
+    const int netlink = socket->domain == LPR_LINUX_AF_NETLINK;
     lpr_fd_unpin(&socket_pin);
 
+    if (netlink) {
+        if (msg->msg_controllen) return -LPR_LINUX_EOPNOTSUPP;
+        return lpr_netlink_send(fd, iov, msg->msg_iovlen, flags,
+            msg->msg_name, msg->msg_namelen, wait_not_ready);
+    }
     int64_t total = 0;
     for (uint64_t i = 0; i < msg->msg_iovlen; i += 1) {
         const int64_t n = lpr_linux_sendto(fd, iov[i].base, iov[i].len, flags, msg->msg_name, msg->msg_namelen, wait_not_ready);
@@ -1550,6 +1630,19 @@ int64_t lpr_linux_recvmsg(uint64_t fd, uint64_t msg_raw, uint64_t flags, unsigne
         return -LPR_LINUX_EFAULT;
     }
     const lpr_linux_iovec_t *iov = (const lpr_linux_iovec_t *)(uintptr_t)msg->msg_iov;
+    if (lpr_socket_backend(fd)->domain == LPR_LINUX_AF_NETLINK) {
+        uint32_t namelen = msg->msg_namelen;
+        uint32_t output_flags = 0;
+        const int64_t result = lpr_netlink_receive(fd, iov, msg->msg_iovlen,
+            flags, msg->msg_name, msg->msg_name ? (uint64_t)(uintptr_t)&namelen : 0,
+            &output_flags, wait_not_ready);
+        if (result >= 0) {
+            if (msg->msg_name) msg->msg_namelen = namelen;
+            msg->msg_flags = output_flags;
+            msg->msg_controllen = 0;
+        }
+        return result;
+    }
     int64_t total = 0;
     for (uint64_t i = 0; i < msg->msg_iovlen; i += 1) {
         uint32_t namelen = msg->msg_namelen;
@@ -1632,24 +1725,17 @@ int64_t lpr_linux_getsockname(uint64_t fd, uint64_t addr, uint64_t addrlen)
     }
     if (lpr_socket_backend(fd)->domain == LPR_LINUX_AF_NETLINK) {
         if (addr == 0 || addrlen == 0) return -LPR_LINUX_EFAULT;
-        uint32_t *length = (uint32_t *)(uintptr_t)addrlen;
-        if (*length < sizeof(lpr_linux_sockaddr_nl_t)) {
-            *length = sizeof(lpr_linux_sockaddr_nl_t);
-            return -LPR_LINUX_EINVAL;
-        }
-        lpr_linux_sockaddr_nl_t *name = (lpr_linux_sockaddr_nl_t *)(uintptr_t)addr;
-        lpr_memset(name, 0, sizeof(*name));
-        name->family = LPR_LINUX_AF_NETLINK;
-        name->pid = lpr_socket_backend(fd)->local_addr_be;
-        name->groups = lpr_socket_backend(fd)->peer_addr_be;
-        *length = sizeof(*name);
+        lpr_netlink_name(addr, addrlen, lpr_socket_backend(fd)->local_addr_be,
+            lpr_socket_backend(fd)->peer_addr_be);
         return 0;
     }
     return lpr_socket_copy_sockaddr(
+        lpr_socket_backend(fd)->domain,
         addr,
         addrlen,
         lpr_socket_backend(fd)->local_addr_be,
-        lpr_socket_backend(fd)->local_port_be);
+        lpr_socket_backend(fd)->local_port_be,
+        lpr_socket_backend(fd)->local_addr_mapped);
 }
 
 int64_t lpr_linux_getpeername(uint64_t fd, uint64_t addr, uint64_t addrlen)
@@ -1662,10 +1748,11 @@ int64_t lpr_linux_getpeername(uint64_t fd, uint64_t addr, uint64_t addrlen)
         return -LPR_LINUX_ENOTCONN;
     }
     return lpr_socket_copy_sockaddr(
+        lpr_socket_backend(fd)->domain,
         addr,
         addrlen,
         lpr_socket_backend(fd)->peer_addr_be,
-        lpr_socket_backend(fd)->peer_port_be);
+        lpr_socket_backend(fd)->peer_port_be, 1);
 }
 
 int64_t lpr_linux_shutdown(uint64_t fd, uint64_t how)
@@ -1686,6 +1773,14 @@ int64_t lpr_linux_setsockopt(uint64_t fd, uint64_t level, uint64_t optname, uint
     }
     if (optval == 0 && optlen != 0) {
         return -LPR_LINUX_EFAULT;
+    }
+    if (level == LPR_LINUX_IPPROTO_IPV6) {
+        if (lpr_socket_backend(fd)->domain != LPR_LINUX_AF_INET6 ||
+            optname != LPR_LINUX_IPV6_V6ONLY) return -LPR_LINUX_ENOPROTOOPT;
+        if (optlen < sizeof(int32_t)) return -LPR_LINUX_EINVAL;
+        if (!optval) return -LPR_LINUX_EFAULT;
+        /* There is no native IPv6 transport to isolate from IPv4. */
+        return *(const int32_t *)(uintptr_t)optval ? -LPR_LINUX_EOPNOTSUPP : 0;
     }
     if (level == LPR_LINUX_SOL_SOCKET) {
         if (optname == LPR_LINUX_SO_SNDTIMEO || optname == LPR_LINUX_SO_RCVTIMEO) {
@@ -1735,8 +1830,7 @@ int64_t lpr_linux_setsockopt(uint64_t fd, uint64_t level, uint64_t optname, uint
         lpr_socket_backend(fd)->tcp_nodelay = *(const int32_t *)(uintptr_t)optval != 0;
         return 0;
     }
-    if ((level == LPR_LINUX_IPPROTO_IP && (optname == LPR_LINUX_IP_TOS || optname == LPR_LINUX_IP_TTL)) ||
-        (level == LPR_LINUX_IPPROTO_IPV6 && optname == LPR_LINUX_IPV6_V6ONLY)) {
+    if (level == LPR_LINUX_IPPROTO_IP && (optname == LPR_LINUX_IP_TOS || optname == LPR_LINUX_IP_TTL)) {
         return 0;
     }
     return 0;
@@ -1752,6 +1846,14 @@ int64_t lpr_linux_getsockopt(uint64_t fd, uint64_t level, uint64_t optname, uint
         return -LPR_LINUX_EFAULT;
     }
     uint32_t *optlen = (uint32_t *)(uintptr_t)optlen_raw;
+    if (level == LPR_LINUX_IPPROTO_IPV6) {
+        if (lpr_socket_backend(fd)->domain != LPR_LINUX_AF_INET6 ||
+            optname != LPR_LINUX_IPV6_V6ONLY) return -LPR_LINUX_ENOPROTOOPT;
+        if (*optlen < sizeof(int32_t)) return -LPR_LINUX_EINVAL;
+        *(int32_t *)(uintptr_t)optval = 0;
+        *optlen = sizeof(int32_t);
+        return 0;
+    }
     if (level == LPR_LINUX_SOL_SOCKET) {
         if (optname == LPR_LINUX_SO_PEERPIDFD) {
             /* LPR has no pidfd object.  A successful zero-valued result would
@@ -2152,11 +2254,14 @@ static int64_t lpr_linux_poll_scan(
             continue;
         }
         if (lpr_linux_filed_fd_active(fd)) {
-            fds[i].revents = (int16_t)((uint32_t)fds[i].events &
-                (LPR_LINUX_POLLIN | LPR_LINUX_POLLOUT));
-            if (fds[i].revents != 0) {
-                ready++;
-            }
+            const int64_t filed_events = lpr_filed_poll_events(
+                fd, (uint32_t)(uint16_t)fds[i].events);
+            if (filed_events < 0)
+                fds[i].revents = filed_events == -LPR_LINUX_EBADF ?
+                    LPR_LINUX_POLLNVAL : LPR_LINUX_POLLERR;
+            else
+                fds[i].revents = (int16_t)(uint16_t)filed_events;
+            if (fds[i].revents != 0) ready++;
             continue;
         }
         if (lpr_linux_device_fd_active(fd)) {
@@ -2524,8 +2629,20 @@ static int64_t lpr_linux_select_scan(
             if (revents < 0) return revents;
             is_read = (revents & LPR_LINUX_POLLIN) != 0;
             is_except = (revents & LPR_LINUX_POLLERR) != 0;
+        } else if (lpr_linux_filed_fd_active(fd)) {
+            uint32_t events = 0;
+            if (want_read) events |= LPR_LINUX_POLLIN;
+            if (want_write) events |= LPR_LINUX_POLLOUT;
+            if (want_except) events |= LPR_LINUX_POLLERR;
+            const int64_t revents = lpr_filed_poll_events(fd, events);
+            if (revents < 0) return revents;
+            is_read = (revents & (LPR_LINUX_POLLIN |
+                LPR_LINUX_POLLHUP | LPR_LINUX_POLLERR)) != 0;
+            is_write = (revents & (LPR_LINUX_POLLOUT |
+                LPR_LINUX_POLLERR)) != 0;
+            is_except = (revents & LPR_LINUX_POLLERR) != 0;
         } else {
-            if (lpr_linux_filed_fd_active(fd) || lpr_linux_device_fd_active(fd)) {
+            if (lpr_linux_device_fd_active(fd)) {
                 is_read = want_read;
                 is_write = want_write;
             } else {
@@ -2633,7 +2750,18 @@ static int64_t lpr_linux_select_wait(
             if (status != 0) return status;
         }
         status = lpr_wait_graph_block(&graph, &deadline, wait_not_ready);
-        if (status != 0) return status;
+        if (status != 0) {
+            /* A signal/spurious native wake may restart the Linux syscall.
+             * The scan already cleared the user's result sets; preserve the
+             * original interests before dispatch can abandon this stack. */
+            if (readfds != 0)
+                lpr_memcpy((void *)(uintptr_t)readfds, read_orig, (size_t)fdset_bytes);
+            if (writefds != 0)
+                lpr_memcpy((void *)(uintptr_t)writefds, write_orig, (size_t)fdset_bytes);
+            if (exceptfds != 0)
+                lpr_memcpy((void *)(uintptr_t)exceptfds, except_orig, (size_t)fdset_bytes);
+            return status;
+        }
     }
 }
 

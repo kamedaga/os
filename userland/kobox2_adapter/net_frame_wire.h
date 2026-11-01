@@ -36,6 +36,9 @@ struct ph_net_frame_shared {
     uint32_t wifi_length;
     uint32_t wifi_events;
     uint8_t wifi_bytes[PH_NET_WIFI_BYTES];
+    /* INFO snapshot. Existing offsets and operation numbers stay fixed.
+     * Deployment replaces both peers together; no speculative tail probing. */
+    struct kobox_linux_net_rx_stats rx_stats;
 };
 
 _Static_assert(sizeof(struct ph_net_frame_shared) <= PH_NET_FRAME_SHARED_BYTES,

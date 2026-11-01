@@ -280,6 +280,11 @@ printf '%s\n' \
   '    exec /bin/busybox env -i HOME=/root USER=root LOGNAME=root SHELL=/bin/bash PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/cmd TERM=linux LANG=C.UTF-8 LC_ALL=C.UTF-8 /bin/bash --noprofile --norc -i' \
   '    ;;' \
   'esac' \
+  '# An interrupted startx may leave xauth hard-link locks on the persistent rootfs.' \
+  '# No X server is active at this boot point, so recover them before startx retries.' \
+  'if [ -e /root/.Xauthority-c ] || [ -e /root/.Xauthority-l ]; then' \
+  '  /usr/bin/xauth -b -f /root/.Xauthority info >/dev/null 2>&1 || true' \
+  'fi' \
   'exec /bin/busybox env -i HOME=/root USER=root LOGNAME=root SHELL=/bin/bash PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/cmd TERM=linux XDG_RUNTIME_DIR=/run/user/0 LANG=C.UTF-8 LC_ALL=C.UTF-8 /usr/bin/startx /root/.xinitrc' \
   >"${runtime}/sbin/pacha-boot-session"
 chmod 0755 "${runtime}/sbin/pacha-boot-session"

@@ -13,7 +13,9 @@ static struct fixture_file files[] = {{"request", "", 0}, {"response", "", 0},
     {"status", "", 0}, {"session", "", 0}, {"scan-results", "", 0}};
 static int response_fail, status_fail, prepare_error, configuration_error;
 static unsigned response_attempts, response_commits, scan_calls, results_calls;
-static unsigned disconnect_calls, configuration_calls, publication_count;
+static unsigned disconnect_calls, configuration_calls, publication_count,ps_off,ps_on,buffer_calls;
+static int power_error;
+static unsigned fixture_request_id=1;
 static char publication_order[32], last_attempt[16384];
 static int config_present, status_error;
 static uint64_t generation;
@@ -99,6 +101,8 @@ int netd_kobox2_wifi_command(const void *bytes, size_t length, void *reply,
     } else if (!strcmp(request, "SCAN")) ++scan_calls;
     else if (!strcmp(request, "SCAN_RESULTS")) { ++results_calls; text = scan_text; }
     else if (!strcmp(request, "DISCONNECT")) ++disconnect_calls;
+    else if(!strcmp(request,"NET_PERF_PS_OFF")){ps_off++;if(power_error)text="FAIL\n";}
+    else if(!strcmp(request,"NET_PERF_PS_ON"))ps_on++;
     else CHECK(!"unexpected NIC command");
     *received = strlen(text); CHECK(*received <= capacity);
     memcpy(reply, text, *received); return 0;
@@ -107,6 +111,8 @@ const struct netd_link_info *netd_link_current(void) { return &test_link; }
 const struct netd_network_config *netd_network_config_get(void) { return &test_policy; }
 void netd_libuinet_ipv4_suspend(void) { }
 void netd_packet_io_discard_rx(void) { }
+
+int netd_libuinet_perf_buffers(int large,char *reply,size_t capacity) {buffer_calls++;snprintf(reply,capacity,"large=%d\n",large);return 0;}
 
 static void reset(void)
 {
@@ -129,17 +135,17 @@ static void start(void)
 static void request(const char *op)
 {
     struct fixture_file *file = file_named("request");
-    CHECK(snprintf(file->text, sizeof(file->text), "%s%016x %s\n", wifi.session, 1, op) > 0);
+    CHECK(snprintf(file->text, sizeof(file->text), "%s%016x %s\n", wifi.session, fixture_request_id, op) > 0);
     file->present = 1;
 }
 static void expect_reply(int error, const char *payload)
 {
     char expected[16384];
     CHECK(snprintf(expected, sizeof(expected), "%s%016x %d\n%s",
-        wifi.session, 1, error, payload) > 0);
+        wifi.session, fixture_request_id, error, payload) > 0);
     CHECK(file_named("response")->present);
     CHECK(!strcmp(file_named("response")->text, expected));
-    CHECK(wifi.pending == NONE && response_commits == 1);
+    CHECK(wifi.pending == NONE && response_commits == fixture_request_id);
 }
 static void scan_pending(void)
 {
@@ -217,7 +223,7 @@ static void connect_reply_snapshot(void)
     nic_status = "wpa_state=COMPLETED\nssid=second\n";
     netd_wifi_control_poll(&runtime, 22); CHECK(!strcmp(pending, last_attempt));
     response_fail = 0; netd_wifi_control_poll(&runtime, 23);
-    CHECK(wifi.pending == NONE && response_commits == 1 && configuration_calls == 1);
+    CHECK(wifi.pending == NONE && response_commits == fixture_request_id && configuration_calls == 1);
     CHECK(!strcmp(file_named("response")->text, pending));
     CHECK(strstr(pending, "ssid=first\n") && !strstr(pending, "ssid=second\n"));
 }
@@ -240,9 +246,18 @@ static void disconnect_retry(void)
     expect_reply(0, "Disconnected.\n"); CHECK(disconnect_calls == 1);
 }
 
+static void perf_controls(void)
+{
+ start();request("power-save-off");CHECK(netd_wifi_control_poll(&runtime,10)==0);expect_reply(0,"OK\n");CHECK(ps_off==1);
+ ++fixture_request_id;request("power-save-on");CHECK(netd_wifi_control_poll(&runtime,11)==0);expect_reply(0,"OK\n");CHECK(ps_on==1);
+ power_error=1;++fixture_request_id;request("power-save-off");CHECK(netd_wifi_control_poll(&runtime,12)==0);expect_reply(-EIO,"");CHECK(ps_off==2);
+ ++fixture_request_id;request("tcp-buffers-large");CHECK(netd_wifi_control_poll(&runtime,13)==0);expect_reply(0,"large=1\n");CHECK(buffer_calls==1);
+ ++fixture_request_id;request("tcp-buffers-default");CHECK(netd_wifi_control_poll(&runtime,14)==0);expect_reply(0,"large=0\n");CHECK(buffer_calls==2);
+}
 int main(void)
 {
     const struct { const char *name; void (*run)(void); } cases[] = {
+        {"PS and buffer experiments preserve link state",perf_controls},
         {"startup status before session", startup_order},
         {"failed startup status preserves old session", startup_status_failure},
         {"SCAN reply retries without event/command replay", scan_reply_retry},

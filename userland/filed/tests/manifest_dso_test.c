@@ -78,7 +78,7 @@ static int segment(FILE *file,const char *path,const Elf64_Phdr *ph,unsigned phn
         KB2_FILESYSTEM_STATX_SIZE_OFFSET,&bytes,sizeof(bytes));
     filed_rx_manifest_t manifest={0};
     if (filed_rx_manifest_build(raw,length,offset,uuid,identity,
-            scanner,&manifest)) {
+            scanner,NULL,&manifest)) {
         free(raw);free(expected);return -1;
     }
     uint64_t hash_ns=0,apply_ns=0;

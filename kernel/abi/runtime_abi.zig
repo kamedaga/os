@@ -32,8 +32,13 @@ pub const syscall_futex_requeue: u64 = 38;
 // The updated word requires a writable ordinary-RAM VMA; device and legacy
 // bootstrap-only mappings without that retained backing authority fail MAP.
 pub const syscall_futex_wake_op: u64 = 39;
-pub const syscall_getrandom: u64 = 40;
-pub const syscall_power_control: u64 = 41;
+// Owner-aware mutex slowpath: RDI=word, RSI=operation, RDX=absolute CLOCK_MONOTONIC milliseconds
+// (zero=infinite), R10=key flags. Caller identity is derived by the kernel.
+// All admitted threads currently have the same scheduling priority. A future
+// unequal-priority policy must extend ownership inheritance before admission.
+pub const syscall_futex_pi: u64 = 40;
+pub const syscall_getrandom: u64 = 41;
+pub const syscall_power_control: u64 = 42;
 // GETRANDOM: flags must be zero, length <= 4096. Returns bytes written or
 // negative native status (INVALID=1, MAP=4); positive errors are not counts.
 pub const syscall_runtime_last: u64 = syscall_power_control;
@@ -114,6 +119,7 @@ test "runtime syscall range is contiguous" {
         syscall_futex_wake_wait,
         syscall_futex_requeue,
         syscall_futex_wake_op,
+        syscall_futex_pi,
         syscall_getrandom,
         syscall_power_control,
     };
@@ -122,3 +128,23 @@ test "runtime syscall range is contiguous" {
         try std.testing.expectEqual(syscall_runtime_first + @as(u64, @intCast(offset)), nr);
     }
 }
+
+// The native owner word permits atomic userspace acquire/release fastpaths.
+// Recovery-marked words and truly shared keys are not supported yet.
+pub const futex_pi_owner_mask: u32 = 0x3fffffff;
+pub const futex_pi_recovery: u32 = 0x40000000;
+pub const futex_pi_waiters: u32 = 0x80000000;
+pub const futex_pi_private_key: u64 = 1;
+pub const FutexPiOperation = enum(u64) { lock, try_lock, unlock };
+pub const FutexPiResult = enum(u64) {
+    acquired = 0,
+    invalid = 1,
+    interrupted_or_busy = 2,
+    allocation = 3,
+    bad_memory = 4,
+    timed_out = 5,
+    not_owner = 7,
+    deadlock = 8,
+    owner_missing = 9,
+    unsupported = 10,
+};
