@@ -80,5 +80,15 @@ int main(void)
     assert(locked.ranges==old && allocations==1);
     assert(!lpr_linux_munlock(0x2000,4096) && !allocations);
     assert(lpr_linux_mlock(UINT64_MAX,4096,UINT64_MAX)==-LPR_LINUX_EINVAL);
+    assert(!lpr_linux_mlock(0x2000,4096,4096));
+    unsigned allocation_before=allocations;
+    assert(lpr_mlock_madvise_begin(0x2000,4096)==-LPR_LINUX_EINVAL);
+    assert(!locked.lock && allocations==allocation_before);
+    assert(lpr_mlock_madvise_begin(0x2001,1)==-LPR_LINUX_EINVAL);
+    assert(lpr_mlock_madvise_begin(0xfffffffffffff000ull,4096)==-LPR_LINUX_EINVAL);
+    assert(!lpr_mlock_madvise_begin(0x4000,4096));
+    assert(locked.lock && allocations==allocation_before);lpr_mlock_vm_end();
+    assert(!lpr_mlock_madvise_begin(0x2000,0));lpr_mlock_vm_end();
+    assert(!lpr_linux_munlock(0x2000,4096));
     puts("mlock limits/overlap/split/unmap/fork and failed prefault/allocation PASS");
 }

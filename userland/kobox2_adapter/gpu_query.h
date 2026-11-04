@@ -57,6 +57,8 @@ int ph_gpu_query_dispatch(struct ph_gpu_query *query,
                           struct kobox_linux_drm_service *service,
                           uint64_t file_cookie,
                           struct kobox_linux_drm_file *file);
+int ph_gpu_query_attachment_error(struct ph_gpu_query *, int, struct kobox_linux_drm_service *,
+                                  int (*)(struct kobox_linux_drm_service *, uint64_t));
 int ph_gpu_query_publish_attachment(struct ph_gpu_query *query,
                                     struct ph_ipc *ipc);
 

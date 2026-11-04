@@ -14,6 +14,9 @@ typedef int64_t pacha_fd_t;
 #define lpr_memset memset
 static unsigned char page[4096];
 static void *allocation;
+static pacha_fd_t lpr_tty_wire_page_fd=20;
+static void *lpr_tty_wire_page=page;
+static int expected_reusable=1;
 static unsigned pages, frees, calls;
 static int fail_aux, call_error, bad_reply;
 static uint32_t expected_count;
@@ -24,7 +27,7 @@ static void lpr_destroy_tty_wire_page(pacha_fd_t fd,void *p)
 static void *lpr_gpud_drm_payload(void *p) { return p; }
 static int lpr_drm_aux_create(uint64_t bytes,int reusable,pacha_fd_t *fd,void **out,uint64_t *size)
 {
-    assert(!reusable && bytes && bytes<=18432);
+    assert(reusable==expected_reusable && bytes && bytes<=18432);
     if(fail_aux) return -12;
     allocation=malloc(bytes);assert(allocation);memset(allocation,0xcc,bytes);
     *fd=21;*out=allocation;*size=bytes;return 0;
@@ -51,7 +54,8 @@ static int64_t lpr_gpud_drm_call_transfer(uint64_t op,pacha_fd_t fd,void *p,
 int main(void) {
  struct extension {gpud_i915_user_extension_t base;uint32_t pad,count;uint64_t pointer;} e={0};
  uint32_t region=0;e.count=1;e.pointer=(uintptr_t)&region;
- for(unsigned n=0;n<2;++n)for(unsigned fail=0;fail<4;++fail) {
+ for(unsigned cached=0;cached<3;++cached)for(unsigned n=0;n<2;++n)for(unsigned fail=0;fail<4;++fail) {
+  expected_reusable=cached==1;lpr_tty_wire_page_fd=cached?20:99;lpr_tty_wire_page=cached==2?page+1:page;
   gpud_i915_create_ext_t input={.size=2097152,.handle=0xfeed,.extensions=n?(uintptr_t)&e:0};
   expected_count=n;call_error=fail==1?-12:0;bad_reply=fail>=2?fail-1:0;
   int64_t result=lpr_i915_create_ext_ioctl(42,(uintptr_t)&input);
@@ -59,6 +63,7 @@ int main(void) {
   assert(input.handle==(fail?0xfeedu:37u) && input.extensions==(n?(uintptr_t)&e:0));
   assert(!allocation && pages==frees);
  }
+ expected_reusable=1;lpr_tty_wire_page_fd=20;lpr_tty_wire_page=page;
  call_error=bad_reply=0;expected_count=1;
  gpud_i915_create_ext_t input={.size=2097152,.extensions=(uintptr_t)&e};unsigned before=calls;
  e.base.next=(uintptr_t)&e;assert(lpr_i915_create_ext_ioctl(42,(uintptr_t)&input)==-22);e.base.next=0;

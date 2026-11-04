@@ -2,6 +2,7 @@
 #include "broker.h"
 #include "escrow.h"
 #include "rights.h"
+#include <pacha/readiness.h>
 #include "pacha/ipc.h"
 #include "pacha/status.h"
 #include "filed/unix_path.h"
@@ -81,6 +82,13 @@ struct service_waiter {
     pacha_fd_t notify_fd;
 };
 
+struct service_readiness {
+    struct service_readiness *next;
+    uint64_t socket;
+    struct unix_poll_sequence sequence;
+    struct pacha_readiness *page;
+    pacha_fd_t fd;
+};
 struct service_path { struct service_path *next; uint64_t socket, hold; };
 struct service_handoff {
     struct service_handoff *next;
@@ -99,6 +107,7 @@ struct unix_service {
     int admin;
     int filed_path;
     struct service_path *paths;
+    struct service_readiness *readiness;
     struct service_handoff *handoffs;
     struct unix_session *handoff_roots;
     uint64_t next_handoff;
@@ -182,9 +191,25 @@ static int filed_path_call(struct unix_service *service, struct filed_unix_path 
     return status;
 }
 
+static void release_readiness(void *opaque, uint64_t socket)
+{
+    struct unix_service *service = opaque;
+    struct service_readiness **ready = &service->readiness;
+    while (*ready && (*ready)->socket != socket) ready = &(*ready)->next;
+    if (*ready) {
+        struct service_readiness *old = *ready;
+        *ready = old->next;
+        pacha_readiness_publish(old->page, 0x18u);
+        (void)pacha_munmap(old->page, PACHA_READINESS_BYTES);
+        (void)pacha_fd_close(old->fd);
+        free(old);
+    }
+}
+
 static void release_path(void *opaque, uint64_t socket)
 {
     struct unix_service *service = opaque;
+    release_readiness(opaque, socket);
     struct service_path **cursor = &service->paths;
     while (*cursor && (*cursor)->socket != socket) cursor = &(*cursor)->next;
     if (!*cursor) return;
@@ -549,9 +574,60 @@ static void drop_thread_waiters(struct unix_service *service, uint64_t owner)
     }
 }
 
+static void publish_readiness(struct unix_service *service, uint64_t socket)
+{
+    for (struct service_readiness *view = service->readiness; view; view = view->next) {
+        if (view->socket != socket) continue;
+        uint64_t ready;
+        struct unix_poll_sequence sequence;
+        if (unix_broker_listener_snapshot(service->broker, socket, &ready, &sequence)) return;
+        if (!view->page->sample || (uint32_t)(view->page->sample & PACHA_READINESS_MASK) != ready ||
+            memcmp(&view->sequence, &sequence, sizeof(sequence))) {
+            pacha_readiness_publish_events(view->page, (uint32_t)ready,
+                view->sequence.read != sequence.read ? 1u : 0);
+            view->sequence = sequence;
+        }
+        return;
+    }
+}
+
+static int export_readiness(struct unix_service *service, struct service_session *session,
+    uint64_t socket, struct response *response)
+{
+    struct unix_socket_diagnostic info;
+    int status = unix_broker_diagnose(service->broker, session->session, socket, &info);
+    if (status) return status;
+    if (!info.listening) return -EINVAL;
+    struct service_readiness *view;
+    for (view = service->readiness; view && view->socket != socket; view = view->next) {}
+    if (!view) {
+        status = admit(1);
+        if (status) return status;
+        view = calloc(1, sizeof(*view));
+        if (!view) return -ENOMEM;
+        view->fd = pacha_vmo_create(PACHA_READINESS_BYTES, UNIX_CAP_MEMORY, 0);
+        if (view->fd < 16) { free(view); return -ENOMEM; }
+        view->page = pacha_mmap(view->fd, PACHA_READINESS_BYTES,
+            PACHA_PROT_READ | PACHA_PROT_WRITE, PACHA_MMAP_SHARED, 0);
+        if (!view->page) { (void)pacha_fd_close(view->fd); free(view); return -ENOMEM; }
+        view->socket = socket;
+        view->page->identity = socket;
+        view->next = service->readiness;
+        service->readiness = view;
+        publish_readiness(service, socket);
+    }
+    append_cap(response, view->fd,
+        PACHA_FD_RIGHT_INSPECT | PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_MAP_READ, 0);
+    response->capabilities[response->count - 1].transfer_flags =
+        PACHA_IPC_TRANSFER_PRIVATE | PACHA_IPC_TRANSFER_CLOEXEC;
+    return 0;
+}
+
 static void notify_socket(void *context, uint64_t socket)
 {
     struct unix_service *service = context;
+    /* Publish before the existing sticky doorbell; arm/drain/recheck is safe. */
+    publish_readiness(service, socket);
     for (struct service_waiter *waiter = service->waiters; waiter; waiter = waiter->next) {
         for (struct service_watch *watch = waiter->watches; watch; watch = watch->next) {
             if (watch->socket != socket) continue;
@@ -876,6 +952,9 @@ static int dispatch(struct unix_service *service, struct service_session *sessio
         return unix_broker_name(service->broker, session->session, request->socket,
             request->argument != 0, &request->address);
     case UNIX_OP_POLL:
+        if (request->transaction == PACHA_READINESS_EXPORT)
+            return export_readiness(service, session, request->socket, response);
+        if (request->transaction) return -EINVAL;
         if (request->argument > UINT32_MAX) return -EINVAL;
         {
             int status = unix_broker_poll_sequence(service->broker, session->session,

@@ -5,6 +5,8 @@ const std = @import("std");
 const types = @import("types.zig");
 const refs = types.references;
 pub const enabled = if (@import("builtin").is_test) true else if (@hasDecl(@import("root"), "kernel_reference_checks_enabled")) @import("root").kernel_reference_checks_enabled else false;
+// Host performance fixtures disable only the pin scan oracle; production follows the existing reference-check option.
+pub const pin_oracle_enabled = enabled and (if (@import("builtin").is_test and @hasDecl(@import("root"), "kernel_pin_oracle_enabled")) @import("root").kernel_pin_oracle_enabled else true);
 pub const Error = error{ Missing, Target, Identity, Range, Allocation, Extra, BrokenLink, Duplicate, Count, Ownership, VmaMark };
 
 /// Stable-boundary checks also cover anonymous/logical entries without a VMO.
@@ -114,6 +116,56 @@ fn queue(self: anytype, q: *types.IpcQueue, identity: refs.Identity) Error!void 
 pub fn check(self: anytype) Error!void {
     var vmos = self.native_vmos.iterator();
     while (vmos.next()) |item| reset(&item.value.references);
+    // Independent source-table oracle: a missing alias cannot hide behind a
+    // matching reverse-edge list maintained by the same publication helper.
+    vmos = self.native_vmos.iterator();
+    while (vmos.next()) |item| {
+        const slot = item.value;
+        var expected: usize = 0;
+        for (0..self.process_capacity) |p| {
+            const table = self.vmaTableForProcessIndex(p) orelse continue;
+            var entries = table.entries.iterator();
+            while (entries.next()) |source| {
+                const entry = source.value;
+                if (!entry.active or entry.vmo.index != item.ref.index or entry.vmo.generation != item.ref.generation) continue;
+                expected += 1;
+                const pair = entry.references orelse return error.Missing;
+                var found = false;
+                var cursor = slot.vma_alias_head;
+                var visits: usize = 0;
+                while (cursor) |alias| : (cursor = alias.vmo_alias_next) {
+                    visits += 1;
+                    if (visits > slot.references.count) return error.Count;
+                    if (alias == pair) found = true;
+                }
+                if (!found) return error.Missing;
+            }
+        }
+        var previous: ?*types.VmaReferences = null;
+        var cursor = slot.vma_alias_head;
+        var actual: usize = 0;
+        while (cursor) |alias| : (cursor = alias.vmo_alias_next) {
+            actual += 1;
+            if (actual > expected or alias.vmo_alias_prev != previous or alias.vmo.target != &slot.references) return error.BrokenLink;
+            const entry = alias.entry orelse return error.Missing;
+            if (!entry.active or entry.references != alias or entry.vmo.index != item.ref.index or entry.vmo.generation != item.ref.generation) return error.Target;
+            previous = alias;
+        }
+        if (actual != expected) return error.Count;
+        var kernels: u32 = 0;
+        var edge = slot.references.head;
+        while (edge) |node| : (edge = node.next) if (node.identity.kind == .kernel) { kernels += 1; };
+        if (kernels != slot.kernel_edges) return error.Count;
+        var children: u32 = 0;
+        var all = self.native_vmos.iterator();
+        while (all.next()) |child| {
+            if (child.value.kind == .anonymous and std.meta.eql(child.value.backing.parent.ref, types.NativeVmoRef{ .index = item.ref.index, .generation = item.ref.generation })) children += 1;
+        }
+        if (children != slot.non_view_children) return error.Count;
+        if (slot.kind == .anonymous and slot.backing.parent.ref.isNull() and slot.has_page_store) try viewCounters(self, item.ref, slot);
+        if (slot.kind == .page_view and slot.has_page_store) try viewParentPages(self, slot);
+
+    }
     var cows = self.native_cow_tables.iterator();
     while (cows.next()) |item| reset(&item.value.references);
     var objects = self.fd_objects.iterator();
@@ -122,6 +174,13 @@ pub fn check(self: anytype) Error!void {
 
     for (0..self.process_capacity) |p| {
         const desc = self.processDescriptorSlotConst(p) orelse continue;
+        if (@import("../memory/user_vm.zig").getUserSpace(@enumFromInt(p))) |space| {
+            if (!space.thread_identity_vmo.isNull()) {
+                const vmo = self.nativeVmoSlot(space.thread_identity_vmo) orelse return error.Target;
+                try expect(&vmo.references, &space.thread_identity_reference,
+                    .{ .kind = .kernel, .owner = @intCast(p), .sequence = space.thread_identity_cookie }, .{});
+            }
+        }
         if (self.vmaTableForProcessIndex(p)) |table| {
             try vmaTable(table);
             for (0..table.active_count) |position| {
@@ -160,6 +219,7 @@ pub fn check(self: anytype) Error!void {
                 const desc = self.processDescriptorSlotConst(p) orelse return error.Identity;
                 const table = self.vmaTableForProcessIndex(p) orelse return error.Identity;
                 try expect(&table.pinned_objects, &slot.reference_state.?.payload_edge, .{ .kind = .pinned_object, .container = @intFromEnum(slot.kind), .owner = @intCast(p), .owner_generation = desc.generation, .index = item.ref.index, .generation = item.ref.generation }, .{ .start = payload.user_va, .size = payload.size });
+                if (!slot.reference_state.?.payload_edge.pin.linked) return error.Missing;
             },
             else => {},
         };
@@ -187,7 +247,13 @@ pub fn check(self: anytype) Error!void {
     while (cows.next()) |item| try finish(&item.value.references, item.value.ref_count);
     objects = self.fd_objects.iterator();
     while (objects.next()) |item| if (tracked(item.value.kind)) try finish(&item.value.reference_state.?.holders, item.value.ref_count);
-    for (0..self.process_capacity) |p| if (self.vmaTableForProcessIndex(p)) |table| try finish(&table.pinned_objects, null);
+    for (0..self.process_capacity) |p| if (self.vmaTableForProcessIndex(p)) |table| {
+        try finish(&table.pinned_objects, null);
+        var pins: usize = 0;
+        for (&table.pinned_index.trees) |*tree| pins += tree.count;
+        if (pins != table.pinned_objects.count) return error.Count;
+        if (@import("builtin").is_test) table.pinned_index.validate() catch return error.Range;
+    };
 }
 
 pub fn failure(err: anyerror) noreturn {
@@ -296,4 +362,68 @@ pub fn census(self: anytype, free: *types.FreePageList) Census {
 }
 pub fn report(value: Census) void {
     @import("../kernel_log.zig").writeFmt("reference-live free={} vmo={} cow={} object={} channel={} node={} record={} pair={} temporary={} storage-pages={} pending-pages={}\n", .{ value.free, value.vmos, value.cows, value.objects, value.channels, value.nodes, value.records, value.pairs, value.temporary, value.storage, value.pending });
+}
+
+// Recount from independently enumerated view records. No pair of Store locks
+// is held together; the caller's outer transaction excludes refresh/teardown.
+fn viewCounters(self: anytype, ref: anytype, parent: *types.NativeVmoSlot) Error!void {
+    var first: usize = 0;
+    var pages: [64]types.BackedPage = undefined;
+    while (first < parent.page_count) {
+        const count = types.snapshotVmoBackingPagesChecked(parent.page_store_start, parent.page_count, parent.page_store_owner, first, parent.page_count, &pages) catch return error.Ownership;
+        if (count == 0) break;
+        for (pages[0..count]) |page| {
+            var expected: u32 = 0;
+            var views = self.native_vmos.iterator();
+            while (views.next()) |item| {
+                const view = item.value;
+                if (view.kind != .page_view or view.backing.parent.ref.index != ref.index or view.backing.parent.ref.generation != ref.generation) continue;
+                var next: usize = 0;
+                var borrowed: [64]types.BackedPage = undefined;
+                while (next < view.page_count) {
+                    const n = types.snapshotVmoBackingPagesChecked(view.page_store_start, view.page_count, view.page_store_owner, next, view.page_count, &borrowed) catch return error.Ownership;
+                    if (n == 0) break;
+                    view.page_store.lock.lock();
+                    for (borrowed[0..n]) |entry| {
+                        const encoded = view.page_store.parentIndexLocked(entry.index);
+                        if (encoded == 0) { view.page_store.lock.unlock(); return error.Ownership; }
+                        if (encoded - 1 == page.index) {
+                            if (entry.paddr != page.paddr) { view.page_store.lock.unlock(); return error.Target; }
+                            expected += 1;
+                        }
+                    }
+                    view.page_store.lock.unlock();
+                    next = @as(usize, borrowed[n - 1].index) + 1;
+                }
+            }
+            parent.page_store.lock.lock();
+            const actual = parent.page_store.viewRefsLocked(page.index);
+            parent.page_store.lock.unlock();
+            if (actual != expected) return error.Count;
+        }
+        first = @as(usize, pages[count - 1].index) + 1;
+    }
+}
+
+fn viewParentPages(self: anytype, view: *types.NativeVmoSlot) Error!void {
+    const parent = self.nativeVmoSlot(view.backing.parent.ref) orelse return error.Target;
+    var first: usize = 0;
+    var pages: [64]types.BackedPage = undefined;
+    var indices: [64]u32 = undefined;
+    while (first < view.page_count) {
+        const n = types.snapshotVmoBackingPagesChecked(view.page_store_start, view.page_count, view.page_store_owner, first, view.page_count, &pages) catch return error.Ownership;
+        if (n == 0) break;
+        view.page_store.lock.lock();
+        for (pages[0..n], 0..) |page, i| indices[i] = view.page_store.parentIndexLocked(page.index);
+        view.page_store.lock.unlock();
+        parent.page_store.lock.lock();
+        for (pages[0..n], indices[0..n]) |page, encoded| {
+            if (encoded == 0 or encoded - 1 >= parent.page_count or parent.page_store.getLocked(encoded - 1) != page.paddr) {
+                parent.page_store.lock.unlock();
+                return error.Target;
+            }
+        }
+        parent.page_store.lock.unlock();
+        first = @as(usize, pages[n - 1].index) + 1;
+    }
 }

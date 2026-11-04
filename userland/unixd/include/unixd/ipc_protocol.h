@@ -33,7 +33,7 @@ enum unix_operation {
     UNIX_OP_ACCEPT = 9,
     UNIX_OP_NAME = 10,
     UNIX_OP_PEERCRED = 11, /* credentials=connection-time peer identity, no VMOs */
-    UNIX_OP_POLL = 12,
+    UNIX_OP_POLL = 12, /* transaction=1 exports listener RO readiness VMO once */
     UNIX_OP_PENDING = 13, /* result=next packet bytes; no capability transfer */
     UNIX_OP_ATTACH = 14,
     UNIX_OP_RETAIN = 15,

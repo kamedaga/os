@@ -230,15 +230,6 @@ pub fn fillRandomBytes(self: anytype, owner: PrincipalId, out: []u8) void {
     }
 }
 
-pub fn findRandomizedFreeUserMapVa(
-    self: anytype,
-    owner: PrincipalId,
-    size_bytes: u64,
-    purpose: u64,
-) KernelError!u64 {
-    return self.findFreeUserMapVa(owner, size_bytes, self.nextAslrWord(owner, purpose));
-}
-
 pub fn initPhase1InPlace(self: anytype) void {
     initializeStorageInPlace(self);
     self.initPrincipalState();

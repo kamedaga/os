@@ -15,6 +15,9 @@ static uint64_t test_counter(void);
 #define LPR_CLOCK_COUNTER() test_counter()
 #include "../userland/personality/linux/runtime/lpr_clock.c"
 
+/* Entry-leaf copy sites are exercised by lpr_clock_entry_unit; this fixture
+ * links only the C reader/copy path and supplies distinct recovery symbols. */
+unsigned char lpr_clock_entry_copy_seconds[1], lpr_clock_entry_copy_nanos[1], lpr_clock_entry_copy_bad[1];
 static unsigned opens, maps, closes;
 static int map_failure, open_failure;
 void lpr_state_lock(volatile uint32_t *word) { assert(!*word); *word = 1; }

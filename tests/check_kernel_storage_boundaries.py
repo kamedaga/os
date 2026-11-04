@@ -166,7 +166,15 @@ def thread_metadata_boundary(source):
         errors.append('thread metadata: reader/exclusion census changed; audit required')
     for name in names:
         expected_mentions = 1 + sum(row['calls'].get(name, 0) for row in expected.values())
-        if len(re.findall(r'\b' + name + r'\b', source)) != expected_mentions:
+        # function_body's declaration search sees the earlier
+        # runnableHandoffContextLocked call before its definition, so that
+        # helper's direct lookup is pinned lexically in addition to the reader
+        # census.  Word-vs-call equality still rejects aliases.
+        if name == 'threadContextLocked':
+            expected_mentions += 1
+        mentions = len(re.findall(r'\b' + name + r'\b', source))
+        calls = len(re.findall(r'\b' + name + r'\s*\(', source))
+        if mentions != expected_mentions or calls != mentions:
             errors.append(name + ': alias or lookup outside audited reader bodies')
     retry = function_body(source, 'snapshotThreadCapacityAndRetryReturns')
     sequence = ('thread_table.lock()', 'retryUnpublished()', 'reclaimRetiredAfterBorrowExclusion()', 'threadDirectory()')
@@ -358,7 +366,8 @@ def cpu_pin_boundary(files):
                    for path, text in files.items()
                    if re.search(r'\binitializeStaticStorage\b', without_tests(code_only(text)))}
     # uninterruptible wait's additional reset belongs to the compile-time host-only frontend fixture.
-    expected_reset = {'kernel/src/scheduler_connection.zig': 6, 'kernel/src/boot/entry.zig': 1,
+    expected_reset = {'kernel/src/scheduler_connection.zig': 9, 'kernel/src/boot/entry.zig': 1,
+                      'kernel/src/scheduler_test.zig': 1,
                       'kernel/src/syscalls.zig': 4, 'kernel/src/lock_diagnostics_scheduler_test.zig': 1}
     if 'comptime std.debug.assert(builtin.is_test);' not in function_body(production_source(files['kernel/src/scheduler_connection.zig']), 'testUninterruptibleWaitFrontendMatrix'):
         errors.append('CPU pin: uninterruptible wait frontend fixture must remain test-only')
@@ -488,11 +497,61 @@ def pmm_boundary(files):
         errors.append('PMM leaf has an owner/driver dependency or lost its shared error vocabulary')
     cache_source = without_tests(files['kernel/src/memory/reclaim_cache.zig'])
     imports = re.findall(r'@import\("([^"\n]+)"\)', cache_source)
-    if sorted(imports) != sorted(('std', 'owned_storage.zig', 'page_cache.zig')):
+    if sorted(imports) != sorted(('std', 'owned_storage.zig', 'page_cache.zig', 'discard_pages.zig', 'shared_discard_slots.zig')):
         errors.append('reclaim cache: owner/scheduler dependency')
+    # The newly registered discard domain must be as independent as the
+    # generic retired queue: no process/scheduler import or callback under its
+    # queue leaf, and no backing-store borrow may survive queue publication.
+    discard_source = without_tests(files['kernel/src/memory/discard_pages.zig'])
+    if sorted(re.findall(r'@import\("([^"\n]+)"\)', discard_source)) != sorted(('std', 'owned_storage.zig', 'vmo_backing.zig', 'page_cache.zig')):
+        errors.append('discard reclaim: owner/scheduler dependency')
+    discard = code_only(discard_source)
+    reclaim = function_body(discard, 'reclaim')
+    detach = ('var cursor = self.head;', 'self.head = null;', 'self.lock.unlock();', 'batch.return_data(batch.data_context, page.paddr)')
+    positions = [reclaim.find(token) for token in detach]
+    if min(positions) < 0 or positions != sorted(positions):
+        errors.append('discard reclaim: data callback before detached snapshot/leaf release')
+    push = function_body(discard, 'push')
+    if 'batch.store = .{};' not in push or push.index('batch.store = .{};') > push.index('self.head = batch;'):
+        errors.append('discard reclaim: queued batch retained a VMO borrow')
     registry = function_body(code_only(cache_source), 'reclaim')
     if 'domain.reclaim()' not in registry or any(x in registry for x in ('kernel_state_lock', 'reclaimFdCapabilities', '.boundary(', '.retire(')):
         errors.append('OOM may reclaim only detached physical grants')
+    # Shared pressure reclaim must win ownership before reading detached PAs.
+    slots_source = without_tests(files['kernel/src/memory/shared_discard_slots.zig'])
+    slots = code_only(slots_source)
+    if re.findall(r'@import\("([^"\n]+)"\)', slots_source) != ['std'] or any(
+            token in slots for token in ('.lock(', '.unlock(', 'store:', 'store =', 'allocator', 'alloc(', '@ptrFromInt')):
+        errors.append('shared discard reclaim: owner borrow, allocation or leaf callback')
+    cas = '@cmpxchgStrong(State, &slot.state, .filled, .draining, .acquire, .monotonic)'
+    for name in ('claim', 'reclaim'):
+        body = function_body(slots, name)
+        call = 'self.drain(slot)'
+        if (cas not in body or call not in body or body.index(cas) > body.index(call) or
+                'slot.pages' in body or 'slot.count' in body or '!= null) continue;' not in body):
+            errors.append('shared discard reclaim: CAS must exclude payload readers')
+    drain = function_body(slots, 'drain')
+    ordered = ('const count = slot.count;', 'if (count > capacity)', 'std.mem.sort(',
+               'pa & 4095', 'self.return_run(', 'slot.count = 0;',
+               '@atomicStore(State, &slot.state, .free, .release)')
+    positions = [drain.find(token) for token in ordered]
+    if min(positions) < 0 or positions != sorted(positions) or 'pages[i - 1] >= pa' not in drain:
+        errors.append('shared discard reclaim: validate and return before release reuse')
+    if ('@atomicStore(State, &self.state, .filled, .release)' not in slots or
+            'list.appendContiguousRange(start, count) catch @panic(' not in slots or
+            slots.count('self.drain(slot)') != 2):
+        errors.append('shared discard reclaim: publication or PMM failure contract')
+    producer = function_body(code_only(files['kernel/src/state/shared_discard.zig']), 'discard')
+    if ('reclaim.global.claim() orelse return error.NotReady' not in producer or
+            producer.index('reclaim.global.claim()') > producer.index('slot.page_store.lock.lock()') or
+            producer.index('reclaim.global.claim()') > producer.index('vm.withdrawSharedDiscardRange(')):
+        errors.append('shared discard reclaim: claim before mutation and outside store leaf')
+    boot = code_only(files['kernel/src/boot/entry.zig'])
+    exit_body = function_body(files['kernel/src/syscalls.zig'], 'reclaimDiscardAfterExit')
+    if ('shared_retired.init(smp.cpuCount(), kernel_runtime.global_free_list)' not in boot or
+            'reclaimable.shared_discard_retired = shared_retired' not in boot or
+            'self.shared_discard_retired' not in registry or 'memory/shared_discard_slots.zig' not in exit_body):
+        errors.append('shared discard reclaim: boot, exit or OOM registration missing')
     queue = code_only(files['kernel/src/memory/owned_storage.zig']).split('pub const RetiredQueue = struct {')[1].split('pub fn requiredPages')[0]
     reclaim_queue = function_body(queue, 'reclaim')
     if ('allocator.returnRecord(record, extent)' not in reclaim_queue or
@@ -581,6 +640,8 @@ def vmo_storage_boundary(files):
     compact = lambda text: re.sub(r'\s+', '', text)
     ensure = compact(function_body(source, 'ensureLocked'))
     release = compact(function_body(source, 'release'))
+    grant_release = compact(function_body(source, 'releaseGrant'))
+    deferred = compact(function_body(source, 'reclaimDeferred'))
     retry = compact(function_body(source, 'reclaim'))
     clear = compact(function_body(source, 'clear'))
     required = ('self.lock.unlock();vardraft=reservePath(missing,allocator)',
@@ -600,9 +661,14 @@ def vmo_storage_boundary(files):
     if any(token not in fault for token in fault_required):
         errors.append('VMO fault resolution must keep parent/allocation/return outside owner lock and revalidate publication')
     if ('constallocator=p.allocator;' not in release or 'constgrant=p.grant;' not in release or
-        'allocator.release(allocator.context,grant)' not in release or
+        'if(releaseGrant(allocator,grant))return;' not in release or
+        'if(!allocator.release(allocator.context,grant))returnfalse;' not in grant_release or
         'pending_lock.lock();p.next=pending;pending=p;' not in release):
         errors.append('VMO return must preserve original issuer/grant and retain failed pages')
+    if ('deferred_lock.unlock(irq);while(list)|p|{' not in deferred or
+        'constnext=p.next;constallocator=p.allocator;constgrant=p.grant;' not in deferred or
+        'if(!releaseGrant(allocator,grant))enqueueDeferred(p);list=next;' not in deferred):
+        errors.append('VMO deferred retry must use a finite unlocked snapshot and queue-neutral return')
     if 'while(list)|p|{list=p.next;release(p);}' not in retry:
         errors.append('VMO finite pending retry must save next before return')
     if 'self.root=null;' not in clear or 'self.lock.unlock();if(root)|node|self.destroyNode(node,0);' not in clear:
@@ -705,10 +771,16 @@ def as_directory_boundary(files):
             errors.append(other + ': unaudited stable-append caller/alias')
         constructors = {
             path: 1, 'kernel/src/boot/entry.zig': 1,
-            'kernel/src/mmio_overlay_test.zig': 1,
+            'kernel/src/mmio_overlay_test.zig': 1, 'kernel/src/vm_query_test.zig': 1,
         }
         if len(re.findall(r'\binitializeFreshStorage\b', production)) != constructors.get(other, 0):
             errors.append(other + ': AS fresh-construction caller/alias census changed')
+    fixture = function_body(files['kernel/src/vm_query_test.zig'], 'run')
+    # Comments cannot establish admission; bind the masked code span back to
+    # the real builtin import so a same-named foreign module cannot pass.
+    guard = re.search(r'comptime\s+std\.debug\.assert\(@import\(\s*\)\.is_test\);', code_only(fixture))
+    if guard is None or not re.fullmatch(r'comptime\s+std\.debug\.assert\(@import\("builtin"\)\.is_test\);', fixture[guard.start():guard.end()]):
+        errors.append('AS query fixture escaped host-only construction')
     return errors
 
 
@@ -902,7 +974,7 @@ def fd_storage_boundary(files):
         nr == runtime_abi.syscall_clock_getres or nr == runtime_abi.syscall_yield or
         nr == runtime_abi.syscall_nanosleep or nr == runtime_abi.syscall_futex_wait or
         nr == runtime_abi.syscall_futex_wake or nr == runtime_abi.syscall_futex_wake_wait or
-        nr == runtime_abi.syscall_futex_requeue) return false;
+        nr == runtime_abi.syscall_futex_requeue or nr == runtime_abi.syscall_futex_wake_op) return false;
         if (nr == fd_abi.syscall_vmo_revoke) return true;
         return process_abi.isProcessSyscall(nr) or
         (nr >= pager_abi.syscall_pager_port_create and nr <= pager_abi.syscall_pager_fail) or
@@ -1047,6 +1119,10 @@ def without_profile_stages(code):
     """Drop comptime-gated lock_profile stage statements from whitespace-free
     code, then unwrap the bare blocks that only scoped their samples. Braces
     owned by if/while/defer/else are kept because they follow a token."""
+    # DMA exit attribution is diagnostic-only too. Match the entire reviewed
+    # comptime envelope; an unconditional stage call or lock drop remains code.
+    code = code.replace('constdma_sample:lock_profile.OptionalToken=if(comptimelock_profile.enabled)(if(dma_retire)lock_profile.stageBegin()else.{})else{};', '')
+    code = code.replace('if(comptimelock_profile.enabled){if(dma_retire)lock_profile.stageEnd(.dma_exit_retire,dma_sample);}', '')
     code = re.sub(r'const\w+=if\(comptimelock_profile\.enabled\)lock_profile\.stageBegin\(\)else\{\};', '', code)
     code = re.sub(r'if\(comptimelock_profile\.enabled\)lock_profile\.stageEnd\([^;]*\);', '', code)
     index = 0
@@ -1369,6 +1445,9 @@ def main():
         # MmioRetirementFixture.start allocates a fresh KernelState; end destroys that same
         # allocation. It never uses the constructor to reset a live owner.
         'kernel/src/mmio_overlay_test.zig': Counter(initFromDetectedRegionsInPlace=2),
+        # Platform Fixture.init creates fresh heap state; deinit closes each
+        # process FD table and deinitializes pools before freeing that state.
+        'kernel/src/platform_device_test.zig': Counter(initFromDetectedRegionsInPlace=1),
         'tests/kernel_state.zig': Counter(initFromDetectedRegionsInPlace=2),
         'tests/fd_ipc_minimal.zig': Counter(initFromDetectedRegionsInPlace=1),
     }
@@ -1522,6 +1601,14 @@ def main():
         changed['kernel/src/legacy_endpoint_bypass.zig'] = injection
         assert legacy_endpoint_boundary(changed)
     assert not as_directory_boundary(files), as_directory_boundary(files)
+    for replacement in ('', '// comptime std.debug.assert(@import("builtin").is_test);',
+                        'comptime std.debug.assert(@import("fake_builtin").is_test);'):
+        changed = dict(files)
+        changed['kernel/src/vm_query_test.zig'] = changed['kernel/src/vm_query_test.zig'].replace('comptime std.debug.assert(@import("builtin").is_test);', replacement)
+        assert as_directory_boundary(changed), 'AS query fixture lost actual builtin host-only guard'
+    changed = dict(files)
+    changed['kernel/src/syscalls.zig'] = changed['kernel/src/syscalls.zig'].replace('if (dma_retire) lock_profile.stageEnd(.dma_exit_retire, dma_sample);', 'kernel_state_lock.unlock(); if (dma_retire) lock_profile.stageEnd(.dma_exit_retire, dma_sample);')
+    assert pending_data_return_boundary(changed), 'profile envelope hid a K unlock'
     assert not vma_directory_boundary(files), vma_directory_boundary(files)
     assert not descriptor_boundary(files), descriptor_boundary(files)
     changed = dict(files)
@@ -1736,6 +1823,26 @@ def main():
         changed[path] = changed[path].replace(old, new)
         assert pmm_boundary(changed), ('reclaim cache', old)
 
+    for old, new in (
+            ('const std = @import("std");', 'const std = @import("../kernel.zig");'),
+            ('self.lock.unlock();', ''),
+            ('batch.store = .{};', '')):
+        changed = dict(files)
+        path = 'kernel/src/memory/discard_pages.zig'
+        assert old in changed[path]
+        changed[path] = changed[path].replace(old, new)
+        assert pmm_boundary(changed), ('discard reclaim', old)
+    for old, new in (
+            ('if (@cmpxchgStrong(State, &slot.state, .filled, .draining, .acquire, .monotonic) != null) continue;',
+             'if (slot.pages[0] == 0) continue;'),
+            ('count: usize = 0,', 'count: usize = 0, store: ?*anyopaque = null,'),
+            ('self.return_run(self.context, pages[first], end - first);',
+             'self.lock.lock(); self.return_run(self.context, pages[first], end - first);')):
+        changed = dict(files)
+        path = 'kernel/src/memory/shared_discard_slots.zig'
+        assert old in changed[path]
+        changed[path] = changed[path].replace(old, new)
+        assert pmm_boundary(changed), ('shared discard reclaim', old)
     assert not vmo_storage_boundary(files), vmo_storage_boundary(files)
     for old, new in (
             ('const valid = self.matches(ref, ref.owner);', 'const valid = true;'),
@@ -1743,6 +1850,9 @@ def main():
             ('self.lock.unlock();\n            if (has_parent)', 'if (has_parent)'),
             ('const allocator = p.allocator;', 'const allocator = other;'),
             ('const grant = p.grant;', 'const grant = other;'),
+            ('if (releaseGrant(allocator, grant)) return;', 'if (true) return;'),
+            ('if (!allocator.release(allocator.context, grant)) return false;', 'if (false) return false;'),
+            ('if (!releaseGrant(allocator, grant)) enqueueDeferred(p);', 'release(p);'),
             ('pending = p;', 'pending = null;'),
             ('list = p.next;', 'list = null;'),
             ('self.root = null;', 'self.owner = 0;')):

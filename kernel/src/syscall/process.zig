@@ -183,6 +183,13 @@ fn writeProtectForkCowVmas(state: *kernel.KernelState, from: kernel.PrincipalId)
         const source_entry = (source_table.entries.get(@intCast(entry_index)).?);
         if (!source_entry.active) continue;
         if (!source_entry.flags.fork_cow and !kernel.KernelState.forkCowEligible(source_entry)) continue;
+        if (comptime @import("builtin").is_test) {
+            if (ForkPreparationTest.fail_parent_wp_after) |remaining| {
+                if (remaining == 0) return sc.syscall_err_map;
+                ForkPreparationTest.fail_parent_wp_after = remaining - 1;
+            }
+        }
+        if (comptime ForkProfile.enabled) ForkProfile.add(.cow_vmas, 1);
         if (!user_vm.writeProtectPresentUserPagesForForkCow(from, source_entry.start_va, source_entry.size_bytes)) {
             return sc.syscall_err_map;
         }
@@ -267,6 +274,7 @@ fn cleanupProcess(h: anytype, state: *kernel.KernelState, principal: kernel.Prin
     fd_syscall.closeProcessFdsWithWakes(h, state, principal, false);
     if (!user_vm.lockVmTransaction(principal)) return;
     user_vm.clearUserAddressSpace(principal);
+    if (user_vm.getUserSpace(principal)) |space| @import("../thread_identity.zig").retire(state, space, h.free_list);
     state.releasePrincipalNativeMemory(principal, h.free_list);
     state.resetProcessRuntimeTables(process_index);
     user_vm.retireUserAddressSpace(principal);
@@ -408,7 +416,59 @@ fn addressSpacePreparationStatus(err: error{ OutOfFreePages, InvalidState }) u64
     };
 }
 
+const ForkProfile = user_copy.ForkProfile;
+const ForkStage = enum { validation, descriptor, empty_as, fd, thread_handle, vm_lock, vma, as_metadata, cow_commit, parent_wp, vm_unlock, child_publish, cleanup };
+const ForkSample = struct {
+    id: u64, owner: u32, tid: usize, cpu: usize, start: u64, last: u64,
+    stage: ForkStage = .validation, phases: [16]u64 = @splat(0),
+    before: ForkProfile.Row, fd_capacity: usize = 0, vmas: usize = 0,
+    ok: bool = false, valid: bool = true,
+    fn init(owner: kernel.PrincipalId) @This() {
+        const now = ForkProfile.stamp();
+        return .{ .id = ForkProfile.nextReport(), .owner = @intFromEnum(owner), .tid = scheduler.currentThread() + 1, .cpu = ForkProfile.cpu(), .start = now, .last = now, .before = ForkProfile.snapshot() };
+    }
+    fn mark(self: *@This(), next: ForkStage) void {
+        const now = ForkProfile.stamp();
+        if (now < self.last or ForkProfile.cpu() != self.cpu) {
+            self.valid = false;
+        } else {
+            const sum = @addWithOverflow(self.phases[@intFromEnum(self.stage)], now - self.last);
+            if (sum[1] != 0) self.valid = false;
+            self.phases[@intFromEnum(self.stage)] = if (sum[1] != 0) std.math.maxInt(u64) else sum[0];
+        }
+        self.last = now; self.stage = next;
+    }
+    fn finish(self: *@This()) void {
+        self.mark(self.stage);
+        const end = self.last;
+        const diff = ForkProfile.difference(self.before, ForkProfile.snapshot());
+        self.valid = self.valid and diff != null and self.cpu < 64;
+        if (self.id == 257) { kernel_log.writeProfileFmt("mc-k1 DROP id=257 capacity=256\n", .{}); return; }
+        if (self.id == 0 or self.id > 256) return;
+        const counters = diff orelse @as(ForkProfile.Row, @splat(0));
+        // No VM/shared/X lock or unpublished-child cleanup remains here.
+        // Ring-only output is bounded and deliberately excluded from ticks;
+        // native20's outer wall still includes it and measures that overhead.
+        kernel_log.writeProfileFmt("mc-k1 BEGIN id={} owner={} tid={} cpu={} start={} end={} ok={} valid={}\n", .{ self.id, self.owner, self.tid, self.cpu, self.start, end, @intFromBool(self.ok), @intFromBool(self.valid) });
+        kernel_log.writeProfileFmt("mc-k1 shape id={} fd_capacity={} vmas={} sample_bytes={} counters_bytes={}\n", .{ self.id, self.fd_capacity, self.vmas, @sizeOf(@This()), @sizeOf(ForkProfile.Row) * 64 });
+        var base: usize = 0;
+        while (base < 16) : (base += 4) {
+            const v = self.phases[base..][0..4];
+            kernel_log.writeProfileFmt("mc-k1 phase id={} base={} {} {} {} {}\n", .{ self.id, base, v[0],v[1],v[2],v[3] });
+        }
+        base = 0;
+        while (base < 24) : (base += 4) {
+            const v = counters[base..][0..4];
+            kernel_log.writeProfileFmt("mc-k1 counter id={} base={} {} {} {} {}\n", .{ self.id, base, v[0],v[1],v[2],v[3] });
+        }
+        kernel_log.writeProfileFmt("mc-k1 END id={}\n", .{self.id});
+    }
+};
+
 fn cloneCurrentProcessForFork(comptime Scheduler: type, h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, frame: *TrapFrame) u64 {
+    var fork_sample: if (ForkProfile.enabled) ForkSample else void = if (ForkProfile.enabled) ForkSample.init(proc) else {};
+    defer if (comptime ForkProfile.enabled) fork_sample.finish();
+
     const rights = kernel.fdRightsFromBits(frame.rdi);
     if ((frame.rsi & ~process_abi.process_clone_known_flags_mask) != 0) return sc.syscall_err_invalid;
     if ((frame.rsi & process_abi.process_clone_flag_current_thread) == 0) return sc.syscall_err_invalid;
@@ -429,6 +489,7 @@ fn cloneCurrentProcessForFork(comptime Scheduler: type, h: anytype, state: *kern
         break :blk copied;
     };
 
+    if (comptime ForkProfile.enabled) fork_sample.mark(.descriptor);
     const child = state.createProcessDescriptorWithUserAddressSpaceChecked(
         "fd-process-clone",
         h.free_list,
@@ -437,6 +498,7 @@ fn cloneCurrentProcessForFork(comptime Scheduler: type, h: anytype, state: *kern
     ) orelse return reportForkFailure("process_descriptor", sc.syscall_err_alloc);
     var child_active = true;
     defer if (child_active) {
+        if (comptime ForkProfile.enabled) fork_sample.mark(.cleanup);
         if (kernel.processIndexFromPrincipal(child)) |child_index| cleanup: {
             if (!user_vm.lockVmTransaction(child)) break :cleanup;
             defer user_vm.unlockVmTransaction(child);
@@ -447,9 +509,12 @@ fn cloneCurrentProcessForFork(comptime Scheduler: type, h: anytype, state: *kern
         _ = state.removeProcessDescriptor(child);
     };
 
+    if (comptime ForkProfile.enabled) fork_sample.mark(.empty_as);
     user_vm.buildEmptyUserAddressSpace(child) catch |err|
         return reportForkFailure("address_space", addressSpacePreparationStatus(err));
+    if (comptime ForkProfile.enabled) fork_sample.mark(.fd);
     const source_table = state.getFdTableConst(proc) orelse return sc.syscall_err_invalid;
+    if (comptime ForkProfile.enabled) fork_sample.fd_capacity = source_table.capacity;
     state.ensureFdTableCapacity(child, source_table.capacity, h.free_list) catch
         return reportForkFailure("fd_table_capacity", sc.syscall_err_alloc);
     state.cloneFdTableForFork(proc, child) catch |err| return switch (err) {
@@ -460,12 +525,14 @@ fn cloneCurrentProcessForFork(comptime Scheduler: type, h: anytype, state: *kern
     // Allocate every remaining fallible resource before committing parent
     // VM metadata.  The child remains suspended and its process FD cannot be
     // observed until this syscall returns.
+    if (comptime ForkProfile.enabled) fork_sample.mark(.thread_handle);
     const allocated = Scheduler.allocateSuspendedThread(child, h.user_spaces, child_frame, h.free_list) orelse
         return reportForkFailure("thread", sc.syscall_err_alloc);
     const thread_index = allocated.index;
     var thread_active = true;
     defer {
         if (thread_active) {
+            if (comptime ForkProfile.enabled) fork_sample.mark(.cleanup);
             _ = Scheduler.releaseThreadGeneration(thread_index, allocated.generation, child);
         }
     }
@@ -484,17 +551,24 @@ fn cloneCurrentProcessForFork(comptime Scheduler: type, h: anytype, state: *kern
         else => sc.syscall_err_invalid,
     };
     var process_fd_active = true;
-    defer if (process_fd_active)
+    defer if (process_fd_active) {
+        if (comptime ForkProfile.enabled) fork_sample.mark(.cleanup);
         state.closeFdWithFreeList(proc, process_fd, h.free_list) catch {};
+    };
 
     // VMA metadata and the shared native-COW pool form one VM transaction.
     // Pair locking keeps the parent/child page-table handoff atomic while the
     // shared-object lock protects cross-address-space VMO/COW state.
     {
+        if (comptime ForkProfile.enabled) fork_sample.mark(.vm_lock);
         if (!user_vm.lockVmTransactionPair(proc, child)) {
             return reportForkFailure("vm_lock", sc.syscall_err_map);
         }
         defer user_vm.unlockVmTransactionPair(proc, child);
+        if (comptime ForkProfile.enabled) {
+            fork_sample.mark(.vma);
+            fork_sample.vmas = if (state.getVmaTable(proc)) |table| table.active_count else 0;
+        }
         state.cloneVmaTableForFork(proc, child) catch |err| return switch (err) {
             kernel.KernelError.TableFull, kernel.KernelError.OutOfFreePages => reportForkFailure("vma_table", sc.syscall_err_alloc),
             else => sc.syscall_err_invalid,
@@ -503,9 +577,12 @@ fn cloneCurrentProcessForFork(comptime Scheduler: type, h: anytype, state: *kern
         // the parent.  Marking every eligible parent VMA COW before the first
         // write-protect makes even a partially failed PTE pass recoverable:
         // any resulting RO page takes the normal COW write-fault path.
+        if (comptime ForkProfile.enabled) fork_sample.mark(.as_metadata);
         user_vm.cloneAddressSpaceMetadataForFork(proc, child) catch |err|
             return reportForkFailure("page_table_clone", addressSpacePreparationStatus(err));
+        if (comptime ForkProfile.enabled) fork_sample.mark(.cow_commit);
         state.markForkCowVmasCommitted(proc);
+        if (comptime ForkProfile.enabled) fork_sample.mark(.parent_wp);
         const protect_status = writeProtectForkCowVmas(state, proc);
         if (protect_status != sc.syscall_ok) {
             return reportForkFailure("parent_write_protect", protect_status);
@@ -515,10 +592,12 @@ fn cloneCurrentProcessForFork(comptime Scheduler: type, h: anytype, state: *kern
         // above. Detach on the first write, after invalidating that writer's
         // entire VMA, rather than copying all dirty pages before fork returns.
         // In particular, fork followed by exec need not copy untouched heaps.
+        if (comptime ForkProfile.enabled) fork_sample.mark(.vm_unlock);
     }
     // Publish the child to the scheduler only after the parent has a durable
     // process handle.  Before this point every rollback can release a
     // suspended context without racing an AP that already entered the child.
+    if (comptime ForkProfile.enabled) fork_sample.mark(.child_publish);
     if (!Scheduler.markThreadReadyGeneration(thread_index, allocated.generation, child, true)) {
         return sc.syscall_err_not_ready;
     }
@@ -526,12 +605,14 @@ fn cloneCurrentProcessForFork(comptime Scheduler: type, h: anytype, state: *kern
     thread_active = false;
     child_active = false;
 
+    if (comptime ForkProfile.enabled) fork_sample.ok = true;
     return process_fd;
 }
 
 // Host tests replace only privileged/lifecycle boundaries. Resource ownership,
 // syscall status and rollback execute the production transaction above.
 pub const ForkPreparationTest = if (@import("builtin").is_test) struct {
+    pub var fail_parent_wp_after: ?usize = null;
     pub fn run(comptime Scheduler: type, h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, frame: *TrapFrame) u64 {
         return cloneCurrentProcessForFork(Scheduler, h, state, proc, frame);
     }
@@ -1160,7 +1241,6 @@ fn installProcessMapLocked(
     state: *kernel.KernelState,
     proc: kernel.PrincipalId,
     free_list: *kernel.FreePageList,
-    process_fd: kernel.Fd,
     target_owner: kernel.PrincipalId,
     req: ProcessMapRequest,
 ) ProcessMapInstallResult {
@@ -1192,14 +1272,13 @@ fn installProcessMapLocked(
     }
     const anywhere = target_va == process_abi.process_map_anywhere_va;
     if (anywhere) {
-        const purpose = 0x5052_4f43_4d41_5000 ^ scheduler.lapic_tick_count ^ (@as(u64, process_fd) << 32) ^ @as(u64, req.vmo_fd);
-        target_va = state.findRandomizedFreeUserMapVa(target_owner, req.aligned_size, purpose) catch |err| switch (err) {
+        target_va = state.findFreeUserMapVa(target_owner, req.aligned_size) catch |err| switch (err) {
             kernel.KernelError.TableFull => {
-                kernel_log.write("process.map failed aslr-full\n");
+                kernel_log.write("process.map failed placement-full\n");
                 return .{ .status = sc.syscall_err_alloc };
             },
             else => {
-                kernel_log.write("process.map failed aslr\n");
+                kernel_log.write("process.map failed placement\n");
                 return .{ .status = sc.syscall_err_map };
             },
         };
@@ -1236,6 +1315,13 @@ fn installProcessMapLocked(
             return .{ .status = sc.syscall_err_invalid };
         },
     };
+
+    // Same non-inheritance rule as MMAP: fault installs PTEs without a
+    // linear reservation. This also covers self PROCESS_MAP/BATCH admission.
+    if (state.nativeVmoRefForFd(proc, req.vmo_fd)) |ref| {
+        if (state.nativeVmoSlotConst(ref).?.kind == .thread_page)
+            return .{ .status = sc.syscall_ok, .mapped_va = target_va };
+    }
 
     if (req.flags.private and !req.flags.shared) {
         return .{ .status = sc.syscall_ok, .mapped_va = target_va };
@@ -1295,7 +1381,7 @@ fn mapIntoProcess(
     }
     if (!user_vm.lockVmTransactionPair(proc, target_owner)) return sc.syscall_err_invalid;
     defer user_vm.unlockVmTransactionPair(proc, target_owner);
-    const installed = installProcessMapLocked(state, proc, free_list, process_fd, target_owner, prepared.request);
+    const installed = installProcessMapLocked(state, proc, free_list, target_owner, prepared.request);
     return if (installed.status == sc.syscall_ok) installed.mapped_va else installed.status;
 }
 
@@ -1388,7 +1474,7 @@ fn mapBatchIntoProcess(
     var mapped_count: usize = 0;
     i = 0;
     while (i < entry_count) : (i += 1) {
-        const installed = installProcessMapLocked(state, proc, free_list, process_fd, target_owner, requests[i]);
+        const installed = installProcessMapLocked(state, proc, free_list, target_owner, requests[i]);
         if (installed.status != sc.syscall_ok) {
             while (mapped_count > 0) {
                 mapped_count -= 1;
@@ -1469,6 +1555,13 @@ fn execFromStagedProcess(
 // a blocked thread is not proof that its old translations have been retired.
 fn transferStagedVmasForExec(state: *kernel.KernelState, free_list: *kernel.FreePageList, proc: kernel.PrincipalId, staged_owner: kernel.PrincipalId) void {
     user_vm.clearUserAddressSpace(staged_owner);
+    // Both roots have now retired their old translations. Single-thread
+    // exec cannot wait for its own live thread to disappear; publication is
+    // withdrawn in the no-fail PT commit and the current context is rebound
+    // below before user return. Neither source nor destination page survives.
+    if (user_vm.getUserSpace(proc)) |space| @import("../thread_identity.zig").retire(state, space, free_list);
+    if (user_vm.getUserSpace(staged_owner)) |space| @import("../thread_identity.zig").retire(state, space, free_list);
+    state.dropThreadIdentityVmasForExec(staged_owner, free_list);
     state.replaceVmaTableForExec(proc, staged_owner, free_list) catch unreachable;
 }
 

@@ -1,3 +1,4 @@
+#include "lpr_futex_wake.h"
 #include "lpr_clock.h"
 #include "lpr_linux_syscall.h"
 #include "lpr_filed_internal.h"
@@ -2664,6 +2665,22 @@ static int64_t lpr_sys_mremap(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3
 static int64_t lpr_sys_madvise(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused)))
 {
     (void)a3; (void)a4; (void)a5;
+    /* There is no THP promotion or Linux core writer here. NOHUGEPAGE and
+     * DONTDUMP already have their requested effect; use native NORMAL only
+     * for its atomic coverage/alignment check, never unconditional success.
+     * Introducing either facility requires preserving those VMA attributes. */
+    /* With no core writer, both excluding and re-including pages already
+     * have their requested observable effect. Keep the native coverage and
+     * alignment check: accepting a hint must not hide invalid ranges. */
+    if (a2==15 || a2==16 || a2==17) a2=0;
+    if (a2==4 || a2==8) {
+        const int64_t locked=lpr_mlock_madvise_begin(a0,a1);
+        if (locked) return locked;
+        const int64_t result=pacha_kernel_status_to_errno(
+            lpr_pacha_syscall3(PACHA_VM_SYSCALL_MADVISE,a0,a1,a2));
+        lpr_mlock_vm_end();
+        return result;
+    }
     return pacha_kernel_status_to_errno(lpr_pacha_syscall3(PACHA_VM_SYSCALL_MADVISE, a0, a1, a2));
 }
 static int64_t lpr_mprotect_native_range(uint64_t address, uint64_t length, uint64_t prot)
@@ -2818,7 +2835,7 @@ static int64_t lpr_sys_statfs(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3
 static int64_t lpr_sys_fstatfs(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_fstatfs(a0, a1); }
 static int64_t lpr_sys_fsync(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_fsync(a0); }
 static int64_t lpr_sys_ftruncate(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_ftruncate(a0, a1); }
-static int64_t lpr_sys_fallocate(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a0; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; return -LPR_LINUX_EOPNOTSUPP; }
+static int64_t lpr_sys_fallocate(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a4; (void)a5; return lpr_linux_fallocate(a0, (uint64_t)(int64_t)(int32_t)a1, a2, a3); }
 static int64_t lpr_sys_sync(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a0; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_sync(); }
 static int64_t lpr_sys_reboot(uint64_t magic1, uint64_t magic2, uint64_t command,
     uint64_t arg, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused)))
@@ -3026,10 +3043,8 @@ static int64_t lpr_sys_futex(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
     if (command == LPR_LINUX_FUTEX_WAKE) {
         /* Counts overlap positive native statuses. Mixed PI/ordinary domain
          * errors use negative native statuses; translate only that half. */
-        const int64_t result = lpr_pacha_syscall2(
-            PACHAOS_SYSCALL_FUTEX_WAKE,
-            a0,
-            a2);
+        const int64_t result = lpr_futex_wake_native(a0, a2, flags,
+            lpr_pacha_syscall2, lpr_pacha_syscall4);
         return result < 0 ? lpr_linux_pacha_status_to_errno(result) : result;
     }
     if (command == LPR_LINUX_FUTEX_REQUEUE) {
@@ -3607,7 +3622,7 @@ static int64_t lpr_sys_membarrier(uint64_t a0, uint64_t a1, uint64_t a2, uint64_
     }
 }
 static int64_t lpr_sys_fcntl(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a3; (void)a4; (void)a5; return lpr_linux_socket_fd_active(a0) ? lpr_linux_socket_fcntl(a0, a1, a2) : lpr_linux_fcntl(a0, a1, a2); }
-static int64_t lpr_sys_flock(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_flock(a0, a1); }
+static int64_t lpr_sys_flock(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_flock(a0, (uint32_t)a1, wait_not_ready); }
 static int64_t lpr_sys_poll(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, unsigned *wait_not_ready __attribute__((unused))) { (void)a3; (void)a4; (void)a5; return lpr_linux_poll(a0, a1, a2, wait_not_ready); }
 
 #define LPR_SYSCALL_TRACE 1u
@@ -3685,7 +3700,7 @@ static lpr_syscall_entry_t lpr_syscall_table[LPR_LINUX_SYS_LAST + 1u] = {
     LPR_SYSCALL(LPR_LINUX_SYS_TGKILL, "tgkill", LPR_LINUX_SYSCALL_CLASS_PROCESS, LPR_LINUX_SYSCALL_BACKEND_LOCAL_STATE, lpr_sys_tgkill, 0),
     LPR_SYSCALL(LPR_LINUX_SYS_UNAME, "uname", LPR_LINUX_SYSCALL_CLASS_PROCESS, LPR_LINUX_SYSCALL_BACKEND_LOCAL_STATE, lpr_sys_uname, 0),
     LPR_SYSCALL(LPR_LINUX_SYS_FCNTL, "fcntl", LPR_LINUX_SYSCALL_CLASS_FD_CONTROL, LPR_LINUX_SYSCALL_BACKEND_FILED, lpr_sys_fcntl, LPR_SYSCALL_TRACE),
-    LPR_SYSCALL(LPR_LINUX_SYS_FLOCK, "flock", LPR_LINUX_SYSCALL_CLASS_FD_CONTROL, LPR_LINUX_SYSCALL_BACKEND_LOCAL_STATE, lpr_sys_flock, 0),
+    LPR_SYSCALL(LPR_LINUX_SYS_FLOCK, "flock", LPR_LINUX_SYSCALL_CLASS_FD_CONTROL, LPR_LINUX_SYSCALL_BACKEND_FILED, lpr_sys_flock, 0),
     LPR_SYSCALL(LPR_LINUX_SYS_FSYNC, "fsync", LPR_LINUX_SYSCALL_CLASS_FD_CONTROL, LPR_LINUX_SYSCALL_BACKEND_FILED, lpr_sys_fsync, 0),
     LPR_SYSCALL(LPR_LINUX_SYS_FDATASYNC, "fdatasync", LPR_LINUX_SYSCALL_CLASS_FD_CONTROL, LPR_LINUX_SYSCALL_BACKEND_FILED, lpr_sys_fsync, 0),
     LPR_SYSCALL(LPR_LINUX_SYS_FTRUNCATE, "ftruncate", LPR_LINUX_SYSCALL_CLASS_FD_CONTROL, LPR_LINUX_SYSCALL_BACKEND_FILED, lpr_sys_ftruncate, 0),

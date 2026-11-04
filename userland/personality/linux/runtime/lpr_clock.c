@@ -1,5 +1,14 @@
 #include "lpr_filed_internal.h"
 #include "lpr_clock.h"
+#include "lpr_clock_entry.h"
+
+_Static_assert(offsetof(lpr_signal_thread_state_t, native_pending_hint) == LPR_CLOCK_HINT_OFFSET, "clock entry signal hint");
+_Static_assert(offsetof(lpr_signal_thread_state_t, native_pending_hint_active) == LPR_CLOCK_HINT_ACTIVE_OFFSET, "clock entry signal registration");
+_Static_assert(offsetof(lpr_signal_thread_state_t, pending_mask) == LPR_CLOCK_PENDING_OFFSET, "clock entry pending mask");
+/* Private assembly inputs, not exported process ABI. The count pointer avoids
+ * duplicating lpr_state's layout or maintaining a second thread counter. */
+const volatile uint32_t *const lpr_clock_thread_count = &lpr_state.thread_count;
+const volatile unsigned char *lpr_clock_fast_page;
 
 static const volatile unsigned char *clock_page;
 /* 0=unattempted, 1=initializer, 2=done (including permanent map failure).
@@ -23,7 +32,10 @@ static void clock_page_map(void)
         int64_t address = lpr_pacha_syscall6(PACHAOS_SYSCALL_MMAP,
             fd, 0, PACHA_CLOCK_PAGE_SIZE, PACHAOS_PROT_READ, PACHAOS_MMAP_SHARED, 0);
         (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, fd);
-        if (address >= 4096) clock_page = (const volatile unsigned char *)(uintptr_t)address;
+        if (address >= 4096) {
+            clock_page = (const volatile unsigned char *)(uintptr_t)address;
+            __atomic_store_n(&lpr_clock_fast_page, clock_page, __ATOMIC_RELEASE);
+        }
     }
     __atomic_store_n(&clock_mapping_state, 2, __ATOMIC_RELEASE);
     lpr_state_unlock(&clock_mapping_lock);
@@ -40,6 +52,7 @@ void lpr_clock_after_fork_child(void)
     clock_mapping_lock = 0;
     if (clock_mapping_state == 1) {
         clock_page = 0;
+        __atomic_store_n(&lpr_clock_fast_page, 0, __ATOMIC_RELEASE);
         clock_mapping_state = 0;
     }
 }
@@ -102,12 +115,16 @@ int lpr_clock_monotonic(uint64_t *nanoseconds)
 }
 
 extern unsigned char lpr_clock_copy_seconds[], lpr_clock_copy_nanos[], lpr_clock_copy_bad[];
+extern unsigned char lpr_clock_entry_copy_seconds[], lpr_clock_entry_copy_nanos[], lpr_clock_entry_copy_bad[];
 uintptr_t lpr_clock_copy_fault_target(uint64_t vector, uint64_t error, uint64_t rip)
 {
-    /* Only the two audited user-output stores may recover. Other LPR faults
+    /* Only the audited timespec stores may recover. Other LPR faults
      * retain their normal signal handling; COW faults are resolved natively. */
     if (vector == 14 && (error & 2) && !(error & 16) &&
         (rip == (uintptr_t)lpr_clock_copy_seconds || rip == (uintptr_t)lpr_clock_copy_nanos))
         return (uintptr_t)lpr_clock_copy_bad;
+    if (vector == 14 && (error & 2) && !(error & 16) &&
+        (rip == (uintptr_t)lpr_clock_entry_copy_seconds || rip == (uintptr_t)lpr_clock_entry_copy_nanos))
+        return (uintptr_t)lpr_clock_entry_copy_bad;
     return 0;
 }

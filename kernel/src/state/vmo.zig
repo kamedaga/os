@@ -141,6 +141,19 @@ pub fn nativeVmoSlotConst(self: anytype, vmo_ref: NativeVmoRef) ?*const NativeVm
 }
 
 pub fn clearNativeVmoSlot(self: anytype, slot: *NativeVmoSlot) void {
+    if (slot.kind == .page_view and slot.has_page_store and !slot.backing.parent.ref.isNull()) {
+        // Parent retain survives this clear; drop borrowed-page counters before
+        // disconnecting its edge or freeing the view's recorded parent indices.
+        const parent = self.nativeVmoSlot(slot.backing.parent.ref) orelse @panic("view parent missing");
+        slot.page_store.releaseViewRefs(slot.page_store_start, parent.page_store_start, slot.page_count);
+    }
+    if (slot.parent_edge.target != null and slot.kind != .page_view) {
+        const parent = self.nativeVmoSlot(slot.backing.parent.ref) orelse unreachable;
+        std.debug.assert(parent.non_view_children != 0);
+        @import("../sync/lock_diagnostics.zig").assertKernelStateHeld();
+        parent.non_view_children -= 1;
+    }
+    if (slot.kind == .page_view and slot.backing.parent.ref.isNull() and slot.page_store.used != 0) @panic("orphan populated view");
     types.references.Root.disconnect(&slot.parent_edge, true);
     std.debug.assert(slot.ram_cache_state == .wb);
     std.debug.assert(slot.pending_data_return == null);
@@ -352,6 +365,8 @@ pub fn kernelClockPageVmo(self: anytype, paddr: u64, free_list: ?*FreePageList) 
     try self.retainNativeVmo(ref);
     errdefer self.releaseNativeVmo(ref);
     try setVmoBackingPageStorePaddrs(slot.page_store_start, slot.page_count, 0, slot.page_store_owner, &.{paddr}, free_list);
+    @import("../sync/lock_diagnostics.zig").assertKernelStateHeld();
+    slot.kernel_edges += 1;
     slot.references.connect(&self.clock_reference, .{ .kind = .kernel }, .{}, true);
     self.kernel_clock_page_vmo = ref;
     return ref;
@@ -814,13 +829,47 @@ pub fn nativeVmoResolvedPagePaddrOrZero(self: anytype, vmo_ref: NativeVmoRef, pa
     return null;
 }
 
-/// Fault commit only, under the existing AS/shared-VM lifetime exclusion.
-/// Merge the previous root lookup and insert so metadata allocation does not
-/// add an owner-lock acquisition. Parent locks are never nested inside it.
+// Only this module constructs the opaque loan. Allocation, callback and return
+// share one stack lifetime; callers cannot substitute a previously exposed PA.
+pub const FreshFaultPage = opaque {};
+const FreshLoan = struct { paddr: u64, installed: bool = false };
+// Caller retains AS and shared VM through the callback. PMM zeroing may
+// allocate but publishes no alias; callback failure leaves the loan owned here.
+pub fn withFreshFaultPage(self: anytype, fl: *FreePageList, context: anytype, comptime commit: anytype) error{ Revalidate, OutOfMemory, Denied }!types.NativeVmaFaultMapping {
+    const page = self.allocPhysicalPage(fl) catch |err| return if (err == error.OutOfFreePages) error.OutOfMemory else error.Denied;
+    var loan = FreshLoan{ .paddr = page.paddr };
+    defer if (!loan.installed) {
+        fl.appendPage(loan.paddr) catch |err| switch (err) {
+            error.PageQuarantined => {},
+            else => @panic("invalid PMM return"),
+        };
+    };
+    return commit(context, @as(*FreshFaultPage, @ptrCast(&loan)));
+}
+pub fn resolveFreshNativeVmoPage(self: anytype, ref: NativeVmoRef, index: u32, page: *FreshFaultPage, fl: *FreePageList) KernelError!u64 {
+    const loan: *FreshLoan = @ptrCast(@alignCast(page));
+    if (loan.installed) return error.InvalidState;
+    const result = try resolveNativePage(self, ref, index, loan.paddr, fl, true);
+    loan.installed = result == loan.paddr;
+    return result;
+}
 pub fn resolveOrInstallNativeVmoPage(self: anytype, ref: NativeVmoRef, index: u32, candidate: u64, free_list: ?*FreePageList) KernelError!u64 {
+    return resolveNativePage(self, ref, index, candidate, free_list, false);
+}
+fn resolveNativePage(self: anytype, ref: NativeVmoRef, index: u32, candidate: u64, free_list: ?*FreePageList, fresh: bool) KernelError!u64 {
     const slot = self.nativeVmoSlot(ref) orelse return KernelError.InvalidState;
-    if (slot.kind != .anonymous or slot.ram_cache_state != .wb or index >= slot.page_count or candidate == 0 or candidate & 4095 != 0)
+    if (slot.kind != .anonymous or slot.ram_cache_state == .retiring or index >= slot.page_count or candidate == 0 or candidate & 4095 != 0)
         return KernelError.InvalidState;
+    if (slot.ram_cache_state == .cached) {
+        if (!fresh or !slot.backing.parent.ref.isNull()) return KernelError.InvalidState;
+        // Spans describe PA ranges, not VMO indices. Resident-only transitions
+        // plus the unchanged removal guards keep every leased index backed.
+        // Shared VM stays held through insertion; all-AS writers cannot race.
+        if (self.nativeVmoResolvedPagePaddrOrZero(ref, index)) |existing| {
+            if (existing != 0) return existing;
+        } else return KernelError.InvalidState;
+        if (@import("../memory/ram_cache_snapshot.zig").policyForLockedPage(candidate) != .ordinary) return KernelError.InvalidState;
+    }
     try @TypeOf(self.*).ensureNativeVmoPageStore(slot);
     const owner = vmoBackingStoreOwner(.native_vmo, ref.index, ref.generation);
     if (slot.page_store_owner != owner or slot.page_store_start.owner != owner) return KernelError.InvalidState;
@@ -876,6 +925,16 @@ pub fn nativeRamCachePages(self: anytype, vmo_ref: NativeVmoRef, first: usize, o
 pub const RamCacheMappingError = error{ Invalid, PrivateAlias, ExecutableAlias, ShadowAlias, DmaPinned };
 
 fn ramCacheOverlapsBlockingPin(self: anytype, principal: PrincipalId, start_va: u64, bytes: u64) bool {
+    _ = std.math.add(u64, start_va, bytes) catch return true;
+    const vma = @import("vma.zig");
+    const locked = vma.lockPinIndex(principal);
+    defer vma.unlockPinIndex(principal, locked);
+    const table = self.getVmaTableConst(principal) orelse return false;
+    const result = table.pinned_index.anyOverlap(start_va, bytes, 3, null);
+    if (comptime @import("reference_check.zig").pin_oracle_enabled) if (result != ramCacheOverlapsBlockingPinOracle(self, principal, start_va, bytes)) @import("reference_check.zig").failure(error.PinnedMismatch);
+    return result;
+}
+fn ramCacheOverlapsBlockingPinOracle(self: anytype, principal: PrincipalId, start_va: u64, bytes: u64) bool {
     const PinRange = struct { start: u64, size: u64 };
     const end_va = std.math.add(u64, start_va, bytes) catch return true;
     const principal_raw = @intFromEnum(principal);
@@ -975,7 +1034,7 @@ fn indexedRamCacheMappings(self: anytype, ref: NativeVmoRef, first_page: usize, 
             const principal = @TypeOf(self.*).processPrincipal(edge.identity.owner);
             const backing = self.nativeVmoSlotConst(entry.vmo) orelse return error.Invalid;
             // Neither BAR pages nor the kernel clock page take RAM cache policy.
-            if (backing.kind == .device_memory or backing.kind == .kernel_page) continue;
+            if (backing.kind == .device_memory or backing.kind == .kernel_page or backing.kind == .thread_page) continue;
             if (directPageViewOf(backing, ref)) {
                 const start: usize = @intCast(entry.vmo_offset / native_page_size);
                 const count: usize = @intCast(entry.size_bytes / native_page_size);
@@ -1452,7 +1511,7 @@ pub fn installNativeVmoPages(
 ) KernelError!void {
     if (paddrs.len == 0) return KernelError.InvalidState;
     const slot = self.nativeVmoSlot(vmo_ref) orelse return KernelError.InvalidState;
-    if (slot.kind == .device_memory or slot.kind == .kernel_page or slot.kind == .pager or slot.ram_cache_state != .wb) return KernelError.InvalidState;
+    if (slot.kind == .page_view or slot.kind == .device_memory or slot.kind == .kernel_page or slot.kind == .thread_page or slot.kind == .pager or slot.ram_cache_state != .wb) return KernelError.InvalidState;
     if (page_offset > slot.page_count or paddrs.len > @as(usize, slot.page_count) - page_offset) {
         return KernelError.InvalidState;
     }
@@ -1466,6 +1525,18 @@ pub fn installNativeVmoPages(
         paddrs,
         free_list,
     );
+}
+
+pub fn installNativeVmoPageViewPages(self: anytype, view: NativeVmoRef, offset: usize, indices: []const u64, free_list: ?*FreePageList) KernelError!void {
+    const slot = self.nativeVmoSlot(view) orelse return KernelError.InvalidState;
+    if (slot.kind != .page_view or slot.ram_cache_state != .wb or !slot.has_page_store) return KernelError.InvalidState;
+    const parent = self.nativeVmoSlot(slot.backing.parent.ref) orelse return KernelError.InvalidState;
+    const expected = types.vmoBackingStoreOwner(.native_vmo, slot.backing.parent.ref.index, slot.backing.parent.ref.generation);
+    if (parent.kind != .anonymous or !parent.backing.parent.ref.isNull() or !parent.has_page_store or parent.page_store_owner != expected) return KernelError.InvalidState;
+    slot.page_store.installView(slot.page_store_start, slot.page_count, offset, parent.page_store_start, parent.page_count, indices, slot.page_view_sparse, try types.backingAllocator(free_list)) catch |err| return switch (err) {
+        error.OutOfMemory => KernelError.OutOfFreePages,
+        error.InvalidState => KernelError.InvalidState,
+    };
 }
 
 /// The pager syscall has already checked port authority and copied every
@@ -1654,6 +1725,8 @@ pub fn publishNativeVmoParent(self: anytype, child: NativeVmoRef, parent: Native
     const source = self.nativeVmoSlot(parent) orelse return KernelError.InvalidState;
     if (!vmoKindHasParentArm(slot.kind) or source.kind != .anonymous or !slot.backing.parent.ref.isNull() or slot.references.ownership().edges != 0) return KernelError.InvalidState;
     if (offset % native_page_size != 0 or offset > source.size_bytes or (slot.kind == .anonymous and slot.size_bytes > source.size_bytes - offset)) return KernelError.InvalidState;
+    @import("../sync/lock_diagnostics.zig").assertKernelStateHeld();
+    if (slot.kind != .page_view) source.non_view_children += 1;
     slot.backing.parent = .{ .ref = parent, .offset = offset };
     source.references.connect(&slot.parent_edge, .{ .kind = .child, .index = child.index, .generation = child.generation }, .{ .size = slot.size_bytes, .offset = offset }, true);
 }
@@ -1763,7 +1836,7 @@ fn oldValidateRamCacheMappings(self: anytype, ref: NativeVmoRef, first_page: usi
             if (!entry.active) continue;
             const backing = self.nativeVmoSlotConst(entry.vmo) orelse return error.Invalid;
             // Neither BAR pages nor the kernel clock page take RAM cache policy.
-            if (backing.kind == .device_memory or backing.kind == .kernel_page) continue;
+            if (backing.kind == .device_memory or backing.kind == .kernel_page or backing.kind == .thread_page) continue;
             if (directPageViewOf(backing, ref)) {
                 const start: usize = @intCast(entry.vmo_offset / native_page_size);
                 const count: usize = @intCast(entry.size_bytes / native_page_size);

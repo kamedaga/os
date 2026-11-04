@@ -28,6 +28,7 @@ fn words() [5]u64 {
 }
 
 pub fn run(query: anytype) !void {
+    comptime std.debug.assert(@import("builtin").is_test);
     const state = try std.testing.allocator.create(kernel.KernelState);
     defer std.testing.allocator.destroy(state);
     state.* = .{};

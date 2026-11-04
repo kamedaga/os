@@ -4,6 +4,9 @@
 #include "diagnostic.h"
 #include "../lpr_filed_internal.h"
 #include <errno.h>
+#include <pacha/readiness.h>
+#include "../support/syscall.h"
+#include <pachaos/abi.h>
 
 enum { UX_NONBLOCK = 0x800, UX_CLOEXEC = 0x80000,
     UX_PEEK = 2, UX_TRUNC = 0x20, UX_DONTWAIT = 0x40, UX_NOSIGNAL = 0x4000,
@@ -34,6 +37,8 @@ int64_t lpr_unix_socket_close(void *state)
     struct lpr_unix_socket *socket = state;
     lpr_unix_cache_forget_socket(socket->socket);
     lpr_unix_mapping_destroy(&socket->mapping);
+    if (socket->readiness) (void)lpr_pacha_syscall2(PACHAOS_SYSCALL_MUNMAP,
+        (uint64_t)(uintptr_t)socket->readiness, PACHA_READINESS_BYTES);
     if (socket->handoff_fd >= 16) {
         (void)lpr_close_native_fd_if_open((uint32_t)socket->handoff_fd);
         socket->handoff_fd = -1;

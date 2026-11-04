@@ -32,6 +32,7 @@ pub const Range = struct {
     offset: u64 = 0,
 };
 pub const Node = struct {
+    pin: PinLinks = .{},
     pool: ?*Pool = null,
     allocation: slots.Ref = .{ .index = 0, .generation = 0 },
     prepared_target: ?*Root = null,
@@ -147,6 +148,7 @@ pub const Root = struct {
         const self = node.target orelse unreachable;
         const flags = self.leaf.lock();
         defer self.leaf.unlock(flags);
+        std.debug.assert(node.identity.kind == identity.kind);
         node.identity = identity;
         node.range = range;
     }
@@ -287,4 +289,143 @@ pub fn backingCarrier(root: *Root, first_page: usize, pages: usize) bool {
         }
     }
     return false;
+}
+
+// The tree key is a stable edge pointer, not a second copy of its range.
+// K + owner AS exclude every publisher/query. Terminal reference leaves are
+// dropped before touching this index; it adds neither a retain nor an owner.
+pub const PinClass = enum(u2) { mmio, buffer, linear, scatter };
+pub const PinLinks = struct {
+    key: ?*Node = null,
+    parent: ?*Node = null,
+    child: [2]?*Node = .{ null, null },
+    max_end: u64 = 0,
+    invalid_count: u32 = 0,
+    class: PinClass = .mmio,
+    red: bool = false,
+    linked: bool = false,
+};
+pub const PinAdapter = struct {
+    pub const Handle = *SelfNode;
+    pub const Node = PinLinks;
+    pub const Key = ?*SelfNode;
+    const SelfNode = @import("reference_index.zig").Node;
+    pub fn resolve(edge: Handle) *PinLinks {
+        return &edge.pin;
+    }
+    pub fn less(lhs: Key, rhs: Key) bool {
+        const a = lhs.?;
+        const b = rhs.?;
+        if (a.range.start != b.range.start) return a.range.start < b.range.start;
+        if (a.identity.container != b.identity.container) return a.identity.container < b.identity.container;
+        if (a.identity.index != b.identity.index) return a.identity.index < b.identity.index;
+        return a.identity.generation < b.identity.generation;
+    }
+    pub fn update(edge: Handle) void {
+        const end, const bad = @addWithOverflow(edge.range.start, edge.range.size);
+        edge.pin.max_end = if (edge.range.size == 0) 0 else if (bad != 0) std.math.maxInt(u64) else end;
+        edge.pin.invalid_count = @intFromBool(edge.range.size != 0 and bad != 0);
+        for (edge.pin.child) |child| if (child) |c| {
+            edge.pin.max_end = @max(edge.pin.max_end, c.pin.max_end);
+            edge.pin.invalid_count += c.pin.invalid_count;
+        };
+    }
+    pub fn validate(edge: Handle) !void {
+        if (edge.pin.key != edge or edge.target == null or edge.identity.kind != .pinned_object) return error.PinIdentity;
+        const end, const bad = @addWithOverflow(edge.range.start, edge.range.size);
+        var maximum: u64 = if (edge.range.size == 0) 0 else if (bad != 0) std.math.maxInt(u64) else end;
+        var invalid: u32 = @intFromBool(edge.range.size != 0 and bad != 0);
+        for (edge.pin.child) |child| if (child) |c| {
+            maximum = @max(maximum, c.pin.max_end);
+            invalid += c.pin.invalid_count;
+        };
+        if (maximum != edge.pin.max_end or invalid != edge.pin.invalid_count) return error.PinAugmentation;
+    }
+};
+pub var pin_query_visits: if (@import("builtin").is_test) usize else void = if (@import("builtin").is_test) 0 else {};
+pub const PinIndex = struct {
+    const Tree = @import("ordered_index.zig").Index(PinAdapter);
+    trees: [4]Tree = @splat(.{}),
+    pub fn insert(self: *PinIndex, edge: *Node, class: PinClass) void {
+        std.debug.assert(edge.identity.kind == .pinned_object and edge.target != null);
+        self.trees[@intFromEnum(class)].insert(edge, edge);
+        edge.pin.class = class;
+    }
+    pub fn remove(self: *PinIndex, edge: *Node) void {
+        if (edge.pin.linked) self.trees[@intFromEnum(edge.pin.class)].remove(edge);
+    }
+    pub fn requireEmpty(self: *const PinIndex, reverse_count: u32) error{PinRetirement}!void {
+        if (reverse_count != 0) return error.PinRetirement;
+        for (&self.trees) |*tree| if (tree.count != 0 or tree.root != null or tree.first != null) return error.PinRetirement;
+    }
+    pub fn validate(self: *const PinIndex) !void {
+        for (&self.trees, 0..) |*tree, class| {
+            try tree.validate();
+            try validateClass(tree.root, @enumFromInt(class));
+        }
+    }
+    fn validateClass(root: ?*Node, class: PinClass) anyerror!void {
+        const edge = root orelse return;
+        if (edge.pin.class != class) return error.PinClass;
+        try validateClass(edge.pin.child[0], class);
+        try validateClass(edge.pin.child[1], class);
+    }
+    fn step() void {
+        if (@import("builtin").is_test) pin_query_visits += 1;
+    }
+    fn matches(edge: *const Node, except: ?Identity) bool {
+        const e = except orelse return false;
+        return edge.identity.container == e.container and edge.identity.index == e.index and edge.identity.generation == e.generation;
+    }
+    fn invalidExcept(root: *Node, except: ?Identity) bool {
+        if (root.pin.invalid_count == 0) return false;
+        if (root.pin.invalid_count > 1) return true;
+        var cursor = root;
+        while (true) {
+            step();
+            if (@addWithOverflow(cursor.range.start, cursor.range.size)[1] != 0 and cursor.range.size != 0) return !matches(cursor, except);
+            if (cursor.pin.child[0]) |left| {
+                if (left.pin.invalid_count != 0) {
+                    cursor = left;
+                    continue;
+                }
+            }
+            cursor = cursor.pin.child[1].?;
+        }
+    }
+    fn search(root: ?*Node, start: u64, end: u64, size: u64, except: ?Identity) bool {
+        const edge = root orelse return false;
+        step();
+        if (edge.pin.max_end <= start) return false;
+        if (search(edge.pin.child[0], start, end, size, except)) return true;
+        if (!matches(edge, except) and overlap(start, size, edge.range.start, edge.range.size)) return true;
+        if (edge.range.start >= end) return false;
+        return search(edge.pin.child[1], start, end, size, except);
+    }
+    fn nonzeroExcept(root: ?*Node, except: ?Identity) bool {
+        const edge = root orelse return false;
+        if (edge.pin.max_end == 0) return false;
+        if (edge.range.size != 0 and !matches(edge, except)) return true;
+        return nonzeroExcept(edge.pin.child[0], except) or nonzeroExcept(edge.pin.child[1], except);
+    }
+    pub fn anyOverlap(self: *const PinIndex, start: u64, size: u64, mask: u4, except: ?Identity) bool {
+        if (size == 0) return false;
+        const end, const bad = @addWithOverflow(start, size);
+        for (&self.trees, 0..) |*tree, class| {
+            if ((mask & (@as(u4, 1) << @as(u2, @intCast(class)))) == 0) continue;
+            const root = tree.root orelse continue;
+            if (bad != 0) {
+                // Overflow is fail-closed in the original overlap predicate.
+                if (nonzeroExcept(root, except)) return true;
+                continue;
+            }
+            if (invalidExcept(root, except) or search(root, start, end, size, except)) return true;
+        }
+        return false;
+    }
+
+};
+comptime {
+    if (@sizeOf(Node) != 160) @compileError("reference Node layout changed: remeasure all pin/FD/VMA/IPC consumers");
+    if (@sizeOf(PinLinks) != 48) @compileError("pin link layout changed: measure Node and pool density before accepting");
 }

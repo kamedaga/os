@@ -1003,7 +1003,7 @@ static int launch_seed0root(const struct storage_boot_config *boot_config,
             PACHA_LAUNCH_DEVICE_DRIVER | PACHA_FD_RIGHT_TRANSFER),
         PACHA_LAUNCH_GRANT(ready_channel_fd, ready_channel_fd, PACHA_LAUNCH_SIGNAL),
         PACHA_LAUNCH_GRANT(service_ready_channel_fd, service_ready_channel_fd,
-            PACHA_LAUNCH_SERVER | PACHA_LAUNCH_SIGNAL),
+            PACHA_LAUNCH_SERVER | PACHA_LAUNCH_SIGNAL | PACHA_FD_RIGHT_TRANSFER),
         PACHA_LAUNCH_GRANT(filed_image_fd, filed_image_fd, PACHA_LAUNCH_BLOB),
         PACHA_LAUNCH_GRANT(bootstrap_fd, bootstrap_fd, PACHA_LAUNCH_BLOB),
         PACHA_LAUNCH_GRANT(power_channel_fd, power_channel_fd,
@@ -1056,8 +1056,20 @@ int main(int argc, char **argv)
     if (!error && size != 24) error = -22;
     if (!error) {
         for (unsigned i = 0; i < 3; ++i) policy[i] = rd64(bytes + i * 8);
-        if (!policy[0] || policy[1] < 2 || policy[1] > 32768 ||
+        if (policy[1] < 2 || policy[1] > 32768 ||
             (policy[1] & (policy[1] - 1)) || !policy[2]) error = -22;
+    }
+    /* tmpfs defaults are computed by Linux from its real RAM arena. Resolve
+     * auto policy on the target, never from the build host or a fixed budget;
+     * otherwise all temporary files share half of an arbitrary 512 MiB core.
+     * Native VMO pages remain demand-backed in the common physical allocator. */
+    if (!error && !policy[0]) {
+        pacha_system_info_t memory={0};
+        error=(int)pacha_syscall1(PACHA_RUNTIME_SYSCALL_SYSTEM_INFO,(uintptr_t)&memory);
+        if (!error) {
+            policy[0]=memory.total_usable_memory_bytes & ~UINT64_C(4095);
+            if (!policy[0]) error=-22;
+        }
     }
     /* Linux selects the UUID among the authorized PCI descendants. The
      * bootstrap loader neither opens a disk nor guesses a GPT partition. */

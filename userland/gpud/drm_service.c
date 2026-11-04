@@ -10,19 +10,62 @@
 #include <pacha/log.h>
 #include <pacha/syscall.h>
 #include <stdio.h>
+#include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
 
 #if defined(GPUD_DRM_RPC_PROFILE) && GPUD_DRM_RPC_PROFILE
+static pacha_fd_t rpc_profile_log_fd = -1;
+static void rpc_profile_log(const char *format, ...) {
+    char line[512];
+    va_list args;
+    va_start(args, format);
+    int length = vsnprintf(line, sizeof(line), format, args);
+    va_end(args);
+    /* Native stdout is serial, not logd. Send bounded diagnostics through the
+     * already authenticated RAM-log endpoint; never expose request buffers. */
+    if (length > 0 && (size_t)length < sizeof(line) && rpc_profile_log_fd >= 16)
+        (void)pacha_log_emit(rpc_profile_log_fd, PACHA_LOG_SOURCE_GPUD, line, length);
+}
+static int profile_active;
+int gpud_drm_profile_enabled(void) { return profile_active; }
+static unsigned long profile_seen, profile_samples_remaining, profile_sample_id;
+void gpud_drm_service_profile_arm(pacha_fd_t log_fd) {
+    rpc_profile_log_fd = log_fd;
+    profile_seen = 0;
+    profile_samples_remaining = 512;
+    profile_active = 1;
+    rpc_profile_log("GPUD_TRACE_ARM samples=512 stride=64\n");
+}
+void gpud_drm_service_profile_disarm(void) {
+    profile_active = 0;
+    profile_samples_remaining = 0;
+    rpc_profile_log("GPUD_TRACE_OFF\n");
+}
 static uint64_t rpc_profile_now(void) {
+    if (!profile_active)
+        return 0;
     uint32_t low, high;
     __asm__ volatile("lfence; rdtsc" : "=a"(low), "=d"(high) :: "memory");
     return ((uint64_t)high << 32) | low;
 }
 
+static uint64_t prime_scan_calls,prime_scan_leases,prime_scan_polls,prime_scan_cycles;
+static uint64_t prime_scan_max_cycles,prime_scan_max_leases;
+static void rpc_profile_prime_scan(uint64_t start,size_t leases,size_t polls)
+{
+    uint64_t elapsed=rpc_profile_now()-start;
+    prime_scan_calls++;prime_scan_leases+=leases;prime_scan_polls+=polls;
+    prime_scan_cycles+=elapsed;
+    if(elapsed>prime_scan_max_cycles)prime_scan_max_cycles=elapsed;
+    if(leases>prime_scan_max_leases)prime_scan_max_leases=leases;
+}
+
 static void rpc_profile_record(uint64_t start, uint64_t map_cycles,
     uint64_t dispatch_cycles, uint64_t unmap_cycles, int mapped, int inlined,
     uint64_t key) {
+    if (!profile_active)
+        return;
     /* The service has one dispatch owner. Diagnostic-only cumulative counters
      * distinguish mapping churn from backend waits without per-request logs.
      * Cycle totals include descheduling and must not be called CPU time. */
@@ -47,14 +90,19 @@ static void rpc_profile_record(uint64_t start, uint64_t map_cycles,
         break;
     }
     if (slot == 64) { ++overflow_calls; overflow_cycles += elapsed; }
-    if (calls % 4096 == 0 && calls <= 262144) {
-        printf("GPUD_RPC_PROFILE principal=%llu calls=%llu maps=%llu inline=%llu "
+    if (calls % 4096 == 0 && profile_samples_remaining) {
+        rpc_profile_log("GPUD_RPC_PROFILE principal=%llu calls=%llu maps=%llu inline=%llu "
             "cycles=%llu map_cycles=%llu dispatch_cycles=%llu unmap_cycles=%llu\n",
             (unsigned long long)pacha_syscall0(PACHA_RUNTIME_SYSCALL_GETPID),
             (unsigned long long)calls, (unsigned long long)maps,
             (unsigned long long)inline_calls, (unsigned long long)total,
             (unsigned long long)map_total, (unsigned long long)dispatch_total,
             (unsigned long long)unmap_total);
+        rpc_profile_log("GPUD_READY_SCAN through=%llu scans=%llu fds=%llu max_fds=%llu polls=%llu cycles=%llu max_cycles=%llu\n",
+            (unsigned long long)calls,(unsigned long long)prime_scan_calls,
+            (unsigned long long)prime_scan_leases,(unsigned long long)prime_scan_max_leases,
+            (unsigned long long)prime_scan_polls,(unsigned long long)prime_scan_cycles,
+            (unsigned long long)prime_scan_max_cycles);
         /* Only numeric operation/ioctl identifiers are retained, never caller
          * buffers. Explicit overflow and top-four totals prevent a truncated
          * diagnostic table being mistaken for complete command attribution. */
@@ -67,19 +115,40 @@ static void rpc_profile_record(uint64_t start, uint64_t map_cycles,
                     best = i;
             if (best == 64) break;
             selected |= UINT64_C(1) << best;
-            printf("GPUD_RPC_COMMAND through=%llu key=%llx calls=%llu cycles=%llu dispatch_cycles=%llu\n",
+            rpc_profile_log("GPUD_RPC_COMMAND through=%llu key=%llx calls=%llu cycles=%llu dispatch_cycles=%llu\n",
                 (unsigned long long)calls, (unsigned long long)commands[best].key,
                 (unsigned long long)commands[best].calls,
                 (unsigned long long)commands[best].cycles,
                 (unsigned long long)commands[best].dispatch);
         }
-        printf("GPUD_RPC_OVERFLOW through=%llu calls=%llu cycles=%llu\n",
+        /* Always include the six wf-10 probes, even below the top four. */
+        for (unsigned i = 0; i < 64; ++i) {
+            if (!commands[i].calls || (selected & (UINT64_C(1) << i))) continue;
+            switch ((uint32_t)commands[i].key) {
+            case UINT32_C(0x40406469): case UINT32_C(0xc00c6466):
+            case UINT32_C(0xc018643b): case UINT32_C(0xc02864c3):
+            case UINT32_C(0xc00864bf): case UINT32_C(0xc00864c0):
+                rpc_profile_log("GPUD_RPC_COMMAND through=%llu key=%llx calls=%llu cycles=%llu dispatch_cycles=%llu\n",
+                    (unsigned long long)calls, (unsigned long long)commands[i].key,
+                    (unsigned long long)commands[i].calls,
+                    (unsigned long long)commands[i].cycles,
+                    (unsigned long long)commands[i].dispatch);
+                break;
+            default: break;
+            }
+        }
+        rpc_profile_log("GPUD_RPC_OVERFLOW through=%llu calls=%llu cycles=%llu\n",
             (unsigned long long)calls, (unsigned long long)overflow_calls,
             (unsigned long long)overflow_cycles);
     }
 }
 #else
+int gpud_drm_profile_enabled(void) { return 0; }
+void gpud_drm_service_profile_disarm(void) {}
+void gpud_drm_service_profile_arm(pacha_fd_t log_fd) { (void)log_fd; }
 static inline uint64_t rpc_profile_now(void) { return 0; }
+static inline void rpc_profile_prime_scan(uint64_t start,size_t leases,size_t polls)
+{(void)start;(void)leases;(void)polls;}
 static inline void rpc_profile_record(uint64_t start, uint64_t map_cycles,
     uint64_t dispatch_cycles, uint64_t unmap_cycles, int mapped, int inlined,
     uint64_t key) {
@@ -88,10 +157,32 @@ static inline void rpc_profile_record(uint64_t start, uint64_t map_cycles,
 }
 #endif
 
+enum { READY_WATCH = 1, READY_LEASE, READY_CONNECTION };
+static int refresh_handle(struct gpud_drm_service *, uint64_t);
+static int reap_watch_one(struct gpud_drm_service *, struct gpud_drm_watch *);
+
 enum {
     GPUD_LINUX_POLLIN = 0x0001u,
     GPUD_LINUX_POLLRDNORM = 0x0040u,
 };
+
+static int reply_to_client(struct gpud_drm_service *service, pacha_fd_t fd,
+                           const struct pacha_ipc_msg *message, int *delivered) {
+    if (delivered)
+        *delivered = 0;
+    service->reply_attempted = 1;
+    int rc = pacha_ipc_reply(fd, message);
+    /* A canceled CALL is not an unknown transport result. Never finalize its
+     * transferred leases or attempt a second reply; reclaim the pending transfer
+     * through the same owner cleanup and keep independent GPU clients alive. */
+    if (rc == -PACHA_SYSCALL_ERR_CLOSED)
+        return 0;
+    if (rc)
+        return -EIO;
+    if (delivered)
+        *delivered = 1;
+    return 0;
+}
 
 static int valid_fd(uint64_t fd, uint64_t kind, uint64_t rights, uint64_t size) {
     struct pacha_fd_info info = {0};
@@ -205,10 +296,29 @@ int gpud_drm_service_bind(struct gpud_drm_service *service, pacha_fd_t endpoint_
      * would merely move exhaustion to the default 256-entry native FD table. */
     struct pacha_fd_table_info capacity;
     const uint64_t needed = GPUD_DRM_MAPPINGS_MAX + GPUD_DRM_PRIMES_MAX +
-        GPUD_DRM_OBJECT_LEASES_MAX + GPUD_DRM_REFERENCES_MAX + 64;
+                            GPUD_DRM_OBJECT_LEASES_MAX + GPUD_DRM_REFERENCES_MAX +
+                            3 * ((GPUD_DRM_WAIT_SOURCES_MAX + 254) / 255) + 128;
     if (pacha_fd_table(needed, &capacity) != 0 || capacity.capacity < needed)
         return -ENOMEM;
+#if defined(GPUD_DRM_RPC_PROFILE) && GPUD_DRM_RPC_PROFILE
+    profile_active = 0;
+    profile_samples_remaining = 0;
+    profile_seen = 0;
+#endif
+    service->ready = gpud_ready_create();
+    if (!service->ready)
+        return -ENOMEM;
+    service->mapping_free_head = service->lease_free_head = 1;
+    for (unsigned i = 0; i < GPUD_DRM_MAPPINGS_MAX; i++)
+        service->mappings[i].free_next = i + 1 < GPUD_DRM_MAPPINGS_MAX ? i + 2 : 0;
+    for (unsigned i = 0; i < GPUD_DRM_OBJECT_LEASES_MAX; i++)
+        service->object_leases[i].free_next = i + 1 < GPUD_DRM_OBJECT_LEASES_MAX ? i + 2 : 0;
     service->endpoint_fd = endpoint_fd;
+    if (service->log_endpoint_fd >= 16) {
+        const char marker[] = "DRM direct requests; HUP push; runtime trace off";
+        (void)pacha_log_emit(service->log_endpoint_fd, PACHA_LOG_SOURCE_GPUD, marker,
+                             sizeof(marker) - 1);
+    }
     return 0;
 }
 
@@ -433,6 +543,7 @@ int gpud_drm_service_pump_events(struct gpud_drm_service *service) {
 }
 
 struct gpud_drm_reply_transfer {
+    struct gpud_drm_service *service;
     struct pacha_ipc_fd fds[2];
     struct gpud_drm_object_lease *lease;
     uint64_t object_id;
@@ -443,6 +554,10 @@ struct gpud_drm_reply_transfer {
 
 static struct gpud_drm_mapping *find_mapping(
     struct gpud_drm_service *service, uint64_t id) {
+    if (service->ready) {
+        uint32_t n = gpud_index_get(service->mapping_index, 2 * GPUD_DRM_MAPPINGS_MAX, id, 0);
+        return n && service->mappings[n - 1].id == id ? service->mappings + n - 1 : NULL;
+    }
     if (id)
         for (size_t i = 0; i < GPUD_DRM_MAPPINGS_MAX; ++i)
             if (service->mappings[i].id == id)
@@ -452,6 +567,9 @@ static struct gpud_drm_mapping *find_mapping(
 
 static struct gpud_drm_mapping *empty_mapping(
     struct gpud_drm_service *service) {
+    if (service->ready)
+        return service->mapping_free_head ? service->mappings + service->mapping_free_head - 1
+                                          : NULL;
     for (size_t i = 0; i < GPUD_DRM_MAPPINGS_MAX; ++i)
         if (!service->mappings[i].id)
             return &service->mappings[i];
@@ -476,6 +594,9 @@ static struct gpud_drm_prime *empty_prime(struct gpud_drm_service *service) {
 
 static struct gpud_drm_object_lease *empty_object_lease(
     struct gpud_drm_service *service) {
+    if (service->ready)
+        return service->lease_free_head ? service->object_leases + service->lease_free_head - 1
+                                        : NULL;
     for (size_t i = 0; i < GPUD_DRM_OBJECT_LEASES_MAX; ++i)
         if (!service->object_leases[i].object_id)
             return &service->object_leases[i];
@@ -497,8 +618,29 @@ static struct gpud_drm_object_lease *empty_object_lease(
     return NULL;
 }
 
+static void queue_closed(struct gpud_drm_service *s, struct gpud_drm_mapping *m) {
+    if (!s->ready || !m->id || m->closed_queued)
+        return;
+    uint32_t n = (uint32_t)(m - s->mappings) + 1;
+    m->closed_queued = 1;
+    m->closed_next = 0;
+    if (s->closed_tail)
+        s->mappings[s->closed_tail - 1].closed_next = n;
+    else
+        s->closed_head = n;
+    s->closed_tail = n;
+}
 static int object_has_leases(
     const struct gpud_drm_service *service, uint64_t id) {
+    if (service->ready) {
+        uint32_t n = gpud_index_get(service->mapping_index, 2 * GPUD_DRM_MAPPINGS_MAX, id, 0);
+        if (n)
+            return service->mappings[n - 1].lease_count != 0;
+        for (size_t i = 0; i < GPUD_DRM_PRIMES_MAX; i++)
+            if (service->primes[i].token == id)
+                return service->primes[i].lease_count != 0;
+        return 0;
+    }
     for (size_t i = 0; i < GPUD_DRM_OBJECT_LEASES_MAX; ++i)
         if (service->object_leases[i].object_id == id)
             return 1;
@@ -577,6 +719,8 @@ static int adopt_mapping(struct gpud_drm_service *service,
             (void)pacha_fd_close((pacha_fd_t)received.fd);
         return -EPROTO;
     }
+    if (service->ready)
+        service->mapping_free_head = slot->free_next;
     *slot = (struct gpud_drm_mapping){
         .id = translation->mapping_id,
         .exchange = translation->mapping_exchange,
@@ -588,6 +732,15 @@ static int adopt_mapping(struct gpud_drm_service *service,
         .cache_policy = translation->mapping_cache_policy,
         .view_fd = (pacha_fd_t)received.fd,
     };
+    if (service->ready) {
+        uint32_t n = (uint32_t)(slot - service->mappings) + 1;
+        slot->gem_next =
+            gpud_index_get(service->gem_index, 2 * GPUD_DRM_MAPPINGS_MAX, handle, slot->gem_handle);
+        if (gpud_index_put(service->mapping_index, 2 * GPUD_DRM_MAPPINGS_MAX, slot->id, 0, n) ||
+            gpud_index_put(service->gem_index, 2 * GPUD_DRM_MAPPINGS_MAX, handle, slot->gem_handle,
+                           n))
+            return service->error = -EPROTO;
+    }
     const size_t occupied_prefix = (size_t)(slot - service->mappings) + 1;
     if (occupied_prefix > service->mapping_high_water) {
         service->mapping_high_water = occupied_prefix;
@@ -610,8 +763,29 @@ static int release_mapping(struct gpud_drm_service *service,
         error = gpud_gpu_rpc_release_mapping(&service->gpu,
             ++service->correlation, mapping->id);
     }
-    if (!error)
+    if (!error) {
+        if (service->ready) {
+            gpud_index_remove(service->mapping_index, 2 * GPUD_DRM_MAPPINGS_MAX, mapping->id, 0);
+            uint32_t head = gpud_index_get(service->gem_index, 2 * GPUD_DRM_MAPPINGS_MAX,
+                                           mapping->handle, mapping->gem_handle),
+                     *link = &head;
+            while (*link && service->mappings[*link - 1].id != mapping->id)
+                link = &service->mappings[*link - 1].gem_next;
+            if (*link)
+                *link = mapping->gem_next;
+            if (head)
+                (void)gpud_index_put(service->gem_index, 2 * GPUD_DRM_MAPPINGS_MAX, mapping->handle,
+                                     mapping->gem_handle, head);
+            else
+                gpud_index_remove(service->gem_index, 2 * GPUD_DRM_MAPPINGS_MAX, mapping->handle,
+                                  mapping->gem_handle);
+        }
         memset(mapping, 0, sizeof(*mapping));
+        if (service->ready) {
+            mapping->free_next = service->mapping_free_head;
+            service->mapping_free_head = (uint32_t)(mapping - service->mappings) + 1;
+        }
+    }
     return error;
 }
 
@@ -632,16 +806,31 @@ static int release_prime(struct gpud_drm_service *service,
 }
 
 static int release_closed_objects(struct gpud_drm_service *service) {
-    for (size_t i = 0; i < GPUD_DRM_MAPPINGS_MAX; ++i) {
-        struct gpud_drm_mapping *mapping = &service->mappings[i];
-        if (!mapping->id || !mapping->owner_closed ||
-            object_has_leases(service, mapping->id))
-            continue;
-        int error = release_mapping(service, mapping);
-        if (error)
-            return gpud_drm_files_fault(
-                &service->files, service->files.generation, error);
+    if (service->ready) {
+        while (service->closed_head) {
+            struct gpud_drm_mapping *m = service->mappings + service->closed_head - 1;
+            service->closed_head = m->closed_next;
+            if (!service->closed_head)
+                service->closed_tail = 0;
+            m->closed_queued = 0;
+            m->closed_next = 0;
+            if (m->id && m->owner_closed && !m->lease_count) {
+                int e = release_mapping(service, m);
+                if (e)
+                    return e;
+            }
+        }
     }
+    if (!service->ready)
+        for (size_t i = 0; i < GPUD_DRM_MAPPINGS_MAX; ++i) {
+            struct gpud_drm_mapping *mapping = &service->mappings[i];
+            if (service->ready || !mapping->id || !mapping->owner_closed ||
+                object_has_leases(service, mapping->id))
+                continue;
+            int error = release_mapping(service, mapping);
+            if (error)
+                return gpud_drm_files_fault(&service->files, service->files.generation, error);
+        }
     for (size_t i = 0; i < GPUD_DRM_PRIMES_MAX; ++i) {
         struct gpud_drm_prime *prime = &service->primes[i];
         if (!prime->token || !prime->owner_closed ||
@@ -657,10 +846,23 @@ static int release_closed_objects(struct gpud_drm_service *service) {
 
 static void close_mapping_owner(
     struct gpud_drm_service *service, uint64_t handle, uint32_t gem_handle) {
+    if (service->ready && gem_handle) {
+        uint32_t n =
+            gpud_index_get(service->gem_index, 2 * GPUD_DRM_MAPPINGS_MAX, handle, gem_handle);
+        while (n) {
+            struct gpud_drm_mapping *m = service->mappings + n - 1;
+            m->owner_closed = 1;
+            queue_closed(service, m);
+            n = m->gem_next;
+        }
+        return;
+    }
     for (size_t i = 0; i < GPUD_DRM_MAPPINGS_MAX; ++i)
         if (service->mappings[i].handle == handle &&
-            (!gem_handle || service->mappings[i].gem_handle == gem_handle))
+            (!gem_handle || service->mappings[i].gem_handle == gem_handle)) {
             service->mappings[i].owner_closed = 1;
+            queue_closed(service, &service->mappings[i]);
+        }
 }
 
 static int retire_owner_watch(struct gpud_drm_service *service, uint64_t handle) {
@@ -668,7 +870,7 @@ static int retire_owner_watch(struct gpud_drm_service *service, uint64_t handle)
         struct gpud_drm_watch *watch = &service->watches[i];
         if (watch->handle != handle || watch->transferred)
             continue;
-        if (pacha_fd_close(watch->fd))
+        if (gpud_ready_remove(&watch->source) || pacha_fd_close(watch->fd))
             return gpud_drm_files_fault(&service->files, service->files.generation, -EIO);
         memset(watch, 0, sizeof(*watch));
         return 0;
@@ -710,7 +912,8 @@ static int close_draining(struct gpud_drm_service *service) {
         for (size_t i = 0; i < GPUD_DRM_REFERENCES_MAX; ++i) {
             if (service->watches[i].handle != handle)
                 continue;
-            if (pacha_fd_close(service->watches[i].fd))
+            if (gpud_ready_remove(&service->watches[i].source) ||
+                pacha_fd_close(service->watches[i].fd))
                 return -EIO;
             memset(&service->watches[i], 0, sizeof(service->watches[i]));
         }
@@ -1426,36 +1629,81 @@ static int mmap_request(struct gpud_drm_service *service,
 }
 
 static int cancel_reply_transfer(struct gpud_drm_service *service,
-    struct gpud_drm_reply_transfer *transfer) {
+                                 struct gpud_drm_reply_transfer *t) {
     int error = 0;
-    if (transfer->owner_fd >= 16)
-        error = pacha_fd_close(transfer->owner_fd);
-    if (transfer->client_fd >= 16) {
-        int closed = pacha_fd_close(transfer->client_fd);
-        if (!error)
-            error = closed;
+    if (t->service && t->lease) {
+        error = gpud_ready_remove(&t->lease->source);
+        if (error)
+            return error;
     }
-    if (transfer->prime_owner && transfer->object_id) {
-        struct gpud_drm_prime *prime = find_prime(
-            service, transfer->object_id);
+    if (t->owner_fd >= 16) {
+        error = pacha_fd_close(t->owner_fd);
+        if (error)
+            return error;
+        t->owner_fd = -1;
+        if (t->service && t->lease)
+            t->lease->fd = -1;
+    }
+    if (t->client_fd >= 16) {
+        error = pacha_fd_close(t->client_fd);
+        if (error)
+            return error;
+        t->client_fd = -1;
+    }
+    if (t->service && t->lease) {
+        service->pending_transfer_client_fd = 0;
+        memset(t->lease, 0, sizeof(*t->lease));
+        t->lease->free_next = service->lease_free_head;
+        service->lease_free_head = (uint32_t)(t->lease - service->object_leases) + 1;
+    }
+    if (t->prime_owner && t->object_id) {
+        struct gpud_drm_prime *prime = find_prime(service, t->object_id);
         if (prime) {
-            int released = release_prime(service, prime);
-            if (!error)
-                error = released;
+            error = release_prime(service, prime);
+            if (error)
+                return error;
         }
     }
-    *transfer = (struct gpud_drm_reply_transfer){
-        .owner_fd = -1, .client_fd = -1};
-    return error;
+    *t = (struct gpud_drm_reply_transfer){.owner_fd = -1, .client_fd = -1};
+    return 0;
 }
 
+static int prepare_reply_transfer(struct gpud_drm_service *service,
+                                  struct gpud_drm_reply_transfer *t) {
+    if (!service->ready || !t->lease)
+        return 0;
+    if (service->pending_transfer_client_fd >= 16)
+        return -EPROTO;
+    service->pending_transfer_client_fd = t->client_fd;
+    service->lease_free_head = t->lease->free_next;
+    *t->lease = (struct gpud_drm_object_lease){
+        .object_id = t->object_id, .fd = t->owner_fd, .prime_owner = t->prime_owner};
+    t->service = service;
+    return gpud_ready_add(service->ready, t->owner_fd,
+                          PACHA_FD_EVENT_HANGUP,
+                          READY_LEASE, t->lease, &t->lease->source);
+}
 static void finish_reply_transfer(struct gpud_drm_reply_transfer *transfer) {
+    struct gpud_ready_source *source = transfer->lease ? transfer->lease->source : NULL;
     if (transfer->lease)
         *transfer->lease = (struct gpud_drm_object_lease){
             .object_id = transfer->object_id,
             .fd = transfer->owner_fd,
             .prime_owner = transfer->prime_owner,
+            .source = source,
         };
+    if (transfer->service) {
+        transfer->service->pending_transfer_client_fd = 0;
+        struct gpud_drm_mapping *m = find_mapping(transfer->service, transfer->object_id);
+        struct gpud_drm_prime *p = find_prime(transfer->service, transfer->object_id);
+        if (m)
+            m->lease_count++;
+        if (p) {
+            p->lease_count++;
+            if (transfer->prime_owner)
+                p->owner_lease = transfer->lease;
+        }
+    }
     *transfer = (struct gpud_drm_reply_transfer){
         .owner_fd = -1, .client_fd = -1};
 }
@@ -1471,6 +1719,16 @@ static int dispatch_request(struct gpud_drm_service *service,
     if (service->correlation == UINT64_MAX)
         return -EOVERFLOW;
     ++service->correlation;
+    if (service->ready && header->payload_size >= 8 &&
+        (header->op == GPUD_DRM_OP_HANDLE_IOCTL || header->op == GPUD_DRM_OP_HANDLE_MMAP ||
+         header->op == GPUD_DRM_OP_HANDLE_POLL || header->op == GPUD_DRM_OP_HANDLE_READ ||
+         header->op == GPUD_DRM_OP_HANDLE_DUP || header->op == GPUD_DRM_OP_HANDLE_CLOSE)) {
+        uint64_t handle;
+        memcpy(&handle, payload, 8);
+        int e = refresh_handle(service, handle);
+        if (e)
+            return e;
+    }
     if (inline_ioctl && header->op != GPUD_DRM_OP_HANDLE_IOCTL)
         return -EINVAL;
     if (header->op == GPUD_DRM_OP_HELLO)
@@ -1505,6 +1763,16 @@ static int dispatch_request(struct gpud_drm_service *service,
                 .device_minor = request->device_minor,
                 .fd = (pacha_fd_t)service->received.fds[1].fd};
             service->received.fds[1].fd = PH_IPC_NO_FD;
+            if (service->ready) {
+                int e = gpud_ready_add(service->ready, watch->fd, PACHA_FD_EVENT_HANGUP,
+                                       READY_WATCH, watch, &watch->source);
+                if (e) {
+                    if (watch->source || gpud_ready_error(service->ready))
+                        return service->error = e;
+                    int cleanup = reap_watch_one(service, watch);
+                    return cleanup ? (service->error = cleanup) : e;
+                }
+            }
             if (request->device_minor == 0)
                 primary_opened(service, *result);
         }
@@ -1603,6 +1871,16 @@ static int dispatch_request(struct gpud_drm_service *service,
                         .device_minor = source ? source->device_minor : 0,
                         .fd = (pacha_fd_t)service->received.fds[1].fd, .transferred = 1};
                     service->received.fds[1].fd = PH_IPC_NO_FD;
+                    if (service->ready) {
+                        int e = gpud_ready_add(service->ready, watch->fd, PACHA_FD_EVENT_HANGUP,
+                                               READY_WATCH, watch, &watch->source);
+                        if (e) {
+                            if (watch->source || gpud_ready_error(service->ready))
+                                return service->error = e;
+                            int cleanup = reap_watch_one(service, watch);
+                            return cleanup ? (service->error = cleanup) : e;
+                        }
+                    }
                 }
             }
             return error;
@@ -1689,6 +1967,25 @@ static int dispatch(struct gpud_drm_service *service,
 
 size_t gpud_drm_service_pollfds(const struct gpud_drm_service *service,
     struct pacha_pollfd *fds, size_t capacity) {
+    if (service->ready) {
+        /* The owner waits on request channels directly. Collectors observe only
+         * lifetime HUP: no request/reply depends on a worker wake or rearm ACK.
+         * This set is O(client streams + PRIME owners), not O(BOs/leases). */
+        size_t n = 0;
+#define REQUEST_FD(fd_value) do { \
+    if (fds && n < capacity) fds[n] = (struct pacha_pollfd){ \
+        .fd = (fd_value), .events = PACHA_FD_EVENT_READABLE}; \
+    ++n; \
+} while (0)
+        REQUEST_FD(gpud_ready_fd(service->ready));
+        for (const struct gpud_drm_connection *c = service->connections; c; c = c->next)
+            REQUEST_FD(c->fd);
+        for (size_t i = 0; i < GPUD_DRM_PRIMES_MAX; i++)
+            if (service->primes[i].owner_lease)
+                REQUEST_FD(service->primes[i].owner_lease->fd);
+#undef REQUEST_FD
+        return n;
+    }
     size_t count = 0;
 #define ADD_SOURCE(source, mask) do { \
     if (fds && count < capacity) fds[count] = (struct pacha_pollfd){ \
@@ -1728,6 +2025,8 @@ int gpud_drm_service_reserve_pollfds(struct gpud_drm_service *service, size_t ex
 
 static int retire_connection(struct gpud_drm_connection **link) {
     struct gpud_drm_connection *connection = *link;
+    if (gpud_ready_remove(&connection->source))
+        return -EIO;
     /* Keep failed cleanup owned for terminal retirement, never forget a live
      * mapping or accidentally close a descriptor reused by a later client. */
     if (connection->aux) {
@@ -1746,19 +2045,221 @@ static int retire_connection(struct gpud_drm_connection **link) {
     return 0;
 }
 
+/* Collector notifications are hints, never caller authority. Only the owner
+ * may close files/leases or send a reply. Remove waits for observer ACK before
+ * closing an FD or reusing its containing slot. */
+static void unqueue_prime(struct gpud_drm_service *s, struct gpud_drm_object_lease *l) {
+    if (!l->readable)
+        return;
+    struct gpud_drm_object_lease **p = &s->prime_ready_head, *prev = NULL;
+    while (*p && *p != l) {
+        prev = *p;
+        p = &(*p)->ready_next;
+    }
+    if (*p) {
+        *p = l->ready_next;
+        if (s->prime_ready_tail == l)
+            s->prime_ready_tail = prev;
+    }
+    l->readable = 0;
+    l->ready_next = NULL;
+}
+static void unqueue_connection(struct gpud_drm_service *s, struct gpud_drm_connection *c) {
+    if (!c->ready)
+        return;
+    struct gpud_drm_connection **p = &s->connection_ready_head, *prev = NULL;
+    while (*p && *p != c) {
+        prev = *p;
+        p = &(*p)->ready_next;
+    }
+    if (*p) {
+        *p = c->ready_next;
+        if (s->connection_ready_tail == c)
+            s->connection_ready_tail = prev;
+    }
+    c->ready = 0;
+    c->ready_next = NULL;
+}
+static int reap_watch_one(struct gpud_drm_service *s, struct gpud_drm_watch *w) {
+    uint64_t handle = w->handle;
+    if (!handle)
+        return 0;
+    if (gpud_ready_remove(&w->source) || pacha_fd_close(w->fd))
+        return -EIO;
+    memset(w, 0, sizeof(*w));
+    int e = gpud_drm_file_close(&s->files, s->files.generation, handle);
+    const struct gpud_drm_file *f = e ? NULL : find_file(s, handle);
+    if (f && f->state == GPUD_DRM_FILE_DRAINING) {
+        struct gpud_drm_event_buffer *b = event_buffer(s, handle);
+        if (b)
+            memset(b, 0, sizeof(*b));
+        close_mapping_owner(s, handle, 0);
+    }
+    if (!e)
+        e = close_draining(s);
+    if (!e)
+        e = release_closed_objects(s);
+    return e;
+}
+static int refresh_handle(struct gpud_drm_service *s, uint64_t handle) {
+    /* At most the fixed 64 frontend reference slots, independent of BO/mapping
+     * count. Check only this handle's lifetime capabilities so collector latency
+     * cannot authorize an ioctl after its last close. This is the same snapshot
+     * linearization boundary as the old pre-receive reap, without global polling. */
+    for (size_t i = 0; i < GPUD_DRM_REFERENCES_MAX; i++) {
+        struct gpud_drm_watch *w = s->watches + i;
+        if (w->handle != handle || w->fd < 16)
+            continue;
+        struct pacha_pollfd p = {.fd = w->fd, .events = PACHA_FD_EVENT_HANGUP};
+        long n = pacha_fd_poll(&p, 1);
+        if (n < 0 || (uint64_t)n != (p.revents != 0) || (p.revents & PACHA_FD_EVENT_ERROR))
+            return -EIO;
+        if (p.revents & PACHA_FD_EVENT_HANGUP) {
+            int e = reap_watch_one(s, w);
+            if (e)
+                return e;
+        }
+    }
+    return 0;
+}
+static int reap_ready(struct gpud_drm_service *s) {
+    struct gpud_ready_event event;
+    int rc = 0;
+    /* Bound event work per owner turn; a pending queue keeps notify readable.
+     * A cancel/rearm flood cannot starve admission. Handle authority below is
+     * still rechecked synchronously, never delayed with this work budget. */
+    for (unsigned done = 0; done < 64 && (rc = gpud_ready_next(s->ready, &event)) > 0; done++) {
+        pacha_fd_t fd;
+        struct gpud_ready_source *source;
+        if (event.kind == READY_WATCH) {
+            struct gpud_drm_watch *w = event.context;
+            fd = w->fd;
+            source = w->source;
+        } else if (event.kind == READY_LEASE) {
+            struct gpud_drm_object_lease *l = event.context;
+            fd = l->fd;
+            source = l->source;
+        } else if (event.kind == READY_CONNECTION) {
+            struct gpud_drm_connection *c = event.context;
+            fd = c->fd;
+            source = c->source;
+        } else
+            return -EPROTO;
+        if (source != event.source)
+            return -EPROTO;
+        struct pacha_pollfd p = {.fd = fd,
+                                 .events = PACHA_FD_EVENT_HANGUP | PACHA_FD_EVENT_READABLE};
+        long n = pacha_fd_poll(&p, 1);
+        if (n < 0 || (uint64_t)n != (p.revents != 0) || (p.revents & PACHA_FD_EVENT_ERROR))
+            return -EIO;
+        if (p.revents & PACHA_FD_EVENT_HANGUP) {
+            if (event.kind == READY_WATCH) {
+                int e = reap_watch_one(s, event.context);
+                if (e)
+                    return e;
+            } else if (event.kind == READY_CONNECTION) {
+                struct gpud_drm_connection *c = event.context;
+                unqueue_connection(s, c);
+                struct gpud_drm_connection **link = &s->connections;
+                while (*link && *link != c)
+                    link = &(*link)->next;
+                if (!*link)
+                    return -EPROTO;
+                int e = retire_connection(link);
+                if (e)
+                    return e;
+            } else {
+                struct gpud_drm_object_lease *l = event.context;
+                uint64_t id = l->object_id;
+                unsigned owner = l->prime_owner;
+                unqueue_prime(s, l);
+                if (gpud_ready_remove(&l->source) || pacha_fd_close(l->fd))
+                    return -EIO;
+                memset(l, 0, sizeof(*l));
+                l->free_next = s->lease_free_head;
+                s->lease_free_head = (uint32_t)(l - s->object_leases) + 1;
+                struct gpud_drm_mapping *m = find_mapping(s, id);
+                struct gpud_drm_prime *prime = find_prime(s, id);
+                if (!m && !prime)
+                    return -EPROTO;
+                if (m) {
+                    if (!m->lease_count)
+                        return -EPROTO;
+                    m->lease_count--;
+                    if (m->owner_closed)
+                        queue_closed(s, m);
+                }
+                if (prime) {
+                    if (!prime->lease_count)
+                        return -EPROTO;
+                    prime->lease_count--;
+                    if (owner) {
+                        prime->owner_lease = NULL;
+                        prime->owner_closed = 1;
+                    }
+                }
+                int e = release_closed_objects(s);
+                if (e)
+                    return e;
+            }
+        } else {
+            int e = gpud_ready_rearm(source);
+            if (e)
+                return e;
+        }
+    }
+    return rc;
+}
+
+static int refresh_requests(struct gpud_drm_service *s) {
+    int e = gpud_drm_service_reserve_pollfds(s, 0);
+    if (e) return e;
+    size_t n = gpud_drm_service_pollfds(s, s->pollfds, s->poll_capacity);
+    for (size_t start = 0; start < n; start += 256) {
+        size_t batch = n - start;
+        if (batch > 256) batch = 256;
+        long ready = pacha_fd_poll(s->pollfds + start, batch);
+        if (ready < 0) return -EIO;
+    }
+    size_t k = 1; /* lifetime queue notify is drained by reap_ready, not here */
+    for (struct gpud_drm_connection *c = s->connections; c; c = c->next)
+        c->ready = !!(s->pollfds[k++].revents & PACHA_FD_EVENT_READABLE);
+    for (size_t i = 0; i < GPUD_DRM_PRIMES_MAX; i++)
+        if (s->primes[i].owner_lease)
+            s->primes[i].owner_lease->readable =
+                !!(s->pollfds[k++].revents & PACHA_FD_EVENT_READABLE);
+    for (size_t i = 0; i < n; i++)
+        if (s->pollfds[i].revents & PACHA_FD_EVENT_ERROR) return -EIO;
+    return 0;
+}
+
 int gpud_drm_service_reap_hangups(struct gpud_drm_service *service) {
     if (!service || service->error || service->files.terminal_error)
         return service ? (service->error ? service->error : service->files.terminal_error) : -EINVAL;
-    /* This runs before every DRM request. Poll live references together:
+    if (service->ready) {
+        int e = reap_ready(service);
+        if (e >= 0) e = refresh_requests(service);
+        return e < 0 ? (service->error = e) : 0;
+    }
+#ifndef GPUD_READY_REFERENCE_FIXTURE
+    if (service->endpoint_fd >= 16)
+        return service->error = -EINVAL;
+#endif
+    /* Unbound host fixtures only. Production bind always creates the push
+     * collectors, and never enters this reference polling implementation.
+     * This runs before every DRM request. Poll live references together:
      * the usual no-hangup case needs one syscall, not one per client/lease.
      * On readiness or error retain the individual checks below; closing a
      * file can retire other watches, so do not reuse a stale poll snapshot. */
+    const uint64_t scan_start = rpc_profile_now();
+#if defined(GPUD_DRM_RPC_PROFILE) && GPUD_DRM_RPC_PROFILE
+    rpc_profile_log_fd = service->log_endpoint_fd;
+#endif
     int reserve = gpud_drm_service_reserve_pollfds(service, 0);
     if (reserve) return service->error = reserve;
     const size_t count = gpud_drm_service_pollfds(
         service, service->pollfds, service->poll_capacity);
-    if (!count)
-        return 0;
+    if (!count) { rpc_profile_prime_scan(scan_start, 0, 0); return 0; }
     /* This is an immediate probe. FD_POLL preserves min_write_bytes and
      * readiness but never builds a transient waiter group. */
     for (size_t start = 0; start < count; start += PACHA_FD_WAIT_RETAINED_MAX_FDS) {
@@ -1770,6 +2271,24 @@ int gpud_drm_service_reap_hangups(struct gpud_drm_service *service) {
             ready += service->pollfds[i].revents != 0;
         if (polled < 0 || (size_t)polled != ready)
             return service->error = -EIO;
+    }
+    rpc_profile_prime_scan(scan_start, count,
+        (count + PACHA_FD_WAIT_RETAINED_MAX_FDS - 1) / PACHA_FD_WAIT_RETAINED_MAX_FDS);
+    /* Copy readiness into the live lease before any hangup cleanup mutates
+     * the table. Removed/reused leases are zeroed; authority still comes from
+     * the actual RECV, never from this snapshot. */
+    size_t lease_index = 0;
+    for (size_t i = 0; i < GPUD_DRM_REFERENCES_MAX; ++i)
+        lease_index += service->watches[i].handle && service->watches[i].fd >= 16;
+    for (size_t i = 0; i < GPUD_DRM_OBJECT_LEASES_MAX; ++i) {
+        struct gpud_drm_object_lease *lease = &service->object_leases[i];
+        lease->readable = 0;
+        if (!lease->object_id || lease->fd < 16) continue;
+        if (service->pollfds[lease_index].fd != (uint64_t)lease->fd)
+            return service->error = -EIO;
+        lease->readable = lease->prime_owner &&
+            (service->pollfds[lease_index].revents & PACHA_FD_EVENT_READABLE);
+        ++lease_index;
     }
     size_t connection_count = 0;
     for (struct gpud_drm_connection *c = service->connections; c; c = c->next)
@@ -1796,7 +2315,7 @@ int gpud_drm_service_reap_hangups(struct gpud_drm_service *service) {
         if (pacha_fd_poll(&poll, 1) <= 0 || !(poll.revents & PACHA_FD_EVENT_HANGUP))
             continue;
         uint64_t handle = watch->handle;
-        if (pacha_fd_close(watch->fd))
+        if (gpud_ready_remove(&watch->source) || pacha_fd_close(watch->fd))
             return service->error =
                 gpud_drm_files_fault(&service->files, service->files.generation, -EIO);
         unsigned int transferred = watch->transferred;
@@ -1866,10 +2385,37 @@ int gpud_drm_service_reap_hangups(struct gpud_drm_service *service) {
     return 0;
 }
 
+int gpud_drm_service_stop_ready(struct gpud_drm_service *service) {
+    if (!service || !service->ready)
+        return 0;
+    int e = gpud_ready_destroy(service->ready);
+    if (e)
+        return e;
+    service->ready = NULL;
+    for (size_t i = 0; i < GPUD_DRM_REFERENCES_MAX; i++)
+        service->watches[i].source = NULL;
+    for (size_t i = 0; i < GPUD_DRM_OBJECT_LEASES_MAX; i++)
+        service->object_leases[i].source = NULL;
+    for (struct gpud_drm_connection *c = service->connections; c; c = c->next)
+        c->source = NULL;
+    return 0;
+}
+
 int gpud_drm_service_retire_mappings(struct gpud_drm_service *service) {
     if (!service)
         return -EINVAL;
     int first_error = 0;
+    {
+        int e = gpud_drm_service_stop_ready(service);
+        if (e)
+            return e;
+    }
+    if (service->pending_transfer_client_fd >= 16) {
+        int e = pacha_fd_close(service->pending_transfer_client_fd);
+        if (e)
+            return e;
+        service->pending_transfer_client_fd = 0;
+    }
     while (service->connections) {
         first_error = retire_connection(&service->connections);
         if (first_error) return first_error;
@@ -1969,9 +2515,19 @@ static int bind_request_page(struct gpud_drm_service *service,
             }
         }
     }
+    if (!status && service->ready) {
+        status = gpud_ready_add(service->ready, connection->fd,
+                                PACHA_FD_EVENT_HANGUP, READY_CONNECTION,
+                                connection, &connection->source);
+        if (status) {
+            int e = retire_connection(&service->connections);
+            if (e)
+                service->files.terminal_error = e;
+        }
+    }
     const struct pacha_ipc_msg reply = {
         .word0 = GPUD_DRM_BIND_PAGE_REPLY_MAGIC, .word1 = (uint64_t)status};
-    return pacha_ipc_reply(PACHA_IPC_REPLY_IMPLICIT, &reply) ? -EIO : 0;
+    return reply_to_client(service, PACHA_IPC_REPLY_IMPLICIT, &reply, NULL);
 }
 
 static int receive_request(struct gpud_drm_service *service, pacha_fd_t endpoint_fd,
@@ -1988,8 +2544,13 @@ static int receive_request(struct gpud_drm_service *service, pacha_fd_t endpoint
         return native == PACHA_SYSCALL_ERR_EMPTY || native == PACHA_SYSCALL_ERR_NOT_READY ?
             -EAGAIN : (service->error = -EIO);
     service->received.fd_count = message.fd_count;
+    service->reply_attempted = 0;
     const uint64_t profile_start = rpc_profile_now();
-    uint64_t profile_map = 0, profile_dispatch = 0, profile_unmap = 0;
+#if defined(GPUD_DRM_RPC_PROFILE) && GPUD_DRM_RPC_PROFILE
+    uint64_t rpc_before[] = {service->gpu.profile_calls, service->gpu.profile_prepare,
+        service->gpu.profile_notify, service->gpu.profile_wait, service->gpu.profile_copy};
+#endif
+    uint64_t profile_map = 0, profile_dispatch = 0, profile_unmap = 0, profile_reply = 0;
     int profile_mapped = 0;
     uint64_t profile_key = UINT64_MAX;
     int error = -EPROTO;
@@ -2028,7 +2589,8 @@ static int receive_request(struct gpud_drm_service *service, pacha_fd_t endpoint
         };
         if (!status)
             memcpy(&reply.word3, request.data, request.data_size);
-        error = pacha_ipc_reply(PACHA_IPC_REPLY_IMPLICIT, &reply) ? -EIO : 0;
+        profile_reply = rpc_profile_now();
+        error = reply_to_client(service, PACHA_IPC_REPLY_IMPLICIT, &reply, NULL);
         goto cleanup;
     }
     const int bound_aux = message.word1 == GPUD_DRM_REQUEST_BOUND_AUX;
@@ -2106,6 +2668,16 @@ static int receive_request(struct gpud_drm_service *service, pacha_fd_t endpoint
             memcpy((unsigned char *)service->page + sizeof(header), &payload, response_size);
         }
     }
+    if (!status && transfer.count) {
+        status = prepare_reply_transfer(service, &transfer);
+        if (status) {
+            int e = cancel_reply_transfer(service, &transfer);
+            if (e) {
+                error = e;
+                goto cleanup;
+            }
+        }
+    }
     pacha_service_reply_init(&response, &header, status, PACHA_SERVICE_ERROR_GPUD_DRM,
         status ? 0 : result, response_size);
     memcpy(service->page, &response, sizeof(response));
@@ -2114,11 +2686,13 @@ static int receive_request(struct gpud_drm_service *service, pacha_fd_t endpoint
         .word3 = header.request_id,
         .fds = transfer.count ? transfer.fds : NULL,
         .fd_count = transfer.count};
-    error = pacha_ipc_reply((pacha_fd_t)reply_fd, &reply) ? -EIO : 0;
-    if (!error && transfer.count)
+    profile_reply = rpc_profile_now();
+    int delivered = 0;
+    error = reply_to_client(service, (pacha_fd_t)reply_fd, &reply, &delivered);
+    if (!error && delivered && transfer.count)
         finish_reply_transfer(&transfer);
 cleanup:
-    if (error) {
+    if (error && !service->reply_attempted) {
         const struct pacha_ipc_msg failed = {.word1 = (uint64_t)(int64_t)error};
         (void)pacha_ipc_reply(PACHA_IPC_REPLY_IMPLICIT, &failed);
     }
@@ -2143,8 +2717,32 @@ cleanup:
     if (service->files.terminal_error)
         error = service->files.terminal_error;
     service->error = error;
+#if defined(GPUD_DRM_RPC_PROFILE) && GPUD_DRM_RPC_PROFILE
+    /* One sample per 64 commands, capped per process. Absolute synchronized
+     * TSC bounds join to the native IPC_CALL ring without a wire extension. */
+    if (profile_samples_remaining && (++profile_seen % 64) == 0) {
+        unsigned long samples = ++profile_sample_id;
+        --profile_samples_remaining;
+        rpc_profile_log("GPUD_REQ_TSC s=%lx key=%llx rx=%llx reply=%llx end=%llx dispatch=%llx\n",
+            samples, (unsigned long long)profile_key,
+            (unsigned long long)profile_start, (unsigned long long)profile_reply,
+            (unsigned long long)rpc_profile_now(), (unsigned long long)profile_dispatch);
+        rpc_profile_log("GPUD_RPC_TSC s=%lx map=%llx unmap=%llx calls=%llx prep=%llx notify=%llx wait=%llx copy=%llx\n",
+            samples, (unsigned long long)profile_map, (unsigned long long)profile_unmap,
+            (unsigned long long)(service->gpu.profile_calls-rpc_before[0]),
+            (unsigned long long)(service->gpu.profile_prepare-rpc_before[1]),
+            (unsigned long long)(service->gpu.profile_notify-rpc_before[2]),
+            (unsigned long long)(service->gpu.profile_wait-rpc_before[3]),
+            (unsigned long long)(service->gpu.profile_copy-rpc_before[4]));
+    }
+#endif
+    (void)profile_reply;
     rpc_profile_record(profile_start, profile_map, profile_dispatch, profile_unmap,
         profile_mapped, message.word0 == GPUD_DRM_INLINE_IOCTL_REQUEST_MAGIC, profile_key);
+#if defined(GPUD_DRM_RPC_PROFILE) && GPUD_DRM_RPC_PROFILE
+    if (profile_active && !profile_samples_remaining)
+        profile_active = 0;
+#endif
     return error;
 }
 
@@ -2167,20 +2765,31 @@ static int receive_connection(struct gpud_drm_service *service) {
 /* The receive endpoint itself proves the caller holds this export's lease.
  * Never accept a caller-supplied token as authority on the public service. */
 static int receive_prime_cpu_sync(struct gpud_drm_service *service) {
-    for (size_t i = 0; i < GPUD_DRM_OBJECT_LEASES_MAX; ++i) {
-        struct gpud_drm_object_lease *lease = &service->object_leases[i];
+    /* reap_hangups already polled these level predicates this iteration.
+     * One owner consumes the snapshot; late arrivals remain level-readable
+     * for wait_service's arm/recheck or the next iteration. No edge is eaten. */
+    const size_t limit = service->ready ? GPUD_DRM_PRIMES_MAX : GPUD_DRM_OBJECT_LEASES_MAX;
+    const size_t start = service->ready ? service->prime_cursor : 0;
+    for (size_t i = 0; i < limit; ++i) {
+        size_t index = (start + i) % limit;
+        struct gpud_drm_object_lease *lease = service->ready ?
+            service->primes[index].owner_lease : &service->object_leases[index];
+        if (service->ready && !lease)
+            continue;
         if (!lease->object_id || !lease->prime_owner || lease->fd < 16) continue;
-        struct pacha_pollfd poll = {.fd = lease->fd, .events = PACHA_FD_EVENT_READABLE};
-        long ready = pacha_fd_poll(&poll, 1);
-        if (ready < 0) return -EIO;
-        if (!ready || !(poll.revents & PACHA_FD_EVENT_READABLE)) continue;
+        if (!lease->readable)
+            continue;
+        lease->readable = 0;
         if (service->received.fd_count) return -EBUSY;
         struct pacha_ipc_msg request = {.fds = service->received.fds,
             .fd_capacity = PACHA_IPC_MAX_TRANSFER_FDS};
         const long native = pacha_ipc_message_syscall(PACHA_IPC_SYSCALL_RECV,
             lease->fd, 0, &request, 0, 0, 0);
-        if (native == PACHA_SYSCALL_ERR_EMPTY || native == PACHA_SYSCALL_ERR_NOT_READY) continue;
+        if (native == PACHA_SYSCALL_ERR_EMPTY || native == PACHA_SYSCALL_ERR_NOT_READY) {
+            continue;
+        }
         if (native) return -EIO;
+        if (service->ready) service->prime_cursor = (unsigned)((index + 1) % limit);
         service->received.fd_count = request.fd_count;
         int status = -EINVAL;
         if (!request.fd_count && request.word0 == GPUD_DRM_PRIME_CPU_SYNC_REQUEST_MAGIC &&
@@ -2196,22 +2805,31 @@ static int receive_prime_cpu_sync(struct gpud_drm_service *service) {
         if (released) return service->error = released;
         const struct pacha_ipc_msg reply = {.word0 = GPUD_DRM_PRIME_CPU_SYNC_REPLY_MAGIC,
             .word1 = (uint64_t)(int64_t)status, .word2 = request.word1, .word3 = request.word2};
-        return pacha_ipc_reply(PACHA_IPC_REPLY_IMPLICIT, &reply) ? -EIO : 0;
+        return reply_to_client(service, PACHA_IPC_REPLY_IMPLICIT, &reply, NULL);
     }
     return -EAGAIN;
 }
 
 int gpud_drm_service_receive(struct gpud_drm_service *service) {
     if (!service || service->error) return service ? service->error : -EINVAL;
-    int sync = receive_prime_cpu_sync(service);
-    if (sync != -EAGAIN) return sync;
+    /* PRIME CPU sync is an independent stream, not unlimited priority over
+     * DRM clients. Alternate classes while keeping each endpoint FIFO and
+     * the existing per-connection round robin. No dispatch is concurrent. */
+    int prime_first = service->prefer_prime;
+    service->prefer_prime = !prime_first;
+    if (prime_first) {
+        int sync = receive_prime_cpu_sync(service);
+        if (sync != -EAGAIN) return sync;
+    }
     int prefer = service->prefer_connection;
     service->prefer_connection = !prefer;
     int result = prefer ? receive_connection(service) :
         receive_request(service, service->endpoint_fd, NULL);
     if (result != -EAGAIN) return result;
-    return prefer ? receive_request(service, service->endpoint_fd, NULL) :
+    result = prefer ? receive_request(service, service->endpoint_fd, NULL) :
         receive_connection(service);
+    if (result != -EAGAIN || prime_first) return result;
+    return receive_prime_cpu_sync(service);
 }
 
 int gpud_drm_service_reject_unavailable(pacha_fd_t endpoint_fd) {

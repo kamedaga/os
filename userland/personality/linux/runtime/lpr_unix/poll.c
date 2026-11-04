@@ -4,8 +4,49 @@
 #include <unixd/profile.h>
 #include "../lpr_filed_internal.h"
 #include <errno.h>
+#include <pacha/readiness.h>
+#include <pachaos/abi.h>
+#include "../support/syscall.h"
 
 enum { UX_IN = 1, UX_OUT = 4, UX_ERR = 8, UX_HUP = 16, UX_RDHUP = 0x2000 };
+
+static int listener_mapping(struct lpr_unix_socket *socket)
+{
+    if (__atomic_load_n(&socket->readiness, __ATOMIC_ACQUIRE)) return 0;
+    lpr_state_lock(&socket->adopt_lock);
+    int status = 0;
+    if (!socket->readiness) {
+        struct lpr_unix_context *context;
+        status = lpr_unix_context_current(&context);
+        struct unix_control request = {.operation = UNIX_OP_POLL, .socket = socket->socket,
+            .transaction = PACHA_READINESS_EXPORT};
+        struct pacha_ipc_fd cap = {0};
+        unsigned count = 0;
+        if (!status) status = lpr_unix_context_call(context, &request, NULL, 0, &cap, 1, &count);
+        struct pacha_fd_info info;
+        const uint64_t rights = PACHA_FD_RIGHT_INSPECT | PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_MAP_READ;
+        if (!status && (count != 1 || cap.fd < 16 ||
+            !lpr_native_fd_info(cap.fd, &info) || info.kind != PACHA_FD_KIND_VMO ||
+            info.rights != rights || info.size != PACHA_READINESS_BYTES ||
+            info.flags != (PACHA_FD_FLAG_PRIVATE | PACHA_FD_FLAG_CLOEXEC))) status = -EPROTO;
+        if (!status) {
+            int64_t address = lpr_pacha_syscall6(PACHAOS_SYSCALL_MMAP, cap.fd, 0,
+                PACHA_READINESS_BYTES, PACHA_PROT_READ, PACHA_MMAP_SHARED, 0);
+            if (address < 4096) status = -ENOMEM;
+            else {
+                const struct pacha_readiness *page = (void *)(uintptr_t)address;
+                if (page->identity != socket->socket || !pacha_readiness_load(page)) {
+                    (void)lpr_pacha_syscall2(PACHAOS_SYSCALL_MUNMAP, address, PACHA_READINESS_BYTES);
+                    status = -EPROTO;
+                } else __atomic_store_n(&socket->readiness, page, __ATOMIC_RELEASE);
+            }
+        }
+        /* The mapping retains the VMO; no extra native FD crosses fork/exec. */
+        if (cap.fd >= 16) (void)lpr_close_native_fd_if_open(cap.fd);
+    }
+    lpr_state_unlock(&socket->adopt_lock);
+    return status;
+}
 
 static int64_t poll_socket(struct lpr_unix_socket *socket, uint32_t events,
     struct unix_poll_sequence *sequence)
@@ -13,6 +54,14 @@ static int64_t poll_socket(struct lpr_unix_socket *socket, uint32_t events,
     UP_BEGIN(total, UP_CONTROL, UNIX_OP_POLL, UP_TOTAL);
     int adoption = lpr_unix_socket_adopt(socket);
     if (adoption) return adoption;
+    if (socket->listening) {
+        int status = listener_mapping(socket);
+        if (status) return status;
+        struct pacha_ready_observation observation=pacha_readiness_observe(socket->readiness);
+        if (sequence) *sequence = (struct unix_poll_sequence){.source = socket->socket,
+            .read = observation.read, .write = observation.write, .error = observation.error};
+        return observation.ready & (events | UX_ERR | UX_HUP);
+    }
     if (!__atomic_load_n(&socket->mapped, __ATOMIC_ACQUIRE)) {
         struct lpr_unix_context *context;
         int status = lpr_unix_context_current(&context);

@@ -229,6 +229,8 @@ pub fn pipeReadBytes(self: anytype, owner: PrincipalId, fd: Fd, out: []u8) PipeI
 }
 
 pub fn pipeWriteBytes(self: anytype, owner: PrincipalId, fd: Fd, in: []const u8, atomic: bool) PipeIoError!usize {
+    const wf11 = @import("../ipc_metric.zig").detailBegin();
+    defer @import("../ipc_metric.zig").detailEnd(.pipe_write, wf11);
     const view = self.fdPayloadWithRightsConst(owner, fd, .{ .write = true }) orelse return PipeIoError.InvalidState;
     const endpoint = @TypeOf(self.*).pipeEndpointFromPayload(view.payload) orelse return PipeIoError.InvalidState;
     if (!endpoint.write) return PipeIoError.InvalidState;
@@ -381,6 +383,8 @@ pub fn takePipeWaiters(
     ready_events: u64,
     out: []ThreadWakeTarget,
 ) usize {
+    const wf11 = @import("../ipc_metric.zig").detailBegin();
+    defer @import("../ipc_metric.zig").detailEnd(.wake_select, wf11);
     const pipe = self.pipeSlot(pipe_ref) orelse return 0;
     const writable_bytes: u64 = if (write_side) @intCast(@TypeOf(self.*).pipeFree(pipe)) else 0;
     return pipe.waiters[if (write_side) 1 else 0].takeEventsWithWritableBytes(ready_events, writable_bytes, out);

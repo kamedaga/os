@@ -15,7 +15,7 @@ static kb2_fs_request_t decoded;
 static kb2_fs_response_t last_reply;
 static uint64_t identity = UINT64_C(0x50434900002d0000);
 static int failure_at, calls, live, maps, closed_handles, fail_config;
-static char paths[32][160];
+static char paths[40][160];
 static int nodes;
 int pacha_capsule_query(pacha_fd_t fd, struct pacha_capsule_info *out)
 { assert(fd == 42); *out = (struct pacha_capsule_info){.kind=PACHA_CAPSULE_KIND_DEVICE, .device=identity}; return 0; }
@@ -25,7 +25,7 @@ int pacha_capsule_pci_config_read(pacha_fd_t fd, uint16_t offset, unsigned width
     if (fail_config) return -EACCES;
     switch (offset) {
     case 0: assert(width == 4); *out = 0x12345678; break;
-    case 8: assert(width == 1); *out = 0x91; break;
+    case 8: assert(width == 4); *out = 0x03020091; break;
     case 14: assert(width == 1); *out = 0; break;
     case 44: assert(width == 4); *out = 0x23456789; break;
     default: assert(0);
@@ -67,7 +67,7 @@ static void operate(void)
     /* Shared directories belong to somebody else. */
     if(r->opcode==KB2_FILESYSTEM_OP_MKDIRAT && live==0 && strcmp(path,"/sys/dev/char/226:128"))
         last_reply.result=-EEXIST;
-    else { assert(live<32); strcpy(paths[live++],path); }
+    else { assert(live<40); strcpy(paths[live++],path); }
 }
 int pacha_ipc_call(pacha_fd_t fd, const struct pacha_ipc_msg *req, struct pacha_ipc_msg *reply, uint64_t timeout, int *sent)
 {
@@ -93,13 +93,18 @@ int main(int argc, char **argv)
 {
     struct gpud_discovery d;
     assert(!gpud_discovery_prepare(&d,42,0));
-    assert(d.count==24 && d.ancestor_count==9);
+    assert(d.count==27 && d.ancestor_count==10);
     assert(!strcmp(d.entries[3].path,"/sys/dev/block") && d.entries[3].kind==GPUD_DISC_DIR);
-    assert(!strcmp(d.entries[14].value,"PCI_SLOT_NAME=0000:2d:00.0\nPCI_ID=5678:1234\n"));
-    assert(!strcmp(d.entries[15].value,"0x5678\n"));
-    assert(!strcmp(d.entries[21].path,"/sys/dev/char/226:128/uevent"));
-    assert(!strcmp(d.entries[21].value,"MAJOR=226\nMINOR=128\nDEVNAME=dri/renderD128\n"));
-    assert(!gpud_discovery_publish(&d,43) && nodes==1 && live==15 && maps==0);
+    assert(!strcmp(d.entries[15].value,"PCI_SLOT_NAME=0000:2d:00.0\nPCI_ID=5678:1234\n"));
+    assert(!strcmp(d.entries[16].value,"0x5678\n"));
+    assert(!strcmp(d.entries[24].path,"/sys/dev/char/226:128/uevent"));
+    assert(!strcmp(d.entries[24].value,"MAJOR=226\nMINOR=128\nDEVNAME=dri/renderD128\n"));
+    assert(!strcmp(d.entries[9].path,"/sys/bus/pci/devices") && d.entries[9].kind==GPUD_DISC_DIR);
+    assert(!strcmp(d.entries[21].path,"/sys/dev/char/226:128/device/class") &&
+        !strcmp(d.entries[21].value,"0x030200\n"));
+    assert(!strcmp(d.entries[22].path,"/sys/bus/pci/devices/0000:2d:00.0") &&
+        !strcmp(d.entries[22].value,"/sys/dev/char/226:128/device"));
+    assert(!gpud_discovery_publish(&d,43) && nodes==1 && live==17 && maps==0);
     int total=calls;
     assert(gpud_discovery_publish(&d,43)==-EINVAL);
     assert(!gpud_discovery_remove(&d,43) && !live && !maps && !d.owned);
@@ -113,13 +118,13 @@ int main(int argc, char **argv)
     fail_config=0; identity=1;
     assert(gpud_discovery_prepare(&d,42,0)==-ENODEV);
     identity=UINT64_C(0x5043490000010301);
-    assert(!gpud_discovery_prepare(&d,42,1) && d.count==31);
-    assert(!strcmp(d.entries[27].path,"/sys/dev/char/226:0/uevent"));
-    assert(!strcmp(d.entries[27].value,"MAJOR=226\nMINOR=0\nDEVNAME=dri/card0\n"));
-    assert(!strcmp(d.entries[30].path,"/dev/dri/card0") && d.entries[30].dev==0xe200);
+    assert(!gpud_discovery_prepare(&d,42,1) && d.count==34);
+    assert(!strcmp(d.entries[30].path,"/sys/dev/char/226:0/uevent"));
+    assert(!strcmp(d.entries[30].value,"MAJOR=226\nMINOR=0\nDEVNAME=dri/card0\n"));
+    assert(!strcmp(d.entries[33].path,"/dev/dri/card0") && d.entries[33].dev==0xe200);
     int before_nodes=nodes;
     calls=0;
-    assert(!gpud_discovery_publish(&d,43) && nodes==before_nodes+2 && live==22);
+    assert(!gpud_discovery_publish(&d,43) && nodes==before_nodes+2 && live==24);
     total=calls;
     assert(!gpud_discovery_remove(&d,43) && !live && !d.owned);
     for (int i=1;i<=total;++i) {

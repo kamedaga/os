@@ -169,3 +169,52 @@ int filed_manifest_storage_save(filed_runtime_t *rt,const uint8_t key[32],
         temporary,0,0,&response);
     return status;
 }
+
+#if defined(FILED_EXEC_STAGE_REPORT) && FILED_EXEC_STAGE_REPORT
+/* Opt-in, bounded diagnostic in the existing private administrative storage
+ * namespace. No exec-provided path/credentials/data select this destination.
+ * Storage RPCs go to the sandbox, never recursively back through filed. */
+int filed_exec_stage_report_store(filed_runtime_t *rt, const uint8_t *bytes, size_t length)
+{
+    static const char target[] = "/var/cache/filed/mc3-exec.metrics";
+    if (!rt || !bytes || !length || length > 32768) return -EINVAL;
+    int status = ensure_directory(rt);
+    if (status) return status;
+    char temporary[160];
+    kb2_fs_response_t response;
+    for (unsigned attempt = 0; attempt < 16; ++attempt) {
+        uint64_t sequence = __atomic_add_fetch(&temporary_sequence, 1, __ATOMIC_RELAXED);
+        int size = snprintf(temporary, sizeof(temporary), "%s/.mc3-%llu", manifest_directory,
+            (unsigned long long)sequence);
+        if (size < 0 || size >= (int)sizeof(temporary)) return -ENAMETOOLONG;
+        status = path_call(rt, KB2_FILESYSTEM_OP_OPENAT2, temporary,
+            O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600, &response);
+        if (status != -EEXIST) break;
+    }
+    if (status) return status;
+    uint64_t handle = response.handle;
+    for (size_t done = 0; !status && done < length;) {
+        size_t chunk = length - done;
+        if (chunk > 16384) chunk = 16384;
+        kb2_fs_request_t write = {.opcode=KB2_FILESYSTEM_OP_PWRITE, .handle=handle,
+            .offset=(int64_t)done, .length=chunk, .data={KB2_FILESYSTEM_REQUEST_SIZE,chunk}};
+        status = filed_storage_pager_request_ex(rt, 1, 1, &write, bytes+done, chunk,
+            &response, NULL, 0);
+        if (!status && response.result != (int64_t)chunk) status = -EIO;
+        done += chunk;
+    }
+    close_handle(rt, handle);
+    if (!status) {
+        size_t old_size = strlen(temporary)+1, new_size = sizeof(target);
+        char paths[288];
+        memcpy(paths, temporary, old_size); memcpy(paths+old_size, target, new_size);
+        kb2_fs_request_t rename = {.opcode=KB2_FILESYSTEM_OP_RENAMEAT2,
+            .path={KB2_FILESYSTEM_REQUEST_SIZE,old_size},
+            .second_path={KB2_FILESYSTEM_REQUEST_SIZE+old_size,new_size}};
+        status = filed_storage_pager_request_ex(rt, 1, 1, &rename, paths,
+            old_size+new_size, &response, NULL, 0);
+    }
+    if (status) (void)path_call(rt, KB2_FILESYSTEM_OP_UNLINKAT, temporary, 0, 0, &response);
+    return status;
+}
+#endif

@@ -120,6 +120,7 @@ fn kernelStaticStorageStartAddr() usize {
     start = minStaticStart(start, staticStorageStart(@TypeOf(boot_rsdp_paddr), &boot_rsdp_paddr));
     start = minStaticStart(start, iommu.kernelStaticStorageStartAddr());
     start = minStaticStart(start, acpi_power.staticStart());
+    start = minStaticStart(start, @import("../thread_identity.zig").staticStart());
     start = minStaticStart(start, platform_device.staticStart());
     start = minStaticStart(start, x86_platform.kernelStaticStorageStartAddr());
     return start;
@@ -141,6 +142,7 @@ fn kernelStaticStorageEndAddr() usize {
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(boot_rsdp_paddr), &boot_rsdp_paddr));
     end = maxStaticEnd(end, iommu.kernelStaticStorageEndAddr());
     end = maxStaticEnd(end, acpi_power.staticEnd());
+    end = maxStaticEnd(end, @import("../thread_identity.zig").staticEnd());
     end = maxStaticEnd(end, pci.kernelStaticStorageEndAddr());
     end = maxStaticEnd(end, platform_device.staticEnd());
     end = maxStaticEnd(end, user_copy.kernelStaticStorageEndAddr());
@@ -285,6 +287,7 @@ fn initMemoryModules() void {
 
     user_vm.init(.{
         .retire_user_tlb_for_principal = user_copy.retireUserTlbForPrincipal,
+        .retire_user_page_tables_for_principal = user_copy.retireUserPageTablesForPrincipal,
         .before_pte_retirement = retainRetiredPageViewWrites,
         .pt_allocator = @import("../memory/identity_allocator.zig").allocatorFor(kernel_runtime.global_free_list, .pt_storage),
         .user_spaces = &user_space_table,
@@ -456,6 +459,7 @@ fn teardownFaultedProcess(principal: kernel.PrincipalId, fault_vector: u8) void 
     }, kernel_runtime.kernel_state_global, principal, false);
     if (!user_vm.lockVmTransaction(principal)) return;
     user_vm.clearUserAddressSpace(principal);
+    if (user_vm.getUserSpace(principal)) |space| @import("../thread_identity.zig").retire(kernel_runtime.kernel_state_global, space, kernel_runtime.global_free_list);
     kernel_runtime.kernel_state_global.releasePrincipalNativeMemory(principal, kernel_runtime.global_free_list);
     kernel_runtime.kernel_state_global.resetProcessRuntimeTables(process_index);
     user_vm.retireUserAddressSpace(principal);
@@ -485,6 +489,7 @@ fn teardownExitedProcess(principal: kernel.PrincipalId) void {
     }, kernel_runtime.kernel_state_global, principal, false);
     if (!user_vm.lockVmTransaction(principal)) return;
     user_vm.clearUserAddressSpace(principal);
+    if (user_vm.getUserSpace(principal)) |space| @import("../thread_identity.zig").retire(kernel_runtime.kernel_state_global, space, kernel_runtime.global_free_list);
     const metric_after_clear_as = if (enable_exit_teardown_metrics) x86_platform.readTimestampCounter() else 0;
     kernel_runtime.kernel_state_global.releasePrincipalNativeMemory(principal, kernel_runtime.global_free_list);
     const metric_after_release_mem = if (enable_exit_teardown_metrics) x86_platform.readTimestampCounter() else 0;
@@ -617,6 +622,7 @@ fn enterUserModeIretq(user_entry_va: u64, user_rsp: u64) noreturn {
     const user_rflags: u64 = boot_static.user_entry_rflags;
     const kernel_transition_rsp = x86_platform.ring0StackTop();
     // First entry uses the same publication/fence API, with a flushing load.
+    scheduler.publishIdentityForUserReturn(0, scheduler.currentCr3());
     const first_user_cr3 = x86_platform.userReturnCr3(scheduler.currentCr3(), true);
 
     xstate_runtime.restoreCurrentThreadXState();
@@ -671,6 +677,17 @@ pub const LimineSmpResources = struct {
     trampoline_base: u64,
 };
 
+fn clockMmioAllowed(base: u64, bytes: u64) bool {
+    const status = smp.explicitUcMmioStatus(base, bytes);
+    if (status != .ready) {
+        const masks = smp.mmioCacheEvidenceCounts();
+        kernel_log.writeFmt("clock: HPET UC proof failed reason={s} base=0x{x} bytes=0x{x} verified={} matching={} online={}\n", .{
+            @tagName(status), base, bytes, masks.verified, masks.matching, masks.online,
+        });
+    }
+    return status == .ready;
+}
+
 pub fn initializeLimineRuntimeOrHalt(smp_resources: LimineSmpResources) void {
     boot_rsdp_paddr = smp_resources.rsdp_paddr;
     initKernelRuntimeOrHalt();
@@ -720,12 +737,17 @@ pub fn initializeLimineRuntimeOrHalt(smp_resources: LimineSmpResources) void {
     smp.configureApSyscallEntry(&traps.syscallEntryForCpu);
     smp.configureApUserTimer(
         boot_static.lapic_timer_vector,
-        lapic.timerInitialCount(boot_static.lapic_timer_initial_count) * @as(u32, @intCast(boot_static.scheduler_slice_ticks)),
+        lapic.timerSliceCount(boot_static.lapic_timer_initial_count, @intCast(boot_static.scheduler_slice_ticks)),
     );
     smp.configureWakeIpiVector(boot_static.scheduler_wake_ipi_vector);
-    if (!smp.startIdleAps(&smp_info, x86_platform.kernel_cr3_value)) {
+    const cpus_started = smp.startIdleAps(&smp_info, x86_platform.kernel_cr3_value);
+    // Collect boot-only HWP diagnostics after AP publication, including a
+    // failed CPU's readback, before the existing startup failure halt.
+    smp.logCpuPerformance();
+    if (!cpus_started) {
         halt.haltWithMessage("SMP application processor startup failed");
     }
+    @import("../realtime_clock.zig").prepareHighResolution(boot_rsdp_paddr, clockMmioAllowed);
     if (!x86_platform.checkRetiredLowMappings(kernel_runtime.global_free_list, smp_info.trampoline_base))
         halt.haltWithMessage("CR3 isolation self-check failed");
     kernel_log.writeFmt("boot: cpus ready count={}\n", .{smp.cpuCount()});
@@ -757,9 +779,14 @@ fn initKernelSubsystems(memory_stats: boot_static.MemoryStats) *kernel.KernelSta
     const state = kernel_runtime.kernel_state_global;
     state.pool_allocator = @import("../memory/identity_allocator.zig").allocator(kernel_runtime.global_free_list);
     kernel_runtime.global_free_list.reclaimable.register(&state.wait_storage_cache);
+    kernel_runtime.global_free_list.reclaimable.register(&state.discard_storage_cache);
     kernel_runtime.global_free_list.reclaimable.fd_retired = &state.fd_retired;
+    kernel_runtime.global_free_list.reclaimable.discard_retired = &@import("../memory/discard_pages.zig").global;
+    const shared_retired = &@import("../memory/shared_discard_slots.zig").global;
+    shared_retired.init(smp.cpuCount(), kernel_runtime.global_free_list);
+    kernel_runtime.global_free_list.reclaimable.shared_discard_retired = shared_retired;
     state.debug_process_lifecycle_hook = null;
-    state.zero_physical_page_hook = user_copy.zeroPhysicalPage;
+    state.zero_physical_page_hook = user_copy.zeroOwnedPhysicalPage;
 
     return state;
 }
@@ -864,13 +891,33 @@ fn checkHighRam(state: *kernel.KernelState, principal: kernel.PrincipalId) !void
     kernel_log.writeFmt("high-ram: pa=0x{x} copy=0x{x} direct-write-read=PASS zero=PASS copy=PASS user=PASS COW=PASS return-reuse=PASS\n", .{ high, copy });
 }
 
+// A reset, a dispatch or a user switch here would invalidate the boot-only
+// exclusion argument. Keep every publication/reclamation boundary lock-free.
+fn assertBootConstructionBoundary() void {
+    @import("../sync/lock_diagnostics.zig").assertRootEmpty();
+    if (comptime @import("../sync/lock_diagnostics.zig").enabled) {
+        if (smp.currentCpuSlotIfKnown() != 0 or kernel_runtime.kernel_state_ready or scheduler.apUserDispatchReady())
+            @panic("invalid boot construction boundary");
+    }
+    smp.assertKernelStateWakeDeferralEnded();
+}
+
 fn constructBootProcesses(state: *kernel.KernelState, res: PreparedBootResources) void {
+    assertBootConstructionBoundary();
+    // This long section is confined to construction before the first user
+    // dispatch: no user can wait for K and AP idle/IPI progress needs no K.
+    // Bootfs page copies, ELF zero/segment scans and high-RAM checks scale
+    // with the input size and delay interrupt service. Preserve the existing
+    // TLB/IPI interrupt windows; this is not a runtime bulk-copy pattern.
+    syscalls.lockKernelStateForBoot();
+    const construction_start = @import("../realtime_clock.zig").readCounter();
     const init_principal = state.createProcessDescriptor("seed2_boot") orelse
         halt.haltWithMessage("seed2_boot process descriptor alloc failed");
     state.setBootstrapOwner(init_principal, true) catch |err| {
         halt.haltWithError("init bootstrap owner mark failed: ", err);
     };
     boot_init_principal = init_principal;
+    scheduler.configureWakeAffinityFixture(init_principal);
     const init_process = process_factory.createUserProcess(state, init_principal, "init", kernel_runtime.global_free_list, &user_space_table);
     checkHighRam(state, init_principal) catch |err| halt.haltWithError("high RAM self-check failed: ", err);
     state.createSerialFdAt(init_principal, 1, 1) catch |err| {
@@ -925,12 +972,23 @@ fn constructBootProcesses(state: *kernel.KernelState, res: PreparedBootResources
         kernel_log.write("init ELF load failed\n");
         halt.haltLoop();
     };
+    const construction_cycles = @import("../realtime_clock.zig").readCounter() -% construction_start;
+    syscalls.unlockKernelStateForBoot();
+    assertBootConstructionBoundary();
+    kernel_log.writeFmt("boot-K: construction hold-cycles={} bootfs-bytes={} root-empty wake-ended\n", .{ construction_cycles, res.bootfs_size });
     // ELF and bootfs staging are released before this long-lived catalog.
     if (!pci.captureBootFunctions())
         halt.haltWithMessage("PCI function catalog capture failed");
+    assertBootConstructionBoundary();
     boot_scratch.seal() catch halt.haltWithMessage("boot scratch has unfinished staging");
+    assertBootConstructionBoundary();
     reclaimBootScratchOrHalt();
     const init_thread = scheduler.threadForPrincipal(init_principal).?;
+    assertBootConstructionBoundary();
+    // Stack randomization mutates KernelState; release explicitly before
+    // scheduler publication so AP dispatch can never inherit the boot hold.
+    syscalls.lockKernelStateForBoot();
+    const stack_start = @import("../realtime_clock.zig").readCounter();
     const init_rsp = process_factory.installInitialUserStackOrHalt(
         state,
         init_principal,
@@ -938,16 +996,24 @@ fn constructBootProcesses(state: *kernel.KernelState, res: PreparedBootResources
         loaded_init,
         "init",
     );
+    const stack_cycles = @import("../realtime_clock.zig").readCounter() -% stack_start;
+    syscalls.unlockKernelStateForBoot();
+    assertBootConstructionBoundary();
+    kernel_log.writeFmt("boot-K: stack hold-cycles={} root-empty wake-ended\n", .{stack_cycles});
     if (!scheduler.setBootstrapThreadEntry(init_thread, init_principal, .fromInt(loaded_init.entry), .fromInt(init_rsp)))
         halt.haltWithMessage("bootstrap thread entry publication rejected");
+    assertBootConstructionBoundary();
     if (!scheduler.activateNextReadyOnCurrentCpu()) {
         halt.haltWithMessage("kernel scheduler failed to activate init");
     }
 
+    assertBootConstructionBoundary();
     @atomicStore(bool, &kernel_runtime.kernel_state_ready, true, .release);
     // Boot threads are already visible to the verified runqueues at this
     // point.  APs must not claim one until its ELF, stack, kernel state, and
     // initial BSP activation are all complete.
+    @import("../sync/lock_diagnostics.zig").assertRootEmpty();
+    smp.assertKernelStateWakeDeferralEnded();
     scheduler.enableApUserDispatch();
 }
 
@@ -956,6 +1022,8 @@ fn constructBootProcesses(state: *kernel.KernelState, res: PreparedBootResources
 // ---------------------------------------------------------------------------
 
 fn wireRuntimeSubsystems(state: *kernel.KernelState, memory_stats: boot_static.MemoryStats) void {
+    @import("../sync/lock_diagnostics.zig").assertRootEmpty();
+    smp.assertKernelStateWakeDeferralEnded();
     syscalls.init(.{
         .state = state,
         .free_list = kernel_runtime.global_free_list,
@@ -971,6 +1039,7 @@ fn wireRuntimeSubsystems(state: *kernel.KernelState, memory_stats: boot_static.M
         .copy_user_bytes_from_va = user_copy.copyUserBytesFromVa,
         .copy_bytes_to_user_va = user_copy.copyBytesToUserVa,
         .probe_user_range = user_copy.probeUserRange,
+        .populate_user_range = user_copy.populateUserRange,
         .resident_read_user_u32 = user_copy.readUserU32Resident,
         .futex_lock_address_space = user_vm.lockAddressSpace,
         .futex_unlock_address_space = user_vm.unlockAddressSpace,
@@ -991,10 +1060,12 @@ fn wireRuntimeSubsystems(state: *kernel.KernelState, memory_stats: boot_static.M
 
 pub fn prepareBootPrelude() void {
     asm volatile ("cli");
+    @import("../tsc_clock.zig").beginBoot();
     xstate_runtime.initXStateSupport();
     lapic.maskLegacyPic();
     kernel_log.reset();
     serial.init();
+    @import("../tsc_clock.zig").logBoot();
     pci.clearInterruptRoutes();
     boot_init_principal = null;
 }
@@ -1003,46 +1074,41 @@ pub fn bootWithResources(resources: PreparedBootResources, comptime checkpoint: 
     kernel_log.writeOnly("boot: bootWithResources entry\n");
     kernel_log.write("boot: init subsystems\n");
     const state = initKernelSubsystems(resources.memory_stats);
-    const highres_ready = @import("../realtime_clock.zig").initializeHighResolution(
-        boot_rsdp_paddr,
-        struct {
-            fn allowed(base: u64, bytes: u64) bool {
-                const status = smp.explicitUcMmioStatus(base, bytes);
-                if (status != .ready) {
-                    const masks = smp.mmioCacheEvidenceCounts();
-                    kernel_log.writeFmt("clock: HPET UC proof failed reason={s} base=0x{x} bytes=0x{x} verified={} matching={} online={}\n", .{
-                        @tagName(status), base, bytes, masks.verified, masks.matching, masks.online,
-                    });
-                }
-                return status == .ready;
-            }
-        }.allowed,
-    );
-    // APs are idle and user dispatch has not started. HPET UC proof is now
-    // complete, so calibration can use an independent bounded deadline.
+    const highres_ready = @import("../realtime_clock.zig").initializeHighResolution();
+    // AP qualification is complete and user dispatch has not started.
+    // Known TSCs use qualified short calibration; CPUs without a crystal
+    // frequency use PIT and a BSP-only measured elapsed-time fallback.
     const timer_calibration = lapic.calibrateTimer(
         boot_static.lapic_timer_initial_count,
         boot_static.lapic_timer_rearm_overhead_ns,
     );
     if (timer_calibration.calibrated) {
-        kernel_log.writeFmt(
-            "lapic-timer: calibration=pit frequency_hz={} initial_count={} rearm_overhead_ns={} pit_ticks={}\n",
-            .{
-                timer_calibration.frequency_hz,
-                timer_calibration.initial_count,
-                timer_calibration.rearm_overhead_ns,
-                timer_calibration.pit_ticks,
-            },
-        );
+        if (timer_calibration.source == .pit) {
+            // PIT gives a nominal reference window, not the TSC path's
+            // bounded sampling brackets. Do not label its zero-initialized
+            // diagnostic fields as a claim of zero measurement uncertainty.
+            kernel_log.writeFmt("lapic-timer: calibration=pit frequency_hz={} initial_count={} pit_ticks={} reference-window-ns={}\n", .{
+                timer_calibration.frequency_hz, timer_calibration.initial_count, timer_calibration.pit_ticks, timer_calibration.window_ns,
+            });
+        } else {
+            kernel_log.writeFmt("lapic-timer: calibration=tsc frequency_hz={} lower_hz={} initial_count={} error-bound-ppm={} window-ns={} elapsed-ns={}\n", .{
+                timer_calibration.frequency_hz, timer_calibration.lower_hz, timer_calibration.initial_count, timer_calibration.error_bound_ppm, timer_calibration.window_ns, timer_calibration.elapsed_ns,
+            });
+            kernel_log.writeBootFmt("lapic-bracket: tsc-hz={} first-width-cycles={} last-width-cycles={}\n", .{ timer_calibration.known_hz, timer_calibration.first_width_cycles, timer_calibration.last_width_cycles });
+        }
     } else {
         kernel_log.writeFmt(
             "lapic-timer: calibration=fallback reason={s} frequency_hz=unknown initial_count={} rearm_overhead_ns={}\n",
             .{ @tagName(timer_calibration.reason), timer_calibration.initial_count, timer_calibration.rearm_overhead_ns },
         );
     }
+    // Without any measured clock, IRQ arrivals are not milliseconds. Refuse
+    // to dispatch users with fabricated elapsed time after calibration fails.
+    if (!highres_ready and @import("../realtime_clock.zig").bootstrapCounterFrequencyHz() == 0)
+        @panic("no calibrated elapsed-time source after LAPIC/PIT initialization");
     smp.configureApUserTimer(
         boot_static.lapic_timer_vector,
-        lapic.timerInitialCount(boot_static.lapic_timer_initial_count) * @as(u32, @intCast(boot_static.scheduler_slice_ticks)),
+        lapic.timerSliceCount(boot_static.lapic_timer_initial_count, @intCast(boot_static.scheduler_slice_ticks)),
     );
     const clock = @import("../realtime_clock.zig");
     const hpet = @import("../hpet.zig").diagnostic();
@@ -1053,7 +1119,7 @@ pub fn bootWithResources(resources: PreparedBootResources, comptime checkpoint: 
     kernel_log.writeFmt("clock: pvclock stable-cpus={} online-cpus={}\n", .{ clock.stableCpuCount(), smp.onlineCpuSet().count() });
     if (highres_ready) {
         kernel_log.writeFmt("clock: monotonic={s} deadline={s} high-resolution=1\n", .{
-            if (clock.usesStableKvmClock()) "kvm" else "hpet",
+            clock.monotonicSourceName(),
             if (lapic.highResolutionReady()) "lapic" else "periodic-fallback",
         });
     } else {

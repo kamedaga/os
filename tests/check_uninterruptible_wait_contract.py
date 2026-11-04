@@ -40,7 +40,9 @@ def check(files):
     for name,flag in [('blockCurrentThreadPreferred','wait_uninterruptible'),('parkApThreadForBlockPreferred','wait_uninterruptible'),('tryWakeWaitTransferLocked','request.wait_uninterruptible')]:
         b=function_body(s,name)
         ctx='source_ctx' if name=='tryWakeWaitTransferLocked' else 'ctx'
-        pattern=r'firstUnblockedPendingSignal\('+ctx+r'\) != 0 and '+ctx+r'\.signal_entry != 0 and\s*!'+re.escape(flag)
+        pattern=(r'firstUnblockedPendingSignal\('+ctx+r'\) != 0 and '
+                 +ctx+r'\.signal_entry != 0 and '+ctx+r'\.signal_delivery_ready and\s*!'
+                 +re.escape(flag))
         require(bool(re.search(pattern,b)),name+' admission')
         # The rejecting branch may unlock, but the accepted path from saved
         # frame capture through blocked publication may not release T.

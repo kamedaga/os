@@ -53,6 +53,32 @@
             "reason": "TLB checked return: select BSP kernel stack before scalar CR3 assertion; saved IRET stack is selected only after assertion"
           }
         }
+      },
+      {
+        "sha256": "32967ef2255d50a8cd4d7516dfa6f9e3322207c28a68727aeea8af2a91a31d41",
+        "switches": {
+          "25": {
+            "initial_bytes": 0,
+            "reason": "NECPI debug-off first user entry: CR3 selection and XState restore finish on the original BSP stack before selecting the boot-owned kernel stack; independently reviewed run-14."
+          },
+          "28": {
+            "initial_bytes": 0,
+            "reason": "NECPI debug-off first user entry: the saved five-word IRET frame is selected after the user CR3 load; IRET follows immediately with no call or push."
+          }
+        }
+      },
+      {
+        "sha256": "96f167b9e59375f1201b99ae051b39cd18187b291bfc4d815585b6a24a9dc377",
+        "switches": {
+          "29": {
+            "initial_bytes": 0,
+            "reason": "Main release first user entry: identity publication, CR3 selection and XState restore complete on the original BSP stack before selecting the boot-owned kernel stack; independently reviewed slow-2."
+          },
+          "32": {
+            "initial_bytes": 0,
+            "reason": "Main release first user entry: the saved five-word IRET frame is selected after the user CR3 load; IRET follows immediately without any call or push."
+          }
+        }
       }
     ]
   },
@@ -252,6 +278,19 @@
           "87": {
             "initial_bytes": 0,
             "reason": "TLB lazy entry/checked return: existing validated CPU kernel stack or saved user/IRET frame; scalar helper calls precede final frame switch"
+          }
+        }
+      },
+      {
+        "sha256": "a47066be7777758e307c8d94f929e92ef261f72a776b9df268ad4008f0933c08",
+        "switches": {
+          "4": {
+            "initial_bytes": 0,
+            "reason": "NECPI debug-off direct IPC: the boot-generated CPU slot selects its kernel stack before any push or aligned helper call; independently reviewed run-14."
+          },
+          "62": {
+            "initial_bytes": 0,
+            "reason": "NECPI debug-off direct IPC: admitted user RSP is restored after the return helper and user CR3 load; three GPR loads then SYSRET use no stack."
           }
         }
       }

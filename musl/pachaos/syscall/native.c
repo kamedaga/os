@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: MIT */
 /* PachaOS-specific translation; upstream musl remains an unmodified consumer. */
 #define _GNU_SOURCE
+#include <sys/file.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -566,6 +567,23 @@ static long dispatch(long n,long a,long b,long c,long d,long e,long f)
             n==SYS_syncfs ? KB2_FILESYSTEM_OP_SYNCFS : KB2_FILESYSTEM_OP_FSYNC;
         r.handle=p->handle; r.offset=b; r.length=b;
         r.flags=n==SYS_lseek ? c : n==SYS_fdatasync;
+        return request(&r,NULL,NULL,NULL,0,NULL,0);
+    case SYS_flock: {
+        p=lookup(a); if (!p) return -EBADF;
+        r.opcode=KB2_FILESYSTEM_OP_FLOCK; r.handle=p->handle;
+        r.flags=(uint32_t)b|LOCK_NB;
+        for (;;) {
+            long result=request(&r,NULL,NULL,NULL,0,NULL,0);
+            if (result!=-EAGAIN || ((uint32_t)b&LOCK_NB)) return result;
+            const struct { long tv_sec,tv_nsec; } delay={0,1000000};
+            result=native_status(__pachaos_raw2(PACHAOS_SYSCALL_NANOSLEEP,(long)&delay,0));
+            if (result) return result;
+        }
+    }
+    case SYS_fallocate:
+        p=lookup(a); if (!p) return -EBADF;
+        r.opcode=KB2_FILESYSTEM_OP_FALLOCATE; r.handle=p->handle;
+        r.mode=(uint64_t)(int64_t)(int)b; r.offset=c; r.length=d;
         return request(&r,NULL,NULL,NULL,0,NULL,0);
     case SYS_fstat: return stat_file(a,"",(void *)b,AT_EMPTY_PATH);
     case SYS_stat: return stat_file(AT_FDCWD,(const char *)a,(void *)b,0);

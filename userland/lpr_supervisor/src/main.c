@@ -1339,6 +1339,13 @@ static int lprs_fork_begin(uint64_t parent_token, void *page)
     uint32_t parent_groups[LPRS_MAX_GROUPS];
     memcpy(parent_groups, parent->groups, sizeof(parent_groups));
     if (g_next_pid > INT32_MAX) return -PACHA_LINUX_EOVERFLOW;
+    /* Allocation may relocate the process table. Snapshot image identity
+     * before it, just like credentials: fork inherits the executable even
+     * when the child never execs (for example a browser fork server). */
+    char parent_comm[LPRS_PROCESS_COMM_BYTES];
+    char parent_cmdline[LPRS_PROCESS_CMDLINE_BYTES];
+    lprs_copy_string(parent_comm, sizeof(parent_comm), parent->comm);
+    lprs_copy_string(parent_cmdline, sizeof(parent_cmdline), parent->cmdline);
     char parent_ctty[LPRS_CTTY_BYTES];
     char parent_cwd[LPRS_CWD_BYTES];
     lprs_copy_string(parent_ctty, sizeof(parent_ctty), parent->ctty);
@@ -1358,6 +1365,8 @@ static int lprs_fork_begin(uint64_t parent_token, void *page)
     child->filed_rights = parent_filed_rights;
     child->credential_rights = parent_credential_rights;
     memcpy(child->groups, parent_groups, sizeof(child->groups));
+    lprs_copy_string(child->comm, sizeof(child->comm), parent_comm);
+    lprs_copy_string(child->cmdline, sizeof(child->cmdline), parent_cmdline);
     child->ppid = parent_pid;
     child->sid = parent_sid;
     child->pgrp = parent_pgrp;

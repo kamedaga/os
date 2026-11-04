@@ -10,6 +10,7 @@ struct kobox_linux_task_report;
 
 /* Optional SEND-only owner grant for selected Linux diagnostic lines. */
 void ph_boot_set_log_fd(pacha_fd_t fd);
+void ph_boot_log_gpu_export_ready(void);
 /* Runtime faults cannot rely on the startup-only management receiver. */
 void ph_boot_log_fault(unsigned long vector, unsigned long error,
     unsigned long core_relative, unsigned long ip, unsigned long address);

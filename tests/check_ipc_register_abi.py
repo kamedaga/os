@@ -14,7 +14,10 @@ def main():
     assert not violations, violations
     abi=(ROOT/'kernel/abi/ipc_abi.zig').read_text()
     assert not re.search(r'\bmsg_(?:size|word\d_offset|fd_\w+_offset|flags_offset)\b',abi)
-    for name,nr in [('send',78),('recv',79),('call',80),('reply',81),('reply_recv',82),('recv_wait',84)]:
+    # Keep the canonical, contiguous ABI assignment explicit.  These numbers
+    # moved together when the preceding syscall range grew; accepting any
+    # declaration here would stop detecting accidental renumbering.
+    for name,nr in [('send',83),('recv',84),('call',85),('reply',86),('reply_recv',87),('recv_wait',89)]:
         assert f'syscall_ipc_{name}: u64 = {nr};' in abi
     # Negative controls: all six operations and both native symbol families.
     for op in ['SEND','RECV','CALL','REPLY','REPLY_RECV','RECV_WAIT']:

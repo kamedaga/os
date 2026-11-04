@@ -22,8 +22,33 @@ int64_t lpr_linux_memfd_create(uint64_t name, uint64_t flags)
     assert(flags == LPR_LINUX_MFD_ALLOW_SEALING);
     return 37;
 }
+lpr_state_t lpr_state;
+static uint64_t directory_offset;
+static unsigned char live_fds[16];
+uint64_t lpr_filed_control_offset(uint64_t fd) { (void)fd;return directory_offset; }
+void lpr_filed_control_set_offset(uint64_t fd,uint64_t value) { (void)fd;directory_offset=value; }
+int lpr_control_fd_active(uint64_t fd) { return fd<sizeof(live_fds) && live_fds[fd]; }
+uint16_t lpr_dirent_reclen(uint64_t n) { return (uint16_t)((19+n+1+7)&~7ull); }
+uint8_t lpr_dtype_from_mode(uint64_t mode) { return (uint8_t)((mode>>12)&15); }
+size_t lpr_strlen(const char *s) { return strlen(s); }
+static void proc_fd_listing_test(void)
+{
+    unsigned char bytes[128];lpr_fd_table_capacity=16;live_fds[0]=live_fds[3]=live_fds[15]=1;
+    assert(lpr_proc_fd_getdents(4,0,16)==-LPR_LINUX_EFAULT);
+    assert(lpr_proc_fd_getdents(4,(uintptr_t)bytes,23)==-LPR_LINUX_EINVAL && !directory_offset);
+    assert(lpr_proc_fd_getdents(4,(uintptr_t)bytes,48)==48 && directory_offset==2);
+    assert(!strcmp((char *)bytes+19,".") && !strcmp((char *)bytes+24+19,".."));
+    assert(lpr_proc_fd_getdents(4,(uintptr_t)bytes,24)==24 && !strcmp((char *)bytes+19,"0"));
+    live_fds[0]=0; /* Removal before the cookie cannot shift or skip FD 3. */
+    assert(lpr_proc_fd_getdents(4,(uintptr_t)bytes,24)==24 && !strcmp((char *)bytes+19,"3"));
+    assert(bytes[18]==10 && directory_offset==17);
+    assert(lpr_proc_fd_getdents(4,(uintptr_t)bytes,sizeof(bytes))==24 && !strcmp((char *)bytes+19,"15"));
+    assert(!lpr_proc_fd_getdents(4,(uintptr_t)bytes,sizeof(bytes)));
+    directory_offset=0;assert(lpr_proc_fd_getdents(4,(uintptr_t)bytes,24)==24 && !strcmp((char *)bytes+19,"."));
+}
 int main(void)
 {
+    proc_fd_listing_test();
     const char *paths[] = {"/proc/cpuinfo", "/proc/meminfo", "/proc/stat",
         "/proc/mounts", "/proc/version"};
     for (unsigned i = 0; i < sizeof(paths) / sizeof(paths[0]); ++i) {

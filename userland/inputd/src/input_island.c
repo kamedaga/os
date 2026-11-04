@@ -1,4 +1,5 @@
 #include "input_island.h"
+#include <inputd/event_ring.h>
 #include "filed_client/module_image.h"
 
 #include <kobox/device_pachaos_capsule.h>
@@ -50,6 +51,9 @@ typedef struct inputd_raw_event {
 } inputd_raw_event_t;
 
 typedef struct inputd_handle {
+    struct inputd_event_ring *shared;
+    uint64_t shared_tail;
+    int shared_clock_dropped;
     int active;
     int revoked;
     uint32_t refs;
@@ -243,7 +247,7 @@ static void flush_notify_edges(void)
         const uint32_t bit = UINT32_C(1) << slot;
         ready &= ~bit;
         inputd_handle_t *handle = &handles[slot];
-        if (!handle->active || handle->notify_fd < 16 || !handle->readable) {
+        if (!handle->active || handle->notify_fd < 16) {
             notify_ready_mask &= ~bit;
             continue;
         }
@@ -258,17 +262,42 @@ static void flush_notify_edges(void)
     }
 }
 
+/* The private history below is producer staging/state-resync only. No READ
+ * or POLL service op remains: clients consume only this per-OFD VMO. */
 static void mark_device_readable(inputd_registry_entry_t *entry)
 {
     uint32_t subscribers = entry->handle_mask;
-    while (subscribers != 0) {
-        const unsigned slot = (unsigned)__builtin_ctz(subscribers);
-        const uint32_t bit = UINT32_C(1) << slot;
+    while (subscribers) {
+        unsigned slot = (unsigned)__builtin_ctz(subscribers);
+        uint32_t bit = UINT32_C(1) << slot;
         subscribers &= ~bit;
         inputd_handle_t *handle = &handles[slot];
-        if (!handle->active || handle->readable || handle->revoked) continue;
-        handle->readable = 1;
-        notify_ready_mask |= bit;
+        if (!handle->active || handle->revoked) continue;
+        if (!handle->shared) { handle->readable = 1; continue; }
+        /* A grab routes future complete reports only to its owner. */
+        if (entry->grabbed_handle && entry->grabbed_handle != handle->id) {
+            handle->cursor = next_sequence;
+            continue;
+        }
+        uint32_t retry = notify_ready_mask & bit;
+        inputd_input_event_t events[INPUTD_FRAME_STAGE_MAX + 2];
+        size_t count = 0;
+        if (handle->shared_clock_dropped) {
+            events[count++] = (inputd_input_event_t){.type=0,.code=3};
+            handle->shared_clock_dropped = 0;
+        }
+        for (;;) {
+            inputd_read_request_t request = {.handle = handle->id,
+                .event_capacity = INPUTD_EVENT_CAPACITY};
+            int status = inputd_input_read(&request);
+            if (status || !request.event_count) break;
+            if (count + request.event_count > INPUTD_FRAME_STAGE_MAX + 2) break;
+            memcpy(events + count, request.events, request.event_count * sizeof(events[0]));
+            count += request.event_count;
+        }
+        notify_ready_mask = (notify_ready_mask & ~bit) | retry; /* staging is not the shared queue */
+        if (inputd_ring_publish(handle->shared, &handle->shared_tail, events, count))
+            notify_ready_mask |= bit;
     }
     flush_notify_edges();
 }
@@ -574,6 +603,7 @@ int inputd_input_source_end(struct inputd_input_island *island,
         for (size_t h = 0; h < INPUTD_HANDLE_MAX; h++) {
             if (!handles[h].active || handles[h].device_id != entry->kobox_device_id)
                 continue;
+            if (handles[h].shared) __atomic_store_n(&handles[h].shared->error, -19, __ATOMIC_RELEASE);
             handles[h].readable = 1;
             notify_ready_mask |= UINT32_C(1) << h;
         }
@@ -836,6 +866,16 @@ int inputd_input_open(uint32_t event_index, uint32_t flags, pacha_fd_t notify_fd
     return 0;
 }
 
+int inputd_input_attach_ring(uint64_t id, struct inputd_event_ring *ring)
+{
+    inputd_handle_t *handle = find_handle(id);
+    if (!handle || !ring) return -22;
+    handle->shared = ring;
+    memset(ring, 0, sizeof(*ring));
+    __atomic_store_n(&ring->handle, id, __ATOMIC_RELEASE);
+    return 0;
+}
+
 int inputd_input_close(uint64_t id)
 {
     inputd_handle_t *handle = find_handle(id);
@@ -844,6 +884,7 @@ int inputd_input_close(uint64_t id)
         handle->refs--;
         return 0;
     }
+    if (handle->shared) (void)pacha_munmap(handle->shared, INPUTD_RING_BYTES);
     if (handle->notify_fd >= 16) (void)pacha_fd_close(handle->notify_fd);
     inputd_registry_entry_t *entry = lookup_registry_by_device_id(handle->device_id);
     const uint32_t bit = UINT32_C(1) << handle_slot(handle);
@@ -1113,6 +1154,33 @@ static int ioctl_copy_string(inputd_ioctl_request_t *request, const char *string
     return ioctl_copy_out(request, string, (uint32_t)length);
 }
 
+/* Single inputd producer; no client-controlled lock is acquired. Snapshot
+ * then claim the unread interval. Losing readers retry their speculative copy.
+ * This implements evdev's EVIOCG* state-query queue compaction. */
+static void shared_flush_type(inputd_handle_t *handle, uint16_t type)
+{
+    if (!handle->shared) return;
+    static inputd_input_event_t scratch[INPUTD_SHARED_EVENTS];
+    struct inputd_event_ring *r = handle->shared;
+    for (;;) {
+        uint64_t h = inputd_ring_head(r), t = handle->shared_tail;
+        if (!((t-h) <= INPUTD_SHARED_EVENTS)) return; /* corrupt client cursor */
+        size_t kept=0; int visible=1;
+        for (uint64_t i=h;i<t;i++) {
+            inputd_input_event_t e; inputd_ring_load(r,i,&e);
+            if(e.type==type) continue;
+            if(e.type==0 && e.code==0) { if(!visible)continue; visible=0; }
+            else visible=1;
+            scratch[kept++]=e;
+        }
+        if(!__atomic_compare_exchange_n(&r->head,&h,t,0,__ATOMIC_SEQ_CST,__ATOMIC_SEQ_CST))continue;
+        if(inputd_ring_publish(r,&handle->shared_tail,scratch,kept))
+            notify_ready_mask |= UINT32_C(1)<<handle_slot(handle);
+        flush_notify_edges();
+        return;
+    }
+}
+
 static int ioctl_copy_state_and_flush(
     inputd_ioctl_request_t *request,
     inputd_handle_t *handle,
@@ -1123,6 +1191,7 @@ static int ioctl_copy_state_and_flush(
     inputd_registry_entry_t *entry =
         lookup_registry_by_device_id(handle->device_id);
     mark_state_events_flushed(handle, entry, type);
+    shared_flush_type(handle, type);
     return ioctl_copy_out(request, state, size);
 }
 
@@ -1151,6 +1220,11 @@ int inputd_input_ioctl(inputd_ioctl_request_t *request)
         int clock_id = -1;
         memcpy(&clock_id, request->data, sizeof(clock_id));
         if (clock_id != INPUTD_CLOCK_REALTIME && clock_id != INPUTD_CLOCK_MONOTONIC) return -22;
+        if (handle->clock_id != clock_id && handle->shared &&
+            inputd_ring_head(handle->shared) != handle->shared_tail) {
+            __atomic_store_n(&handle->shared->head, handle->shared_tail, __ATOMIC_SEQ_CST);
+            handle->shared_clock_dropped = 1;
+        }
         handle->clock_id = clock_id;
         return 0;
     }
@@ -1167,6 +1241,9 @@ int inputd_input_ioctl(inputd_ioctl_request_t *request)
     }
     if (command == INPUTD_EVIOCREVOKE) {
         handle->revoked = 1;
+        if (handle->shared) __atomic_store_n(&handle->shared->error, -19, __ATOMIC_RELEASE);
+        notify_ready_mask |= UINT32_C(1) << handle_slot(handle);
+        flush_notify_edges();
         inputd_registry_entry_t *entry = lookup_registry_by_device_id(handle->device_id);
         if (entry != NULL && entry->grabbed_handle == handle->id)
             entry->grabbed_handle = 0;

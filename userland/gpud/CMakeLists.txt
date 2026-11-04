@@ -27,6 +27,9 @@ add_custom_command(
 add_custom_target(gpud_sandbox ALL DEPENDS "${SANDBOX_ELF}")
 
 set(GPUD_SOURCES
+  "${CMAKE_CURRENT_SOURCE_DIR}/ready.c"
+  "${CMAKE_CURRENT_SOURCE_DIR}/ready_native.c"
+  "${CMAKE_CURRENT_SOURCE_DIR}/ready_entry.S"
   "${REPO_ROOT}/userland/kobox2_owner/boot.c"
   "${CMAKE_CURRENT_SOURCE_DIR}/discovery.c"
   "${CMAKE_CURRENT_SOURCE_DIR}/discovery_filed.c"

@@ -1,5 +1,7 @@
 /* SPDX-License-Identifier: MIT */
 #include "fs_queue.h"
+#include <pacha/pressure.h>
+#include "arena_prefault.h"
 #include "boot/module_launch.h"
 
 #include <errno.h>
@@ -50,9 +52,8 @@ static int shared_create(void *context, uint64_t client, uint64_t sequence,
     const uint64_t *pages, size_t count, uint64_t flags, uint64_t *id) {
     struct ph_fs_queue *queue = context;
     if (!count || flags & ~UINT64_C(3)) return -EINVAL;
-    for (size_t i = 0; i < count; ++i)
-        if (pages[i] != PACHA_VMO_PAGE_VIEW_HOLE &&
-            pages[i] >= ph_core.ram_size / PH_PAGE_SIZE) return -EPROTO;
+    if (ph_arena_prefault(ph_core.direct, ph_core.ram_size,
+            pages, count, true)) return -EPROTO;
     struct ph_fs_shared_export *view = ph_alloc(sizeof(*view));
     if (!view) return -ENOMEM;
     uint64_t rights = PACHA_FD_RIGHT_INSPECT | PACHA_FD_RIGHT_DUP |
@@ -81,9 +82,8 @@ static int shared_create(void *context, uint64_t client, uint64_t sequence,
 
 static int shared_refresh(void *context, uint64_t id, const uint64_t *pages, size_t count) {
     struct ph_fs_queue *queue = context;
-    for (size_t i = 0; i < count; ++i)
-        if (pages[i] != PACHA_VMO_PAGE_VIEW_HOLE &&
-            pages[i] >= ph_core.ram_size / PH_PAGE_SIZE) return -EPROTO;
+    if (ph_arena_prefault(ph_core.direct, ph_core.ram_size,
+            pages, count, true)) return -EPROTO;
     uint64_t mask = shared_lock(queue);
     struct ph_fs_shared_export *view = *shared_find(queue, id);
     int error = !view || view->state == FS_EXPORT_RETIRING ? -ESTALE :
@@ -308,6 +308,20 @@ static int reply_management(struct ph_fs_queue *queue, struct ph_ipc *ipc,
 
 static int client_prepare(struct ph_fs_queue *queue, struct ph_ipc_packet *packet) {
     if (queue->reply_operation || !packet->correlation) return fault(queue);
+    if (packet->operation == PACHA_PRESSURE_BIND) {
+        if (queue->pressure.generation || packet->fd_count != 1 || packet->correlation || packet->value ||
+            packet->fds[0].rights != PACHA_PRESSURE_RIGHTS ||
+            packet->fds[0].flags != PACHA_FD_FLAG_CLOEXEC || packet->fds[0].transfer_flags)
+            return fault(queue);
+        watch_lock(queue);
+        int error = ph_ipc_init(&queue->pressure, packet->fds[0].fd, packet->generation);
+        if (!error) ++queue->watch_epoch;
+        watch_unlock(queue);
+        if (error) return error;
+        packet->fds[0].fd = PH_IPC_NO_FD;
+        PH_OK(wake(queue));
+        return PH_LIFECYCLE_SERVICE_IDLE;
+    }
     if (packet->operation == PH_FS_CLIENT_PREPARE) {
         if (packet->fd_count || !packet->value || packet->correlation <= queue->client_watermark ||
             packet->correlation <= queue->config[0].channel_id ||
@@ -388,6 +402,20 @@ static int client_prepare(struct ph_fs_queue *queue, struct ph_ipc_packet *packe
 static int prepare(void *context, struct ph_ipc_packet *packet) {
     struct ph_fs_queue *queue = context;
     if (queue->closing || packet->generation != queue->config[0].generation) return fault(queue);
+    if (packet->operation == PACHA_PRESSURE_BIND) {
+        if (queue->pressure.generation || packet->fd_count != 1 || packet->correlation || packet->value ||
+            packet->fds[0].rights != PACHA_PRESSURE_RIGHTS ||
+            packet->fds[0].flags != PACHA_FD_FLAG_CLOEXEC || packet->fds[0].transfer_flags)
+            return fault(queue);
+        watch_lock(queue);
+        int error = ph_ipc_init(&queue->pressure, packet->fds[0].fd, packet->generation);
+        if (!error) ++queue->watch_epoch;
+        watch_unlock(queue);
+        if (error) return error;
+        packet->fds[0].fd = PH_IPC_NO_FD;
+        PH_OK(wake(queue));
+        return PH_LIFECYCLE_SERVICE_IDLE;
+    }
     if (packet->operation == PH_FS_CLIENT_PREPARE || packet->operation == PH_FS_CLIENT_BIND ||
         packet->operation == PH_FS_CLIENT_RELEASE) return client_prepare(queue, packet);
     if (packet->operation == PH_FS_EXCHANGE_PREPARE || packet->operation == PH_FS_EXCHANGE_OWNER_PREPARE) {
@@ -808,12 +836,71 @@ static int start(void *context, void *linux_service) {
     if (error) return error;
     /* Lone requests run on the receiving task itself; a sleeping one lends
      * reception to the lifecycle deputy instead of stopping this ring. */
-    error = queue->serve(queue->workers);
+    error = queue->pressure_start(wake, queue);
+#if defined(PH_RESIDENT_STRESS) && PH_RESIDENT_STRESS
+    if (!error) {
+        int (*probe)(void) = ph_image_lookup(&ph_core, "kobox_linux_resident_test_start");
+        if (!probe) return -ENOENT;
+        error = probe();
+    }
+#endif
+    if (!error) error = queue->serve(queue->workers);
     if (!error) return 0;
     PH_OK(queue->close(queue->workers));
     PH_OK(queue->destroy(queue->workers));
     queue->workers = NULL;
     return error;
+}
+
+/* Called only by the Linux control task. The receive/submit path does not
+ * wait for reclaim: its independent Linux worker publishes later via wake. */
+static int pressure_advance(struct ph_fs_queue *queue) {
+    if (!queue->pressure.admitted || queue->pressure_dead) return 0;
+    if (queue->pressure_pending && !queue->pressure_have_result &&
+        !queue->pressure_collect(&queue->pressure_result)) {
+        watch_lock(queue); queue->pressure_have_result = 1; ++queue->watch_epoch; watch_unlock(queue);
+    }
+    if (queue->pressure_have_result) {
+        const struct pacha_ipc_msg ack = {
+            .word0 = pacha_pressure_tag(queue->pressure_sequence, PACHA_PRESSURE_ACK),
+            .word1 = queue->pressure_result.requested_pages,
+            .word2 = queue->pressure_result.linux_freed_pages,
+            .word3 = queue->pressure_result.reported_ok_pages};
+        int error = pacha_ipc_message_syscall(PACHA_IPC_SYSCALL_SEND, queue->pressure.fd, &ack, NULL, 0, 0, NULL);
+        if (!error) {
+            queue->pressure_pending = 0;
+            watch_lock(queue); queue->pressure_have_result = 0; ++queue->watch_epoch; watch_unlock(queue);
+            return PH_LIFECYCLE_SERVICE_PROGRESS;
+        }
+        if (error == PACHA_SYSCALL_ERR_NOT_READY || error == PACHA_SYSCALL_ERR_EMPTY) return 0;
+        goto disconnected;
+    }
+    if (queue->pressure_pending) return 0;
+    struct pacha_ipc_msg request = {0};
+    int error = pacha_ipc_message_syscall(PACHA_IPC_SYSCALL_RECV, queue->pressure.fd, NULL, &request, 0, 0, NULL);
+    if (error == PACHA_SYSCALL_ERR_NOT_READY || error == PACHA_SYSCALL_ERR_EMPTY) return 0;
+    if (error || request.fd_count || (request.word0 & 0xffff) != PACHA_PRESSURE_REQUEST ||
+        (request.word0 >> 16) <= queue->pressure_sequence || !request.word1 ||
+        request.word1 > PACHA_PRESSURE_MAX_PAGES || request.word3) goto disconnected;
+    queue->pressure_sequence = request.word0 >> 16;
+    uint64_t time[2];
+    if (pacha_syscall2(PACHA_RUNTIME_SYSCALL_CLOCK_GETTIME, 1, (uintptr_t)time)) goto disconnected;
+    uint64_t now = time[0] * UINT64_C(1000000000) + time[1];
+    if (now >= request.word2) goto disconnected;
+    uint64_t budget = request.word2 - now;
+    if (budget > UINT64_C(100000000)) budget = UINT64_C(100000000);
+    /* Linux ktime and the host monotonic clock have different boot origins.
+     * Pass a duration into Linux, never the host's absolute timestamp. */
+    error = queue->pressure_submit(request.word1, budget);
+    if (error) goto disconnected;
+    queue->pressure_pending = 1;
+    return PH_LIFECYCLE_SERVICE_PROGRESS;
+disconnected:
+    /* Keep the FD pinned until the receiver has joined. Remove it from the
+     * watch set and wake the helper before any eventual close. */
+    watch_lock(queue); queue->pressure_dead = 1; ++queue->watch_epoch; watch_unlock(queue);
+    PH_OK(wake(queue));
+    return 0;
 }
 
 static int advance(void *context, void *linux_service, struct ph_ipc *ipc, bool quiescing) {
@@ -828,7 +915,7 @@ static int advance(void *context, void *linux_service, struct ph_ipc *ipc, bool 
     /* Collect every completion now. Collecting alone is not progress: the
      * accepts below already see what it released, and another pass would
      * only repeat this advance's syscalls. Closing still waits on it. */
-    int progressed = 0, collected;
+    int progressed = queue->closing ? 0 : pressure_advance(queue), collected;
     while ((collected = collect_one(queue, ipc)) > 0) progressed = 1;
     if (collected < 0) return collected;
     int retired = queue->closing ? 0 : retire_one(queue, ipc);
@@ -851,6 +938,7 @@ static int advance(void *context, void *linux_service, struct ph_ipc *ipc, bool 
 static int finish(void *context, void *linux_service) {
     struct ph_fs_queue *queue = context;
     (void)linux_service;
+    queue->pressure_stop();
     if (!queue->workers) return 0;
     PH_CHECK(!queue->inflight);
     int error = queue->close(queue->workers);
@@ -872,6 +960,7 @@ static int stop(void *context) {
         int status = lane_retire(queue, &queue->lanes[i], &queue->config[i]);
         if (status) error = status;
     }
+    if (queue->pressure.generation) PH_OK(ph_ipc_destroy(&queue->pressure, queue->config[0].generation));
     if (queue->wake_tx.generation) {
         int status = ph_ipc_destroy(&queue->wake_tx, queue->config[0].generation);
         if (status) error = status;
@@ -914,6 +1003,10 @@ static uint64_t wait_snapshot(struct ph_fs_queue *queue, pacha_fd_t control_fd, 
     uint64_t following = 0, last = after;
     watch_lock(queue);
     *epoch = queue->watch_epoch;
+    if (queue->pressure.admitted && !queue->pressure_dead)
+        events[(*count)++] = (struct pacha_pollfd){.fd = queue->pressure.fd,
+            .events = PACHA_FD_EVENT_READABLE | PACHA_FD_EVENT_HANGUP |
+                (queue->pressure_have_result ? PACHA_FD_EVENT_WRITABLE : 0)};
     for (struct ph_fs_client_queue *client = queue->clients; client; client = client->next) {
         /* A faulted doorbell stays readable until the owner closes it. */
         if (!client->watch_fd || client->config.channel_id <= after ||
@@ -1035,6 +1128,10 @@ int ph_fs_queue_init(struct ph_fs_queue *queue, void *core,
     if (!symbol) return -ENOENT; \
     memcpy(&queue->member, &symbol, sizeof(queue->member)); \
 } while (0)
+    LOAD(pressure_start, "kobox_linux_pressure_start");
+    LOAD(pressure_submit, "kobox_linux_pressure_submit");
+    LOAD(pressure_collect, "kobox_linux_pressure_collect");
+    LOAD(pressure_stop, "kobox_linux_pressure_stop");
     LOAD(create, "kobox_linux_fs_workers_create");
     LOAD(shared_bind, "kobox_linux_fs_service_shared_bind");
     LOAD(shared_close, "kobox_linux_fs_service_shared_close");

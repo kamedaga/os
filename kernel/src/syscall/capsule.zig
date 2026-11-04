@@ -1,3 +1,4 @@
+const dma_profile = @import("../lock_profile.zig");
 const std = @import("std");
 const abi_root = @import("kernel_abi_root");
 const capsule_abi = abi_root.capsule_abi;
@@ -270,16 +271,19 @@ fn resolveUserDmaPages(
 
     if (!user_vm.lockAddressSpace(proc)) return null;
     defer user_vm.unlockAddressSpace(proc);
-    if (state.rangeConflictsWithDmaDerivation(
+    const dma_conflict_sample = if (comptime dma_profile.enabled) dma_profile.stageBegin() else {};
+    const dma_conflict = state.rangeConflictsWithDmaDerivation(
         proc,
         first_page_va,
         page_span,
         except_pinned_object,
         allow_dma_mapping_aliases,
         iommu.isActive(),
-    )) {
-        return null;
-    }
+    );
+    if (comptime dma_profile.enabled) dma_profile.stageEnd(.dma_conflict, dma_conflict_sample);
+    if (dma_conflict) return null;
+    const dma_pages_sample = if (comptime dma_profile.enabled) dma_profile.stageBegin() else {};
+    defer if (comptime dma_profile.enabled) dma_profile.stageEnd(.dma_pages, dma_pages_sample);
 
     var page_index: u64 = 0;
     while (page_index < page_count) : (page_index += 1) {
@@ -377,6 +381,9 @@ fn mapResolvedDmaPages(
     readable: bool,
     writable: bool,
 ) DmaPolicyError!u64 {
+    const sample = if (comptime dma_profile.enabled) dma_profile.stageBegin() else {};
+    defer if (comptime dma_profile.enabled) dma_profile.stageEnd(.dma_iommu, sample);
+
     if (!iommu.isActive()) {
         const paddr = kernel.dmaAddressForResolvedPages(
             resolved.paddrs(),
@@ -641,9 +648,7 @@ fn exportDeviceMemoryVmo(h: anytype, state: *kernel.KernelState, proc: kernel.Pr
 
 /// K pins the FD, rights and claim generation through the single PIO operation.
 /// A value return avoids consuming a keyboard byte before a failing copyout.
-pub fn platformPortIo(state: *const kernel.KernelState, proc: kernel.PrincipalId,
-    raw_fd: u64, port: u64, width: u64, writing: bool, value: u64) u64
-{
+pub fn platformPortIo(state: *const kernel.KernelState, proc: kernel.PrincipalId, raw_fd: u64, port: u64, width: u64, writing: bool, value: u64) u64 {
     const invalid: u64 = if (writing) sc.syscall_err_invalid else @bitCast(-@as(i64, @intCast(sc.syscall_err_invalid)));
     const fd = u32Arg(raw_fd) orelse return invalid;
     const view = state.fdPayloadWithRightsConst(proc, fd, .{}) orelse return invalid;
@@ -695,9 +700,18 @@ pub fn dispatch(
             if (!state.isBootstrapOwner(proc) or frame.rdi > std.math.maxInt(usize)) break :blk sc.syscall_err_invalid;
             const grant = platform_device.claim(@intCast(frame.rdi)) orelse break :blk sc.syscall_err_invalid;
             break :blk state.createPlatformDeviceFd(proc, grant, .{
-                .inspect = true, .dup = true, .transfer = true, .set_flags = true,
-                .close = true, .query = true, .read = true, .write = true,
-                .controller_write = true, .derive_irq = true, .irq_wait = true, .irq_ack = true,
+                .inspect = true,
+                .dup = true,
+                .transfer = true,
+                .set_flags = true,
+                .close = true,
+                .query = true,
+                .read = true,
+                .write = true,
+                .controller_write = true,
+                .derive_irq = true,
+                .irq_wait = true,
+                .irq_ack = true,
             }, .{}, first_dynamic_fd) catch |err| {
                 platform_device.release(grant);
                 break :blk statusFromKernelError(err);
@@ -1102,7 +1116,8 @@ pub fn dispatch(
                 // No hardware unmask before publication. Userland's irq_chip
                 // enables the route only after its handler/worker is ready.
                 break :blk state.createIrqFd(proc, .{
-                    .source = .{ .platform = grant }, .vector = @intCast(platform_device.at(0).?.gsi),
+                    .source = .{ .platform = grant },
+                    .vector = @intCast(platform_device.at(0).?.gsi),
                 }, rightsForIrq(view.rights), .{}, first_dynamic_fd) catch |err| {
                     platform_device.closeIrq(grant);
                     break :blk statusFromKernelError(err);

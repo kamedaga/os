@@ -46,6 +46,7 @@ pub const Hooks = struct {
     write_user_u64: *const fn (kernel.PrincipalId, u64, u64) bool,
     copy_user_bytes_from_va: *const fn (kernel.PrincipalId, u64, []u8) bool,
     copy_bytes_to_user_va: *const fn (kernel.PrincipalId, u64, []const u8) bool,
+    populate_user_range: ?*const fn (kernel.PrincipalId, u64, usize, bool) user_copy.PopulateResult = null,
     probe_user_range: ?*const fn (kernel.PrincipalId, u64, usize, bool) user_copy.ProbeResult = null,
     resident_read_user_u32: ?*const fn (kernel.PrincipalId, u64) ?u32 = null,
     futex_lock_address_space: ?*const fn (kernel.PrincipalId) bool = null,
@@ -170,6 +171,20 @@ const KernelStateSpinLock = struct {
 };
 
 var kernel_state_lock: KernelStateSpinLock = .{};
+
+/// Boot construction only: BSP, IF=0, no other locks, before state-ready/AP
+/// user dispatch and after CPU storage initialization. The caller owns the
+/// two bounded sections and must release before publishing user dispatch.
+/// Reuse K so boot alias/identity maintenance obeys the runtime contract;
+/// hooks are still unwired, so unlock cannot publish runtime timers.
+pub fn lockKernelStateForBoot() void {
+    kernel_state_lock.lock(if (lock_profile.enabled) .other else {});
+}
+
+pub fn unlockKernelStateForBoot() void {
+    kernel_state_lock.unlock();
+}
+
 
 pub const ExternalPrincipalTeardownAcquire = enum {
     acquired,
@@ -565,8 +580,22 @@ fn preflightUserBuffers(h: anytype, proc: kernel.PrincipalId, frame: *TrapFrame,
             // A supplied VMO/COW page remains resident through its live refs,
             // including PROT_NONE. A future evictor must preserve this contract
             // or provide residency ownership before reclaiming these pages.
-            if (h.probe_user_range == null) return sc.syscall_err_not_ready;
-            return probeBuffer(h, proc, frame, frame.rdi, length, frame.rdx == vm.madvise_populate_write);
+            if (frame.rdi == 0) return sc.syscall_err_map;
+            // Populate alone exposes resource exhaustion as the existing ALLOC
+            // status; ordinary copy preflight retains its MAP contract.
+            if (comptime @hasField(@TypeOf(h.*), "populate_user_range")) {
+                const populate = h.populate_user_range orelse return sc.syscall_err_not_ready;
+                switch (populate(proc, frame.rdi, @intCast(length), frame.rdx == vm.madvise_populate_write)) {
+                    .resident => return null,
+                    .invalid_address => return sc.syscall_err_map,
+                    .out_of_memory => return sc.syscall_err_alloc,
+                    .backing_absent => |va| {
+                        frame.rdx = va;
+                        return sc.syscall_err_pager_absent;
+                    },
+                }
+            }
+            return sc.syscall_err_not_ready;
         },
         sc.syscall_log => return probeBuffer(h, proc, frame, frame.rdi, @min(frame.rsi, sc.user_log_max_bytes), false),
         sc.syscall_kernel_log_read => return probeBuffer(h, proc, frame, frame.rdi, @sizeOf(kernel_log_abi.Read), true),
@@ -652,6 +681,10 @@ fn preflightUserBuffers(h: anytype, proc: kernel.PrincipalId, frame: *TrapFrame,
                 abi.process_abi.signal_ctl_set_timer => if (frame.r8 == 0) null else probeBuffer(h, proc, frame, frame.r8, abi.process_abi.signal_timer_state_size, true),
                 else => null,
             };
+        },
+        sc.syscall_vmo_discard => {
+            if (frame.rdx == 0 or frame.rdx > 32 or frame.r10 != 0) return sc.syscall_err_invalid;
+            return probeBuffer(h, proc, frame, frame.rsi, frame.rdx * 16, false);
         },
         sc.syscall_vmo_collect_dirty => {
             if (frame.rdx > (kernel.max_vmo_logical_pages + 63) / 64) return sc.syscall_err_invalid;
@@ -759,23 +792,26 @@ test "iovec preflight captures one immutable descriptor before transfer" {
     try std.testing.expectEqual(@as(u64, 8192), iovecs.words[1]);
 }
 
-test "pager preflight populate validates access and preserves retry address" {
+test "stage4b pager preflight populate validates access and preserves retry address" {
     const Mock = struct {
         var writes: bool = false;
         var calls: usize = 0;
-        var outcome: user_copy.ProbeResult = .resident;
-        fn probe(_: kernel.PrincipalId, va: u64, len: usize, write: bool) user_copy.ProbeResult {
+        var outcome: user_copy.PopulateResult = .resident;
+        fn populate(_: kernel.PrincipalId, va: u64, len: usize, write: bool) user_copy.PopulateResult {
             std.debug.assert(va == 0x1000 and len == 8192);
             calls += 1;
             writes = write;
             return outcome;
+        }
+        fn probe(_: kernel.PrincipalId, _: u64, _: usize, _: bool) user_copy.ProbeResult {
+            return .invalid_address;
         }
         fn copy(_: kernel.PrincipalId, _: u64, _: []u8) bool {
             unreachable;
         }
     };
     const Probe = *const fn (kernel.PrincipalId, u64, usize, bool) user_copy.ProbeResult;
-    const h = .{ .probe_user_range = @as(?Probe, Mock.probe), .copy_user_bytes_from_va = Mock.copy };
+    const h = .{ .probe_user_range = @as(?Probe, Mock.probe), .populate_user_range = @as(?*const fn (kernel.PrincipalId, u64, usize, bool) user_copy.PopulateResult, Mock.populate), .copy_user_bytes_from_va = Mock.copy };
     const missing = .{ .probe_user_range = @as(?Probe, null), .copy_user_bytes_from_va = Mock.copy };
     var iovecs = IovecSnapshot{};
     var signal_frame: process_syscalls.ProcessCloneUserFrame = undefined;
@@ -791,6 +827,13 @@ test "pager preflight populate validates access and preserves retry address" {
         try std.testing.expect(preflightUserBuffers(&h, @enumFromInt(1), &frame, &iovecs, &signal_frame) == null);
         try std.testing.expectEqual(advice == vm.madvise_populate_write, Mock.writes);
     }
+    Mock.outcome = .out_of_memory;
+    try std.testing.expectEqual(sc.syscall_err_alloc, preflightUserBuffers(&h, @enumFromInt(1), &frame, &iovecs, &signal_frame).?);
+    frame.rax = sc.syscall_log;
+    try std.testing.expectEqual(sc.syscall_err_map, preflightUserBuffers(&h, @enumFromInt(1), &frame, &iovecs, &signal_frame).?);
+    frame.rax = sc.syscall_madvise;
+    Mock.outcome = .invalid_address;
+    try std.testing.expectEqual(sc.syscall_err_map, preflightUserBuffers(&h, @enumFromInt(1), &frame, &iovecs, &signal_frame).?);
     Mock.outcome = .{ .backing_absent = 0x2000 };
     try std.testing.expectEqual(sc.syscall_err_pager_absent, preflightUserBuffers(&h, @enumFromInt(1), &frame, &iovecs, &signal_frame).?);
     try std.testing.expectEqual(@as(u64, 0x2000), frame.rdx);
@@ -807,6 +850,7 @@ test "pager preflight populate validates access and preserves retry address" {
     try std.testing.expectEqual(sc.syscall_err_invalid, preflightUserBuffers(&h, @enumFromInt(1), &frame, &iovecs, &signal_frame).?);
     try std.testing.expectEqual(calls, Mock.calls);
 }
+
 
 test "lifecycle admission does not report byte progress for a rejected syscall" {
     const not_ready: u64 = 0 -% sc.syscall_err_not_ready;
@@ -827,15 +871,15 @@ fn dispatchCompactSyscall(frame: *TrapFrame) u64 {
     // ring. General call markers would bury a request in GUI background IO.
     const trace_call = @import("wake_trace.zig").enabled and (nr == sc.syscall_futex_wait or nr == sc.syscall_futex_wake or
         nr == sc.syscall_futex_wake_wait or nr == sc.syscall_ipc_call or
-        nr == sc.syscall_ipc_reply or nr == sc.syscall_ipc_notify or
+        nr == sc.syscall_ipc_send or nr == sc.syscall_ipc_reply or nr == sc.syscall_ipc_notify or
         nr == sc.syscall_ipc_notify_wait or nr == sc.syscall_ipc_recv_wait or
         nr == sc.syscall_process_signal_ctl or nr == sc.syscall_gettid or
         nr == sc.syscall_fd_read or nr == sc.syscall_fd_write or
-        nr == sc.syscall_fd_wait_many or nr == sc.syscall_fd_poll);
+        nr == sc.syscall_fd_writev or nr == sc.syscall_fd_wait_many or nr == sc.syscall_fd_poll);
     const trace_thread = if (trace_call) scheduler.currentThread() else 0;
     const trace_arg = if (trace_call) frame.rdi else 0;
-    if (trace_call) @import("wake_trace.zig").record(.syscall_enter, nr, trace_arg, trace_thread);
-    defer if (trace_call) @import("wake_trace.zig").record(.syscall_exit, nr, trace_arg, trace_thread);
+    if (trace_call) if (comptime @import("wake_trace.zig").enabled) @import("wake_trace.zig").record(.syscall_enter, nr, trace_arg, trace_thread);
+    defer if (trace_call) if (comptime @import("wake_trace.zig").enabled) @import("wake_trace.zig").record(.syscall_exit, nr, trace_arg, trace_thread);
     user_copy.beginSyscallCopyTracking(scheduler.currentPrincipal());
     const result = dispatchCompactSyscallBody(frame);
     if (user_copy.takeSyscallCopyAbsent()) |absent| {
@@ -895,7 +939,11 @@ fn dispatchCompactSyscallBody(frame: *TrapFrame) u64 {
     // Clock copyout uses the address-space/shared-VM transaction used by
     // preflight and by the existing K-free nanosleep copy; neither path adds
     // K-only retirement work. An unready source retains K for CMOS/tick use.
-    const hold_kernel_state_lock = syscall_lock_policy.needsKernelStateLock(frame.rax) and
+    // Profile capture participates in the normal K admission and leave/
+    // reacquire callbacks. A private K section inside an otherwise K-free
+    // handler would not carry those lifetime/retirement hooks.
+    const profile_snapshot_lock = if (comptime lock_profile.enabled and kernel_log.ring_enabled) frame.rax == sc.syscall_kernel_log_read else false;
+    const hold_kernel_state_lock = (profile_snapshot_lock or syscall_lock_policy.needsKernelStateLock(frame.rax)) and
         !(frame.rax == sc.syscall_clock_gettime and runtime_syscalls.clockGettimeMaySkipK(frame.rdi));
     if (comptime lock_profile.enabled) {
         if (hold_kernel_state_lock) runtime_nr_profile.recordLocked(frame.rax);
@@ -944,6 +992,9 @@ fn dispatchCompactSyscallBody(frame: *TrapFrame) u64 {
         b3.end(507, drain_start);
     }
     perf.runtimeElapsed(runtime_path, .lock_wait_cycles, runtime_lock_start);
+    // Save the entry number: the handler overwrites frame.rax with its result.
+    const dma_retire = frame.rax == sc.syscall_capsule_derive_dma_mapping;
+    const discard_retire = frame.rax == sc.syscall_madvise or frame.rax == sc.syscall_vmo_discard;
     const runtime_body_start = perf.runtimeTimestamp(runtime_path);
     defer {
         perf.runtimeElapsed(runtime_path, .locked_body_cycles, runtime_body_start);
@@ -951,6 +1002,9 @@ fn dispatchCompactSyscallBody(frame: *TrapFrame) u64 {
         const trace_retire = b3.now();
         defer b3.end(508, trace_retire);
         if (lock_held) {
+            // Reuse the existing stage attribution, not a second diagnostic
+            // ring. Include periodic reference/PMM retire costs in DERIVE.
+            const dma_sample: lock_profile.OptionalToken = if (comptime lock_profile.enabled) (if (dma_retire) lock_profile.stageBegin() else .{}) else {};
             const retire_sample = if (comptime lock_profile.enabled) lock_profile.stageBegin() else {};
             {
                 const sample = if (comptime lock_profile.enabled) lock_profile.stageBegin() else {};
@@ -1021,9 +1075,19 @@ fn dispatchCompactSyscallBody(frame: *TrapFrame) u64 {
             }
             if (comptime lock_profile.enabled) lock_profile.stageEnd(.retire_reference_audit, audit_sample);
             if (comptime lock_profile.enabled) lock_profile.stageEnd(.retire, retire_sample);
+            // Stage counters are committed at unlock; finish while the K hold
+            // is still active, otherwise stageEnd deliberately discards it.
+            if (comptime lock_profile.enabled) {
+                if (dma_retire) lock_profile.stageEnd(.dma_exit_retire, dma_sample);
+            }
             kernel_state_lock.unlock();
             handOffIrqFdWaitersAfterRelease();
         }
+        // Handler defers ended every AS/shared borrow, and K is now released.
+        // Only detached independent records reach this callback; PMM pressure
+        // may also reclaim the same domain without acquiring K/AS/shared VM.
+        if (discard_retire) reclaimDiscardAfterExit();
+        if (@import("memory/vmo_backing.zig").hasDeferred()) reclaimDeferredAfterExit();
         perf.runtimeElapsed(runtime_path, .unlock_cycles, runtime_unlock_start);
     }
 
@@ -1089,6 +1153,10 @@ fn dispatchCompactSyscallBody(frame: *TrapFrame) u64 {
                 break :blk sc.syscall_err_invalid;
             if (!kernel_log_abi.requestIsValid(&reply))
                 break :blk sc.syscall_err_invalid;
+            // Header validation precedes capture. The normal admission above
+            // owns K; ring.snapshot releases its leaf before copyout takes A.
+            if (comptime lock_profile.enabled) if (reply.cursor == 0) lock_profile.dumpDmaStages();
+            if (comptime @import("ipc_metric.zig").enabled) if (reply.cursor == 0) @import("ipc_metric.zig").dumpWakeDetails();
             if (!kernel_log.readDebug(reply.cursor, reply.bytes[0..@intCast(reply.limit)], &reply))
                 break :blk sc.syscall_err_empty;
             if (!h.copy_bytes_to_user_va(proc, frame.rdi, std.mem.asBytes(&reply)))
@@ -1188,6 +1256,14 @@ pub export fn syscallDirectIpcPrepare(frame: *const TrapFrame) callconv(.winapi)
 }
 
 pub export fn syscallDirectIpcCommit(frame: *TrapFrame) callconv(.winapi) u64 {
+    const mode = syscallDirectIpcCommitBody(frame);
+    if (mode == 0) return 0;
+    const switched = scheduler.consumeWakeReschedule(frame);
+    @import("traps.zig").stagePendingSignalForUserReturn(frame);
+    return if (switched) 2 else mode;
+}
+
+fn syscallDirectIpcCommitBody(frame: *TrapFrame) u64 {
     if (@import("builtin").is_test) return 0;
     // Reached only after prepare admitted this frame, so the kind exists.
     switch (direct_ipc_entry.directIpcKind(frame.rax).?) {
@@ -1391,6 +1467,7 @@ pub export fn syscallIpcScalarDispatch(frame: *TrapFrame) callconv(.winapi) u64 
         lock_held = false;
     }
     const signal_start = b3.now();
+    _ = scheduler.consumeWakeReschedule(frame);
     @import("traps.zig").stagePendingSignalForUserReturn(frame);
     b3.end(503, signal_start);
     b3.finish();
@@ -1413,6 +1490,7 @@ pub export fn syscallDispatch(frame: *TrapFrame) callconv(.winapi) u64 {
     const result = dispatchCompactSyscall(frame);
     frame.rax = result;
     const runtime_stage_start = perf.runtimeTimestamp(runtime_path);
+    _ = scheduler.consumeWakeReschedule(frame);
     @import("traps.zig").stagePendingSignalForUserReturn(frame);
     perf.runtimeElapsed(runtime_path, .return_stage_cycles, runtime_stage_start);
     return frame.rax;
@@ -1966,7 +2044,32 @@ test "shootdown interrupt guard IPC cancellation survives contention and drains 
 
 // Host races use the actual K implementation and diagnostic class, so the
 // poll regression exercises the exclusion which production already relies on.
+fn reclaimDiscardAfterExit() void {
+    lock_diagnostics.assertRootEmpty();
+    _ = @import("memory/discard_pages.zig").global.reclaim();
+    _ = @import("memory/shared_discard_slots.zig").global.reclaim();
+}
+
+fn reclaimDeferredAfterExit() void {
+    // This is independent of discard retirement: an ordinary dispatcher exit
+    // must retry rejected metadata even if no further discard is issued.
+    lock_diagnostics.assertRootEmpty();
+    @import("memory/vmo_backing.zig").reclaimDeferred();
+}
+
 pub const KernelLockTestSupport = if (@import("builtin").is_test) struct {
+    pub const reclaimDiscard = reclaimDiscardAfterExit;
+    pub fn dispatchBody(h: Hooks, frame: *TrapFrame) u64 {
+        const saved_ready = syscall_hooks_ready;
+        const saved = if (saved_ready) syscall_hooks_storage else undefined;
+        defer {
+            syscall_hooks_ready = saved_ready;
+            syscall_hooks_storage = saved;
+        }
+        syscall_hooks_storage = h;
+        syscall_hooks_ready = true;
+        return dispatchCompactSyscallBody(frame);
+    }
     pub fn tryLock() bool {
         return kernel_state_lock.tryLock();
     }

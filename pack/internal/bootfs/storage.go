@@ -17,7 +17,8 @@ type StorageOptions struct {
 }
 
 func storageEntries(opts StorageOptions) ([]entry, error) {
-	if opts.RAMBytes == 0 || opts.ArenaBytes == 0 || opts.QueueSize < 2 ||
+	// Zero RAM selects runtime discovery; the build host is not the target.
+	if opts.ArenaBytes == 0 || opts.QueueSize < 2 ||
 		opts.QueueSize > 32768 || opts.QueueSize&(opts.QueueSize-1) != 0 {
 		return nil, fmt.Errorf("invalid storage RAM/queue policy")
 	}

@@ -11,6 +11,7 @@
 #include "storage_boot/boot_config.h"
 #include "filed/live_bootstrap.h"
 #include "pacha/live_bootstrap.h"
+#include "pacha/pressure.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -151,7 +152,7 @@ int seed0_launch_storage_boot_nvme(pacha_fd_t ready_channel_fd,
     return status;
 }
 
-int seed0_launch_live_filed(pacha_fd_t ready_channel_fd, pacha_fd_t unix_path_fd,
+int seed0_launch_live_filed(pacha_fd_t ready_channel_fd, pacha_fd_t unix_path_fd, pacha_fd_t pressure_fd,
     pacha_fd_t *out_endpoint_fd)
 {
     if (ready_channel_fd < 16 || unix_path_fd < 16 ||
@@ -201,6 +202,9 @@ int seed0_launch_live_filed(pacha_fd_t ready_channel_fd, pacha_fd_t unix_path_fd
             PACHA_LAUNCH_SERVER | PACHA_LAUNCH_CLIENT |
                 PACHA_FD_RIGHT_DUP | PACHA_FD_RIGHT_TRANSFER |
                 PACHA_FD_RIGHT_SET_FLAGS),
+        {.source_fd=pressure_fd, .target_fd=PACHA_PRESSURE_EXPORT_FD,
+            .rights=PACHA_PRESSURE_RIGHTS | PACHA_FD_RIGHT_TRANSFER,
+            .flags=PACHA_FD_FLAG_PRIVATE | PACHA_FD_FLAG_CLOEXEC},
         PACHA_LAUNCH_GRANT(ready_channel_fd, ready_channel_fd, PACHA_LAUNCH_SIGNAL),
         PACHA_LAUNCH_GRANT(unix_path_fd, unix_path_fd, PACHA_LAUNCH_SERVER),
         PACHA_LAUNCH_GRANT(config_fd, config_fd, PACHA_LAUNCH_BLOB),
@@ -221,7 +225,7 @@ int seed0_launch_live_filed(pacha_fd_t ready_channel_fd, pacha_fd_t unix_path_fd
 }
 
 int seed0_launch_live_seed0root(pacha_fd_t filed_endpoint_fd, pacha_fd_t unix_path_fd,
-    pacha_fd_t root_handoff_fd, pacha_fd_t power_channel_fd)
+    pacha_fd_t root_handoff_fd, pacha_fd_t power_channel_fd, pacha_fd_t pressure_fd)
 {
     const struct seed0_init_descriptor_page *desc = seed0_bootstrap_descriptor();
     if (desc == NULL || filed_endpoint_fd < 16 || unix_path_fd < 16 ||
@@ -248,6 +252,9 @@ int seed0_launch_live_seed0root(pacha_fd_t filed_endpoint_fd, pacha_fd_t unix_pa
         "live root config");
     if (config_fd < 16) return config_fd;
     const struct pacha_process_fd_grant grants[] = {
+        {.source_fd=pressure_fd, .target_fd=PACHA_PRESSURE_EXPORT_FD,
+            .rights=PACHA_PRESSURE_RIGHTS | PACHA_FD_RIGHT_TRANSFER,
+            .flags=PACHA_FD_FLAG_PRIVATE | PACHA_FD_FLAG_CLOEXEC},
         PACHA_LAUNCH_LOG_GRANTS(0),
         PACHA_LAUNCH_GRANT(config_fd, config_fd, PACHA_LAUNCH_BLOB),
         PACHA_LAUNCH_GRANT(filed_endpoint_fd, filed_endpoint_fd,
@@ -256,7 +263,7 @@ int seed0_launch_live_seed0root(pacha_fd_t filed_endpoint_fd, pacha_fd_t unix_pa
         PACHA_LAUNCH_GRANT(unix_path_fd, unix_path_fd,
             PACHA_LAUNCH_CLIENT | PACHA_FD_RIGHT_TRANSFER),
         PACHA_LAUNCH_GRANT(root_handoff_fd, root_handoff_fd,
-            PACHA_LAUNCH_SERVER),
+            PACHA_LAUNCH_SERVER | PACHA_LAUNCH_SIGNAL | PACHA_FD_RIGHT_TRANSFER),
         PACHA_LAUNCH_GRANT(power_channel_fd, power_channel_fd,
             PACHA_LAUNCH_CLIENT | PACHA_FD_RIGHT_TRANSFER),
     };

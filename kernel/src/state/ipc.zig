@@ -1048,6 +1048,8 @@ pub fn wakeIpcWaitersForSendFd(
     fd: Fd,
     out: []ThreadWakeTarget,
 ) KernelError!usize {
+    const wf11 = @import("../ipc_metric.zig").detailBegin();
+    defer @import("../ipc_metric.zig").detailEnd(.wake_select, wf11);
     const source = self.fdEntryConst(owner, fd) orelse return KernelError.InvalidState;
     const send_slot = self.kernelObjectSlotConst(source.object) orelse return KernelError.InvalidState;
     _ = @TypeOf(self.*).ipcRecvWaitKeyFromSendPayload(&send_slot.payload) orelse
@@ -1558,6 +1560,8 @@ pub fn ipcSend(
     send: IpcSendMessage,
     free_list: *FreePageList,
 ) KernelError!void {
+    const wf11 = @import("../ipc_metric.zig").detailBegin();
+    defer @import("../ipc_metric.zig").detailEnd(.enqueue, wf11);
     try self.requireActiveProcess(owner);
     try self.enqueueIpcMessage(owner, fd, send, false, free_list);
 }
@@ -1625,6 +1629,8 @@ pub fn ipcExtractReply(self: anytype, owner: PrincipalId, ref: IpcReplyRef, min_
 }
 
 pub fn ipcTakeDirectReceiver(self: anytype, owner: PrincipalId, fd: Fd, require_call: bool) KernelError!?ThreadWakeTarget {
+    const wf11 = @import("../ipc_metric.zig").detailBegin();
+    defer @import("../ipc_metric.zig").detailEnd(.wake_select, wf11);
     const entry = self.fdEntryConst(owner, fd) orelse return KernelError.InvalidState;
     if (if (require_call) !entry.rights.call else !entry.rights.send) return KernelError.InvalidState;
     const queue = try self.ipcMessageQueueForSend(entry.object);

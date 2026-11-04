@@ -357,6 +357,7 @@ static int prepare(void *context, struct ph_ipc_packet *packet) {
 
 static int dispatch(void *context, void *linux_service) {
     struct ph_gpu_queue *queue = context;
+    queue->active_service = linux_service;
     if (queue->event_active) {
         if (!linux_service)
             return -ENODEV;
@@ -493,6 +494,9 @@ static int complete(void *context, struct ph_ipc *ipc) {
     }
     int result = (queue->cpu_sync_token || queue->sync_file.opcode) ? 0 : ph_gpu_query_publish_attachment(query, ipc);
     if (result)
+        result = ph_gpu_query_attachment_error(query, result, queue->active_service,
+                                               queue->service.unmap);
+    if (result)
         return result;
     if (!queue->cpu_sync_token && !queue->sync_file.opcode && queue->active_lane != GPUD_GPU_QUEUE_CONTROL)
         memcpy((unsigned char *)queue->mapping + GPUD_GPU_OUTPUT_OFFSET,
@@ -524,6 +528,7 @@ static int release_request(void *context) {
     /* Chains end at used publication. A failed chain remains owned until
      * terminal channel retirement; never drop it and admit more work. */
     struct ph_gpu_queue *queue = context;
+    queue->active_service = NULL;
     if (queue->event_active) {
         int result = queue->event_fences ? 0 : ph_gpu_session_release(queue->service.sessions,
             queue->service.query.generation, queue->service.client_id,
@@ -601,6 +606,7 @@ int ph_gpu_queue_init_profile(struct ph_gpu_queue *queue,
         .notify_fences = notify_fence_event,
     };
     queue->request = (kb2_vq_chain_t){.segments = queue->segments, .capacity = GPUD_GPU_QUEUE_SIZE};
+    ph_boot_log_gpu_export_ready();
     *service = (struct ph_lifecycle_service){.context = queue,
                                              .prepare = prepare,
                                              .dispatch = dispatch,

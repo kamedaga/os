@@ -1073,3 +1073,13 @@ int unix_broker_dgram_finish(struct unix_broker *broker, struct unix_socket *soc
     if (route->source == NULL && route->queued == 0) destroy_route(broker, route);
     return 0;
 }
+
+int unix_broker_listener_snapshot(struct unix_broker *broker, uint64_t id,
+    uint64_t *ready, struct unix_poll_sequence *sequence)
+{
+    const struct unix_socket *socket = find_socket(broker, id);
+    if (!socket || !socket->listening) return -EBADF;
+    *ready = socket->pending_count ? 1u : 0;
+    *sequence = socket->poll_sequence;
+    return 0;
+}

@@ -39,6 +39,9 @@ pub const Ref = struct {
 pub const Error = storage.Error || error{ IndexExhausted, NeedStorage, StalePreparation };
 pub var test_directory_copy_bytes: if (builtin.is_test) usize else void = if (builtin.is_test) 0 else {};
 pub var test_mark_search_nodes: if (builtin.is_test) usize else void = if (builtin.is_test) 0 else {};
+// Host-test visit counters: bound slot selection by work done, not wall time.
+pub var test_get_calls: if (builtin.is_test) usize else void = if (builtin.is_test) 0 else {};
+pub var test_free_walk_nodes: if (builtin.is_test) usize else void = if (builtin.is_test) 0 else {};
 
 const none: u64 = std.math.maxInt(u64);
 
@@ -63,6 +66,11 @@ pub fn SlotTable(comptime T: type) type {
             entries: [block_slots]Entry = [_]Entry{.{}} ** block_slots,
             values: ?[*]Body = null,
             live: usize = 0,
+            // Writer-only reclaim candidate link (block base index). A listed
+            // block is "needs re-check", not "currently empty": it may be
+            // reused or have its body retired while listed (see noteEmpty).
+            empty_next: u64 = none,
+            empty_listed: bool = false,
         };
         const Directory = @import("radix.zig").Directory(Block);
         const Node = Directory.Node;
@@ -81,6 +89,11 @@ pub fn SlotTable(comptime T: type) type {
         capacity: u64 = 0,
         live: usize = 0,
         free_head: u64 = none,
+        // Head of the reclaim candidate list. Invariant (writer exclusion):
+        // every block with live == 0 and values != null is listed exactly
+        // once, so reclaimEmptyBodies visits candidates instead of every
+        // radix block (O(capacity) per munmap/MAP_FIXED commit before).
+        empty_head: u64 = none,
         directory_owner: storage.Owner = .{},
         metadata_owner: storage.Owner = .{},
         body_owner: storage.Owner = .{},
@@ -131,10 +144,43 @@ pub fn SlotTable(comptime T: type) type {
             return Directory.get(self.root, index >> block_shift, levels);
         }
 
+        /// Writer exclusion. Call at every transition that can make a block
+        /// "live == 0 with a body": last release, body (re)attachment and new
+        /// block publication. An already listed block still represents this
+        /// state, so it is never pushed twice (no duplicate, no cycle).
+        fn noteEmptyCandidate(self: *Self, block: *Block, index: u64) void {
+            if (block.live != 0 or block.values == null or block.empty_listed) return;
+            block.empty_listed = true;
+            block.empty_next = self.empty_head;
+            self.empty_head = index & ~@as(u64, block_slots - 1);
+        }
+
+        /// Writer-only, read-only walk of the unused-index list from its head.
+        /// Yields only indices that are neither used, withdrawn nor exhausted
+        /// (release/commit link only such entries). The caller must not mutate
+        /// this table while iterating; prepareIndex/claimIndex end the walk.
+        pub const FreeIterator = struct {
+            table: *const Self,
+            next_index: u64,
+            pub fn next(self: *FreeIterator) ?u32 {
+                if (self.next_index == none) return null;
+                const index: u32 = @intCast(self.next_index);
+                if (builtin.is_test) test_free_walk_nodes += 1;
+                const entry = &self.table.blockAt(index).?.entries[index & (block_slots - 1)];
+                std.debug.assert(!entry.used and !entry.withdrawn and !entry.exhausted);
+                self.next_index = entry.next;
+                return index;
+            }
+        };
+        pub fn freeIndices(self: *const Self) FreeIterator {
+            return .{ .table = self, .next_index = self.free_head };
+        }
+
         /// Caller owns writer exclusion or the directory leaf. No directory
         /// pointer escapes. Body lifetime must separately be protected through
         /// the last dereference, including before acquiring a body-level lock.
         pub fn get(self: *const Self, index: u32) ?*T {
+            if (builtin.is_test) test_get_calls += 1;
             const block = self.blockAt(index) orelse return null;
             const offset = index & (block_slots - 1);
             if (!block.entries[offset].used) return null;
@@ -302,6 +348,7 @@ pub fn SlotTable(comptime T: type) type {
                 if (block.values != null) return error.StalePreparation;
                 try draft.body.commitAdditionalStable();
                 @atomicStore(?[*]Body, &block.values, draft.values, .release);
+                self.noteEmptyCandidate(block, self.free_head);
                 return .{};
             }
             if (self.capacity > max_index or self.capacity + block_slots - 1 > max_index)
@@ -335,7 +382,9 @@ pub fn SlotTable(comptime T: type) type {
             draft.body.commitAdditionalStable() catch unreachable;
             @atomicStore(?*Node, &self.root, draft.nodes[0], .release);
             self.free_head = self.capacity;
+            const block_base = self.capacity;
             @atomicStore(u64, &self.capacity, self.capacity + block_slots, .release);
+            self.noteEmptyCandidate(block, block_base);
             return retired;
         }
 
@@ -358,6 +407,7 @@ pub fn SlotTable(comptime T: type) type {
             entry.marks = 0;
             block.live -= 1;
             self.live -= 1;
+            self.noteEmptyCandidate(block, ref.index);
             if (entry.generation == std.math.maxInt(u32)) {
                 entry.exhausted = true;
             } else {
@@ -370,12 +420,18 @@ pub fn SlotTable(comptime T: type) type {
         /// Call only after directory readers AND body borrowers are excluded.
         /// No leaf may be held while allocator callbacks run.
         pub fn reclaimEmptyBodies(self: *Self) void {
-            var base: u64 = 0;
-            while (base < self.capacity) : (base += block_slots) {
-                const block = self.blockAt(@intCast(base)).?;
+            while (self.empty_head != none) {
+                const block = self.blockAt(@intCast(self.empty_head)).?;
+                // Unlink and clear the flag BEFORE re-checking: a later 1->0
+                // transition must be able to list this block again.
+                self.empty_head = block.empty_next;
+                block.empty_next = none;
+                block.empty_listed = false;
+                // Stale candidates (reused, or body already retired by
+                // remove/finishWithdrawal) are skipped, never retired twice.
                 if (block.live == 0) if (block.values) |values| {
-                    self.body_owner.retireAllocation(Body, values) catch unreachable;
                     @atomicStore(?[*]Body, &block.values, null, .release);
+                    self.body_owner.retireAllocation(Body, values) catch unreachable;
                 };
             }
             self.reclaim();
@@ -401,6 +457,8 @@ pub fn SlotTable(comptime T: type) type {
             @atomicStore(u64, &self.capacity, 0, .release);
             self.live = 0;
             self.free_head = none;
+            // Candidate links live in the retired block metadata.
+            self.empty_head = none;
             for ([_]*storage.Owner{ &self.directory_owner, &self.metadata_owner, &self.body_owner }) |owner| {
                 if (owner.bound_address == null and owner.published == null and owner.retired == null and owner.pending == null) continue;
                 owner.retireAll() catch unreachable;
@@ -435,6 +493,7 @@ pub fn SlotTable(comptime T: type) type {
                 for (values) |*value| value.* = .{ .index = 0, .value = initialValue() };
                 try body.commitAdditionalStable();
                 @atomicStore(?[*]Body, &block.values, values.ptr, .release);
+                self.noteEmptyCandidate(block, index);
             }
         }
 
@@ -582,10 +641,13 @@ pub fn SlotTable(comptime T: type) type {
             self.capacity = source.capacity;
             self.live = source.live;
             self.free_head = source.free_head;
+            // Block links move with the block metadata itself.
+            self.empty_head = source.empty_head;
             source.root = null;
             source.capacity = 0;
             source.live = 0;
             source.free_head = none;
+            source.empty_head = none;
         }
 
         pub fn deinitInto(self: *Self, owner: *storage.Owner) void {
@@ -889,4 +951,180 @@ test "outside writer readers keep stable bodies while directories grow and retir
     while (@atomicLoad(usize, &reader.reads, .monotonic) == 0) std.atomic.spinLoopHint();
     for (0..4097) |_| _ = try table.allocate(backend.interface(), &leaf, std.math.maxInt(u32));
     try std.testing.expectEqual(first.value, table.resolve(first.ref).?);
+}
+
+// Full-scan oracle for the reclaim candidate list: no cycle, aligned in-range
+// bases, flag == reachability, no duplicate, and every block with live == 0
+// and a body is listed. Stale listed blocks (reused/retired) are allowed.
+fn expectEmptyCandidateInvariant(table: anytype) !void {
+    const T = @TypeOf(table.*);
+    var reached: usize = 0;
+    var cursor = table.empty_head;
+    while (cursor != none) {
+        try std.testing.expect(cursor % T.block_slots == 0 and cursor < table.capacity);
+        const block = table.blockAt(@intCast(cursor)).?;
+        try std.testing.expect(block.empty_listed);
+        reached += 1;
+        try std.testing.expect(reached <= table.capacity / T.block_slots);
+        cursor = block.empty_next;
+    }
+    var listed: usize = 0;
+    var base: u64 = 0;
+    while (base < table.capacity) : (base += T.block_slots) {
+        const block = table.blockAt(@intCast(base)).?;
+        if (block.empty_listed) listed += 1 else try std.testing.expect(block.empty_next == none);
+        if (block.live == 0 and block.values != null) try std.testing.expect(block.empty_listed);
+    }
+    try std.testing.expectEqual(listed, reached);
+}
+
+fn expectReclaimMatchesFullScan(table: anytype) !void {
+    const T = @TypeOf(table.*);
+    var expected: [64]bool = @splat(false);
+    var kept: [64]bool = @splat(false);
+    var base: u64 = 0;
+    while (base < table.capacity) : (base += T.block_slots) {
+        const block = table.blockAt(@intCast(base)).?;
+        const ordinal: usize = @intCast(base / T.block_slots);
+        expected[ordinal] = block.live == 0 and block.values != null;
+        kept[ordinal] = block.live != 0 and block.values != null;
+    }
+    table.reclaimEmptyBodies();
+    base = 0;
+    while (base < table.capacity) : (base += T.block_slots) {
+        const block = table.blockAt(@intCast(base)).?;
+        const ordinal: usize = @intCast(base / T.block_slots);
+        if (expected[ordinal]) try std.testing.expect(block.values == null);
+        if (kept[ordinal]) try std.testing.expect(block.values != null);
+        try std.testing.expect(!block.empty_listed and block.empty_next == none);
+    }
+    try std.testing.expectEqual(none, table.empty_head);
+}
+
+test "reclaim candidates cover every empty body transition and match the full scan" {
+    var backend = TestBackend{};
+    defer backend.deinit();
+    const Table = SlotTable(u64);
+    var table = Table{};
+    defer table.deinit();
+    const slots = Table.block_slots;
+    // New block publication (append) leaves an empty body: it must be listed.
+    try table.prepareIndex(0, backend.interface());
+    try expectEmptyCandidateInvariant(&table);
+    try expectReclaimMatchesFullScan(&table);
+    // Body re-attachment by prepareIndex on an empty block.
+    try table.prepareIndex(3, backend.interface());
+    try expectEmptyCandidateInvariant(&table);
+    const a = try table.claimIndex(3);
+    try expectEmptyCandidateInvariant(&table);
+    // Last release (via removeRetainingCapacity) lists the block again.
+    table.removeRetainingCapacity(a);
+    try expectEmptyCandidateInvariant(&table);
+    // A listed block reused before reclaim becomes a stale candidate.
+    const b = try table.allocate(backend.interface(), null, std.math.maxInt(u32));
+    try expectEmptyCandidateInvariant(&table);
+    try expectReclaimMatchesFullScan(&table);
+    try std.testing.expect(table.blockAt(b.ref.index).?.values != null);
+    // remove retires the body itself; the stale node must not double retire.
+    table.remove(b.value, null);
+    try expectEmptyCandidateInvariant(&table);
+    try expectReclaimMatchesFullScan(&table);
+    // commitPreparedMode's existing-block branch re-attaches a body (live 0).
+    const c = try table.allocate(backend.interface(), null, std.math.maxInt(u32));
+    try expectEmptyCandidateInvariant(&table);
+    // withdraw keeps block live; finishWithdrawal releases and retires.
+    table.withdraw(c.value, null);
+    try expectEmptyCandidateInvariant(&table);
+    table.finishWithdrawal(c.value, null);
+    try expectEmptyCandidateInvariant(&table);
+    try expectReclaimMatchesFullScan(&table);
+
+    // Pseudo-random sequence over several blocks against the full-scan oracle.
+    var prng = std.Random.DefaultPrng.init(0x5107);
+    const random = prng.random();
+    var held: [256]?*u64 = @splat(null);
+    for (0..4000) |_| {
+        const slot = random.uintLessThan(usize, held.len);
+        switch (random.uintLessThan(u8, 6)) {
+            0, 1 => if (held[slot] == null) {
+                held[slot] = (try table.allocate(backend.interface(), null, std.math.maxInt(u32))).value;
+            },
+            2 => if (held[slot]) |value| {
+                table.removeRetainingCapacity(value);
+                held[slot] = null;
+            },
+            3 => if (held[slot]) |value| {
+                table.remove(value, null);
+                held[slot] = null;
+            },
+            4 => {
+                const index: u32 = @intCast(random.uintLessThan(usize, 4 * slots));
+                if (table.get(index) == null) {
+                    try table.prepareIndex(index, backend.interface());
+                    if (random.boolean()) {
+                        var free_slot: ?usize = null;
+                        for (held, 0..) |item, i| if (item == null) {
+                            free_slot = i;
+                            break;
+                        };
+                        if (free_slot) |i| held[i] = try table.claimIndex(index);
+                    }
+                }
+            },
+            else => try expectReclaimMatchesFullScan(&table),
+        }
+        try expectEmptyCandidateInvariant(&table);
+    }
+    // Exec transfer moves candidate links; the source keeps none.
+    var destination = Table{};
+    defer destination.deinit();
+    try destination.prepareIndex(0, backend.interface());
+    destination.reclaimEmptyBodies();
+    for (&held) |*item| if (item.*) |value| {
+        table.removeRetainingCapacity(value);
+        item.* = null;
+    };
+    destination.takeFrom(&table);
+    try std.testing.expectEqual(none, table.empty_head);
+    try expectEmptyCandidateInvariant(&destination);
+    try expectReclaimMatchesFullScan(&destination);
+    // Direct commitPrepared (futex/PI callers) re-attaching a body to an
+    // empty free-head block without allocating from it must list the block.
+    const direct = try destination.allocate(backend.interface(), null, std.math.maxInt(u32));
+    destination.remove(direct.value, null);
+    try std.testing.expect(destination.blockAt(@intCast(destination.free_head)).?.values == null);
+    destination.reclaimEmptyBodies();
+    var draft = Table.Prepared.init(&destination, backend.interface());
+    defer draft.finish();
+    try draft.reserve();
+    destination.retirePath(try destination.commitPrepared(&draft, std.math.maxInt(u32)));
+    try std.testing.expect(destination.blockAt(@intCast(destination.free_head)).?.values != null);
+    try expectEmptyCandidateInvariant(&destination);
+    // retire with a listed candidate leaves no head into retired metadata.
+    try std.testing.expect(destination.empty_head != none);
+    destination.retire();
+    try std.testing.expectEqual(none, destination.empty_head);
+}
+
+test "free index iterator walks only unused indices from the head without mutation" {
+    var backend = TestBackend{};
+    defer backend.deinit();
+    var table = SlotTable(u64){};
+    defer table.deinit();
+    const first = try table.allocate(backend.interface(), null, std.math.maxInt(u32));
+    const second = try table.allocate(backend.interface(), null, std.math.maxInt(u32));
+    table.removeRetainingCapacity(first.value);
+    var it = table.freeIndices();
+    try std.testing.expectEqual(first.ref.index, it.next().?);
+    var count: usize = 1;
+    while (it.next()) |index| {
+        try std.testing.expect(index != second.ref.index and table.get(index) == null);
+        count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, @TypeOf(table).block_slots - 1), count);
+    // Withdrawn indices are not unused: they never appear.
+    table.withdraw(second.value, null);
+    var again = table.freeIndices();
+    while (again.next()) |index| try std.testing.expect(index != second.ref.index);
+    table.finishWithdrawal(second.value, null);
 }

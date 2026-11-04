@@ -22,12 +22,14 @@ const lapic_reg_divide_config: u32 = 0x3E0;
 pub const pit_frequency_hz: u64 = 1_193_182;
 pub const calibration_pit_ticks: u16 = 59_659;
 pub const timer_target_period_ns: u64 = 1_000_000;
+// CPUs without a CPUID crystal frequency use PIT channel 2 as their
+// independent boot-time reference; qualified TSC CPUs retain the short path.
 // PIT mode 0 nominally completes in 50 ms. HPET is independent of both
 // clocks being calibrated. A second work bound handles a stopped HPET; it
 // is not a claim about wall time of a trapped port I/O instruction.
 const pit_timeout_ns: u64 = 100_000_000;
 const pit_clock_stall_limit: usize = 100_000;
-pub const CalibrationReason = enum { ready, unavailable, no_deadline_clock, pit_not_low, timeout, clock_stalled, invalid_measurement };
+pub const CalibrationReason = enum { ready, unavailable, no_deadline_clock, pit_not_low, timeout, clock_stalled, invalid_measurement, tsc_unqualified, arat_missing };
 
 const PitWait = struct {
     start: u64,
@@ -73,6 +75,13 @@ fn latchPitCounter2() u16 {
     const low = inb(0x42);
     const high = inb(0x42);
     return @as(u16, low) | (@as(u16, high) << 8);
+}
+
+fn calibrationPitLatch(comptime stopped: bool) u16 {
+    // Freeze the PIT interface in diagnostic images. Merely holding gate low
+    // is not a portable fault injection: some QEMU PIT models still advance
+    // their latched count. Production always reads the actual channel.
+    return if (stopped) calibration_pit_ticks else latchPitCounter2();
 }
 
 const icr_delivery_status: u32 = 1 << 12;
@@ -132,6 +141,14 @@ fn x2Icr(destination: u32, command: u32) u64 {
 
 pub const TimerCalibration = struct {
     calibrated: bool,
+    source: enum { none, tsc, pit } = .none,
+    lower_hz: u64 = 0,
+    first_width_cycles: u64 = 0,
+    last_width_cycles: u64 = 0,
+    elapsed_ns: u64 = 0,
+    known_hz: u64 = 0,
+    error_bound_ppm: u64 = 0,
+    window_ns: u64 = 0,
     reason: CalibrationReason = .ready,
     frequency_hz: u64,
     initial_count: u32,
@@ -276,77 +293,235 @@ fn fallbackCalibration(fallback_initial_count: u32, rearm_overhead_ns: u64, reas
     };
 }
 
-pub fn calibrateTimer(fallback_initial_count: u32, rearm_overhead_ns: u64) TimerCalibration {
-    if (lapic_base_pa == 0 or fallback_initial_count == 0) {
-        return fallbackCalibration(fallback_initial_count, rearm_overhead_ns, .invalid_measurement);
+const tsc = @import("tsc_clock.zig");
+const calibration_options = if (@import("builtin").os.tag == .freestanding) @import("clock_test_options") else struct {
+    const lapic_stop_pit = false;
+    const lapic_reject_tsc = false;
+};
+const minimum_window_ns = 500_000;
+const maximum_window_ns = 2_000_000;
+const maximum_error_ppm = 10_000;
+pub const CountSample = struct { before: u64, count: u32, after: u64 };
+pub const RateBounds = struct { lower_hz: u64, upper_hz: u64, error_ppm: u64, window_ns: u64 };
+
+fn rawRateBounds(a: CountSample, b: CountSample, known_hz: u64) ?RateBounds {
+    if (known_hz == 0 or a.before > a.after or a.after >= b.before or b.before > b.after or
+        a.count == 0 or b.count == 0 or b.count >= a.count) return null;
+    const shortest = b.before - a.after;
+    const longest = b.after - a.before;
+    if (@as(u128, shortest) * 1_000_000_000 < @as(u128, known_hz) * minimum_window_ns or
+        @as(u128, longest) * 1_000_000_000 > @as(u128, known_hz) * maximum_window_ns) return null;
+    const delta: u64 = a.count - b.count;
+    if (delta <= 1) return null;
+    // Both MMIO sample instants lie inside ordered TSC brackets. Include one
+    // count of endpoint phase uncertainty as well: D/minDelta is not an upper
+    // bound. Programming the CEIL of the upper rate makes conversion late,
+    // never early, in the same known-TSC time domain as absolute deadlines.
+    const lower = @as(u128, delta - 1) * known_hz / longest;
+    const upper = (@as(u128, delta + 1) * known_hz + shortest - 1) / shortest;
+    if (lower == 0 or upper > std.math.maxInt(u64)) return null;
+    const error_ppm = ((upper - lower) * 1_000_000 + lower - 1) / lower;
+    return .{ .lower_hz = @intCast(lower), .upper_hz = @intCast(upper), .error_ppm = @intCast(error_ppm), .window_ns = tsc.cyclesNs(longest, known_hz) };
+}
+
+pub fn rateFromTsc(a: CountSample, b: CountSample, known_hz: u64) ?RateBounds {
+    const rate = rawRateBounds(a, b, known_hz) orelse return null;
+    return if (rate.error_ppm <= maximum_error_ppm) rate else null;
+}
+const MeasurementDecision = enum { accept, extend, reject };
+fn measurementDecision(a: CountSample, b: CountSample, hz: u64, extended: bool) MeasurementDecision {
+    const rate = rawRateBounds(a, b, hz) orelse return .reject;
+    if (rate.error_ppm <= maximum_error_ppm) return .accept;
+    return if (extended) .reject else .extend;
+}
+
+const TscSource = struct {
+    fn read() u64 {
+        return tsc.readCounter();
     }
+};
+fn waitCounter(comptime Source: type, start: u64, target: u64) ?u64 {
+    var previous = start;
+    // A stopped TSC has no independent wall clock here. Bound work instead;
+    // exhaustion is terminal, even if a later sample would look plausible.
+    for (0..100_000) |_| {
+        const now = Source.read();
+        if (now < previous) return null;
+        if (now >= target) return now;
+        previous = now;
+        std.atomic.spinLoopHint();
+    }
+    return null;
+}
 
-    // Prefer the post-SMP UC-verified HPET. When absent, use the PIT's own
-    // known-frequency counter; TSC remains only a measurement target.
-    const hpet = @import("hpet.zig");
-    const start = hpet.monotonicNs();
-    var wait = PitWait{ .start = start orelse 0, .previous = start orelse 0 };
-    var pit_wait: PitCounterWait = .{};
-    const original_port_b = inb(0x61);
-    defer outb(0x61, original_port_b);
+fn countSample() CountSample {
+    // Both fences and compiler memory clobbers matter for UC MMIO as well as
+    // MSR-backed x2APIC reads. A one-sided RDTSC can understate the bracket.
+    const before = tsc.readCounter();
+    const count = readRegister(lapic_reg_current_count);
+    return .{ .before = before, .count = count, .after = tsc.readCounter() };
+}
 
-    // PIT channel 2 is polled, so calibration does not depend on the legacy
-    // PIC or on interrupts being enabled. Mode 0 gives one 49.999916 ms window.
-    outb(0x61, original_port_b & ~@as(u8, 0x03));
-    outb(0x43, 0xB0); // channel 2, low/high bytes, mode 0, binary
+pub fn calibrateTimer(fallback_initial_count: u32, rearm_overhead_ns: u64) TimerCalibration {
+    const start = tsc.readCounter();
+    const q = tsc.lapicTimerQualification();
+    // A rejected known-frequency TSC must not bypass qualification through
+    // the legacy path. Missing CPUID frequency is different: PIT measures
+    // the BSP counter without claiming cross-CPU TSC synchronization.
+    if (usePitCalibration(tsc.knownFrequency(), calibration_options.lapic_reject_tsc))
+        return calibrateWithPit(fallback_initial_count, rearm_overhead_ns);
+    var result = calibrateWithTsc(fallback_initial_count, rearm_overhead_ns, q);
+    result.known_hz = q.hz;
+    result.elapsed_ns = tsc.cyclesNs(tsc.readCounter() -| start, q.hz);
+    return result;
+}
+fn usePitCalibration(known_hz: ?u64, reject_tsc: bool) bool {
+    return known_hz == null and !reject_tsc;
+}
+
+const PitMeasurement = struct { frequency_hz: u64, tsc_cycles: u64 };
+fn pitMeasurement(current_count: u32, counter_start: u64, counter_end: u64) ?PitMeasurement {
+    if (current_count == 0 or current_count == std.math.maxInt(u32) or counter_end <= counter_start) return null;
+    const hz = frequencyFromPitMeasurement(std.math.maxInt(u32) - current_count, calibration_pit_ticks) orelse return null;
+    return .{ .frequency_hz = hz, .tsc_cycles = counter_end - counter_start };
+}
+
+fn calibrateWithPit(fallback_initial_count: u32, rearm_overhead_ns: u64) TimerCalibration {
+    if (!tsc.onlineTimersAlwaysRunning())
+        return fallbackCalibration(fallback_initial_count, rearm_overhead_ns, .arat_missing);
+    if (lapic_base_pa == 0 or fallback_initial_count == 0)
+        return fallbackCalibration(fallback_initial_count, rearm_overhead_ns, .invalid_measurement);
+    const original_lvt = readRegister(lapic_reg_lvt_timer);
+    if (original_lvt & (3 << 17) != 0)
+        return fallbackCalibration(fallback_initial_count, rearm_overhead_ns, .invalid_measurement);
+    writeRegister(lapic_reg_lvt_timer, original_lvt | (1 << 16));
+    defer writeRegister(lapic_reg_lvt_timer, original_lvt);
+    writeRegister(lapic_reg_divide_config, 0x3);
+    const original_port = inb(0x61);
+    defer outb(0x61, original_port);
+    outb(0x61, original_port & ~@as(u8, 3));
+    outb(0x43, 0xb0);
     outb(0x42, @truncate(calibration_pit_ticks));
     outb(0x42, @truncate(calibration_pit_ticks >> 8));
-    if ((inb(0x61) & 0x20) != 0) {
-        return fallbackCalibration(fallback_initial_count, rearm_overhead_ns, .invalid_measurement);
-    }
-
+    if (inb(0x61) & 0x20 != 0)
+        return fallbackCalibration(fallback_initial_count, rearm_overhead_ns, .pit_not_low);
     writeRegister(lapic_reg_initial_count, std.math.maxInt(u32));
-    const counter_start = realtime_clock.readCounter();
-    outb(0x61, (original_port_b & ~@as(u8, 0x02)) | 0x01);
-
-    while (true) {
-        const outcome = if (start != null) hpet_wait: {
-            const done = (inb(0x61) & 0x20) != 0;
-            const now = hpet.monotonicNs() orelse
-                return fallbackCalibration(fallback_initial_count, rearm_overhead_ns, .no_deadline_clock);
-            break :hpet_wait wait.check(now, done);
-        } else pit_counter_wait: {
-            const count = latchPitCounter2();
-            const done = (inb(0x61) & 0x20) != 0;
-            break :pit_counter_wait pit_wait.check(count, done);
-        };
-        if (outcome) |reason| {
-            if (reason != .ready) return fallbackCalibration(fallback_initial_count, rearm_overhead_ns, reason);
+    const counter_start = tsc.readCounter();
+    outb(0x61, (original_port & ~@as(u8, 3)) | @as(u8, if (calibration_options.lapic_stop_pit) 0 else 1));
+    var wait: PitCounterWait = .{};
+    var completed = false;
+    // A progressing PIT gives a 50ms reference window. Total work is also
+    // bounded independently: a broken/trapped port cannot extend each small
+    // decrement into another unbounded wait. No HPET health is assumed here.
+    for (0..1_000_000) |_| {
+        const count = calibrationPitLatch(calibration_options.lapic_stop_pit);
+        const done = !calibration_options.lapic_stop_pit and inb(0x61) & 0x20 != 0;
+        if (wait.check(count, done)) |reason| {
+            if (reason != .ready)
+                return fallbackCalibration(fallback_initial_count, rearm_overhead_ns, reason);
+            completed = true;
             break;
         }
-        asm volatile ("pause");
+        std.atomic.spinLoopHint();
     }
-    const counter_end = realtime_clock.readCounter();
+    if (!completed) return fallbackCalibration(fallback_initial_count, rearm_overhead_ns, .timeout);
+    const counter_end = tsc.readCounter();
     const current_count = readRegister(lapic_reg_current_count);
-    const elapsed_counts = std.math.maxInt(u32) - current_count;
-    const frequency_hz = frequencyFromPitMeasurement(elapsed_counts, calibration_pit_ticks) orelse {
+    // The one-shot counter must still be running; saturation at zero loses
+    // the elapsed count and must not be accepted as a low-frequency sample.
+    const measured = pitMeasurement(current_count, counter_start, counter_end) orelse
         return fallbackCalibration(fallback_initial_count, rearm_overhead_ns, .invalid_measurement);
-    };
-    const initial_count = initialCountForPeriod(
-        frequency_hz,
-        timer_target_period_ns,
-        rearm_overhead_ns,
-    ) orelse {
+    const frequency_hz = measured.frequency_hz;
+    const initial = deadlineCount(frequency_hz, 0, timer_target_period_ns) orelse
         return fallbackCalibration(fallback_initial_count, rearm_overhead_ns, .invalid_measurement);
-    };
-
-    bsp_timer_initial_count = initial_count;
+    // Publish only a BSP elapsed-time fallback. configureCounter checks
+    // invariant TSC and rebases its epoch; it does not expose an AP fast page.
+    realtime_clock.configureCounter(measured.tsc_cycles, calibration_pit_ticks, pit_frequency_hz);
     timer_frequency_hz = frequency_hz;
-    if (counter_end > counter_start)
-        realtime_clock.configureCounter(counter_end - counter_start, calibration_pit_ticks, pit_frequency_hz);
-    _ = armTimer(initial_count);
-    return .{
-        .calibrated = true,
-        .frequency_hz = frequency_hz,
-        .initial_count = initial_count,
-        .rearm_overhead_ns = rearm_overhead_ns,
-        .pit_ticks = calibration_pit_ticks,
-    };
+    bsp_timer_initial_count = initial;
+    _ = armTimer(initial);
+    return .{ .calibrated = true, .source = .pit, .frequency_hz = frequency_hz, .initial_count = initial, .rearm_overhead_ns = rearm_overhead_ns, .pit_ticks = calibration_pit_ticks, .window_ns = @as(u64, calibration_pit_ticks) * 1_000_000_000 / pit_frequency_hz };
+}
+
+fn calibrateWithTsc(fallback_initial_count: u32, rearm_overhead_ns: u64, q: tsc.TimerQualification) TimerCalibration {
+    if (q.hz == 0 or calibration_options.lapic_reject_tsc)
+        return fallbackCalibration(fallback_initial_count, rearm_overhead_ns, .tsc_unqualified);
+    if (!q.arat) return fallbackCalibration(fallback_initial_count, rearm_overhead_ns, .arat_missing);
+    if (lapic_base_pa == 0 or fallback_initial_count == 0)
+        return fallbackCalibration(fallback_initial_count, rearm_overhead_ns, .invalid_measurement);
+    const original_lvt = readRegister(lapic_reg_lvt_timer);
+    // The existing timer is one-shot/div16 on BSP and AP. One-shot stops at
+    // zero, so it cannot hide a complete modulo wrap between our samples.
+    if (original_lvt & (3 << 17) != 0)
+        return fallbackCalibration(fallback_initial_count, rearm_overhead_ns, .invalid_measurement);
+    writeRegister(lapic_reg_lvt_timer, original_lvt | (1 << 16));
+    defer writeRegister(lapic_reg_lvt_timer, original_lvt);
+    writeRegister(lapic_reg_divide_config, 0x3);
+    const original_port = inb(0x61);
+    defer outb(0x61, original_port);
+    outb(0x61, original_port & ~@as(u8, 3));
+    outb(0x43, 0xb0);
+    outb(0x42, @truncate(calibration_pit_ticks));
+    outb(0x42, @truncate(calibration_pit_ticks >> 8));
+    const programmed_port = inb(0x61);
+    outb(0x61, (original_port & ~@as(u8, 3)) | @as(u8, if (calibration_options.lapic_stop_pit) 0 else 1));
+    const pit_first = calibrationPitLatch(calibration_options.lapic_stop_pit);
+    const port_first = inb(0x61);
+    // Record PIT progress once, without waiting 50ms for OUT or treating HPET
+    // as a healthy reference on PC10-damaged hardware. PIT cannot veto TSC.
+    defer @import("kernel_log.zig").writeBootFmt("lapic-pit: original=0x{x} programmed=0x{x} first-port=0x{x} last-port=0x{x} first={} last={} test-stop={}\n", .{ original_port, programmed_port, port_first, inb(0x61), pit_first, calibrationPitLatch(calibration_options.lapic_stop_pit), @intFromBool(calibration_options.lapic_stop_pit) });
+    writeRegister(lapic_reg_initial_count, std.math.maxInt(u32));
+    const first = countSample();
+    const target = std.math.add(u64, first.after, @max(q.hz / 1000, 1)) catch
+        return fallbackCalibration(fallback_initial_count, rearm_overhead_ns, .invalid_measurement);
+    const reached = waitCounter(TscSource, first.after, target) orelse
+        return fallbackCalibration(fallback_initial_count, rearm_overhead_ns, .clock_stalled);
+    var last = countSample();
+    if (last.before < reached) return fallbackCalibration(fallback_initial_count, rearm_overhead_ns, .invalid_measurement);
+    var measured = rateFromTsc(first, last, q.hz);
+    if (measurementDecision(first, last, q.hz, false) == .extend) {
+        // Trapped MMIO may have a wider bracket than bare metal. One bounded
+        // extension can reduce that relative uncertainty; NEVER relax the
+        // error bound or the 2ms maximum admission window to make it pass.
+        const extended = std.math.add(u64, first.after, @intCast(@as(u128, q.hz) * 7 / 4000)) catch 0;
+        if (extended != 0) {
+            const extended_reached = waitCounter(TscSource, last.after, extended) orelse
+                return fallbackCalibration(fallback_initial_count, rearm_overhead_ns, .clock_stalled);
+            const previous_count = last.count;
+            last = countSample();
+            if (last.count == 0 or last.count >= previous_count) return fallbackCalibration(fallback_initial_count, rearm_overhead_ns, .invalid_measurement);
+            if (last.before < extended_reached) return fallbackCalibration(fallback_initial_count, rearm_overhead_ns, .invalid_measurement);
+            measured = rateFromTsc(first, last, q.hz);
+        }
+    }
+    @import("kernel_log.zig").writeBootFmt("lapic-samples: first={},{},{} last={},{},{} hz={}\n", .{ first.before, first.count, first.after, last.before, last.count, last.after, q.hz });
+    const rate = measured orelse return fallbackCalibration(fallback_initial_count, rearm_overhead_ns, .invalid_measurement);
+    const initial = deadlineCount(rate.upper_hz, 0, timer_target_period_ns).?;
+    // SMM may have changed ADJUST during the window; never publish that
+    // interval as a permanent rate. Later ADJUST-only changes do not alter
+    // the calibrated ARAT hardware rate itself.
+    if (tsc.runtimeFailure(0) != .none) return fallbackCalibration(fallback_initial_count, rearm_overhead_ns, .tsc_unqualified);
+    // HPET may be absent even though CPUID provides a qualified TSC Hz.
+    // Install BSP elapsed-time catch-up without touching the realtime units
+    // or the already-selected cross-CPU clock conversion.
+    realtime_clock.configureBootstrapCounter(q.hz);
+    timer_frequency_hz = rate.upper_hz;
+    bsp_timer_initial_count = initial;
+    _ = armTimer(initial);
+    // CPUID known Hz belongs to the clocksource. Do not retune realtime from
+    // this timer or from PIT, and do not subtract a guessed rearm overhead.
+    return .{ .calibrated = true, .source = .tsc, .frequency_hz = rate.upper_hz, .initial_count = initial, .rearm_overhead_ns = rearm_overhead_ns, .pit_ticks = 0, .lower_hz = rate.lower_hz, .first_width_cycles = first.after - first.before, .last_width_cycles = last.after - last.before, .error_bound_ppm = rate.error_ppm, .window_ns = rate.window_ns };
+}
+
+// Every AP uses the BSP's divide-by-16 rate. Both calibration paths check
+// ARAT on every online CPU. Saturation also protects synthetic large slices.
+pub fn sliceCount(initial: u32, ticks: u32) u32 {
+    // A zero slice disables AP preemption; preserve that existing contract.
+    // Only a nonzero count product saturates at the hardware register limit.
+    return @intCast(@min(@as(u64, initial) * ticks, std.math.maxInt(u32)));
+}
+pub fn timerSliceCount(fallback: u32, ticks: u32) u32 {
+    return sliceCount(timerInitialCount(fallback), ticks);
 }
 
 pub fn timerInitialCount(fallback_initial_count: u32) u32 {
@@ -370,7 +545,8 @@ pub fn highResolutionReady() bool {
 
 pub fn deadlineCount(frequency: u64, now: u64, deadline: u64) ?u32 {
     if (frequency == 0) return null;
-    const delay = if (deadline > now) deadline - now else 1;
+    if (deadline <= now) return 1;
+    const delay = deadline - now;
     // Round up: a conversion must never make a deadline fire early.
     const count = (@as(u128, delay) * frequency + 999_999_999) / 1_000_000_000;
     return @intCast(@min(@max(count, 1), std.math.maxInt(u32)));
@@ -618,4 +794,132 @@ test "PIT deadline without HPET bounds missing output stopped counter and slow r
     wait = .{};
     try std.testing.expect(wait.check(1, false) == null);
     try std.testing.expectEqual(CalibrationReason.ready, wait.check(65535, true).?);
+}
+
+test "TSC LAPIC brackets include endpoint phase and round safely" {
+    const a: CountSample = .{ .before = 0, .count = 100000, .after = 100 };
+    const b: CountSample = .{ .before = 1000100, .count = 90000, .after = 1000200 };
+    const r = rateFromTsc(a, b, 1_000_000_000).?;
+    try std.testing.expect(r.lower_hz <= 10_000_000 and r.upper_hz >= 10_000_000);
+    try std.testing.expect(r.error_ppm > 0 and r.error_ppm <= maximum_error_ppm);
+    try std.testing.expect(@as(u128, deadlineCount(r.upper_hz, 0, 16_000_000).?) * 1_000_000_000 >= @as(u128, r.upper_hz) * 16_000_000);
+    try std.testing.expectEqual(@as(u32, std.math.maxInt(u32)), sliceCount(std.math.maxInt(u32), 4));
+    try std.testing.expectEqual(@as(u32, 0), sliceCount(0, 0));
+    try std.testing.expectEqual(@as(u32, 0), sliceCount(50000, 0));
+}
+test "TSC LAPIC rejects wraps stops bad windows and excessive uncertainty" {
+    const a: CountSample = .{ .before = 0, .count = 100000, .after = 100 };
+    const good: CountSample = .{ .before = 1000100, .count = 90000, .after = 1000200 };
+    for (0..9) |bad| {
+        var b = good;
+        switch (bad) {
+            0 => b.count = 100001,
+            1 => b.count = 100000,
+            2 => b.count = 0,
+            3 => b.before = 99,
+            4 => b.after = b.before - 1,
+            5 => {
+                b.before = 200;
+                b.after = 300;
+            },
+            6 => {
+                b.before = 3000000;
+                b.after = 3000100;
+            },
+            7 => {
+                b.after = 1800000;
+            },
+            else => b.count = 99999,
+        }
+        try std.testing.expect(rateFromTsc(a, b, 1_000_000_000) == null);
+    }
+    try std.testing.expect(rateFromTsc(a, good, 0) == null);
+    try std.testing.expect(rateFromTsc(.{ .before = 101, .after = 100, .count = 100000 }, good, 1_000_000_000) == null);
+    try std.testing.expectEqual(@as(?u32, 1), deadlineCount(1, 123, 0));
+    try std.testing.expectEqual(@as(?u32, 1), deadlineCount(std.math.maxInt(u64), 123, 0));
+    try std.testing.expectEqual(@as(?u32, std.math.maxInt(u32)), deadlineCount(std.math.maxInt(u64), 0, std.math.maxInt(u64)));
+}
+
+test "TSC rate bounds constrain endpoint phase exact window and ppm boundaries" {
+    const a: CountSample = .{ .before = 0, .after = 0, .count = 100000 };
+    var b: CountSample = .{ .before = 1000000, .after = 1000000, .count = 90000 };
+    const r = rateFromTsc(a, b, 1_000_000_000).?;
+    try std.testing.expectEqual(@as(u64, 10001000), r.upper_hz);
+    try std.testing.expectEqual(@as(u64, 9999000), r.lower_hz);
+    for ([_]u64{ 500000, 2000000 }) |window| {
+        b.before = window;
+        b.after = window;
+        try std.testing.expect(rateFromTsc(a, b, 1_000_000_000) != null);
+    }
+    for ([_]u64{ 499999, 2000001 }) |window| {
+        b.before = window;
+        b.after = window;
+        try std.testing.expect(rateFromTsc(a, b, 1_000_000_000) == null);
+    }
+    b = .{ .before = 1000000, .after = 1000000, .count = 99799 };
+    try std.testing.expectEqual(@as(u64, 10000), rateFromTsc(a, b, 1_000_000_000).?.error_ppm);
+    b.count = 99800;
+    try std.testing.expect(rateFromTsc(a, b, 1_000_000_000) == null);
+}
+
+test "only uncertainty can extend once and a later sample cannot hide a backwards TSC" {
+    const a: CountSample = .{ .before = 0, .after = 100, .count = 100000 };
+    var b: CountSample = .{ .before = 1000100, .after = 1020000, .count = 90000 };
+    try std.testing.expectEqual(MeasurementDecision.extend, measurementDecision(a, b, 1_000_000_000, false));
+    try std.testing.expectEqual(MeasurementDecision.reject, measurementDecision(a, b, 1_000_000_000, true));
+    b = .{ .before = 1750100, .after = 1750200, .count = 82500 };
+    try std.testing.expectEqual(MeasurementDecision.accept, measurementDecision(a, b, 1_000_000_000, true));
+    for (0..4) |bad| {
+        var broken = b;
+        switch (bad) {
+            0 => broken.after = broken.before - 1,
+            1 => broken.before = 99,
+            2 => broken.count = 100000,
+            else => broken.count = 0,
+        }
+        try std.testing.expectEqual(MeasurementDecision.reject, measurementDecision(a, broken, 1_000_000_000, false));
+    }
+}
+
+test "counter wait cannot accept a reverse then recovery or exhaustion before extended target" {
+    const Fake = struct {
+        var calls: usize = 0;
+        var reverse: bool = false;
+        fn read() u64 {
+            calls += 1;
+            return if (reverse) (if (calls == 1) 150 else if (calls == 2) 149 else 300) else 150;
+        }
+    };
+    Fake.calls = 0;
+    Fake.reverse = true;
+    try std.testing.expect(waitCounter(Fake, 100, 200) == null);
+    try std.testing.expectEqual(@as(usize, 2), Fake.calls);
+    Fake.calls = 0;
+    Fake.reverse = false;
+    try std.testing.expect(waitCounter(Fake, 100, 200) == null);
+    try std.testing.expectEqual(@as(usize, 100_000), Fake.calls);
+    try std.testing.expectEqual(@as(?u64, 150), waitCounter(Fake, 100, 150));
+}
+
+test "PIT stopped interface injection does not execute privileged port IO" {
+    try std.testing.expectEqual(calibration_pit_ticks, calibrationPitLatch(true));
+    try std.testing.expectEqual(calibration_pit_ticks, calibrationPitLatch(true));
+}
+
+test "PIT fallback is only selected for absent CPUID frequency" {
+    try std.testing.expect(usePitCalibration(null, false));
+    try std.testing.expect(!usePitCalibration(3_000_000_000, false));
+    try std.testing.expect(!usePitCalibration(null, true));
+    try std.testing.expect(!usePitCalibration(3_000_000_000, true));
+}
+
+test "PIT calibration rejects stopped saturated and regressing samples" {
+    const top = std.math.maxInt(u32);
+    try std.testing.expect(pitMeasurement(top, 10, 20) == null);
+    try std.testing.expect(pitMeasurement(0, 10, 20) == null);
+    try std.testing.expect(pitMeasurement(top - 100, 10, 10) == null);
+    try std.testing.expect(pitMeasurement(top - 100, 20, 10) == null);
+    const measured = pitMeasurement(top - 3_126_557, 100, 175_000_100).?;
+    try std.testing.expectEqual(@as(u64, 175_000_000), measured.tsc_cycles);
+    try std.testing.expectEqual(frequencyFromPitMeasurement(3_126_557, calibration_pit_ticks).?, measured.frequency_hz);
 }

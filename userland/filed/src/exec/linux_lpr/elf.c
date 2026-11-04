@@ -280,15 +280,23 @@ int lpr_exec_patch_syscalls(
     unsigned char *original = malloc((size_t)size);
     if (original == NULL) return -12;
     memcpy(original, bytes, (size_t)size);
+    /* Prove candidates locally first. A successful conservative scan agrees
+     * with a successful full walk: among its 16 starting offsets is a real
+     * boundary of that walk (x86 instructions are <=15 bytes). Unanimous
+     * SITE/INTERIOR classification therefore cannot contradict the full walk.
+     * If the full walk would fail elsewhere, its previous conservative retry
+     * would produce this same result. Ambiguity still falls back to the known
+     * section-boundary walk, then the unchanged independent FDE proof.
+     * This avoids decoding a large text with only interior 0f05 byte pairs. */
     lpr_patch_scan_result_t result;
     int status = lpr_patch_scan_syscalls(
-        bytes, size, LPR_PATCH_SCAN_START_BOUNDARY, &result);
+        bytes, size, 0, &result);
     if (status != 0) {
-        /* Match executable snapshot manifests: an executable section may
-         * contain assembler data, so retry the conservative candidate scan
-         * on immutable input. Ambiguous syscall candidates still reject. */
+        /* The conservative proof may be ambiguous where the known section
+         * boundary gives one valid stream. Restore immutable input before
+         * that walk; failed scans must never feed patched bytes to a retry. */
         memcpy(bytes, original, (size_t)size);
-        status = lpr_patch_scan_syscalls(bytes, size, 0, &result);
+        status = lpr_patch_scan_syscalls(bytes, size, LPR_PATCH_SCAN_START_BOUNDARY, &result);
     }
     if (status != 0) {
         /* As for RX manifests: only a candidate outside every .eh_frame FDE

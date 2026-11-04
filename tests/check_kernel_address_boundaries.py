@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Guard only migrated address boundaries; not a whole-kernel safety proof."""
+from functools import lru_cache
 from pathlib import Path
 import re
 import subprocess
@@ -8,6 +9,9 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 
 
+# Mutation checks repeatedly inspect unchanged files. Full-content keys keep
+# changed inputs distinct, with no stale results across processes.
+@lru_cache(maxsize=512)
 def code_only(source):
     # Preserve positions/newlines so function bodies can be delimited, while
     # explanatory comments and string/assembly text cannot satisfy a guard.
@@ -17,13 +21,36 @@ def code_only(source):
     return re.sub(pattern, lambda match: ''.join('\n' if c == '\n' else ' ' for c in match[0]), source)
 
 
+@lru_cache(maxsize=128)
+def _function_starts(source):
+    # Censuses ask for every function in the same file. Search declarations
+    # once, retaining the first match just like the original per-name regex.
+    # Store offsets rather than copied tails/bodies; bound source retention.
+    starts = {}
+    for match in re.finditer(r'\bfn\s+(\w+)\s*\(', source):
+        starts.setdefault(match[1], match.start())
+    return starts
+
+
 def function_body(source, name):
-    match = re.search(r'\bfn\s+' + re.escape(name) + r'\s*\(', source)
-    if not match:
+    # Some censuses already pass a tail starting at this declaration. Building
+    # an index for every such tail would rescan the rest of the file per row.
+    # A declaration at offset zero is necessarily the first lexical match.
+    first = re.match(r'\bfn\s+' + re.escape(name) + r'\s*\(', source) if source.startswith('fn') else None
+    if first:
+        match_offset = 0
+    elif re.fullmatch(r'\w+', name):
+        match_offset = _function_starts(source).get(name)
+    else:
+        # Quoted Zig identifiers and other non-word spellings keep the exact
+        # escaped-name search used before indexing was introduced.
+        match = re.search(r'\bfn\s+' + re.escape(name) + r'\s*\(', source)
+        match_offset = match.start() if match else None
+    if match_offset is None:
         raise ValueError('missing migrated function ' + name)
     # Close the parameter list first; parameter/return types can themselves
     # contain braces (notably error{AlreadyInitialized}!void).
-    cursor = source.index('(', match.start()) + 1
+    cursor = source.index('(', match_offset) + 1
     parens = 1
     while cursor < len(source) and parens:
         parens += (source[cursor] == '(') - (source[cursor] == ')')
@@ -49,10 +76,16 @@ def function_body(source, name):
     return source[start + 1:end - 1]
 
 
+@lru_cache(maxsize=512)
 def without_tests(source):
     # Only test blocks may reset private boot configuration. Braces in strings
     # and comments have already been removed by code_only.
-    while match := re.search(r'\btest\s+\{', source):
+    # Keep the original text and search forward: rescanning a masked prefix and
+    # copying the whole file for every block makes large test roots quadratic.
+    blocks = re.compile(r'\btest\s+\{')
+    parts = []
+    cursor = 0
+    while match := blocks.search(source, cursor):
         start = source.index('{', match.start())
         depth, end = 1, start + 1
         while depth and end < len(source):
@@ -60,8 +93,11 @@ def without_tests(source):
             end += 1
         if depth:
             raise ValueError('unterminated test block')
-        source = source[:match.start()] + ' ' * (end - match.start()) + source[end:]
-    return source
+        parts.append(source[cursor:match.start()])
+        parts.append(' ' * (end - match.start()))
+        cursor = end
+    parts.append(source[cursor:])
+    return ''.join(parts)
 
 
 # Reviewed physical access call graph, not a general Zig safety proof. Adding/renaming a
@@ -968,6 +1004,14 @@ ADDRESS_DOMAIN_BINDINGS['arch/x86_64/cpu_runtime.zig:import:image'] = '../../boo
 ADDRESS_DOMAIN_CALLS['user_copy.zig:mapPhysWindow'] += ['copy_profile.copyTimestamp', 'copy_profile.copyEnd']
 ADDRESS_DOMAIN_BINDINGS['user_copy.zig:import:copy_profile'] = 'lock_profile.zig'
 ADDRESS_DOMAIN_INVARIANTS['user_copy.zig:mapPhysWindow'] = 'd8c30561c3ff0eea39539e3e7da903843dceb793719e696c33b8679cc5cb4c8c'
+
+# Current owners retain the same typed-address boundaries while their control
+# flow grew.  Keep exact call/import sets so new aliases still require review.
+ADDRESS_DOMAIN_CALLS['../../bootloader/limine/resources.zig:collectMemoryStatsOrHalt'] += ['and']
+ADDRESS_DOMAIN_CALLS['pci.zig:readConfig'] = ['@intCast', 'readLegacyConfig']
+ADDRESS_DOMAIN_IMPORTS['pci.zig:readConfig'] = []
+ADDRESS_DOMAIN_CALLS['vtd.zig:init'] += ['@import', 'haltWithMessage', 'installFirmwareReservedMappings']
+ADDRESS_DOMAIN_IMPORTS['vtd.zig:init'] = ['halt.zig']
 
 def check_address_domains(sources):
     import hashlib

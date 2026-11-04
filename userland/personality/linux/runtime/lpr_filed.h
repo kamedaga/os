@@ -25,7 +25,7 @@ int64_t lpr_linux_syncfs(uint64_t fd);
 int64_t lpr_linux_sync(void);
 int64_t lpr_linux_lseek(uint64_t fd, uint64_t offset, uint64_t whence);
 int64_t lpr_linux_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg);
-int64_t lpr_linux_flock(uint64_t fd, uint64_t operation);
+int64_t lpr_linux_flock(uint64_t fd, uint64_t operation, unsigned *wait_not_ready);
 int64_t lpr_linux_ioctl(uint64_t fd, uint64_t request, uint64_t arg, unsigned *wait_not_ready __attribute__((unused)));
 int64_t lpr_linux_newfstatat(uint64_t dirfd, uint64_t path, uint64_t statbuf, uint64_t flags, unsigned *wait_not_ready __attribute__((unused)));
 int64_t lpr_linux_faccessat(uint64_t dirfd, uint64_t path, uint64_t mode, uint64_t flags);

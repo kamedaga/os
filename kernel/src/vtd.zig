@@ -2380,6 +2380,12 @@ test "VT-d withdrawal contract owner cleanup waits for ACK and failed cleanup re
         const owner_state = try std.testing.allocator.create(kernel.KernelState);
         defer std.testing.allocator.destroy(owner_state);
         try owner_state.initFromDetectedRegionsInPlace(1);
+        // Owner teardown follows the dispatcher order: K before FD/AS/IOMMU.
+        // Hold only K's diagnostic identity: the dispatcher lock would pull
+        // syscall/trap entry code into this host IOMMU test module.
+        var k: lock_diagnostics.Record = .{};
+        lock_diagnostics.acquired(&k, .{ .class = .kernel_state });
+        defer lock_diagnostics.releasing(&k);
         const owner = kernel.processPrincipalFromIndex(0).?;
         const page = try fixture.list.popFront();
         const vmo_fd = try owner_state.createAnonymousVmoFd(owner, page_size, .{ .close = true, .map_read = true, .map_write = true }, .{}, 16);

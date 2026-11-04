@@ -1,7 +1,10 @@
 const std = @import("std");
 const storage = @import("owned_storage.zig");
 
-pub const slots_per_bank = 64;
+// An intrusive ordered node keeps placement walks independent of slot order.
+// 32 is the metadata packing unit that still fits one owned 4 KiB bank;
+// it does not limit store growth or change a user-visible representation.
+pub const slots_per_bank = 32;
 pub const no_index: u16 = 0xffff;
 pub const Page = [4096]u8;
 pub const PagePointer = *align(4096) Page;
@@ -17,7 +20,30 @@ pub const Allocator = storage.Allocator;
 pub const PhysicalExtent = storage.PhysicalExtent;
 pub const MappedExtent = storage.MappedExtent;
 
+pub const AssignmentAdapter = struct {
+    pub const Key = u64;
+    pub const Handle = *Descriptor;
+    pub const Node = struct {
+        key: Key = 0,
+        parent: ?Handle = null,
+        child: [2]?Handle = .{ null, null },
+        red: bool = false,
+        linked: bool = false,
+    };
+    pub const augmented = false;
+    pub fn resolve(h: Handle) *Node {
+        return &h.assignment;
+    }
+    pub fn less(a: Key, b: Key) bool {
+        return a < b;
+    }
+    pub fn update(_: Handle) void {}
+    pub fn validate(_: Handle) !void {}
+};
+
 pub const Descriptor = struct {
+    assignment: AssignmentAdapter.Node = .{},
+    user_present_count: u16 = 0,
     page: ?PtPointer = null,
     allocation: PhysicalExtent = undefined, // Valid exactly while page != null.
     // Owned detached page: reusable only after the enclosing AS shootdown ACK.
@@ -56,6 +82,20 @@ comptime {
 pub const Store = struct {
     chunks: ?*align(4096) DirectoryChunk = null,
     slot_limit: usize = 0,
+    // A protects the index and stable descriptor/page borrows together. Never
+    // reconstruct a table pointer from the physical address in a hardware PTE.
+    // user_vm indexes only nonempty user PTs; empty prepared grants stay owned
+    // by the store without contributing to placement traversal.
+    assignments: @import("ordered_index.zig").Index(AssignmentAdapter) = .{},
+
+    pub fn assignOrdered(self: *Store, slot: usize, key: u64) void {
+        self.assignDescriptor(self.descriptor(slot).?, key);
+    }
+
+    pub fn assignDescriptor(self: *Store, entry: *Descriptor, key: u64) void {
+        std.debug.assert(entry.page != null);
+        self.assignments.insert(entry, key);
+    }
 
     pub fn capacity(self: *const Store) usize {
         return self.slot_limit;
@@ -134,9 +174,12 @@ pub const Store = struct {
 
     /// Caller has detached and acknowledged every hardware reference.
     pub fn resetDetachedContents(self: *Store) void {
+        self.assignments = .{};
         var it = self.iterator();
         while (it.next()) |slot| {
             const entry = self.descriptor(slot).?;
+            entry.assignment = .{};
+            entry.user_present_count = 0;
             entry.retire_pending = false;
             entry.pml4 = no_index;
             entry.pdp = no_index;
@@ -150,6 +193,8 @@ pub const Store = struct {
         defer if (comptime @import("../lock_profile.zig").enabled) @import("../lock_profile.zig").stageEnd(.retire, stage_sample);
         const entry = self.descriptor(slot) orelse return;
         const allocator = self.bankAt(slot / slots_per_bank).?.allocator;
+        if (entry.assignment.linked) self.assignments.remove(entry);
+        entry.user_present_count = 0;
         entry.retire_pending = false;
         entry.pml4 = no_index;
         entry.pdp = no_index;
@@ -342,10 +387,10 @@ test "MMIO overlay overflow storage boundaries preserve addresses and content" {
     const before = fixture.allocate_calls;
     try std.testing.expect(store.ensurePage(0, callbacks).? == first);
     try std.testing.expectEqual(before, fixture.allocate_calls);
-    _ = store.ensurePage(63, callbacks).?;
-    const next = store.ensurePage(64, callbacks).?;
+    _ = store.ensurePage(slots_per_bank - 1, callbacks).?;
+    const next = store.ensurePage(slots_per_bank, callbacks).?;
     try std.testing.expect(first != next);
-    try std.testing.expectEqual(@as(usize, 128), store.capacity());
+    try std.testing.expectEqual(@as(usize, 2 * slots_per_bank), store.capacity());
     try std.testing.expectEqual(@as(u64, 0x1234), first[511]);
     try std.testing.expectEqual(@as(u16, 7), read_only.descriptorConst(0).?.pd);
     for (0..store.capacity()) |slot| {
@@ -387,15 +432,15 @@ test "MMIO overlay overflow storage failed PT return is reusable without double 
     defer fixture.cleanup(&store);
     const callbacks = fixture.callbacks();
     const retained = store.ensurePage(0, callbacks).?;
-    _ = store.ensurePage(63, callbacks).?;
-    _ = store.ensurePage(64, callbacks).?;
+    _ = store.ensurePage(slots_per_bank - 1, callbacks).?;
+    _ = store.ensurePage(slots_per_bank, callbacks).?;
     retained[0] = 42;
     store.descriptor(0).?.pml4 = 1;
     store.descriptor(0).?.pdp = 2;
     store.descriptor(0).?.pd = 3;
     fixture.fail_release = @ptrCast(retained);
     store.freeDetached();
-    try std.testing.expectEqual(@as(usize, 64), store.capacity());
+    try std.testing.expectEqual(@as(usize, slots_per_bank), store.capacity());
     try std.testing.expect(store.descriptor(0).?.page.? == retained);
     try std.testing.expect(std.mem.allEqual(u64, retained, 0));
     try std.testing.expectEqual(no_index, store.descriptor(0).?.pml4);
@@ -420,10 +465,10 @@ test "MMIO overlay overflow storage bank failure retains only its sparse owner" 
     defer fixture.cleanup(&store);
     const callbacks = fixture.callbacks();
     _ = store.ensurePage(0, callbacks).?;
-    _ = store.ensurePage(64, callbacks).?;
+    _ = store.ensurePage(slots_per_bank, callbacks).?;
     fixture.fail_release = @ptrCast(store.bankAt(1).?);
     store.freeDetached();
-    try std.testing.expectEqual(@as(usize, 128), store.capacity());
+    try std.testing.expectEqual(@as(usize, 2 * slots_per_bank), store.capacity());
     try std.testing.expect(store.descriptor(0) == null);
     var it = store.iterator();
     while (it.next()) |slot| try std.testing.expect(store.descriptor(slot).?.page == null);
@@ -455,10 +500,10 @@ test "MMIO overlay PT grants stay with each bank issuer across replacement and O
     first.fail_allocate_at = 0;
     _ = store.ensurePage(1, second.callbacks()).?;
     try std.testing.expectEqual(@as(usize, 0), second.allocate_calls);
-    _ = store.ensurePage(64, second.callbacks()).?;
+    _ = store.ensurePage(slots_per_bank, second.callbacks()).?;
     try std.testing.expectEqual(@as(usize, 2), second.allocate_calls);
     try std.testing.expectEqual(@as(u64, 117), store.descriptor(1).?.allocation.region_id);
-    try std.testing.expectEqual(@as(u64, 229), store.descriptor(64).?.allocation.region_id);
+    try std.testing.expectEqual(@as(u64, 229), store.descriptor(slots_per_bank).?.allocation.region_id);
     first.fail_all_releases = true;
     second.fail_all_releases = true;
     const a_before = first.release_calls;
@@ -467,7 +512,7 @@ test "MMIO overlay PT grants stay with each bank issuer across replacement and O
     // Each PT is attempted once. Banks with live PT grants cannot be returned.
     try std.testing.expectEqual(a_before + 2, first.release_calls);
     try std.testing.expectEqual(b_before + 1, second.release_calls);
-    try std.testing.expectEqual(@as(usize, 128), store.capacity());
+    try std.testing.expectEqual(@as(usize, 2 * slots_per_bank), store.capacity());
     first.fail_all_releases = false;
     second.fail_all_releases = false;
     store.freeDetached();
@@ -562,4 +607,39 @@ test "MMIO overlay G3 rejected directory return keeps owner with zero capacity" 
     const returns = fixture.release_calls;
     store.freeDetached();
     try std.testing.expectEqual(returns, fixture.release_calls);
+}
+
+test "MMIO overlay ordered PT ownership index survives bank growth and rejected returns" {
+    var fixture = TestAllocator{};
+    var store = Store{};
+    defer fixture.cleanup(&store);
+    const slots = [_]usize{ 0, slots_per_bank - 1, slots_per_bank, slots_per_bank * 2 };
+    const keys = [_]u64{ 99, 3, 40, 17 };
+    for (slots, keys) |slot, key| {
+        _ = store.ensurePage(slot, fixture.callbacks()).?;
+        store.descriptor(slot).?.pml4 = 0;
+        store.assignOrdered(slot, key);
+    }
+    try store.assignments.validate();
+    var next = store.assignments.first;
+    for ([_]u64{ 3, 17, 40, 99 }) |key| {
+        const entry = next.?;
+        try std.testing.expectEqual(key, entry.assignment.key);
+        next = store.assignments.successor(entry);
+    }
+    try std.testing.expect(next == null);
+    const retained = store.descriptor(slots[2]).?.page.?;
+    fixture.fail_release = @ptrCast(retained);
+    store.releasePageDetached(slots[2]);
+    try store.assignments.validate();
+    try std.testing.expectEqual(@as(usize, 3), store.assignments.count);
+    try std.testing.expectEqual(@as(u64, 17), store.assignments.lastAtOrBefore(40).?.assignment.key);
+    try std.testing.expectEqual(retained, store.ensurePage(slots[2], fixture.callbacks()).?);
+    store.descriptor(slots[2]).?.pml4 = 0;
+    store.assignOrdered(slots[2], 42);
+    try store.assignments.validate();
+    store.resetDetachedContents();
+    try store.assignments.validate();
+    try std.testing.expectEqual(@as(usize, 0), store.assignments.count);
+    try std.testing.expect(!store.descriptor(slots[2]).?.assignment.linked);
 }

@@ -422,6 +422,10 @@ pacha_fd_t pacha_vmo_create_contiguous(uint64_t size, uint64_t rights, uint32_t 
     ));
 }
 
+int pacha_vmo_discard(pacha_fd_t fd, const struct pacha_vmo_discard_range *ranges, size_t count) {
+    return (int)pacha_syscall4(PACHA_FD_SYSCALL_VMO_DISCARD, fd, (uint64_t)(uintptr_t)ranges, count, 0);
+}
+
 int pacha_vmo_grow(pacha_fd_t fd, uint64_t new_capacity) {
     return pacha_status_to_int(pacha_syscall2(PACHA_FD_SYSCALL_VMO_GROW,
         (uint64_t)fd, new_capacity));

@@ -1,3 +1,4 @@
+#include "../../gpud/pressure_owner.h"
 /* SPDX-License-Identifier: MIT */
 #include "kobox2_nic.h"
 #include "wifi_control.h"
@@ -314,6 +315,9 @@ static int start_generation(void)
             return nic_failure(NETD_NIC_STEP_LIFECYCLE, -EIO,
                 waited, 0, 0);
     }
+    static pacha_fd_t pressure_liveness = -1;
+    error = gpud_export_pressure(&current->ipc, current->launch.process.fd, &pressure_liveness);
+    if (error) return error;
     nic_progress(NETD_NIC_STEP_FRAME_ATTACH, "attach shared network frame transport");
     error = netd_kobox2_frame_open(&current->frames, &current->ipc,
         current->launch.process.fd, generation);

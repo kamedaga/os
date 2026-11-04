@@ -750,6 +750,8 @@ int lpr_fd_transfer_prepare(
     uint32_t capability_capacity,
     uint32_t *out_capability_count);
 int64_t lpr_netd_transfer_dup_handle(uint64_t handle, pacha_fd_t lease_fd);
+int64_t lpr_netd_transfer_hold(uint64_t handle, pacha_fd_t lease_fd);
+int64_t lpr_netd_readiness_import(lpr_socket_backend_t *socket);
 int lpr_fd_transfer_stage_batch(
     const struct unix_transfer_item *items,
     uint32_t item_count,
@@ -898,9 +900,10 @@ int64_t lpr_linux_fchmod(uint64_t fd, uint64_t mode);
 int64_t lpr_linux_fchmodat(uint64_t dirfd, uint64_t path_raw, uint64_t mode, uint64_t flags);
 int64_t lpr_linux_fchownat(uint64_t dirfd, uint64_t path, uint64_t owner, uint64_t group, uint64_t flags);
 int64_t lpr_linux_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg);
+int64_t lpr_filed_record_lock(uint64_t fd, uint64_t cmd, uint64_t arg);
 int64_t lpr_linux_file_vmo(uint64_t fd, uint64_t file_offset, uint64_t length, int executable, uint64_t *out_loaded, uint64_t *out_vmo_offset, int *out_pager);
 int64_t lpr_linux_shared_file_vmo(uint64_t fd, uint64_t file_offset, uint64_t length, int writable, int executable, uint32_t initial_prot, uint64_t *out_file_size);
-int64_t lpr_linux_flock(uint64_t fd, uint64_t operation);
+int64_t lpr_linux_flock(uint64_t fd, uint64_t operation, unsigned *wait_not_ready);
 int64_t lpr_filed_close_posix_locks(const lpr_fd_pin_t *pin);
 int64_t lpr_linux_fork(void);
 int64_t lpr_linux_fstat(uint64_t fd, uint64_t statbuf, unsigned *wait_not_ready __attribute__((unused)));
@@ -908,6 +911,7 @@ int64_t lpr_linux_statfs(uint64_t path, uint64_t statfsbuf);
 int64_t lpr_linux_fstatfs(uint64_t fd, uint64_t statfsbuf);
 int64_t lpr_linux_fsync(uint64_t fd);
 int64_t lpr_linux_ftruncate(uint64_t fd, uint64_t length);
+int64_t lpr_linux_fallocate(uint64_t fd, uint64_t mode, uint64_t offset, uint64_t length);
 int64_t lpr_linux_getcwd(uint64_t buf, uint64_t size);
 int64_t lpr_linux_getdents64(uint64_t fd, uint64_t buf, uint64_t count);
 int64_t lpr_linux_proc_getdents64(uint64_t fd, uint64_t buf, uint64_t count);
@@ -1115,5 +1119,10 @@ void lpr_wait_native_diag_event(
     int64_t status);
 #endif
 #endif
+
+int lpr_input_prepare_wait(uint64_t fd);
+void lpr_input_mark_hangup(uint64_t fd);
+int64_t lpr_input_poll_sequence(uint64_t fd, uint32_t events, struct unix_poll_sequence *sequence);
+int lpr_input_prepare_wait_sequence(uint64_t fd, uint32_t events, uint32_t ignore, const struct unix_poll_sequence *sequence);
 
 #endif

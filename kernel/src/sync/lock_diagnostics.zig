@@ -197,3 +197,23 @@ test "lock ordering CPU migration preserves BSP holds and admits CPU 71" {
     releasing(&last_record);
     assertAllQuiescent();
 }
+
+/// Alias publication is serialized by K even when the target AS is absent.
+pub fn assertKernelStateHeld() void {
+    if (comptime enabled) {
+        assertInterruptsDisabled();
+        const cpu = &cpus[currentCpu()];
+        var cursor = cpu.head;
+        while (cursor) |held| : (cursor = held.next) {
+            if (held.key.class == .kernel_state and held.context == cpu.interrupt_depth) return;
+        }
+        failure(error.NotHeld);
+    }
+}
+
+// Host threads have no registered kernel stacks. Use the same injected CPU
+// identity for lock ownership and diagnostics when testing cross-CPU waiters.
+pub fn testCpuIndex() usize {
+    if (!builtin.is_test or !enabled) @compileError("diagnostic host CPU only");
+    return currentCpu();
+}

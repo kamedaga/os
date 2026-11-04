@@ -62,13 +62,13 @@ int gpud_discovery_remove(struct gpud_discovery *d, pacha_fd_t filed_fd)
     int first = 0;
     for (size_t n = d->published; n; --n) {
         size_t i = n - 1;
-        if (!(d->owned & (UINT32_C(1) << i))) continue;
+        if (!(d->owned & (UINT64_C(1) << i))) continue;
         kb2_fs_request_t request = {.opcode = KB2_FILESYSTEM_OP_UNLINKAT,
             .flags = d->entries[i].kind == GPUD_DISC_DIR ? AT_REMOVEDIR : 0};
         kb2_fs_response_t response;
         int status = call(filed_fd, &request, d->entries[i].path, NULL,
             NULL, 0, &response);
-        if (!status || status == -ENOENT) d->owned &= ~(UINT32_C(1) << i);
+        if (!status || status == -ENOENT) d->owned &= ~(UINT64_C(1) << i);
         else if (!first) first = status;
     }
     if (!d->owned) d->published = 0;
@@ -77,14 +77,14 @@ int gpud_discovery_remove(struct gpud_discovery *d, pacha_fd_t filed_fd)
 
 int gpud_discovery_publish(struct gpud_discovery *d, pacha_fd_t filed_fd)
 {
-    if (!d || !d->count || d->count > 32 || d->published || filed_fd < 16)
+    if (!d || !d->count || d->count > sizeof(d->entries) / sizeof(d->entries[0]) || d->published || filed_fd < 16)
         return -EINVAL;
     int status = 0;
     for (size_t i = 0; i < d->count; ++i) {
         int owned = 0;
         status = create(filed_fd, &d->entries[i], &owned);
         d->published = i + 1;
-        if (owned) d->owned |= UINT32_C(1) << i;
+        if (owned) d->owned |= UINT64_C(1) << i;
         /* Shared ancestors may preexist, but another publisher's metadata
          * must never be replaced or removed during rollback. */
         if (status == -EEXIST && i < d->ancestor_count) status = 0;

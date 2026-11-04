@@ -321,9 +321,32 @@ int64_t lpr_drm_native_mmap(uint64_t fd, uint64_t address, uint64_t length,
     uint64_t prot, uint64_t flags, uint64_t offset)
 {
     lpr_state_lock(&lpr_drm_mapping_lock);
-    int64_t result = lpr_pacha_syscall6(PACHAOS_SYSCALL_MMAP,
-        fd, address, length, prot, flags, offset);
-    uint64_t span = lpr_drm_page_span(length);
+    int64_t result = -1;
+    /* A colliding hint falls back to the native high randomized arena. JVM
+     * low-address reservations then discard that result and advance their
+     * hint one page at a time. Probe a bounded number of adjacent spans with
+     * NOREPLACE instead: these are placement suggestions, never authority to
+     * replace an existing mapping. Leave ordinary allocation as the final
+     * fallback, including its error result. No VMA snapshot or cache is used. */
+    const uint64_t hint = address & ~UINT64_C(4095);
+    const uint64_t span = lpr_drm_page_span(length);
+    if (hint >= 4096 && span &&
+        !(flags & (PACHAOS_MMAP_FIXED | PACHAOS_MMAP_FIXED_NOREPLACE))) {
+        uint64_t candidate = hint;
+        for (unsigned attempt = 0; attempt < 8; ++attempt) {
+            if (candidate >= UINT64_C(0x800000000000) ||
+                span > UINT64_C(0x800000000000) - candidate) break;
+            result = lpr_pacha_syscall6(PACHAOS_SYSCALL_MMAP,
+                fd, candidate, length, prot,
+                flags | PACHAOS_MMAP_FIXED_NOREPLACE, offset);
+            if (result >= 4096) break;
+            candidate += span;
+        }
+    }
+    if (result < 4096) {
+        result = lpr_pacha_syscall6(PACHAOS_SYSCALL_MMAP,
+            fd, address, length, prot, flags, offset);
+    }
     if (result >= 4096 && span && (flags & PACHAOS_MMAP_FIXED))
         lpr_drm_mapping_drop_locked((uint64_t)result, span);
     lpr_state_unlock(&lpr_drm_mapping_lock);

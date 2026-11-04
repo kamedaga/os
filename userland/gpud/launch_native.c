@@ -126,7 +126,7 @@ int gpud_native_launch_prepare(struct gpud_native_launch *launch,
     *launch = (struct gpud_native_launch){.process = {.generation = request->generation}};
     uint64_t rights = PACHA_FD_RIGHT_INSPECT | PACHA_FD_RIGHT_KILL | PACHA_FD_RIGHT_WAIT | PACHA_FD_RIGHT_POLL |
         PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_MAP_INTO | PACHA_FD_RIGHT_SPAWN |
-        PACHA_FD_RIGHT_SET_CONTEXT;
+        PACHA_FD_RIGHT_SET_CONTEXT | PACHA_FD_RIGHT_TRANSFER;
     long process = pacha_syscall5(PACHA_PROCESS_SYSCALL_CREATE, 0, rights, 0,
         (uintptr_t)request->grants, request->grant_count);
     if (!valid_fd(process)) {

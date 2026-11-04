@@ -1,4 +1,4 @@
-//! PCID retention and user execution are separate CPU-local facts. The owner
+//! PCID retention, user execution and borrowed roots are distinct facts. The owner
 //! publishes active with IF clear; the requester may invalidate retained roots.
 //! A zero row forbids NOFLUSH on the next return, even after an IPI ACK.
 const std = @import("std");
@@ -27,19 +27,28 @@ var bootstrap: [1][pcids]u64 = @splat(@splat(0));
 var roots: [][pcids]u64 = &bootstrap;
 var bootstrap_active: [1]Active = .{.{}};
 var active: []Active = &bootstrap_active;
+// Kernel-mode user-root loads are not user returns. Keep their exposure
+// separate so a temporary root cannot erase a return-window registration.
+var bootstrap_borrowed: [1]Active = .{.{}};
+var borrowed: []Active = &bootstrap_borrowed;
 
 // BSP boot allocation, before AP publication. Both arrays have kernel lifetime;
 // failure aborts boot and cannot publish a partially initialized CPU capacity.
 pub fn initCpuStorage(count: usize) !void {
-    std.debug.assert(count >= roots.len and count >= active.len);
+    std.debug.assert(count >= roots.len and count >= active.len and count >= borrowed.len);
     const runtime = @import("arch/x86_64/cpu_runtime.zig");
     const storage = try runtime.alloc([pcids]u64, count);
     const execution = try runtime.alloc(Active, count);
+    const kernel_execution = try runtime.alloc(Active, count);
     @memset(storage, @splat(0));
+    @memset(execution, .{});
+    @memset(kernel_execution, .{});
     @memcpy(storage[0..roots.len], roots);
     @memcpy(execution[0..active.len], active);
+    @memcpy(kernel_execution[0..borrowed.len], borrowed);
     roots = storage;
     active = execution;
+    borrowed = kernel_execution;
 }
 
 /// Scalar-only: used with live user XState. This non-publishing entry serves
@@ -76,11 +85,40 @@ pub fn enterUser(cpu: usize, context: UserContext) bool {
 pub fn leaveUser(cpu: usize) void {
     std.debug.assert(cpu < active.len);
     @atomicStore(u64, &active[cpu].value, 0, .release);
+    leaveBorrowed(cpu);
 }
 
 /// A missing storage slot is conservatively targeted, never silently skipped.
 pub fn isActive(cpu: usize, context: UserContext) bool {
-    return cpu >= active.len or @atomicLoad(u64, &active[cpu].value, .acquire) == context.value;
+    return cpu >= active.len or cpu >= borrowed.len or
+        @atomicLoad(u64, &active[cpu].value, .acquire) == context.value or
+        @atomicLoad(u64, &borrowed[cpu].value, .acquire) == context.value;
+}
+
+/// Caller holds IF=0 through the real load. Publishing before MFENCE pairs
+/// with PTE stores -> requester MFENCE -> exposure snapshot: an entrant the
+/// snapshot misses still owes the subsequent flushing CR3 load. This also
+/// covers copy helpers restoring a user root while still executing ring 0.
+pub fn loadKernelContext(comptime Load: type, cpu: usize, cr3: u64, kernel_cr3: u64, pcid_enabled: bool) void {
+    const context = UserContext.fromCr3(cr3);
+    const kernel_root = context.root() == UserContext.fromCr3(kernel_cr3).root();
+    var operand = cr3;
+    if (!kernel_root) {
+        std.debug.assert(cpu < borrowed.len);
+        @atomicStore(u64, &borrowed[cpu].value, context.value, .monotonic);
+        fenceBeforeSnapshot();
+        const retained = enterRetained(cpu, cr3);
+        if (!pcid_enabled or context.pcid() == 0 or !retained) operand &= ~(@as(u64, 1) << 63);
+    } else if (!pcid_enabled or context.pcid() == 0) operand &= ~(@as(u64, 1) << 63);
+    Load.write(operand);
+    // A clear must prove the hardware load has finished, not just that it
+    // was planned. The old non-global translations are gone before reuse.
+    if (kernel_root) leaveBorrowed(cpu);
+}
+
+fn leaveBorrowed(cpu: usize) void {
+    std.debug.assert(cpu < borrowed.len);
+    @atomicStore(u64, &borrowed[cpu].value, 0, .release);
 }
 
 /// Requester owns shootdown serialization. CAS cannot erase a replacement
@@ -142,11 +180,15 @@ test "zero retention never hides an active user from consecutive requests" {
     var execution: [1]Active = .{.{}};
     const old_roots = roots;
     const old_active = active;
+    const old_borrowed = borrowed;
+    var test_borrowed: [72]Active = @splat(.{});
+    borrowed = &test_borrowed;
     roots = &rows;
     active = &execution;
     defer {
         roots = old_roots;
         active = old_active;
+        borrowed = old_borrowed;
     }
     const context = UserContext.fromCr3(0x8000_0000_1234_5001);
     try std.testing.expectEqual(@as(u64, 0x12345001), context.value);
@@ -176,17 +218,22 @@ test "CPU storage preserves bootstrap active and retention" {
     var seed_active: [1]Active = .{.{}};
     const old_roots = roots;
     const old_active = active;
+    const old_borrowed = borrowed;
+    var test_borrowed: [1]Active = @splat(.{});
+    borrowed = &test_borrowed;
     roots = &seed_roots;
     active = &seed_active;
     defer {
         roots = old_roots;
         active = old_active;
+        borrowed = old_borrowed;
     }
     const context = UserContext.fromCr3(0x12345001);
     try std.testing.expect(!enterUser(0, context));
     try initCpuStorage(72);
     defer std.heap.page_allocator.free(roots);
     defer std.heap.page_allocator.free(active);
+    defer std.heap.page_allocator.free(borrowed);
     try std.testing.expect(contains(0, context.value));
     try std.testing.expect(isActive(0, context));
     try std.testing.expect(!contains(71, context.value));
@@ -198,4 +245,89 @@ test "CPU storage preserves bootstrap active and retention" {
     leaveUser(71);
     try std.testing.expect(!isActive(71, context));
     try std.testing.expect(isActive(72, context));
+}
+
+test "PCID zero borrowed loads publish before hardware and clear only after kernel load" {
+    var rows: [2][pcids]u64 = @splat(@splat(0));
+    var users: [2]Active = @splat(.{});
+    var loans: [2]Active = @splat(.{});
+    const old_roots = roots;
+    const old_active = active;
+    const old_borrowed = borrowed;
+    roots = &rows;
+    active = &users;
+    borrowed = &loans;
+    defer { roots = old_roots; active = old_active; borrowed = old_borrowed; }
+    const Load = struct {
+        var expected: u64 = 0;
+        var prior: u64 = 0;
+        var kernel: bool = false;
+        var calls: usize = 0;
+        pub fn write(value: u64) void {
+            calls += 1;
+            std.debug.assert(value == expected);
+            // During kernel load the old exposure must STILL be present.
+            std.debug.assert(isActive(1, UserContext.fromCr3(if (kernel) prior else expected)));
+            std.debug.assert(isActive(1, UserContext.fromCr3(0x9000))); // independent user return
+        }
+    };
+    _ = enterUser(1, UserContext.fromCr3(0x9000));
+    for ([_]u64{ 0x1000, 0x2000, 0x1000 }) |root| {
+        Load.expected = root; Load.kernel = false;
+        loadKernelContext(Load, 1, root | (@as(u64, 1) << 63), 0x8000, false);
+        for (0..2) |_| {
+            invalidateRetained(1, UserContext.fromCr3(root));
+            try std.testing.expect(isActive(1, UserContext.fromCr3(root)));
+        }
+        try std.testing.expect(!contains(1, root));
+    }
+    Load.expected = 0x8000; Load.prior = 0x1000; Load.kernel = true;
+    loadKernelContext(Load, 1, 0x8000, 0x8000, false);
+    try std.testing.expect(!isActive(1, UserContext.fromCr3(0x1000)));
+    try std.testing.expect(isActive(1, UserContext.fromCr3(0x9000)));
+    leaveUser(1);
+    try std.testing.expect(!isActive(1, UserContext.fromCr3(0x9000)));
+    // A PCID-0 forced user return also publishes even without retention.
+    try std.testing.expect(!enterUser(1, UserContext.fromCr3(0x3000)));
+    try std.testing.expect(isActive(1, UserContext.fromCr3(0x3000)));
+    leaveUser(1);
+    try std.testing.expect(isActive(2, UserContext.fromCr3(0x3000)));
+    try std.testing.expectEqual(@as(usize, 4), Load.calls);
+}
+
+test "PCID zero and tagged borrowed retention remain separate" {
+    var rows: [1][pcids]u64 = @splat(@splat(0));
+    var users: [1]Active = @splat(.{});
+    var loans: [1]Active = @splat(.{});
+    const old_roots = roots;
+    const old_active = active;
+    const old_borrowed = borrowed;
+    roots = &rows; active = &users; borrowed = &loans;
+    defer { roots = old_roots; active = old_active; borrowed = old_borrowed; }
+    const Load = struct {
+        var operand: u64 = 0;
+        pub fn write(v: u64) void { operand = v; }
+    };
+    const root: u64 = 0x1001;
+    const noflush = @as(u64, 1) << 63;
+    loadKernelContext(Load, 0, root | noflush, 0x8000, true);
+    try std.testing.expectEqual(root, Load.operand);
+    try std.testing.expect(isActive(0, UserContext.fromCr3(root)));
+    loadKernelContext(Load, 0, root | noflush, 0x8000, true);
+    try std.testing.expectEqual(root | noflush, Load.operand);
+    invalidateRetained(0, UserContext.fromCr3(root));
+    try std.testing.expect(isActive(0, UserContext.fromCr3(root)));
+    loadKernelContext(Load, 0, root | noflush, 0x8000, true);
+    try std.testing.expectEqual(root, Load.operand);
+    // Even with CR4.PCIDE, tag zero never inherits a noflush privilege.
+    loadKernelContext(Load, 0, 0x2000 | noflush, 0x8000, true);
+    try std.testing.expectEqual(@as(u64, 0x2000), Load.operand);
+    // A tagged NOFLUSH load may leave dormant tag-0 entries behind. Safety
+    // depends on the future tag-0 load flushing, not on erasing them on exit.
+    loadKernelContext(Load, 0, root | noflush, 0x8000, true);
+    try std.testing.expectEqual(root | noflush, Load.operand);
+    loadKernelContext(Load, 0, 0x2000 | noflush, 0x8000, true);
+    try std.testing.expectEqual(@as(u64, 0x2000), Load.operand);
+    leaveUser(0);
+    try std.testing.expect(!isActive(0, UserContext.fromCr3(0x2000)));
 }

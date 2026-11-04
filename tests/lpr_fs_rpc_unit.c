@@ -27,6 +27,7 @@ static int return_capability;
 static struct pacha_ipc_msg completion;
 static uint32_t expected_opcode;
 static const char *expected_first, *expected_second;
+static uint64_t expected_mode;
 static uint64_t expected_handle, expected_second_handle, expected_flags, expected_offset, expected_length;
 static lpr_filed_backend_t first_file = {.active = 1, .handle = 112};
 static lpr_filed_backend_t second_file = {.active = 1, .handle = 223};
@@ -55,7 +56,12 @@ int lpr_fd_table_pin(lpr_fd_table_t *table,lpr_linux_fd_t fd,lpr_fd_pin_t *pin)
 {
     assert(table==&lpr_control_fd_table && !active_pins);
     lpr_filed_backend_t *file=lpr_filed_backend(fd);
-    if (!file) return -1;
+    if (!file) {
+        if (fd < 10 || fd > 14) return -1;
+        *pin=(lpr_fd_pin_t){.fd=fd,.ops_id=fd==14?LPR_FD_OPS_FILED:fd==10?LPR_FD_OPS_PIPE:fd==11?LPR_FD_OPS_UNIX:fd==12?LPR_FD_OPS_INSTALL_DISK:LPR_FD_OPS_PIPE,
+            .effective_rights=(fd==13||fd==14)?LPR_FD_RIGHT_READ:LPR_FD_RIGHT_WRITE,.state=&first_file};
+        ++active_pins;return 0;
+    }
     *pin=(lpr_fd_pin_t){.fd=fd,.ops_id=LPR_FD_OPS_FILED,.state=file};
     ++active_pins;
     return 0;
@@ -98,6 +104,7 @@ static size_t answer(unsigned char *wire, size_t request_size, size_t capacity)
                 request.opcode, expected_opcode, (unsigned long long)request.handle,
                 (unsigned long long)expected_handle);
         assert(request.opcode == expected_opcode && request.handle == expected_handle);
+        if (expected_opcode==KB2_FILESYSTEM_OP_FALLOCATE) assert(request.mode==expected_mode && active_pins==1);
         assert(request.second_handle == expected_second_handle && request.flags == expected_flags);
         assert((uint64_t)request.offset == expected_offset && request.length == expected_length && !request.data.length);
         if (expected_first) {
@@ -404,6 +411,25 @@ static void test_operation_operands(void)
     injected = -LPR_LINUX_EINVAL;
     assert(lpr_linux_ftruncate(3, expected_offset) == injected);
     injected = 0;
+    expected_opcode = KB2_FILESYSTEM_OP_FALLOCATE;
+    expected_handle=112;expected_offset=4096;expected_length=8192;
+    for (unsigned mode=0;mode<2;mode++) {expected_mode=mode;assert(!lpr_linux_fallocate(3,mode,4096,8192));}
+    expected_mode=UINT64_MAX;expected_offset=UINT64_MAX;expected_length=0;
+    injected=-LPR_LINUX_EINVAL;
+    assert(lpr_linux_fallocate(3,expected_mode,expected_offset,0)==injected);
+    injected=-LPR_LINUX_ENOSPC;
+    assert(lpr_linux_fallocate(3,expected_mode,expected_offset,0)==injected);
+    injected=0;
+    assert(lpr_linux_fallocate(UINT64_MAX,0,0,1)==-LPR_LINUX_EBADF);
+    assert(lpr_linux_fallocate(10,0,0,1)==-LPR_LINUX_ESPIPE);
+    assert(lpr_linux_fallocate(11,0,0,1)==-LPR_LINUX_ENODEV);
+    assert(lpr_linux_fallocate(12,0,0,1)==-LPR_LINUX_EOPNOTSUPP);
+    assert(lpr_linux_fallocate(13,0,0,1)==-LPR_LINUX_EBADF);
+    first_file.flags=LPR_LINUX_O_RDWR;
+    assert(lpr_linux_fallocate(14,0,0,1)==-LPR_LINUX_EBADF);
+    first_file.flags=0;
+    assert(!active_pins);
+    expected_mode=expected_offset=expected_length=0;
     expected_opcode = 0;
 }
 

@@ -160,6 +160,10 @@ const CpuSchedulerState = struct {
     idle_thread: usize = idleThreadMarker,
     // Service checkpoints are independent of the CPU's preemption cadence.
     runtime_accounting: @import("scheduler_runtime_accounting.zig").Accounting = .{},
+    // Release-published CPU hint, never a retained thread authority. Clear
+    // before inspecting the queue: a concurrent publisher then remains set.
+    wake_reschedule: u8 = 0,
+    ownership_service_start: i64 = 0,
     tick_accum: u64 = 0,
     deferred_slice_ticks: u64 = 0,
     enabled: bool = false,
@@ -171,12 +175,29 @@ const CpuSchedulerState = struct {
     lock_free_idle_wait: bool = false,
 };
 
+// No guest interface: opt-in QEMU correctness fixture, compiled out of every
+// normal image. The boot constructor supplies the actual initapp principal;
+// never guess a process number or change service scheduling for this test.
+const wake_test_affinity = if (@hasDecl(@import("root"), "wake_test_affinity")) @import("root").wake_test_affinity else 0;
+var wake_test_owner: ?kernel.PrincipalId = null;
+var wake_test_main: ?usize = null;
+var wake_test_words: [2]usize = .{ 1, 2 };
+pub fn configureWakeAffinityFixture(owner: kernel.PrincipalId) void {
+    if (comptime wake_test_affinity == 0) return;
+    std.debug.assert(wake_test_owner == null);
+    wake_test_owner = owner;
+    kernel_log.writeFmt("mc13-test-affinity: mode={} owner={}\n", .{ wake_test_affinity, @intFromEnum(owner) });
+}
+
 pub const ThreadContext = struct {
     id: u32 = 0,
     generation: u32 = 1,
     allocated: bool = false,
     scheduler_entity: ?*scheduler_runqueue.Node = null,
     owner_process: kernel.PrincipalId = default_process_principal,
+    // The live thread/CPU pin retains the AS body just as it retains its CR3.
+    // Rebound with exec; never recovered by an unpinned principal lookup.
+    identity_space: ?*UserAddressSpace = null,
     cpu_slot: usize = bootstrap_cpu_slot,
     // Null is unrestricted; explicit affinity borrows stable topology-sized storage.
     cpu_affinity: ?CpuSet = null,
@@ -497,13 +518,71 @@ fn cpuRunqueueFloor(state: *const CpuSchedulerState) i64 {
     return state.runqueue.minimumVruntime() orelse state.virtual_time;
 }
 
+const maximum_wake_credit: i64 = 4_000_000;
+fn cpuWakePlacementFloor(state: *const CpuSchedulerState) i64 {
+    // Preserve charge/request semantics. Only placement needs a lower bound:
+    // at publication a sleep/migration can trail destination V by at most one
+    // default quantum in virtual ns. Never subtract from accumulated service;
+    // this is not a bound on running-vs-V distance or wall time at all weights.
+    // The queue minimum excludes the running owner. It can be milliseconds
+    // AHEAD of V/current service; using it as a floor manufactures debt in a
+    // newly completed waiter (observed +3.16ms). Cap that placement floor at
+    // V, while max(old vruntime, floor) in the scalar keeps existing debt.
+    return @max(@min(cpuRunqueueFloor(state), state.virtual_time), state.virtual_time -| maximum_wake_credit);
+}
+
+const CpuPlacement = enum { wake, migrate };
+// CPU virtual clocks have different offsets. Keeping an absolute vruntime on
+// migration turned source credit into destination debt (observed -12.15ms ->
+// +7.98ms). Translate both eligibility and runtime; never trim paid service or
+// positive lag. The floor only bounds negative placement credit afterward.
+fn placeEntityInCpuDomain(comptime operation: CpuPlacement, entity: *const verified_sched.Entity, source_v: i64, destination_v: i64, floor: i64, crossing: bool, out: *verified_sched.Entity) verified_sched.EevdfRc {
+    const original = entity.*; // Also support an aliased input/output in tests.
+    var rebased = original;
+    var protected_eligible: i64 = 0;
+    var weighted_slice: i64 = 0;
+    if (crossing) {
+        if (source_v < 0 or destination_v < 0 or original.vruntime < 0 or original.eligible_time < original.vruntime) { out.* = original; return .state; }
+        weighted_slice = std.math.sub(i64, original.deadline, original.eligible_time) catch { out.* = original; return .overflow; };
+        if (weighted_slice <= 0) { out.* = original; return .state; }
+        const vr = @max(0, @as(i128, destination_v) + original.vruntime - source_v);
+        const eligible = @max(vr, @as(i128, destination_v) + original.eligible_time - source_v);
+        if (vr > std.math.maxInt(i64) or eligible > std.math.maxInt(i64)) { out.* = original; return .overflow; }
+        rebased.vruntime = @intCast(vr);
+        rebased.eligible_time = @intCast(eligible);
+        rebased.deadline = std.math.add(i64, rebased.eligible_time, weighted_slice) catch { out.* = original; return .overflow; };
+        protected_eligible = rebased.eligible_time;
+    }
+    var placed: verified_sched.Entity = undefined;
+    const rc = switch (operation) {
+        .wake => verified_sched.pacha_eevdf_entity_wake(&rebased, floor, &placed),
+        .migrate => verified_sched.pacha_eevdf_entity_migrate(&rebased, floor, &placed),
+    };
+    if (rc != .ok) { out.* = original; return rc; }
+    if (crossing) {
+        // Clamping away excess negative credit raises VR, not entitlement.
+        // Preserve E/D relative to V, rather than adding the trimmed credit
+        // again as artificial positive eligibility debt. No earlier E or D
+        // than the affine translation is admitted.
+        placed.eligible_time = @max(placed.eligible_time, protected_eligible);
+        placed.deadline = std.math.add(i64, placed.eligible_time, weighted_slice) catch { out.* = original; return .overflow; };
+    }
+    out.* = placed;
+    return .ok;
+}
+
 fn setCpuVirtualTime(state: *CpuSchedulerState, value: i64) void {
     state.virtual_time = value;
     state.runqueue.setSelectionVirtualTime(value);
 }
 
 fn refreshCpuVirtualTime(state: *CpuSchedulerState) void {
-    if (state.runqueue.minimumVruntime()) |minimum| {
+    if (state.runqueue.minimumVruntime()) |queued| {
+        // A block/exit/steal can leave an older entity executing on this CPU.
+        // Omitting it advances V without that owner earning the service and
+        // corrupts the offsets subsequently used by cross-CPU placement.
+        // As at timer expiry, include actual running VR; never rewind V.
+        const minimum = if (state.current_entity) |current| @min(queued, current.entity.vruntime) else queued;
         if (minimum > state.virtual_time) setCpuVirtualTime(state, minimum);
     }
 }
@@ -521,10 +600,13 @@ const PreparedRuntime = struct {
 // Caller owns the runqueue lock. Preparation is read-only so rejection of a
 // fused transition cannot charge time twice or change its fallback inputs.
 fn prepareRuntimeCharge(state: *CpuSchedulerState, node: *scheduler_runqueue.Node, fallback_ns: u64) ?PreparedRuntime {
+    return prepareRuntimeChargeAtFloor(state, node, fallback_ns, cpuRunqueueFloor(state));
+}
+fn prepareRuntimeChargeAtFloor(state: *CpuSchedulerState, node: *scheduler_runqueue.Node, fallback_ns: u64, floor: i64) ?PreparedRuntime {
     const interval = state.runtime_accounting.prepare(runtimeAccountingNow(), fallback_ns);
     if (interval.runtime_ns > std.math.maxInt(i64)) return null;
     var charged = node.entity;
-    if (interval.runtime_ns != 0 and verified_sched.pacha_eevdf_entity_charge(&node.entity, @intCast(interval.runtime_ns), cpuRunqueueFloor(state), &charged) != .ok) return null;
+    if (interval.runtime_ns != 0 and verified_sched.pacha_eevdf_entity_charge(&node.entity, @intCast(interval.runtime_ns), floor, &charged) != .ok) return null;
     return .{ .entity = charged, .interval = interval };
 }
 fn chargeRunningTransition(state: *CpuSchedulerState, node: *scheduler_runqueue.Node) bool {
@@ -580,7 +662,11 @@ fn verifiedAddThreadLocked(thread_index: usize, generation: u32, ready: bool) bo
         @intCast(generation),
         1024,
         4_000_000,
-        cpuRunqueueFloor(state),
+        // A new identity has paid no service. A future queued minimum would
+        // clone another entity's positive lag for free, which migration can
+        // amplify across CPU domains. Admit only the common bounded credit;
+        // the debt of existing entities is preserved by their placement path.
+        cpuWakePlacementFloor(state),
         &entity,
     );
     if (scalarIssue("add", init_rc, thread_index)) {
@@ -595,6 +681,7 @@ fn verifiedAddThreadLocked(thread_index: usize, generation: u32, ready: bool) bo
             noteVerifiedCoreIssue("add-tree", .state, thread_index);
             return false;
         }
+        @atomicStore(u8, &state.wake_reschedule, 1, .release);
     } else {
         var blocked: verified_sched.Entity = undefined;
         const rc = verified_sched.pacha_eevdf_entity_block(&node.entity, &blocked);
@@ -606,7 +693,9 @@ fn verifiedAddThreadLocked(thread_index: usize, generation: u32, ready: bool) bo
         node.ownership = .blocked;
     }
     state.runqueue_lock.unlock();
-    if (ready and cpu_id != currentCpu()) _ = smp.wakeCpu(cpu_id);
+    if (ready and cpu_id != currentCpu() and !notifyPublishedWake(cpu_id)) {
+        if (!builtin.is_test) @panic("scheduler wake IPI failed after ready initialization");
+    }
     return true;
 }
 
@@ -616,6 +705,8 @@ fn verifiedWakeThreadGenerationPreferred(
     preferred_cpu: ?usize,
     deferred_notify_cpu: ?*?usize,
 ) bool {
+    const wf11 = @import("ipc_metric.zig").detailBegin();
+    defer @import("ipc_metric.zig").detailEnd(.runqueue_wake, wf11);
     const start = perf.timestamp();
     perf.add(.wake_scan_calls, 1);
     defer perf.elapsed(.wake_scan_cycles, start);
@@ -623,6 +714,7 @@ fn verifiedWakeThreadGenerationPreferred(
     // Wake callers own table through the context and runqueue transition.
     const ctx = threadContextLocked(thread_index) orelse return false;
     const node = ctx.scheduler_entity orelse return false;
+    if (comptime wake_trace.enabled) wake_trace.record(.wake_select_begin, currentCpu(), node.cpu_slot, thread_index);
     const last_cpu = node.cpu_slot;
     const last_state = schedulerStateForSlot(last_cpu) orelse return false;
 
@@ -634,6 +726,10 @@ fn verifiedWakeThreadGenerationPreferred(
             preferred_selected = true;
         }
     }
+    // There is no placement decision on a one-CPU topology. Avoid sampling
+    // and locking the sole queue only to lock it again for publication.
+    if (!preferred_selected and verifiedCoreCpuCount() == 1 and last_cpu == 0 and
+        schedulerCpuEnabled(0) and threadAllowsCpu(ctx, 0)) preferred_selected = true;
     // A valid synchronous IPC handoff selects this CPU regardless of load.
     // Do not inspect every runqueue only to discard that choice afterward.
     var target_count: usize = std.math.maxInt(usize);
@@ -670,9 +766,21 @@ fn verifiedWakeThreadGenerationPreferred(
         target_cpu = last_cpu;
     }
 
+    // Existing preferred synchronous IPC placement remains authoritative.
+    // Limit this exception to the observed idle last-CPU edge, not a general
+    // load-balancer change. T and local IF=0 retain the source/empty queue
+    // through publication; the safe return still reselects the best candidate.
+    if (!preferred_selected and target_idle and target_cpu == last_cpu and target_cpu != currentCpu() and
+        wakeCanUseSourceCpu(ctx, node, currentCpu()))
+    {
+        target_cpu = currentCpu();
+        preferred_selected = true;
+    }
+    if (comptime wake_trace.enabled) wake_trace.record(.wake_select_end, currentCpu(), target_cpu, thread_index);
     const target_state = schedulerStateForSlot(target_cpu) orelse return false;
     const first = if (last_cpu <= target_cpu) last_state else target_state;
     const second = if (last_cpu <= target_cpu) target_state else last_state;
+    if (comptime wake_trace.enabled) wake_trace.record(.wake_enqueue_begin, currentCpu(), target_cpu, thread_index);
     const woke = wake_locked: {
         first.lock.lock();
         if (second != first) second.lock.lock();
@@ -711,10 +819,14 @@ fn verifiedWakeThreadGenerationPreferred(
         {
             target_cpu = last_cpu;
         }
+        if (comptime wake_trace.enabled) wake_trace.record(.wake_origin_domain, @intCast(last_state.virtual_time), @intCast(node.entity.vruntime), thread_index);
+        if (comptime wake_trace.enabled) wake_trace.record(.wake_origin_protection, @intCast(node.entity.eligible_time), @intCast(node.entity.deadline), thread_index);
         const destination = schedulerStateForSlot(target_cpu) orelse break :wake_locked false;
+        if (comptime wake_trace.enabled) wake_trace.record(.wake_destination_domain, @intCast(destination.virtual_time), @intCast(cpuRunqueueFloor(destination)), thread_index);
         var runnable: verified_sched.Entity = undefined;
-        const rc = verified_sched.pacha_eevdf_entity_wake(&node.entity, cpuRunqueueFloor(destination), &runnable);
+        const rc = placeEntityInCpuDomain(.wake, &node.entity, last_state.virtual_time, destination.virtual_time, cpuWakePlacementFloor(destination), last_cpu != target_cpu, &runnable);
         if (scalarIssue("wake", rc, thread_index)) break :wake_locked false;
+        if (comptime wake_trace.enabled) wake_trace.record(.wake_placed, @intCast(runnable.vruntime), @intCast(runnable.eligible_time), thread_index);
         const blocked = node.entity;
         node.entity = runnable;
         node.cpu_slot = target_cpu;
@@ -727,15 +839,33 @@ fn verifiedWakeThreadGenerationPreferred(
             break :wake_locked false;
         }
         ctx.cpu_slot = target_cpu;
+        @atomicStore(u8, &destination.wake_reschedule, 1, .release);
+        if (comptime wake_trace.enabled) wake_trace.record(.wake_enqueued, currentCpu(), target_cpu, thread_index);
         break :wake_locked true;
     };
-    if (woke) wake_trace.record(.ready_publish, thread_index, 0, thread_index);
+    if (woke) if (comptime wake_trace.enabled) wake_trace.record(.ready_publish, wake_trace.identity(@intFromEnum(ctx.owner_process), generation), target_cpu, thread_index);
     if (woke and target_cpu != currentCpu()) {
         // Notification commit retains K/E/T until publication. Return only a
         // CPU number so its caller can end E before the coalesced wake edge.
-        if (deferred_notify_cpu) |out| out.* = target_cpu else _ = smp.wakeCpu(target_cpu);
+        if (comptime wake_trace.enabled) wake_trace.record(.wake_notify_deferred, currentCpu(), target_cpu, thread_index);
+        if (deferred_notify_cpu) |out| {
+            out.* = target_cpu;
+        } else if (!notifyPublishedWake(target_cpu)) {
+            // The committed generation may already have been consumed by an
+            // older vector/idle scan: rollback is no longer safe. Match K's
+            // existing deferred-edge failure policy instead of returning a
+            // false success while an idle AP remains in HLT. smp retains its
+            // three delivery attempts; this failure is unrecoverable.
+            if (!builtin.is_test) @panic("scheduler wake IPI failed after publication");
+        }
     }
     return woke;
+}
+
+const PublishedWakeTest = struct { var fail = false; var attempts: usize = 0; };
+fn notifyPublishedWake(cpu: usize) bool {
+    if (builtin.is_test) { PublishedWakeTest.attempts += 1; return !PublishedWakeTest.fail; }
+    return smp.wakeCpu(cpu);
 }
 
 fn verifiedWakeThreadGeneration(thread_index: usize, generation: u32) bool {
@@ -1116,22 +1246,28 @@ fn verifiedHandoffToThreadOnCpuLocked(
         state.runqueue_lock.unlock();
         return false;
     }
+    const moved = handoffChargedOwnerLocked(state, current, target);
+    state.runqueue_lock.unlock();
+    return moved;
+}
+
+// Shared ownership transaction: caller owns T and RQ and has already settled
+// current service. Keeping it separate avoids charging/retaking RQ twice when
+// the wake policy itself needed the up-to-date entity for its comparison.
+fn handoffChargedOwnerLocked(state: *CpuSchedulerState, current: *scheduler_runqueue.Node, target: *scheduler_runqueue.Node) bool {
     var runnable_current: verified_sched.Entity = undefined;
     const finish_rc = verified_sched.pacha_eevdf_entity_finish(&current.entity, &runnable_current);
     if (scalarIssue("handoff-finish", finish_rc, current.thread_index)) {
-        state.runqueue_lock.unlock();
         return false;
     }
     if (!state.runqueue.remove(target)) {
-        state.runqueue_lock.unlock();
         return false;
     }
     var running: verified_sched.Entity = undefined;
     const run_rc = verified_sched.pacha_eevdf_entity_mark_running(&target.entity, &running);
-    if (scalarIssue("handoff", run_rc, thread_index)) {
+    if (scalarIssue("handoff", run_rc, target.thread_index)) {
         target.ownership = .runnable;
         _ = state.runqueue.insert(target);
-        state.runqueue_lock.unlock();
         return false;
     }
     const old_current_entity = current.entity;
@@ -1142,14 +1278,12 @@ fn verifiedHandoffToThreadOnCpuLocked(
         current.ownership = .running;
         target.ownership = .runnable;
         _ = state.runqueue.insert(target);
-        state.runqueue_lock.unlock();
         noteVerifiedCoreIssue("handoff-current-tree", .state, current.thread_index);
         return false;
     }
     target.entity = running;
     target.ownership = .running;
     state.current_entity = target;
-    state.runqueue_lock.unlock();
     return true;
 }
 
@@ -1197,7 +1331,7 @@ pub fn migrateRunnableThreadGeneration(thread_index: usize, generation: u32, dst
     if (!nodeMatches(node, thread_index, generation, src_cpu) or node.ownership != .runnable) return false;
     if (!src.runqueue.remove(node)) return false;
     var migrated: verified_sched.Entity = undefined;
-    const rc = verified_sched.pacha_eevdf_entity_migrate(&node.entity, cpuRunqueueFloor(dst), &migrated);
+    const rc = placeEntityInCpuDomain(.migrate, &node.entity, src.virtual_time, dst.virtual_time, cpuWakePlacementFloor(dst), true, &migrated);
     if (scalarIssue("migrate", rc, thread_index)) {
         _ = src.runqueue.insert(node);
         return false;
@@ -1477,11 +1611,8 @@ fn stealRunnableForIdleCpu(dst_cpu: usize) bool {
         {
             if (!src.runqueue.remove(node)) return false;
             var migrated: verified_sched.Entity = undefined;
-            const rc = verified_sched.pacha_eevdf_entity_migrate(
-                &node.entity,
-                cpuRunqueueFloor(dst),
-                &migrated,
-            );
+            const rc = placeEntityInCpuDomain(.migrate, &node.entity, src.virtual_time, dst.virtual_time,
+                cpuWakePlacementFloor(dst), true, &migrated);
             if (scalarIssue("steal", rc, node.thread_index)) {
                 _ = src.runqueue.insert(node);
                 return false;
@@ -1522,6 +1653,13 @@ inline fn installCurrentContextLocked(state: *CpuSchedulerState, thread_index: u
     // later user frames. Consume it at pin installation, before any user or
     // interrupt can run, so it cannot survive preemption with the same RIP.
     ctx.entry_state.notify_sysret_continuation = false;
+    // Only an actual ownership change starts protection. Neither an enqueue
+    // nor partial accounting can renew it. All pick/direct IPC/WAKE_WAIT and
+    // handoff installs pass here; rollback without an install preserves it.
+    if (state.current_context != ctx or state.current_generation != ctx.generation) {
+        if (comptime wake_trace.enabled) wake_trace.record(.context_install, wake_trace.identity(@intFromEnum(ctx.owner_process), ctx.generation), state.current_thread, thread_index);
+        state.ownership_service_start = if (ctx.scheduler_entity) |node| node.entity.service_ns else 0;
+    }
     state.current_context = ctx;
     state.current_generation = ctx.generation;
     state.current_thread = thread_index;
@@ -2100,7 +2238,7 @@ pub fn parkApThreadForBlockPreferred(
         ctx.wait_completion_claimed = false;
         ctx.wait_completion_publish_pending = false;
         ctx.wait_completion_rax = 0;
-        setWakeTickLocked(ctx, if (timeout_ticks == 0) 0 else lapic_tick_count +| timeout_ticks);
+        setWakeTickLocked(ctx, wakeTickAfterTicks(timeout_ticks));
         ctx.wait_uninterruptible = wait_uninterruptible;
         commitThreadBlockedLocked(ctx);
         setThreadHotCr3(current_thread, ctx.cr3);
@@ -2755,6 +2893,11 @@ fn maxStaticEnd(a: usize, b: usize) usize {
 
 pub fn staticStorageEndAddr() usize {
     var end: usize = 0;
+    if (comptime wake_test_affinity != 0) {
+        end = @max(end, @intFromPtr(&wake_test_words) + @sizeOf(@TypeOf(wake_test_words)));
+        end = @max(end, @intFromPtr(&wake_test_owner) + @sizeOf(@TypeOf(wake_test_owner)));
+        end = @max(end, @intFromPtr(&wake_test_main) + @sizeOf(@TypeOf(wake_test_main)));
+    }
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(initial_thread_contexts), &initial_thread_contexts));
     end = maxStaticEnd(end, @intFromPtr(&initial_context_pointers) + @sizeOf(@TypeOf(initial_context_pointers)));
     end = maxStaticEnd(end, @intFromPtr(&initial_thread_directory) + @sizeOf(ThreadDirectory));
@@ -2782,6 +2925,21 @@ pub fn staticStorageEndAddr() usize {
     return end;
 }
 
+/// Only called after the final user target was selected, with IF clear. The
+/// pin protects both the context and its AS owner through the last store.
+pub fn publishIdentityForUserReturn(cpu: usize, cr3: u64) void {
+    const ctx = pinnedContextForCpu(cpu) orelse return;
+    const space = ctx.identity_space orelse return;
+    const identity = @import("thread_identity.zig");
+    if (x86_platform.cr3AddressPart(cr3) != space.cr3 or
+        x86_platform.cr3AddressPart(ctx.cr3) != space.cr3)
+    {
+        identity.close(space);
+        return;
+    }
+    identity.publish(space, cpu, @as(u64, ctx.id) + 1);
+}
+
 pub fn currentThread() usize {
     const state = schedulerStateForSlot(currentCpu()) orelse return 0;
     return state.current_thread;
@@ -2791,9 +2949,13 @@ pub fn currentThread() usize {
 /// before XSAVE. A CPU pin supplies stable identity without a directory
 /// borrow. It is not permission to free other outstanding context borrowers.
 pub fn notifyDiagnosticUserReturn() void {
-    if (comptime !ipc_metric.enabled) return;
+    if (comptime !ipc_metric.enabled and !wake_trace.enabled) return;
+    // The CPU pin already validates this incarnation with IF clear. Taking T
+    // after XRSTOR would add contention to the return being measured; scalar
+    // numeric identity needs neither a new borrower nor a new lock.
     const ctx = pinnedContextForCpu(currentCpu()) orelse return;
-    @import("notify_metric.zig").userReturn(&ctx.notify_stamp.stamp, ctx.generation);
+    if (comptime wake_trace.enabled) wake_trace.record(.user_return, wake_trace.identity(@intFromEnum(ctx.owner_process), ctx.generation), 0, ctx.id);
+    if (comptime ipc_metric.enabled) @import("notify_metric.zig").userReturn(&ctx.notify_stamp.stamp, ctx.generation);
 }
 
 pub noinline fn currentContextForXState() ?*ThreadContext {
@@ -3558,6 +3720,54 @@ fn boolByte(value: bool) u8 {
 // T owns the index together with wait admission/claim/publication. Nodes
 // live in stable bodies, not the replaceable hot/directory arrays. Removing
 // before mutating the key prevents cancellation from targeting a newer wait.
+const wake_tick_ns: u64 = 1_000_000;
+
+// Converts a relative timeout of whole ticks into the absolute wake tick
+// stored in ThreadContext.wake_tick. Timers fire when floor(now/1ms) reaches
+// wake_tick, so the result must satisfy wake_tick*1ms >= start + timeout.
+// lapic_tick_count is only floor(now/1ms) as of the last BSP timer IRQ: adding
+// to it drops the intra-tick phase (and any AP-observed staleness), which woke
+// sleepers up to one tick early. Round the real start time up instead. Zero
+// stays the "no timeout" sentinel; a caller with timeout 0 never blocks.
+fn wakeTickAfterTicks(timeout_ticks: u64) u64 {
+    if (timeout_ticks == 0) return 0;
+    if (runtimeAccountingNow()) |now_ns| {
+        const start_tick = now_ns / wake_tick_ns + @intFromBool(now_ns % wake_tick_ns != 0);
+        return start_tick +| timeout_ticks;
+    }
+    // No monotonic clock yet: the counter may lag the true time by up to one
+    // whole tick, so one extra tick keeps the result from firing early.
+    return lapic_tick_count +| timeout_ticks +| 1;
+}
+
+test "deadline wake ticks never fire before the requested timeout" {
+    const saved_tick = lapic_tick_count;
+    defer lapic_tick_count = saved_tick;
+    defer RuntimeAccountingTest.now_ns = null;
+    lapic_tick_count = 41;
+    RuntimeAccountingTest.now_ns = 41_999_999;
+    // The old lapic_tick_count + 1 = 42 would fire after 1ns, not 1ms.
+    try std.testing.expectEqual(@as(u64, 43), wakeTickAfterTicks(1));
+    RuntimeAccountingTest.now_ns = 42_000_000;
+    try std.testing.expectEqual(@as(u64, 47), wakeTickAfterTicks(5));
+    // AP view of the BSP counter may be stale; the real clock decides.
+    lapic_tick_count = 40;
+    RuntimeAccountingTest.now_ns = 42_500_000;
+    try std.testing.expectEqual(@as(u64, 59), wakeTickAfterTicks(16));
+    try std.testing.expectEqual(@as(u64, 0), wakeTickAfterTicks(0));
+    try std.testing.expectEqual(std.math.maxInt(u64), wakeTickAfterTicks(std.math.maxInt(u64)));
+    RuntimeAccountingTest.now_ns = null;
+    try std.testing.expectEqual(@as(u64, 46), wakeTickAfterTicks(5));
+    // Every result satisfies wake_tick*1ms >= start + timeout.
+    var start: u64 = 0;
+    while (start < 3 * wake_tick_ns) : (start += 333_333) {
+        RuntimeAccountingTest.now_ns = start;
+        for ([_]u64{ 1, 5, 16 }) |ticks| {
+            try std.testing.expect(wakeTickAfterTicks(ticks) * wake_tick_ns >= start + ticks * wake_tick_ns);
+        }
+    }
+}
+
 fn setWakeTickLocked(ctx: *ThreadContext, tick: u64) void {
     const tree = &scheduler_state.thread_table.deadlines;
     if (ctx.deadline_node.linked) tree.remove(&ctx.deadline_node);
@@ -3777,7 +3987,9 @@ fn initializeThreadContextWithReadyState(
     const user_cr3 = x86_platform.cr3WithUserPcid(space.cr3, pcidForPrincipal(owner_process));
     scheduler_state.thread_table.lock();
     defer scheduler_state.thread_table.unlock();
-    return initializeThreadContextLocked(thread_index, owner_process, user_cr3, initial_frame, initial_ready);
+    const ok = initializeThreadContextLocked(thread_index, owner_process, user_cr3, initial_frame, initial_ready);
+    if (ok) threadContextLocked(thread_index).?.identity_space = space;
+    return ok;
 }
 
 fn initializeThreadContextLocked(
@@ -3797,12 +4009,27 @@ fn initializeThreadContextLocked(
     // bypass allocateThread's scan while a retiring CPU still owns this slot.
     if (threadSlotReferencedByCpu(thread_index)) return false;
     std.debug.assert(ctx.pi_node.waiting_mutex == null and ctx.pi_node.owned_head == null);
+    var fixture_cpu: ?usize = null;
+    if (comptime wake_test_affinity != 0) {
+        const fixture_owner = wake_test_owner orelse @panic("MC13_AFFINITY_FAIL: target not bound");
+        if (owner_process == fixture_owner) {
+            const cpu: usize = if (wake_test_affinity == 1 or wake_test_main == null) 0 else 1;
+            if (cpu >= verifiedCoreCpuCount() or !schedulerCpuEnabled(cpu)) @panic("MC13_AFFINITY_FAIL: CPU unavailable");
+            fixture_cpu = cpu;
+        }
+    }
     ctx.id = @intCast(thread_index);
     ctx.generation = slot.generation;
     ctx.allocated = true;
     ctx.owner_process = owner_process;
-    ctx.cpu_slot = selectCpuForNewThreadLocked();
+    ctx.cpu_slot = fixture_cpu orelse selectCpuForNewThreadLocked();
     ctx.cpu_affinity = null;
+    if (comptime wake_test_affinity != 0) {
+        if (fixture_cpu) |cpu| {
+            ctx.cpu_affinity = .{ .words = wake_test_words[cpu..cpu + 1], .capacity = @bitSizeOf(usize) };
+            if (wake_test_main == null) wake_test_main = thread_index;
+        }
+    }
     ctx.cr3 = user_cr3;
     ctx.fs_base = 0;
     ctx.gs_base = 0;
@@ -4113,7 +4340,7 @@ fn fastIpcTargetLocked(t: kernel.ThreadWakeTarget) ?*ThreadContext {
     defer cpu.runqueue_lock.unlock();
     if (!cpu.enabled) return null;
     var runnable: verified_sched.Entity = undefined;
-    if (verified_sched.pacha_eevdf_entity_wake(&node.entity, cpuRunqueueFloor(cpu), &runnable) != .ok) return null;
+    if (verified_sched.pacha_eevdf_entity_wake(&node.entity, cpuWakePlacementFloor(cpu), &runnable) != .ok) return null;
     return ctx;
 }
 fn fastIpcPublishLocked(ctx: *ThreadContext, t: kernel.ThreadWakeTarget, words: [4]u64) void {
@@ -4335,7 +4562,7 @@ pub fn prepareDirectHandoff(owner: kernel.PrincipalId, frame: *const TrapFrame, 
     if (!cpu.enabled or cpu.is_idle or cpu.current_context != source or cpu.current_generation != source.generation or
         cpu.current_entity != current or cpu.current_cr3 != source.cr3 or current.linked_tree != null or cpu.runqueue.selection_virtual_time != cpu.virtual_time) return false;
     var runnable: verified_sched.Entity = undefined;
-    if (verified_sched.pacha_eevdf_entity_wake(&next.entity, cpuRunqueueFloor(cpu), &runnable) != .ok) return false;
+    if (verified_sched.pacha_eevdf_entity_wake(&next.entity, cpuWakePlacementFloor(cpu), &runnable) != .ok) return false;
     const selected_time = cpu.runqueue.directWakeSelectionTime(&runnable) orelse return false;
     const accounting = prepareRuntimeCharge(cpu, current, 0) orelse return false;
     if (!accounting.interval.measured) return false;
@@ -4555,7 +4782,7 @@ pub fn prepareDirectNotify(owner: kernel.PrincipalId, frame: *const TrapFrame, c
     if (runnable_hint) {
         if (next.linked_tree != &cpu.runqueue) return false;
         @memcpy(std.mem.asBytes(&runnable), std.mem.asBytes(&next.entity));
-    } else if (verified_sched.pacha_eevdf_entity_wake(&next.entity, cpuRunqueueFloor(cpu), &runnable) != .ok) return false;
+    } else if (verified_sched.pacha_eevdf_entity_wake(&next.entity, cpuWakePlacementFloor(cpu), &runnable) != .ok) return false;
     {
         const current = source.scheduler_entity.?;
         if (cpu.is_idle or cpu.current_context != source or cpu.current_generation != source.generation or
@@ -5203,6 +5430,7 @@ fn allocateThreadWithReadyState(owner_process: kernel.PrincipalId, user_spaces: 
             // No candidate pointer or generation crosses the exclusion gap:
             // claim, context initialization and node admission are one action.
             if (!initializeThreadContextLocked(i, owner_process, user_cr3, initial_frame, initial_ready)) continue;
+            ctx.identity_space = space;
             const generation = ctx.generation;
             if (!verifiedAddThreadLocked(i, generation, initial_ready)) {
                 // Failed admission never links the node into a runqueue.
@@ -6027,6 +6255,7 @@ pub fn installExecContextForCurrentThread(
         exec_generation = ctx.generation;
         exec_context = ctx;
         ctx.cr3 = cr3;
+        ctx.identity_space = space;
         ctx.fs_base = image.fs_base;
         ctx.gs_base = image.gs_base;
         retirePiThreadLocked(ctx);
@@ -6272,7 +6501,11 @@ fn switchToGenerationLockedWithRegisters(comptime Registers: type, next_thread: 
         restoreSwitchSourceLocked(Registers, current_thread, current_generation, frame);
         return false;
     }
-    wake_trace.record(.context_switch, next_thread, current_thread, next_thread);
+    if (comptime wake_trace.enabled) {
+        // Activation above owns a validated CPU pin for this generation.
+        const target = pinnedContextForCpu(currentCpu()) orelse unreachable;
+        if (comptime wake_trace.enabled) wake_trace.record(.context_switch, wake_trace.identity(@intFromEnum(target.owner_process), next_generation), current_thread, next_thread);
+    }
     return true;
 }
 
@@ -6778,14 +7011,225 @@ fn handoffToReadyThreadGenerationInternal(
     return false;
 }
 
-/// Consume one local runnable entity at a user-mode wake-IPI boundary.  The
-/// normal remote-wake path has no sender trap frame to name a particular
-/// receiver, but it must still not leave a newly runnable entity behind an
-/// unrelated userspace timeslice.  `handoffToReadyThreadGenerationWithRax`
-/// keeps the runqueue ownership transition atomic and preserves the
-/// interrupted thread as runnable on this CPU.
+// A wake publishes readiness under F/E/T; scheduling is delayed until all
+// outer locks have ended and a complete ring-3 return frame is available.
+// Requests are CPU hints, so cancellation/slot reuse/migration need no undo.
+// Caller owns RQ. The maintained cache may describe a FUTURE selection when
+// no node is eligible. Never use that winner at today's V. The full-search
+// implementation remains independent (in particular refreshSelection uses it).
+inline fn bestEligibleForWake(state: *CpuSchedulerState, virtual_time: i64) ?*scheduler_runqueue.Node {
+    if (state.runqueue.selection_virtual_time == virtual_time) {
+        return if (state.runqueue.cachedSelectionTime() == virtual_time) state.runqueue.cachedSelection() else null;
+    }
+    return state.runqueue.bestEligible(virtual_time);
+}
+
+const WakeCandidateDecision = enum { keep, protected, preempt };
+fn wakeCandidateDecision(current: *const verified_sched.Entity, candidate: *const verified_sched.Entity, virtual_time: i64, service_epoch: i64) WakeCandidateDecision {
+    if (candidate.eligible_time > virtual_time) return .keep;
+    if (current.eligible_time <= virtual_time and candidate.deadline >= current.deadline) return .keep;
+    if (current.service_ns -| service_epoch < wake_minimum_service_ns) return .protected;
+    return .preempt;
+}
+
+// This is a placement hint, never context donation. The measured idle remote
+// dispatch dominates the sub-us selection/enqueue work. When the waker has at most one
+// queued peer and this SAME policy predicts the new candidate wins preemption, avoid that APIC/HLT
+// round trip. Affinity, clock failure or competition keeps normal placement.
+fn wakeCanUseSourceCpu(ctx: *const ThreadContext, node: *const scheduler_runqueue.Node, cpu: usize) bool {
+    if (!threadAllowsCpu(ctx, cpu)) return false;
+    const state = schedulerStateForSlot(cpu) orelse return false;
+    const origin = schedulerStateForSlot(node.cpu_slot) orelse return false;
+    const first = if (cpu <= node.cpu_slot) state else origin;
+    const second = if (cpu <= node.cpu_slot) origin else state;
+    // T retains both domains and both incarnations. As with publication,
+    // acquire the CPU pair before the runqueue pair, each in CPU order.
+    first.lock.lock();
+    if (first != second) second.lock.lock();
+    defer { if (first != second) second.lock.unlock(); first.lock.unlock(); }
+    first.runqueue_lock.lock();
+    if (first != second) second.runqueue_lock.lock();
+    defer { if (first != second) second.runqueue_lock.unlock(); first.runqueue_lock.unlock(); }
+    if (comptime wake_trace.enabled) wake_trace.record(.wake_local_occupancy, state.runqueue.count, 0, node.thread_index);
+    if (!state.enabled or state.is_idle or state.runqueue.count > 1) return false;
+    const current = state.current_entity orelse return false;
+    const source = pinnedContextForCpu(cpu) orelse return false;
+    if (!source.ready or source.stopped or source.cpu_slot != cpu or source.scheduler_entity != current or
+        !nodeMatches(current, source.id, source.generation, cpu) or current.ownership != .running or current == node) return false;
+    var awake: verified_sched.Entity = undefined;
+    if (placeEntityInCpuDomain(.wake, &node.entity, origin.virtual_time, state.virtual_time, cpuWakePlacementFloor(state), node.cpu_slot != cpu, &awake) != .ok) return false;
+    const floor = @min(awake.vruntime, state.runqueue.minimumVruntime() orelse awake.vruntime);
+    const charged = prepareRuntimeChargeAtFloor(state, current, 0, floor) orelse return false;
+    if (!charged.interval.measured) return false;
+    // Project the exact post-insert consumer V, including an IPC eligibility
+    // gap. The candidate participates in the queued minimum and the best
+    // comparison: an older eligible peer must never be skipped by this hint.
+    var projected_v = @max(state.virtual_time, @min(charged.entity.vruntime, floor));
+    if (awake.eligible_time > projected_v and state.runqueue.bestEligible(projected_v) == null) {
+        const next_eligible = @min(awake.eligible_time, state.runqueue.minimumEligibleTime() orelse awake.eligible_time);
+        projected_v = @max(projected_v, @min(charged.entity.vruntime, next_eligible));
+    }
+    if (state.runqueue.bestEligible(projected_v)) |old| {
+        if (old.entity.deadline < awake.deadline or
+            (old.entity.deadline == awake.deadline and old.entity.thread_id <= awake.thread_id))
+        {
+            if (comptime wake_trace.enabled) wake_trace.record(.wake_local_choice, state.runqueue.count, 3, node.thread_index);
+            return false;
+        }
+    }
+    if (comptime wake_trace.enabled) wake_trace.record(.wake_local_domain, @intCast(state.virtual_time), @intCast(charged.entity.vruntime), node.thread_index);
+    if (comptime wake_trace.enabled) wake_trace.record(.wake_local_projection, @intCast(charged.entity.deadline), @intCast(awake.deadline), node.thread_index);
+    if (comptime wake_trace.enabled) wake_trace.record(.wake_local_eligible, @intCast(projected_v), @intCast(awake.eligible_time), node.thread_index);
+    const decision = wakeCandidateDecision(&charged.entity, &awake, projected_v, state.ownership_service_start);
+    if (comptime wake_trace.enabled) wake_trace.record(.wake_local_choice, state.runqueue.count, switch (decision) { .keep => 4, .protected => 5, .preempt => 6 }, node.thread_index);
+    return decision == .preempt;
+}
+
+const wake_minimum_service_ns: i64 = 1_000;
+
+pub fn consumeWakeReschedule(frame: *TrapFrame) bool {
+    if ((frame.cs & 3) != 3 or (frame.ss & 3) != 3 or !verifiedCoreReady()) return false;
+    const cpu = currentCpu();
+    const state = schedulerStateForSlot(cpu) orelse return false;
+    // Read-only no-request path matters for every clock/IPC return. A later
+    // remote store keeps its bit and its own existing APIC edge; a local
+    // publisher cannot run concurrently with this IF=0 return boundary.
+    if (@atomicLoad(u8, &state.wake_reschedule, .acquire) == 0) return false;
+    if (@atomicRmw(u8, &state.wake_reschedule, .Xchg, 0, .acq_rel) == 0) return false;
+    // IF is already clear at these user-return boundaries. In particular a
+    // ring-0 IPI never consumes this bit or saves its interrupted kernel frame.
+    // Never extend a futex/IPC/K critical section with the protection pause.
+    // Ring-3 IRQ diagnostic entry deliberately has no kernel IRQ depth;
+    // any remaining root lock or interrupted-kernel scope forbids a switch.
+    lock_diagnostics.assertRootEmpty();
+    var pause_start: ?u64 = null;
+    var attempts: usize = 0;
+    while (attempts < 64) : (attempts += 1) {
+        const Registers = if (builtin.is_test) ContextTransferTestRegisters else x86_platform;
+        const decision = consumeWakeRescheduleOnce(Registers, cpu, state, frame);
+        switch (decision) {
+            .switched => return true,
+            .settled => return false,
+            .retry => {
+                @atomicStore(u8, &state.wake_reschedule, 1, .release);
+                return false;
+            },
+            .protected => {
+                if (pause_start == null) pause_start = runtimeAccountingNow();
+                std.atomic.spinLoopHint();
+            },
+        }
+    }
+    // Healthy but unusually fast loop: request a fresh safe boundary, rather
+    // than silently waiting another four-tick slice. Keep the bit if APIC
+    // delivery fails; the existing timer is an independent progress fallback.
+    const Delivery = if (builtin.is_test) WakeRecheckTestDelivery else smp;
+    _ = requestWakeBoundary(Delivery, cpu, state, pause_start, runtimeAccountingNow());
+    return false;
+}
+
+// Keep pending even when delivery fails. The normal timer remains independent;
+// frozen/null/backward clocks must not create a self-IPI chain.
+fn requestWakeBoundary(comptime Delivery: type, cpu: usize, state: *CpuSchedulerState, start: ?u64, end: ?u64) bool {
+    @atomicStore(u8, &state.wake_reschedule, 1, .release);
+    if (start == null or end == null or end.? <= start.?) return false;
+    return Delivery.interruptCpu(cpu);
+}
+const WakeRecheckTestDelivery = struct {
+    var attempts: usize = 0;
+    var success = true;
+    fn interruptCpu(_: usize) bool { attempts += 1; return success; }
+};
+
+const WakeRescheduleDecision = enum { switched, settled, retry, protected };
+fn consumeWakeRescheduleOnce(comptime Registers: type, cpu: usize, state: *CpuSchedulerState, frame: *TrapFrame) WakeRescheduleDecision {
+    scheduler_state.thread_table.lock();
+    defer scheduler_state.thread_table.unlock();
+    state.lock.lock();
+    state.runqueue_lock.lock();
+    const source = pinnedContextForCpu(cpu) orelse {
+        state.runqueue_lock.unlock(); state.lock.unlock(); return .settled;
+    };
+    const current = state.current_entity orelse {
+        state.runqueue_lock.unlock(); state.lock.unlock(); return .settled;
+    };
+    if (!state.enabled or state.is_idle or !source.ready or source.stopped or
+        !nodeMatches(current, source.id, source.generation, cpu) or current.ownership != .running)
+    {
+        state.runqueue_lock.unlock(); state.lock.unlock(); return .settled;
+    }
+    if (state.runqueue.count == 0) {
+        // No scheduling decision needs a sample. Keep the original checkpoint,
+        // credit and epoch: the next block/timer will settle this interval.
+        state.runqueue_lock.unlock(); state.lock.unlock(); return .settled;
+    }
+    const interval = state.runtime_accounting.prepare(runtimeAccountingNow(), 0);
+    if (!interval.measured or interval.runtime_ns > std.math.maxInt(i64)) {
+        state.runqueue_lock.unlock(); state.lock.unlock(); return .retry;
+    }
+    // This path commits real service even if the policy keeps the owner. The
+    // scalar API permits aliasing and copies the original on ANY error, so an
+    // in-place charge avoids a full Entity preflight copy without consuming a
+    // checkpoint on failure. Zero service retains the old deadline unchanged.
+    if (interval.runtime_ns != 0 and verified_sched.pacha_eevdf_entity_charge(&current.entity,
+        @intCast(interval.runtime_ns), cpuRunqueueFloor(state), &current.entity) != .ok)
+    {
+        state.runqueue_lock.unlock(); state.lock.unlock(); return .retry;
+    }
+    state.runtime_accounting.commit(interval);
+    var progress = current.entity.vruntime;
+    if (state.runqueue.minimumVruntime()) |v| progress = @min(progress, v);
+    if (progress > state.virtual_time) setCpuVirtualTime(state, progress);
+    // As in timer expiry, a queued IPC eligibility floor can exceed its
+    // vruntime. That older minimum must not freeze V despite service already
+    // consumed by this CPU. Advance no further than that ACTUAL service and
+    // the next eligibility boundary; never mint virtual progress for a wake.
+    if (bestEligibleForWake(state, state.virtual_time) == null) {
+        if (state.runqueue.minimumEligibleTime()) |eligible| {
+            const earned = @min(current.entity.vruntime, eligible);
+            if (earned > state.virtual_time) setCpuVirtualTime(state, earned);
+        }
+    }
+    const target = bestEligibleForWake(state, state.virtual_time) orelse {
+        if (comptime wake_trace.enabled) wake_trace.record(.wake_policy_ineligible, @intCast(state.runqueue.minimumEligibleTime() orelse state.virtual_time), @intCast(state.virtual_time), source.id);
+        if (comptime wake_trace.enabled) wake_trace.record(.wake_policy_service, @intCast(current.entity.vruntime), @intCast(current.entity.service_ns), source.id);
+        state.runqueue_lock.unlock(); state.lock.unlock(); return .settled;
+    };
+    // Equal deadlines retain the running owner. Selection always uses the best
+    // eligible queue entry, not the last publication or an IPI's old identity.
+    switch (wakeCandidateDecision(&current.entity, &target.entity, state.virtual_time, state.ownership_service_start)) {
+        .keep => { if (comptime wake_trace.enabled) wake_trace.record(.wake_policy_keep, @intCast(current.entity.deadline), @intCast(target.entity.deadline), target.thread_index); state.runqueue_lock.unlock(); state.lock.unlock(); return .settled; },
+        .protected => { if (comptime wake_trace.enabled) wake_trace.record(.wake_policy_protected, @intCast(current.entity.service_ns), @intCast(state.ownership_service_start), target.thread_index); state.runqueue_lock.unlock(); state.lock.unlock(); return .protected; },
+        .preempt => {},
+    }
+    if (comptime wake_trace.enabled) wake_trace.record(.wake_policy_switch, @intCast(current.entity.deadline), @intCast(target.entity.deadline), target.thread_index);
+    const tid = target.thread_index;
+    const generation = target.generation;
+    const old_epoch = state.ownership_service_start;
+    // T pins both incarnations through candidate admission, ownership transfer
+    // and context installation. The shared commit reuses this exact charged
+    // entity and queue hold, never a fictitious slice. CPU is dropped before the
+    // installer because activation acquires that same CPU lock itself.
+    const ready = runnableHandoffContextLocked(cpu, tid, generation);
+    const moved = ready and handoffChargedOwnerLocked(state, current, target);
+    state.runqueue_lock.unlock();
+    state.lock.unlock();
+    if (!moved) return .retry;
+    if (!builtin.is_test) @import("xstate_runtime.zig").saveIpcLiveIfNeeded();
+    if (switchToGenerationLockedWithRegisters(Registers, tid, generation, frame, frame.rax)) return .switched;
+    verifiedRollbackHandoffLocked(cpu, source.id, source.generation);
+    state.lock.lock(); state.ownership_service_start = old_epoch; state.lock.unlock();
+    return .retry;
+}
+
+fn runnableHandoffContextLocked(cpu: usize, tid: usize, generation: u32) bool {
+    const ctx = threadContextLocked(tid) orelse return false;
+    return ctx.allocated and ctx.generation == generation and ctx.ready and !ctx.stopped and
+        ctx.cpu_slot == cpu and threadAllowsCpu(ctx, cpu) and loadableContextLocked(ctx, generation) != null;
+}
+
 pub fn handoffToBestReadyThreadForWakeIpi(frame: *TrapFrame) bool {
-    return handoffToBestReadyThreadWithRax(frame, frame.rax, null);
+    return consumeWakeReschedule(frame);
 }
 
 // Yield and wake-IPI handoff differ only in the outgoing return value and
@@ -7275,11 +7719,6 @@ fn wakeIfWaitingTokenGenerationLocked(
     return .woke;
 }
 
-pub const KeyedWakeHandoffResult = struct {
-    wake: KeyedWakeResult,
-    handed_off: bool = false,
-};
-
 pub const WakeWaitTransfer = struct {
     peer: usize,
     peer_generation: u32,
@@ -7384,7 +7823,12 @@ fn tryWakeWaitTransferLocked(comptime Registers: type, comptime install: anytype
         const accounting = prepareRuntimeCharge(state, source, 0) orelse break :commit false;
         var running: verified_sched.Entity = undefined;
         var blocked: verified_sched.Entity = undefined;
-        if (scalarIssue("wake-wait-wake", verified_sched.pacha_eevdf_entity_wake(&target.entity, cpuRunqueueFloor(state), &awakened), request.peer) or
+        // This fast handoff can migrate a remote blocked peer. Keeping its
+        // absolute VR manufactures destination debt which ordinary migration
+        // then translates again. Use the common CPU-domain contract under the
+        // existing pair locks. Failure precedes mutation; awakened (including
+        // rollback) belongs to the destination domain after this preflight.
+        if (scalarIssue("wake-wait-wake", placeEntityInCpuDomain(.wake, &target.entity, last.virtual_time, state.virtual_time, cpuWakePlacementFloor(state), last_cpu != cpu, &awakened), request.peer) or
             scalarIssue("wake-wait-run", verified_sched.pacha_eevdf_entity_mark_running(&awakened, &running), request.peer) or
             scalarIssue("wake-wait-block", verified_sched.pacha_eevdf_entity_block(&accounting.entity, &blocked), source_id)) break :commit false;
 
@@ -7411,7 +7855,7 @@ fn tryWakeWaitTransferLocked(comptime Registers: type, comptime install: anytype
         source_ctx.wait_completion_claimed = false;
         source_ctx.wait_completion_publish_pending = false;
         source_ctx.wait_completion_rax = 0;
-        setWakeTickLocked(source_ctx, if (request.timeout_ticks == 0) 0 else lapic_tick_count +| request.timeout_ticks);
+        setWakeTickLocked(source_ctx, wakeTickAfterTicks(request.timeout_ticks));
         setThreadHotWaitState(source_id, true, source_ctx.wake_tick, false);
         setThreadHotCompletionClaimed(source_id, false);
         source.entity = blocked;
@@ -7523,14 +7967,14 @@ fn completeIpcNotifyWaiterAndHandoffWithInstall(
     if (uncontended) {
         // The fused path rechecks every condition under the CPU and runqueue
         // locks; this sample only avoids taking them when it cannot succeed.
-        wake_trace.record(.fused_try, thread_index, wait_token, thread_index);
-        if (tryFusedKeyedWakeLocked(install, .capability_checked, frame, thread_index, generation, owner, wait_token, resume_rax, sender_rax)) |handed_off| {
-            wake_trace.record(if (handed_off) .fused_commit else .fused_reject, thread_index, wait_token, thread_index);
+        if (comptime wake_trace.enabled) wake_trace.record(.fused_try, thread_index, wait_token, thread_index);
+        if (tryFusedIpcNotifyWakeLocked(install, frame, thread_index, generation, owner, wait_token, resume_rax, sender_rax)) |handed_off| {
+            if (comptime wake_trace.enabled) wake_trace.record(if (handed_off) .fused_commit else .fused_reject, thread_index, wait_token, thread_index);
             // A failed install rolled the waiter back to runnable on this
             // CPU; its completion stands.
             return if (handed_off) .handed_off else .published;
         }
-        wake_trace.record(.fused_reject, thread_index, wait_token, thread_index);
+        if (comptime wake_trace.enabled) wake_trace.record(.fused_reject, thread_index, wait_token, thread_index);
     }
     if (claimWaitTokenCompletionLocked(thread_index, generation, owner, wait_token) != .claimed) return .stale;
     return switch (publishClaimedWaitLocked(thread_index, generation, owner, wait_token, resume_rax, cpu, null)) {
@@ -7540,69 +7984,8 @@ fn completeIpcNotifyWaiterAndHandoffWithInstall(
     };
 }
 
-pub fn wakeIfWaitingTokenGenerationWithRaxAndHandoff(
-    frame: *TrapFrame,
-    thread_index: usize,
-    generation: u32,
-    owner: kernel.PrincipalId,
-    wait_token: u64,
-    resume_rax: u64,
-    sender_rax: u64,
-) KeyedWakeHandoffResult {
-    return wakeIfWaitingTokenAndHandoffWithInstall(switchToGenerationLocked, frame, thread_index, generation, owner, wait_token, resume_rax, sender_rax);
-}
-
-fn wakeIfWaitingTokenAndHandoffWithInstall(
+fn tryFusedIpcNotifyWakeLocked(
     comptime install: anytype,
-    frame: *TrapFrame,
-    thread_index: usize,
-    generation: u32,
-    owner: kernel.PrincipalId,
-    wait_token: u64,
-    resume_rax: u64,
-    sender_rax: u64,
-) KeyedWakeHandoffResult {
-    const result = wake: {
-        scheduler_state.thread_table.lock();
-        defer scheduler_state.thread_table.unlock();
-        const cpu = currentCpu();
-        const preferred = if (schedulerStateForSlot(cpu)) |state| blk: {
-            state.runqueue_lock.lock();
-            const uncontended = state.current_entity != null and state.runqueue.count == 0;
-            state.runqueue_lock.unlock();
-            break :blk if (uncontended) cpu else null;
-        } else null;
-        if (preferred != null) {
-            wake_trace.record(.fused_try, thread_index, wait_token, thread_index);
-            if (tryFusedKeyedWakeLocked(install, .same_process, frame, thread_index, generation, owner, wait_token, resume_rax, sender_rax)) |handed_off| {
-                wake_trace.record(if (handed_off) .fused_commit else .fused_reject, thread_index, wait_token, thread_index);
-                return .{ .wake = .woke, .handed_off = handed_off };
-            }
-            wake_trace.record(.fused_reject, thread_index, wait_token, thread_index);
-        }
-        // A miss has not consumed the wait. Preserve ordinary early-wake,
-        // stopped-thread and failed-publication behavior. Fusion's completed
-        // wake with a failed handoff returned above must never be sent again.
-        break :wake wakeIfWaitingTokenGenerationLocked(thread_index, generation, owner, wait_token, resume_rax, preferred);
-    };
-    if (result != .woke) return .{ .wake = result };
-    // A contended ordinary wake must not extend its global table critical
-    // section through context capture/installation. Reacquire with only the
-    // value identity; local handoff revalidates owner/generation/CPU/affinity
-    // and sole runnable ownership rather than retaining a context pointer.
-    scheduler_state.thread_table.lock();
-    defer scheduler_state.thread_table.unlock();
-    return .{ .wake = result, .handed_off = handoffOnlyReadyLocked(install, frame, thread_index, generation, owner, sender_rax) };
-}
-
-/// Who may complete the wait. A futex key is process-local, so its waker must
-/// belong to the waiter's process. An IPC notification was authorized by the
-/// sender's channel capability instead and crosses processes by design.
-const FusedWakeSender = enum { same_process, capability_checked };
-
-fn tryFusedKeyedWakeLocked(
-    comptime install: anytype,
-    comptime sender_scope: FusedWakeSender,
     frame: *TrapFrame,
     thread_index: usize,
     generation: u32,
@@ -7618,7 +8001,6 @@ fn tryFusedKeyedWakeLocked(
     const sender = threadContextLocked(sender_id) orelse return null;
     const peer = threadContextLocked(thread_index) orelse return null;
     if (!sender.allocated or sender.cpu_slot != cpu or !sender.ready or sender.stopped) return null;
-    if (sender_scope == .same_process and sender.owner_process != owner) return null;
     if (!peer.allocated or peer.owner_process != owner or peer.generation != generation or
         peer.active_wait_token != wait_token or peer.wait_completion_claimed or
         peer.ready or !peer.wait_mailbox or peer.stopped or !threadAllowsCpu(peer, cpu)) return null;
@@ -7659,7 +8041,12 @@ fn tryFusedKeyedWakeLocked(
         const accounting = prepareRuntimeCharge(state, source, 0) orelse break :commit false;
         var running: verified_sched.Entity = undefined;
         var finished_source: verified_sched.Entity = undefined;
-        if (scalarIssue("fused-wake", verified_sched.pacha_eevdf_entity_wake(&target.entity, cpuRunqueueFloor(state), &awakened), thread_index) or
+        // This fast handoff can migrate a remote blocked peer. Keeping its
+        // absolute VR manufactures destination debt which ordinary migration
+        // then translates again. Use the common CPU-domain contract under the
+        // existing pair locks. Failure precedes mutation; awakened (including
+        // rollback) belongs to the destination domain after this preflight.
+        if (scalarIssue("fused-wake", placeEntityInCpuDomain(.wake, &target.entity, last.virtual_time, state.virtual_time, cpuWakePlacementFloor(state), last_cpu != cpu, &awakened), thread_index) or
             scalarIssue("fused-run", verified_sched.pacha_eevdf_entity_mark_running(&awakened, &running), thread_index) or
             scalarIssue("fused-finish", verified_sched.pacha_eevdf_entity_finish(&accounting.entity, &finished_source), sender_id)) break :commit false;
         const old_source = source.entity;
@@ -7691,23 +8078,6 @@ fn tryFusedKeyedWakeLocked(
     if (!committed) return null;
     if (install(thread_index, generation, frame, sender_rax)) return true;
     rollbackLocalHandoffLocked(cpu, sender_id, sender_generation, thread_index, generation);
-    return false;
-}
-
-fn handoffOnlyReadyLocked(comptime install: anytype, frame: *TrapFrame, target_id: usize, generation: u32, owner: kernel.PrincipalId, sender_rax: u64) bool {
-    if (!verifiedCoreReady() or (!isBootstrapSchedulerCpu() and !apUserDispatchReady())) return false;
-    const cpu = currentCpu();
-    const sender_id = currentThread();
-    if (sender_id == target_id) return false;
-    const source = threadContextLocked(sender_id) orelse return false;
-    const target = threadContextLocked(target_id) orelse return false;
-    if (!source.allocated or source.cpu_slot != cpu or source.owner_process != owner or
-        !target.allocated or target.owner_process != owner or target.generation != generation or
-        !target.ready or target.cpu_slot != cpu or !threadAllowsCpu(target, cpu)) return false;
-    const sender_generation = source.generation;
-    if (!verifiedHandoffToThreadOnCpuLocked(true, cpu, target_id, generation, sender_id, sender_generation)) return false;
-    if (install(target_id, generation, frame, sender_rax)) return true;
-    rollbackLocalHandoffLocked(cpu, sender_id, sender_generation, target_id, generation);
     return false;
 }
 
@@ -7810,14 +8180,6 @@ test "IPC notify completes another process's waiter and runs it in one transitio
     scheduler_state.cpus[0].current_principal = sender_process;
     var frame = std.mem.zeroes(TrapFrame);
     frame.rip = 0x6000;
-
-    // A futex key is process-local: the same fusion must refuse this waker.
-    scheduler_state.thread_table.lock();
-    const futex_scope = tryFusedKeyedWakeLocked(FusedWakeTestInstaller.install, .same_process, &frame, 5, 17, default_process_principal, 11, 0, 1);
-    scheduler_state.thread_table.unlock();
-    try std.testing.expectEqual(@as(?bool, null), futex_scope);
-    try std.testing.expectEqual(@as(u64, 11), initial_thread_contexts[5].active_wait_token);
-    try std.testing.expectEqual(.blocked, initial_scheduler_entities[5].ownership);
 
     const result = completeIpcNotifyWaiterAndHandoffWithInstall(FusedWakeTestInstaller.install, &frame, 5, 17, default_process_principal, 11, 0, 3);
     try std.testing.expectEqual(IpcNotifyWakeResult.handed_off, result);
@@ -8253,7 +8615,7 @@ test "futex wake wait install failure keeps source blocked and committed receive
         request.timeout_ticks = 12;
         request.resume_rax = 5;
         var expected_peer: verified_sched.Entity = undefined;
-        try std.testing.expectEqual(.ok, verified_sched.pacha_eevdf_entity_wake(&initial_scheduler_entities[5].entity, cpuRunqueueFloor(&scheduler_state.cpus[0]), &expected_peer));
+        try std.testing.expectEqual(.ok, verified_sched.pacha_eevdf_entity_wake(&initial_scheduler_entities[5].entity, cpuWakePlacementFloor(&scheduler_state.cpus[0]), &expected_peer));
         WakeWaitTestInstaller.failure = @intCast(failure);
         var frame = std.mem.zeroes(TrapFrame);
         frame.rdx = std.math.maxInt(u64);
@@ -8266,7 +8628,7 @@ test "futex wake wait install failure keeps source blocked and committed receive
         try std.testing.expect(!initial_thread_contexts[4].ready);
         try std.testing.expectEqual(@as(u64, 1), initial_thread_contexts[4].frame.rdx);
         try std.testing.expectEqual(@as(u64, 5), initial_thread_contexts[4].frame.rax);
-        try std.testing.expectEqual(lapic_tick_count +| 12, initial_thread_contexts[4].wake_tick);
+        try std.testing.expectEqual(wakeTickAfterTicks(12), initial_thread_contexts[4].wake_tick);
         try std.testing.expectEqual(.runnable, initial_scheduler_entities[5].ownership);
         try std.testing.expectEqualDeep(expected_peer, initial_scheduler_entities[5].entity);
         try std.testing.expect(initial_thread_contexts[5].ready and !initial_thread_contexts[5].wait_mailbox);
@@ -8283,7 +8645,7 @@ test "futex wake wait install failure keeps source blocked and committed receive
     }
 }
 
-test "futex fused wake installs sole receiver from local or remote blocked CPU" {
+test "IPC notify fused wake installs sole receiver from local or remote blocked CPU" {
     const saved_contexts = initial_thread_contexts[4..7].*;
     const saved_hot = initial_thread_hot_states[4..7].*;
     defer {
@@ -8296,13 +8658,13 @@ test "futex fused wake installs sole receiver from local or remote blocked CPU" 
         const old_peer = initial_scheduler_entities[5].entity;
         var awake: verified_sched.Entity = undefined;
         var expected: verified_sched.Entity = undefined;
-        try std.testing.expectEqual(.ok, verified_sched.pacha_eevdf_entity_wake(&old_peer, cpuRunqueueFloor(&scheduler_state.cpus[0]), &awake));
+        try std.testing.expectEqual(.ok, verified_sched.pacha_eevdf_entity_wake(&old_peer, cpuWakePlacementFloor(&scheduler_state.cpus[0]), &awake));
         try std.testing.expectEqual(.ok, verified_sched.pacha_eevdf_entity_mark_running(&awake, &expected));
         var frame = std.mem.zeroes(TrapFrame);
         frame.rax = 901;
         frame.rip = 0x9999;
-        const result = wakeIfWaitingTokenAndHandoffWithInstall(FusedWakeTestInstaller.install, &frame, 5, 17, default_process_principal, 11, 0, 1);
-        try std.testing.expectEqualDeep(KeyedWakeHandoffResult{ .wake = .woke, .handed_off = true }, result);
+        const result = completeIpcNotifyWaiterAndHandoffWithInstall(FusedWakeTestInstaller.install, &frame, 5, 17, default_process_principal, 11, 0, 1);
+        try std.testing.expectEqualDeep(IpcNotifyWakeResult.handed_off, result);
         try std.testing.expectEqual(@as(u8, 0), scheduler_state.thread_table.lock_state.value);
         try std.testing.expectEqual(@as(usize, 1), FusedWakeTestInstaller.calls);
         try std.testing.expectEqualDeep(expected, initial_scheduler_entities[5].entity);
@@ -8328,7 +8690,7 @@ test "futex fused wake installs sole receiver from local or remote blocked CPU" 
     }
 }
 
-test "futex fused rejection leaves peer wait and entity unchanged" {
+test "IPC notify fused rejection leaves peer wait and entity unchanged" {
     const saved_contexts = initial_thread_contexts[4..7].*;
     const saved_hot = initial_thread_hot_states[4..7].*;
     defer {
@@ -8358,7 +8720,7 @@ test "futex fused rejection leaves peer wait and entity unchanged" {
                 initial_thread_contexts[6].ready = true;
                 try std.testing.expect(verifiedAddThread(6, 1, true));
             },
-            10 => source.owner_process = kernel.processPrincipalFromIndex(1).?,
+            10 => source.ready = false,
             11 => source.cpu_slot = 1,
             12 => source.stopped = true,
             13 => initial_scheduler_entities[5].ownership = .runnable,
@@ -8375,7 +8737,7 @@ test "futex fused rejection leaves peer wait and entity unchanged" {
         var frame = std.mem.zeroes(TrapFrame);
         const frame_before = frame;
         scheduler_state.thread_table.lock();
-        const result = tryFusedKeyedWakeLocked(FusedWakeTestInstaller.install, .same_process, &frame, 5, 17, default_process_principal, 11, 0, 1);
+        const result = tryFusedIpcNotifyWakeLocked(FusedWakeTestInstaller.install, &frame, 5, 17, default_process_principal, 11, 0, 1);
         scheduler_state.thread_table.unlock();
         try std.testing.expect(result == null);
         try std.testing.expectEqualDeep(peer_before, peer.*);
@@ -8387,7 +8749,7 @@ test "futex fused rejection leaves peer wait and entity unchanged" {
     }
 }
 
-test "futex fused context failure retains completed wake and restores sender ownership" {
+test "IPC notify fused context failure retains completed wake and restores sender ownership" {
     const saved_contexts = initial_thread_contexts[4..7].*;
     const saved_hot = initial_thread_hot_states[4..7].*;
     defer {
@@ -8399,8 +8761,8 @@ test "futex fused context failure retains completed wake and restores sender own
     FusedWakeTestInstaller.fail = true;
     var frame = std.mem.zeroes(TrapFrame);
     frame.rax = 81;
-    const result = wakeIfWaitingTokenAndHandoffWithInstall(FusedWakeTestInstaller.install, &frame, 5, 17, default_process_principal, 11, 0, 1);
-    try std.testing.expectEqualDeep(KeyedWakeHandoffResult{ .wake = .woke }, result);
+    const result = completeIpcNotifyWaiterAndHandoffWithInstall(FusedWakeTestInstaller.install, &frame, 5, 17, default_process_principal, 11, 0, 1);
+    try std.testing.expectEqualDeep(IpcNotifyWakeResult.published, result);
     try std.testing.expectEqual(@as(usize, 1), FusedWakeTestInstaller.calls);
     try std.testing.expectEqual(@as(usize, 4), currentThread());
     try std.testing.expectEqual(@as(u64, 81), frame.rax);
@@ -8413,7 +8775,7 @@ test "futex fused context failure retains completed wake and restores sender own
     try std.testing.expectEqual([3]usize{ 0, 0, 0 }, ContextTransferTestRegisters.writes);
 }
 
-test "futex fused ordinary fallback preserves competitors stopped early and publication failure" {
+test "futex ordinary publication preserves competitors stopped early and enqueue failure" {
     const saved_contexts = initial_thread_contexts[4..7].*;
     const saved_hot = initial_thread_hot_states[4..7].*;
     defer {
@@ -8443,66 +8805,23 @@ test "futex fused ordinary fallback preserves competitors stopped early and publ
         }
         syncHotStateFromContext(5);
         const before = peer.*;
-        var frame = std.mem.zeroes(TrapFrame);
-        const result = wakeIfWaitingTokenAndHandoffWithInstall(FusedWakeTestInstaller.install, &frame, 5, 17, default_process_principal, 11, 0, 1);
-        try std.testing.expect(!result.handed_off);
+        const frame = std.mem.zeroes(TrapFrame);
+        const original_frame = frame;
+        const result = wakeIfWaitingTokenGenerationWithRax(5, 17, default_process_principal, 11, 0);
+        try std.testing.expectEqualDeep(original_frame, frame);
         try std.testing.expectEqual(@as(usize, 4), currentThread());
         try std.testing.expectEqual(@as(usize, 0), FusedWakeTestInstaller.calls);
         if (scenario == 3) {
-            try std.testing.expectEqual(.publish_failed, result.wake);
+            try std.testing.expectEqual(.publish_failed, result);
             try std.testing.expectEqualDeep(before, peer.*);
         } else {
-            try std.testing.expectEqual(.woke, result.wake);
+            try std.testing.expectEqual(.woke, result);
             try std.testing.expect(!peer.wait_mailbox);
             if (scenario == 0) {
                 try std.testing.expectEqual(.runnable, initial_scheduler_entities[6].ownership);
                 try std.testing.expect(scheduler_state.cpus[0].runqueue.contains(&initial_scheduler_entities[6]));
             }
             if (scenario == 1) try std.testing.expect(peer.resume_after_stop and !peer.ready);
-        }
-    }
-}
-
-test "futex fused ordinary handoff revalidates wake identity and sole ownership" {
-    const saved_contexts = initial_thread_contexts[4..7].*;
-    const saved_hot = initial_thread_hot_states[4..7].*;
-    defer {
-        initial_thread_contexts[4..7].* = saved_contexts;
-        initial_thread_hot_states[4..7].* = saved_hot;
-        initializeStaticStorage();
-    }
-    for (0..7) |scenario| {
-        try initializeFusedWakeTest(0);
-        const peer = &initial_thread_contexts[5];
-        peer.cpu_affinity = testAffinity(1);
-        peer.ready = true;
-        try std.testing.expect(verifiedWakeThreadGeneration(5, 17));
-        syncHotStateFromContext(5);
-        // Model a change after ordinary publication but before TT reacquire.
-        switch (scenario) {
-            0 => {},
-            1 => peer.generation += 1,
-            2 => peer.owner_process = kernel.processPrincipalFromIndex(1).?,
-            3 => peer.cpu_slot = 1,
-            4 => peer.cpu_affinity = testAffinity(2),
-            5 => peer.ready = false,
-            6 => {
-                initial_thread_contexts[6].allocated = true;
-                initial_thread_contexts[6].ready = true;
-                try std.testing.expect(verifiedAddThread(6, 1, true));
-            },
-            else => unreachable,
-        }
-        var frame = std.mem.zeroes(TrapFrame);
-        scheduler_state.thread_table.lock();
-        const handed_off = handoffOnlyReadyLocked(FusedWakeTestInstaller.install, &frame, 5, 17, default_process_principal, 1);
-        scheduler_state.thread_table.unlock();
-        try std.testing.expectEqual(scenario == 0, handed_off);
-        try std.testing.expectEqual(@as(usize, if (scenario == 0) 1 else 0), FusedWakeTestInstaller.calls);
-        if (scenario != 0) {
-            try std.testing.expectEqual(@as(usize, 4), currentThread());
-            try std.testing.expectEqual(.running, initial_scheduler_entities[4].ownership);
-            try std.testing.expect(scheduler_state.cpus[0].runqueue.contains(&initial_scheduler_entities[5]));
         }
     }
 }
@@ -8519,6 +8838,8 @@ pub fn claimWaitTokenCompletion(
     owner: kernel.PrincipalId,
     wait_token: u64,
 ) WaitTokenClaimResult {
+    const wf11 = @import("ipc_metric.zig").detailBegin();
+    defer @import("ipc_metric.zig").detailEnd(.claim, wf11);
     if (wait_token == 0) return .stale;
     scheduler_state.thread_table.lock();
     defer scheduler_state.thread_table.unlock();
@@ -8566,7 +8887,7 @@ fn claimWaitTokenCompletionLocked(
     setWakeTickLocked(ctx, 0);
     setThreadHotWaitState(thread_index, true, 0, ctx.ready);
     setThreadHotCompletionClaimed(thread_index, false);
-    wake_trace.record(.wait_claim, @intFromEnum(owner), wait_token, thread_index);
+    if (comptime wake_trace.enabled) wake_trace.record(.wait_claim, wake_trace.identity(@intFromEnum(owner), generation), wait_token, thread_index);
     return .claimed;
 }
 
@@ -8647,6 +8968,8 @@ pub fn publishClaimedWaitCompletion(
     wait_token: u64,
     resume_rax: u64,
 ) ClaimedWaitPublishResult {
+    const wf11 = @import("ipc_metric.zig").detailBegin();
+    defer @import("ipc_metric.zig").detailEnd(.publication, wf11);
     scheduler_state.thread_table.lock();
     defer scheduler_state.thread_table.unlock();
     return publishClaimedWaitLocked(
@@ -8671,6 +8994,8 @@ pub fn publishClaimedWaitCompletionPreferred(
     resume_rax: u64,
     preferred_cpu: usize,
 ) ClaimedWaitPublishResult {
+    const wf11 = @import("ipc_metric.zig").detailBegin();
+    defer @import("ipc_metric.zig").detailEnd(.publication, wf11);
     scheduler_state.thread_table.lock();
     defer scheduler_state.thread_table.unlock();
     return publishClaimedWaitLocked(
@@ -9401,7 +9726,7 @@ pub fn blockCurrentThreadPreferred(
     ctx.wait_completion_claimed = false;
     ctx.wait_completion_publish_pending = false;
     ctx.wait_completion_rax = 0;
-    setWakeTickLocked(ctx, if (timeout_ticks == 0) 0 else lapic_tick_count +| timeout_ticks);
+    setWakeTickLocked(ctx, wakeTickAfterTicks(timeout_ticks));
     ctx.wait_uninterruptible = wait_uninterruptible;
     commitThreadBlockedLocked(ctx);
     setThreadHotCr3(current_thread, ctx.cr3);
@@ -9640,7 +9965,7 @@ test "uninterruptible wait real BSP AP admission matrix and wait attribute lifet
                     try std.testing.expectEqual(!expected, ctx.ready);
                     try std.testing.expectEqual(expected and uninterruptible, ctx.wait_uninterruptible);
                     if (admitted) {
-                        wakeIfTimerExpired(4, lapic_tick_count +| 10);
+                        wakeIfTimerExpired(4, wakeTickAfterTicks(10));
                         try std.testing.expect(ctx.ready and !ctx.wait_uninterruptible);
                         try std.testing.expectEqual(@as(u64, 5), ctx.frame.rax);
                     }
@@ -9916,7 +10241,7 @@ pub fn testUninterruptibleWaitFrontendMatrix() !void {
                                 try std.testing.expectEqual(if (kind == 1) @as(u64, 1) else sc.syscall_ok, ctx.frame.rax);
                                 if (kind == 0) try std.testing.expectEqual(@as(u64, 11), initial_thread_contexts[4].frame.r10);
                             }
-                        } else wakeIfTimerExpired(4, lapic_tick_count +| 10);
+                        } else wakeIfTimerExpired(4, wakeTickAfterTicks(10));
                         try std.testing.expect(ctx.ready and !ctx.wait_uninterruptible);
                     }
                 }
@@ -9969,6 +10294,30 @@ test "thread storage IDs preserve legacy ordering and reject representation over
     try std.testing.expect(nextThreadCapacity(threadIdValueCount + 1, threadIdValueCount) == null);
 }
 
+test "thread storage initialization without a registered signal sibling" {
+    const saved = try std.testing.allocator.dupe(ThreadContext, &initial_thread_contexts);
+    defer std.testing.allocator.free(saved);
+    const saved_hot = initial_thread_hot_states;
+    initializeStaticStorage();
+    defer {
+        @memcpy(&initial_thread_contexts, saved);
+        initial_thread_hot_states = saved_hot;
+        initializeStaticStorage();
+    }
+    scheduler_state.thread_table.lock();
+    defer scheduler_state.thread_table.unlock();
+    for (&initial_thread_contexts) |*ctx| {
+        ctx.allocated = false;
+        ctx.signal_entry = 0;
+    }
+    for (0..3) |index| {
+        try std.testing.expect(initializeThreadContextLocked(index, default_process_principal, 0x2000, std.mem.zeroes(TrapFrame), false));
+        const ctx = threadContextLocked(index).?;
+        try std.testing.expectEqual(@as(u64, 0), ctx.signal_entry);
+        try std.testing.expect(!ctx.signal_owner and !ctx.signal_delivery_ready);
+    }
+}
+
 test "thread storage creates 65537 identities and retires terminal generation" {
     const saved = try std.testing.allocator.dupe(ThreadContext, &initial_thread_contexts);
     defer std.testing.allocator.free(saved);
@@ -9997,6 +10346,9 @@ test "thread storage creates 65537 identities and retires terminal generation" {
         if (index == 0) try std.testing.expect(!initializeThreadContextLocked(index, .Device0, 0x2000, std.mem.zeroes(TrapFrame), false));
         try std.testing.expect(initializeThreadContextLocked(index, default_process_principal, 0x2000, std.mem.zeroes(TrapFrame), false));
         try std.testing.expect(verifiedAddThreadLocked(index, ctx.generation, false));
+        // This test exercises identity capacity. Give the fixture a registered
+        // sibling so each new identity need not scan all 65537 empty handlers.
+        if (index == 0) ctx.signal_entry = 0x4000 else try std.testing.expectEqual(@as(u64, 0x4000), ctx.signal_entry);
     }
     const last = count - 1;
     const ctx = threadContextLocked(last).?;
@@ -10050,6 +10402,10 @@ test "thread storage shared body reclamation preserves generations pins and reje
         for (initialThreadCapacity..count) |index| {
             try std.testing.expect(initializeThreadContextLocked(index, default_process_principal, 0x2000, std.mem.zeroes(TrapFrame), false));
             try std.testing.expect(verifiedAddThreadLocked(index, 1, false));
+            // Keep the reclamation fixture's registration lookup bounded;
+            // generation, pin and rejected-return checks still cover all slots.
+            const ctx = threadContextLocked(index).?;
+            if (index == initialThreadCapacity) ctx.signal_entry = 0x4000 else try std.testing.expectEqual(@as(u64, 0x4000), ctx.signal_entry);
         }
         for (initialThreadCapacity..count - 1) |index| try std.testing.expect(releaseThreadLocked(index));
     }
@@ -13041,4 +13397,770 @@ test "PI scheduler fixture reset drains live queues before rewriting contexts" {
     try std.testing.expectEqual(@as(u64, 0), pi_records.capacity);
     for (4..8) |i| try std.testing.expect(initial_thread_contexts[i].pi_node.waiting_mutex == null and initial_thread_contexts[i].pi_node.owned_head == null);
     for (5..7) |i| try std.testing.expectEqual(@as(u64, @intFromEnum(PiResult.owner_missing)), initial_thread_contexts[i].frame.rax);
+}
+
+// Isolated host fixture for the real syscall-dispatch publication boundary.
+// Unlike collector mocks, its sender owns a running EEVDF entity, so a
+// count=1 context-transfer policy would actually be eligible to switch it.
+pub const PlainWakeTestSupport = if (builtin.is_test) struct {
+    var saved_contexts: [3]ThreadContext = undefined;
+    var saved_hot: [3]ThreadHotState = undefined;
+    pub fn start() !void {
+        saved_contexts = initial_thread_contexts[4..7].*;
+        saved_hot = initial_thread_hot_states[4..7].*;
+        try initializeFusedWakeTest(0);
+    }
+    pub fn end() void {
+        initial_thread_contexts[4..7].* = saved_contexts;
+        initial_thread_hot_states[4..7].* = saved_hot;
+        initializeStaticStorage();
+    }
+    pub fn secondPeer() !void {
+        initial_thread_contexts[6] = initial_thread_contexts[5];
+        initial_thread_contexts[6].id = 6;
+        initial_thread_contexts[6].deadline_node = .{};
+        initial_thread_contexts[6].active_wait_token = 12;
+        initial_thread_contexts[6].scheduler_entity = &initial_scheduler_entities[6];
+        try std.testing.expect(verifiedAddThread(6, 17, false));
+        syncHotStateFromContext(6);
+    }
+    pub fn registerWrites() [3]usize { return ContextTransferTestRegisters.writes; }
+} else struct {};
+
+test "wake preemption charges actual service and preserves outgoing return without quantum renewal" {
+    try PlainWakeTestSupport.start();
+    defer PlainWakeTestSupport.end();
+    defer RuntimeAccountingTest.now_ns = null;
+    scheduler_state.cpu_count = 1;
+    const cpu = &scheduler_state.cpus[0];
+    cpu.runtime_accounting.start(0);
+    RuntimeAccountingTest.now_ns = 2_000;
+    cpu.tick_accum = 3;
+    cpu.deferred_slice_ticks = 2;
+    try std.testing.expectEqual(KeyedWakeResult.woke, wakeIfWaitingTokenGenerationWithRax(5, 17, default_process_principal, 11, 123));
+    try std.testing.expectEqual(@as(u8, 1), @atomicLoad(u8, &cpu.wake_reschedule, .acquire));
+    var frame = std.mem.zeroes(TrapFrame);
+    frame.cs = 0x23; frame.ss = 0x1b; frame.rip = 0x6000; frame.rax = 99;
+    try std.testing.expectEqual(WakeRescheduleDecision.switched, consumeWakeRescheduleOnce(ContextTransferTestRegisters, 0, cpu, &frame));
+    try std.testing.expectEqual(@as(usize, 5), currentThread());
+    try std.testing.expectEqual(@as(u64, 99), initial_thread_contexts[4].frame.rax);
+    try std.testing.expectEqual(@as(u64, 0x6000), initial_thread_contexts[4].frame.rip);
+    try std.testing.expectEqual(@as(u64, 123), frame.rax);
+    try std.testing.expectEqual(@as(u64, 3), cpu.tick_accum);
+    try std.testing.expectEqual(@as(u64, 2), cpu.deferred_slice_ticks);
+    try std.testing.expectEqual(@as(i64, 2_000), initial_scheduler_entities[4].entity.service_ns);
+    try std.testing.expectEqual(@as(u64, 2_000), cpu.runtime_accounting.credit_ns);
+    try std.testing.expectEqual(@as(usize, 1), cpu.runqueue.count);
+}
+
+test "wake preemption protection clock failure ring zero and clear before work" {
+    try PlainWakeTestSupport.start();
+    defer PlainWakeTestSupport.end();
+    defer RuntimeAccountingTest.now_ns = null;
+    scheduler_state.cpu_count = 1;
+    const cpu = &scheduler_state.cpus[0];
+    cpu.runtime_accounting.start(0);
+    RuntimeAccountingTest.now_ns = 500;
+    try std.testing.expectEqual(KeyedWakeResult.woke, wakeIfWaitingTokenGenerationWithRax(5, 17, default_process_principal, 11, 0));
+    var frame = std.mem.zeroes(TrapFrame);
+    frame.rax = 99;
+    try std.testing.expect(!consumeWakeReschedule(&frame));
+    try std.testing.expectEqual(@as(u8, 1), @atomicLoad(u8, &cpu.wake_reschedule, .acquire));
+    frame.cs = 0x23; frame.ss = 0x1b;
+    try std.testing.expectEqual(WakeRescheduleDecision.protected, consumeWakeRescheduleOnce(ContextTransferTestRegisters, 0, cpu, &frame));
+    try std.testing.expectEqual(@as(i64, 0), cpu.ownership_service_start);
+    RuntimeAccountingTest.now_ns = null;
+    try std.testing.expectEqual(WakeRescheduleDecision.retry, consumeWakeRescheduleOnce(ContextTransferTestRegisters, 0, cpu, &frame));
+    try std.testing.expectEqual(@as(i64, 500), initial_scheduler_entities[4].entity.service_ns);
+    RuntimeAccountingTest.now_ns = 400;
+    try std.testing.expectEqual(WakeRescheduleDecision.retry, consumeWakeRescheduleOnce(ContextTransferTestRegisters, 0, cpu, &frame));
+    try std.testing.expectEqual(@as(i64, 500), initial_scheduler_entities[4].entity.service_ns);
+    // A publication during/after clear cannot be erased by a late clear.
+    try std.testing.expectEqual(@as(u8, 1), @atomicRmw(u8, &cpu.wake_reschedule, .Xchg, 0, .acq_rel));
+    @atomicStore(u8, &cpu.wake_reschedule, 1, .release);
+    RuntimeAccountingTest.now_ns = 2_000;
+    try std.testing.expectEqual(WakeRescheduleDecision.switched, consumeWakeRescheduleOnce(ContextTransferTestRegisters, 0, cpu, &frame));
+    try std.testing.expectEqual(@as(u8, 1), @atomicLoad(u8, &cpu.wake_reschedule, .acquire));
+}
+
+test "wake preemption selects best eligible and handles equal later stopped affinity frozen and idle" {
+    for (0..8) |scenario| {
+        try PlainWakeTestSupport.start();
+        defer PlainWakeTestSupport.end();
+        defer RuntimeAccountingTest.now_ns = null;
+        scheduler_state.cpu_count = 1;
+        const cpu = &scheduler_state.cpus[0];
+        cpu.runtime_accounting.start(0);
+        RuntimeAccountingTest.now_ns = if (scenario == 5) 500 else 2000;
+        try std.testing.expectEqual(KeyedWakeResult.woke, wakeIfWaitingTokenGenerationWithRax(5, 17, default_process_principal, 11, 0));
+        var frame = std.mem.zeroes(TrapFrame);
+        frame.cs = 0x23; frame.ss = 0x1b; frame.rax = 8;
+        const target = &initial_scheduler_entities[5];
+        switch (scenario) {
+            0, 1 => {
+                // Replace through tree API: never mutate a linked ordering key.
+                try std.testing.expect(cpu.runqueue.remove(target));
+                target.entity.vruntime = if (scenario == 0) 2000 else 3000;
+                target.entity.eligible_time = target.entity.vruntime;
+                target.entity.deadline = target.entity.vruntime + target.entity.slice_ns;
+                try std.testing.expect(cpu.runqueue.insert(target));
+                try std.testing.expect(!consumeWakeReschedule(&frame));
+                try std.testing.expectEqual(@as(usize, 4), currentThread());
+            },
+            2 => {
+                initial_thread_contexts[5].stopped = true;
+                try std.testing.expect(!consumeWakeReschedule(&frame));
+                try std.testing.expectEqual(@as(usize, 4), currentThread());
+            },
+            3 => {
+                initial_thread_contexts[5].cpu_affinity = testAffinity(2);
+                try std.testing.expect(!consumeWakeReschedule(&frame));
+                try std.testing.expectEqual(@as(usize, 4), currentThread());
+            },
+            4 => {
+                initial_scheduler_entities[4].entity.vruntime = 4000;
+                initial_scheduler_entities[4].entity.eligible_time = 4000;
+                initial_scheduler_entities[4].entity.deadline = 4000 + initial_scheduler_entities[4].entity.slice_ns;
+                try std.testing.expect(consumeWakeReschedule(&frame));
+                try std.testing.expectEqual(@as(usize, 5), currentThread());
+            },
+            5 => {
+                try std.testing.expect(!consumeWakeReschedule(&frame));
+                try std.testing.expectEqual(@as(u8, 1), @atomicLoad(u8, &cpu.wake_reschedule, .acquire));
+                try std.testing.expectEqual(@as(i64, 500), initial_scheduler_entities[4].entity.service_ns);
+                RuntimeAccountingTest.now_ns = 2000;
+                try std.testing.expect(consumeWakeReschedule(&frame));
+            },
+            6 => {
+                initial_thread_contexts[5].generation += 1;
+                try std.testing.expect(!consumeWakeReschedule(&frame));
+                try std.testing.expectEqual(@as(usize, 4), currentThread());
+            },
+            7 => {
+                cpu.enabled = false;
+                try std.testing.expect(!consumeWakeReschedule(&frame));
+                try std.testing.expectEqual(@as(usize, 4), currentThread());
+            },
+            else => unreachable,
+        }
+    }
+}
+
+test "wake preemption sleep placement bounds V relative credit after floor advance or migration" {
+    var cpu: CpuSchedulerState = .{};
+    var sleeper: verified_sched.Entity = undefined;
+    try std.testing.expectEqual(.ok, verified_sched.pacha_eevdf_entity_init(4, 1, 1024, 4000000, 0, &sleeper));
+    try std.testing.expectEqual(.ok, verified_sched.pacha_eevdf_entity_block(&sleeper, &sleeper));
+    for ([_]i64{ 0, 1, 1000, 1000000000, std.math.maxInt(i64) - 4000001 }) |v| {
+        cpu.virtual_time = v;
+        var awake: verified_sched.Entity = undefined;
+        try std.testing.expectEqual(.ok, verified_sched.pacha_eevdf_entity_wake(&sleeper, cpuWakePlacementFloor(&cpu), &awake));
+        try std.testing.expect(awake.vruntime >= v -| maximum_wake_credit);
+        try std.testing.expectEqual(.ok, verified_sched.pacha_eevdf_entity_migrate(&awake, cpuWakePlacementFloor(&cpu), &awake));
+        try std.testing.expect(awake.vruntime >= v -| maximum_wake_credit);
+        try std.testing.expectEqual(.ok, verified_sched.pacha_eevdf_entity_block(&awake, &sleeper));
+    }
+    cpu.virtual_time = std.math.maxInt(i64);
+    try std.testing.expectEqual(.ok, verified_sched.pacha_eevdf_entity_init(4, 1, 1024, 8_000_000, 0, &sleeper));
+    try std.testing.expectEqual(.ok, verified_sched.pacha_eevdf_entity_block(&sleeper, &sleeper));
+    var rejected: verified_sched.Entity = undefined;
+    try std.testing.expectEqual(.overflow, verified_sched.pacha_eevdf_entity_wake(&sleeper, cpuWakePlacementFloor(&cpu), &rejected));
+    try std.testing.expectEqualDeep(sleeper, rejected);
+}
+
+test "wake preemption compares eligible earlier equal later and best of several without advancing eligibility" {
+    for (0..5) |scenario| {
+        try PlainWakeTestSupport.start();
+        defer PlainWakeTestSupport.end();
+        defer RuntimeAccountingTest.now_ns = null;
+        scheduler_state.cpu_count = 1;
+        const cpu = &scheduler_state.cpus[0];
+        RuntimeAccountingTest.now_ns = 2000;
+        cpu.runtime_accounting.start(2000);
+        const current = &initial_scheduler_entities[4];
+        current.entity.service_ns = 2000;
+        current.entity.vruntime = 2000;
+        current.entity.eligible_time = 2000;
+        current.entity.deadline = 4002000;
+        setCpuVirtualTime(cpu, 2000);
+        if (scenario == 4) {
+            var frame = std.mem.zeroes(TrapFrame);
+            frame.cs = 0x23; frame.ss = 0x1b;
+            @atomicStore(u8, &cpu.wake_reschedule, 1, .release);
+            try std.testing.expect(!consumeWakeReschedule(&frame));
+            try std.testing.expectEqual(@as(usize, 4), currentThread());
+            continue;
+        }
+        if (scenario == 3) {
+            try PlainWakeTestSupport.secondPeer();
+            try std.testing.expectEqual(KeyedWakeResult.woke, wakeIfWaitingTokenGenerationWithRax(6, 17, default_process_principal, 12, 66));
+            const first = &initial_scheduler_entities[6];
+            try std.testing.expect(cpu.runqueue.remove(first));
+            first.entity.slice_ns = 1000000;
+            first.entity.deadline = first.entity.eligible_time + first.entity.slice_ns;
+            try std.testing.expect(cpu.runqueue.insert(first));
+        }
+        try std.testing.expectEqual(KeyedWakeResult.woke, wakeIfWaitingTokenGenerationWithRax(5, 17, default_process_principal, 11, 55));
+        const target = &initial_scheduler_entities[5];
+        try std.testing.expect(cpu.runqueue.remove(target));
+        target.entity.slice_ns = switch (scenario) { 0 => 2000000, 1 => 4000000, else => 8000000 };
+        target.entity.deadline = target.entity.eligible_time + target.entity.slice_ns;
+        try std.testing.expect(cpu.runqueue.insert(target));
+        var frame = std.mem.zeroes(TrapFrame);
+        frame.cs = 0x23; frame.ss = 0x1b;
+        try std.testing.expectEqual(scenario == 0 or scenario == 3, consumeWakeReschedule(&frame));
+        try std.testing.expectEqual(@as(usize, if (scenario == 0) 5 else if (scenario == 3) 6 else 4), currentThread());
+        try std.testing.expectEqual(@as(i64, 2000), cpu.virtual_time);
+    }
+}
+
+test "wake preemption request release exchange retains concurrent publications" {
+    var requested = std.atomic.Value(u8).init(0);
+    var acknowledged = std.atomic.Value(u32).init(0);
+    const Publisher = struct {
+        fn run(bit: *std.atomic.Value(u8), ack: *std.atomic.Value(u32)) void {
+            for (1..10001) |i| {
+                bit.store(1, .release);
+                while (ack.load(.acquire) != i) std.atomic.spinLoopHint();
+            }
+        }
+    };
+    const thread = try std.Thread.spawn(.{}, Publisher.run, .{ &requested, &acknowledged });
+    for (1..10001) |i| {
+        while (requested.swap(0, .acq_rel) == 0) std.atomic.spinLoopHint();
+        acknowledged.store(@intCast(i), .release);
+    }
+    thread.join();
+    try std.testing.expectEqual(@as(u32, 10000), acknowledged.load(.acquire));
+}
+
+test "wake preemption local hint respects q0 q1 q2 affinity clock peer ordering and block tail" {
+    for (0..13) |scenario| {
+        try PlainWakeTestSupport.start();
+        defer PlainWakeTestSupport.end();
+        defer RuntimeAccountingTest.now_ns = null;
+        const cpu = &scheduler_state.cpus[0];
+        cpu.runtime_accounting.start(0);
+        RuntimeAccountingTest.now_ns = 2000;
+        const target = &initial_thread_contexts[5];
+        const node = target.scheduler_entity.?;
+        target.cpu_slot = 1;
+        node.cpu_slot = 1;
+        syncHotStateFromContext(5);
+        var extra: scheduler_runqueue.Node = .{};
+        defer if (extra.linked_tree != null) { _ = cpu.runqueue.remove(&extra); };
+        if (scenario >= 1 and scenario <= 3) {
+            initial_thread_contexts[6] = .{ .id = 6, .generation = 1, .allocated = true, .ready = true, .cpu_slot = 0, .scheduler_entity = &initial_scheduler_entities[6] };
+            try std.testing.expect(verifiedAddThread(6, 1, true));
+            const peer = &initial_scheduler_entities[6];
+            try std.testing.expect(cpu.runqueue.remove(peer));
+            peer.entity.slice_ns = switch (scenario) { 1 => 1000000, 2 => 8000000, else => 4000000 };
+            peer.entity.deadline = peer.entity.eligible_time + peer.entity.slice_ns;
+            try std.testing.expect(cpu.runqueue.insert(peer));
+        }
+        if (scenario == 4) {
+            try std.testing.expectEqual(.ok, verified_sched.pacha_eevdf_entity_init(90, 1, 1024, 4000000, 0, &extra.entity));
+            extra.thread_index = 7; extra.generation = 1; extra.ownership = .runnable;
+            try std.testing.expect(cpu.runqueue.insert(&extra));
+            initial_thread_contexts[6] = .{ .id = 6, .allocated = true, .ready = true, .scheduler_entity = &initial_scheduler_entities[6] };
+            try std.testing.expect(verifiedAddThread(6, 1, true));
+        }
+        if (scenario == 5) target.cpu_affinity = testAffinity(2);
+        if (scenario == 6) RuntimeAccountingTest.now_ns = null;
+        if (scenario == 7) RuntimeAccountingTest.now_ns = 500;
+        if (scenario == 9) initial_thread_contexts[4].stopped = true;
+        if (scenario == 10) initial_thread_contexts[4].ready = false;
+        if (scenario == 11) initial_thread_contexts[4].generation += 1;
+        if (scenario == 12) cpu.enabled = false;
+        // q1 earlier/equal-winning peer rejects; q1 later peer permits. q2+
+        // is never an excuse to funnel additional load onto the source CPU.
+        try std.testing.expectEqual(scenario == 0 or scenario == 2 or scenario == 8, wakeCanUseSourceCpu(target, node, 0));
+        if (scenario == 8) {
+            const remote = &scheduler_state.cpus[1];
+            remote.current_thread = 5; remote.is_idle = false;
+            try std.testing.expectEqual(KeyedWakeResult.woke, wakeIfWaitingTokenGenerationWithRax(5, 17, default_process_principal, 11, 0));
+            try std.testing.expectEqual(@as(usize, 1), target.cpu_slot);
+        }
+    }
+}
+
+
+test "wake preemption frozen clock and delivery failure retain request without storms" {
+    var cpu: CpuSchedulerState = .{};
+    WakeRecheckTestDelivery.attempts = 0;
+    WakeRecheckTestDelivery.success = false;
+    defer WakeRecheckTestDelivery.success = true;
+    for (0..100) |_| {
+        try std.testing.expect(!requestWakeBoundary(WakeRecheckTestDelivery, 0, &cpu, 10, 10));
+        try std.testing.expect(!requestWakeBoundary(WakeRecheckTestDelivery, 0, &cpu, 10, 9));
+        try std.testing.expect(!requestWakeBoundary(WakeRecheckTestDelivery, 0, &cpu, null, 11));
+        try std.testing.expect(!requestWakeBoundary(WakeRecheckTestDelivery, 0, &cpu, 10, null));
+    }
+    try std.testing.expectEqual(@as(usize, 0), WakeRecheckTestDelivery.attempts);
+    try std.testing.expectEqual(@as(u8, 1), @atomicLoad(u8, &cpu.wake_reschedule, .acquire));
+    try std.testing.expect(!requestWakeBoundary(WakeRecheckTestDelivery, 0, &cpu, 10, 11));
+    try std.testing.expectEqual(@as(usize, 1), WakeRecheckTestDelivery.attempts);
+    try std.testing.expectEqual(@as(u8, 1), @atomicLoad(u8, &cpu.wake_reschedule, .acquire));
+    WakeRecheckTestDelivery.success = true;
+    try std.testing.expect(requestWakeBoundary(WakeRecheckTestDelivery, 0, &cpu, 10, 11));
+    try std.testing.expectEqual(@as(usize, 2), WakeRecheckTestDelivery.attempts);
+    try std.testing.expectEqual(@as(u8, 1), @atomicLoad(u8, &cpu.wake_reschedule, .acquire));
+}
+
+test "wake preemption low queued floor limits repeated sleep credit and keeps charge semantics" {
+    var cpu: CpuSchedulerState = .{};
+    var old: scheduler_runqueue.Node = .{ .thread_index = 3, .generation = 1, .ownership = .runnable };
+    try std.testing.expectEqual(.ok, verified_sched.pacha_eevdf_entity_init(3, 1, 1024, 4000000, 0, &old.entity));
+    try std.testing.expect(cpu.runqueue.insert(&old));
+    defer { _ = cpu.runqueue.remove(&old); }
+    var sleeper: verified_sched.Entity = undefined;
+    try std.testing.expectEqual(.ok, verified_sched.pacha_eevdf_entity_init(4, 1, 1024, 4000000, 0, &sleeper));
+    try std.testing.expectEqual(.ok, verified_sched.pacha_eevdf_entity_charge(&sleeper, 12345, 0, &sleeper));
+    try std.testing.expectEqual(.ok, verified_sched.pacha_eevdf_entity_block(&sleeper, &sleeper));
+    for (0..100) |i| {
+        cpu.virtual_time = 1_000_000_000 + @as(i64, @intCast(i)) * 10_000_000;
+        try std.testing.expectEqual(@as(i64, 0), cpuRunqueueFloor(&cpu));
+        try std.testing.expectEqual(cpu.virtual_time - maximum_wake_credit, cpuWakePlacementFloor(&cpu));
+        var awake: verified_sched.Entity = undefined;
+        try std.testing.expectEqual(.ok, verified_sched.pacha_eevdf_entity_wake(&sleeper, cpuWakePlacementFloor(&cpu), &awake));
+        try std.testing.expect(awake.vruntime >= cpu.virtual_time - maximum_wake_credit);
+        try std.testing.expectEqual(@as(i64, 12345), awake.service_ns);
+        try std.testing.expectEqual(.ok, verified_sched.pacha_eevdf_entity_migrate(&awake, cpuWakePlacementFloor(&cpu), &awake));
+        try std.testing.expectEqual(.ok, verified_sched.pacha_eevdf_entity_block(&awake, &sleeper));
+    }
+}
+
+
+test "wake preemption future queue floor cannot manufacture waiter debt" {
+    try PlainWakeTestSupport.start();
+    defer PlainWakeTestSupport.end();
+    defer RuntimeAccountingTest.now_ns = null;
+    scheduler_state.cpu_count = 1;
+    const cpu = &scheduler_state.cpus[0];
+    cpu.runtime_accounting.start(0);
+    RuntimeAccountingTest.now_ns = 2000;
+    const current = &initial_scheduler_entities[4];
+    current.entity.service_ns = 10000000;
+    current.entity.vruntime = 10000000;
+    current.entity.eligible_time = 10000000;
+    current.entity.deadline = 14000000;
+    setCpuVirtualTime(cpu, 10000000);
+    initial_thread_contexts[6] = .{ .id = 6, .allocated = true, .ready = true, .scheduler_entity = &initial_scheduler_entities[6] };
+    try std.testing.expect(verifiedAddThread(6, 1, true));
+    const future = &initial_scheduler_entities[6];
+    try std.testing.expect(cpu.runqueue.remove(future));
+    future.entity.vruntime = 13000000;
+    future.entity.eligible_time = 13000000;
+    future.entity.deadline = 17000000;
+    try std.testing.expect(cpu.runqueue.insert(future));
+    try std.testing.expectEqual(@as(i64, 13000000), cpuRunqueueFloor(cpu));
+    try std.testing.expectEqual(@as(i64, 10000000), cpuWakePlacementFloor(cpu));
+    try std.testing.expectEqual(KeyedWakeResult.woke, wakeIfWaitingTokenGenerationWithRax(5, 17, default_process_principal, 11, 12));
+    try std.testing.expectEqual(@as(i64, 10000000), initial_scheduler_entities[5].entity.vruntime);
+    var frame = std.mem.zeroes(TrapFrame);
+    frame.cs = 0x23; frame.ss = 0x1b;
+    try std.testing.expect(consumeWakeReschedule(&frame));
+    try std.testing.expectEqual(@as(usize, 5), currentThread());
+    try std.testing.expectEqual(@as(u64, 12), frame.rax);
+    try std.testing.expectEqual(@as(i64, 13000000), future.entity.vruntime);
+    // An existing entity ahead of V retains that debt on wake/migration.
+    var debtor = future.entity;
+    try std.testing.expectEqual(.ok, verified_sched.pacha_eevdf_entity_block(&debtor, &debtor));
+    var awake: verified_sched.Entity = undefined;
+    try std.testing.expectEqual(.ok, verified_sched.pacha_eevdf_entity_wake(&debtor, cpuWakePlacementFloor(cpu), &awake));
+    try std.testing.expectEqual(@as(i64, 13000000), awake.vruntime);
+    try std.testing.expectEqual(.ok, verified_sched.pacha_eevdf_entity_migrate(&awake, cpuWakePlacementFloor(cpu), &awake));
+    try std.testing.expectEqual(@as(i64, 13000000), awake.vruntime);
+    try std.testing.expectEqual(debtor.service_ns, awake.service_ns);
+}
+
+
+test "wake preemption immediate delivery failure cannot retract a published completion" {
+    try PlainWakeTestSupport.start();
+    defer PlainWakeTestSupport.end();
+    const peer = &initial_thread_contexts[5];
+    peer.cpu_affinity = testAffinity(2);
+    PublishedWakeTest.attempts = 0;
+    PublishedWakeTest.fail = true;
+    defer PublishedWakeTest.fail = false;
+    // The test backend returns for inspection; production takes the explicit
+    // noreturn branch instead of returning this completion to user space.
+    try std.testing.expectEqual(KeyedWakeResult.woke, wakeIfWaitingTokenGenerationWithRax(5, 17, default_process_principal, 11, 77));
+    const node = peer.scheduler_entity.?;
+    try std.testing.expectEqual(@as(usize, 1), PublishedWakeTest.attempts);
+    try std.testing.expectEqual(@as(usize, 1), peer.cpu_slot);
+    try std.testing.expectEqual(@as(u32, 17), peer.generation);
+    try std.testing.expectEqual(@as(u64, 0), peer.active_wait_token);
+    try std.testing.expectEqual(@as(u64, 77), peer.frame.rax);
+    try std.testing.expectEqual(.runnable, node.ownership);
+    try std.testing.expectEqual(@as(usize, 1), scheduler_state.cpus[1].runqueue.count);
+    try std.testing.expect(scheduler_state.cpus[1].runqueue.contains(node));
+    try std.testing.expectEqual(@as(u8, 1), @atomicLoad(u8, &scheduler_state.cpus[1].wake_reschedule, .acquire));
+    try std.testing.expectEqual(KeyedWakeResult.stale, wakeIfWaitingTokenGenerationWithRax(5, 17, default_process_principal, 11, 77));
+    try std.testing.expectEqual(@as(usize, 1), PublishedWakeTest.attempts);
+}
+
+test "wake preemption domain rebase preserves positive debt protection weight service and alias round trips" {
+    var entity: verified_sched.Entity = undefined;
+    try std.testing.expectEqual(.ok, verified_sched.pacha_eevdf_entity_init(9, 1, 512, 4000000, 0, &entity));
+    try std.testing.expectEqual(.ok, verified_sched.pacha_eevdf_entity_charge(&entity, 25000, 0, &entity));
+    entity.eligible_time += 7000;
+    entity.deadline += 7000;
+    const original = entity;
+    for (0..100) |_| {
+        try std.testing.expectEqual(.ok, placeEntityInCpuDomain(.migrate, &entity, 10000, 100000, 0, true, &entity));
+        try std.testing.expectEqual(@as(i64, 140000), entity.vruntime);
+        try std.testing.expectEqual(@as(i64, 147000), entity.eligible_time);
+        try std.testing.expectEqual(@as(i64, 8147000), entity.deadline);
+        try std.testing.expectEqual(original.service_ns, entity.service_ns);
+        try std.testing.expectEqual(.ok, verified_sched.pacha_eevdf_entity_validate(&entity));
+        try std.testing.expectEqual(.ok, placeEntityInCpuDomain(.migrate, &entity, 100000, 10000, 0, true, &entity));
+        try std.testing.expectEqualDeep(original, entity);
+    }
+}
+
+test "wake preemption domain rebase corrects measured false debt with bounded credit and checked failure" {
+    var entity: verified_sched.Entity = undefined;
+    try std.testing.expectEqual(.ok, verified_sched.pacha_eevdf_entity_init(9, 1, 1024, 4000000, 20336866513, &entity));
+    entity.eligible_time = 20338913440;
+    entity.deadline = 20342913440;
+    try std.testing.expectEqual(.ok, verified_sched.pacha_eevdf_entity_block(&entity, &entity));
+    var placed: verified_sched.Entity = undefined;
+    try std.testing.expectEqual(.ok, placeEntityInCpuDomain(.wake, &entity, 20349012196, 20328879544, 20328879544, true, &placed));
+    try std.testing.expectEqual(@as(i64, 20328879544), placed.vruntime);
+    try std.testing.expect(placed.eligible_time <= 20328879544);
+    try std.testing.expectEqual(entity.service_ns, placed.service_ns);
+    // Preserve positive debt far beyond the negative-credit limit.
+    try std.testing.expectEqual(.ok, verified_sched.pacha_eevdf_entity_init(9, 1, 1024, 4000000, 12000000, &entity));
+    try std.testing.expectEqual(.ok, placeEntityInCpuDomain(.migrate, &entity, 2000000, 1000000, 0, true, &placed));
+    try std.testing.expectEqual(@as(i64, 11000000), placed.vruntime);
+    // Negative arithmetic never wraps, and clipped credit never moves E/D
+    // earlier than their exact affine destination-domain position.
+    try std.testing.expectEqual(.ok, placeEntityInCpuDomain(.migrate, &entity, 20000000, 1000000, 0, true, &placed));
+    try std.testing.expectEqual(@as(i64, 0), placed.vruntime);
+    try std.testing.expectEqual(.ok, verified_sched.pacha_eevdf_entity_validate(&placed));
+    const before = entity;
+    try std.testing.expectEqual(.overflow, placeEntityInCpuDomain(.migrate, &entity, 0, std.math.maxInt(i64), 0, true, &entity));
+    try std.testing.expectEqualDeep(before, entity);
+    var direct: verified_sched.Entity = undefined;
+    try std.testing.expectEqual(.ok, verified_sched.pacha_eevdf_entity_migrate(&before, 100, &direct));
+    try std.testing.expectEqual(.ok, placeEntityInCpuDomain(.migrate, &before, 0, 0, 100, false, &placed));
+    try std.testing.expectEqualDeep(direct, placed);
+}
+
+test "wake preemption new ready local remote blocked and failed initialization use common requests" {
+    for ([_]usize{ 0, 1 }) |cpu_id| for ([_]bool{ false, true }) |ready| {
+        try PlainWakeTestSupport.start();
+        defer PlainWakeTestSupport.end();
+        for (scheduler_state.cpus[0..2]) |*cpu| @atomicStore(u8, &cpu.wake_reschedule, 0, .release);
+        PublishedWakeTest.attempts = 0;
+        initial_thread_contexts[6] = .{ .id = 6, .allocated = true, .ready = ready, .cpu_slot = cpu_id, .cr3 = 0x1000, .scheduler_entity = &initial_scheduler_entities[6] };
+        syncHotStateFromContext(6);
+        // Expected scalar rejection: suppress the production UART diagnostic
+        // in this host-only fault injection, as other scheduler fixtures do.
+        @atomicStore(u32, &scheduler_state.verified.log_count, 16, .release);
+        try std.testing.expect(!verifiedAddThread(6, 0, ready));
+        try std.testing.expectEqual(@as(u8, 0), @atomicLoad(u8, &scheduler_state.cpus[cpu_id].wake_reschedule, .acquire));
+        try std.testing.expect(verifiedAddThread(6, 1, ready));
+        try std.testing.expectEqual(@as(u8, @intFromBool(ready)), @atomicLoad(u8, &scheduler_state.cpus[cpu_id].wake_reschedule, .acquire));
+        try std.testing.expectEqual(@as(usize, @intFromBool(ready and cpu_id != 0)), PublishedWakeTest.attempts);
+        try std.testing.expectEqual(@as(usize, 4), currentThread());
+        try std.testing.expectEqual(if (ready) scheduler_runqueue.Ownership.runnable else .blocked, initial_scheduler_entities[6].ownership);
+    };
+}
+
+test "wake preemption real cross CPU completion migration and failed rebase keep one owner" {
+    try PlainWakeTestSupport.start();
+    defer PlainWakeTestSupport.end();
+    defer RuntimeAccountingTest.now_ns = null;
+    const local = &scheduler_state.cpus[0];
+    const remote = &scheduler_state.cpus[1];
+    setCpuVirtualTime(local, 100000000);
+    setCpuVirtualTime(remote, 200000000);
+    const source = &initial_scheduler_entities[4];
+    source.entity.service_ns = 100000000;
+    source.entity.vruntime = 100000000;
+    source.entity.eligible_time = 100000000;
+    source.entity.deadline = 104000000;
+    local.runtime_accounting.start(0);
+    RuntimeAccountingTest.now_ns = 2000;
+    const peer = &initial_thread_contexts[5];
+    const target = peer.scheduler_entity.?;
+    peer.cpu_slot = 1; target.cpu_slot = 1;
+    target.entity.vruntime = 198000000;
+    target.entity.eligible_time = 198500000;
+    target.entity.deadline = 202500000;
+    syncHotStateFromContext(5);
+    try std.testing.expectEqual(KeyedWakeResult.woke, wakeIfWaitingTokenGenerationWithRaxPreferUncontendedCurrent(5, 17, default_process_principal, 11, 88));
+    try std.testing.expectEqual(@as(usize, 0), peer.cpu_slot);
+    try std.testing.expectEqual(@as(i64, 100000000), target.entity.vruntime);
+    try std.testing.expectEqual(@as(i64, 100000000), target.entity.eligible_time);
+    var frame = std.mem.zeroes(TrapFrame);
+    frame.cs = 0x23; frame.ss = 0x1b; frame.rax = 99;
+    try std.testing.expect(consumeWakeReschedule(&frame));
+    try std.testing.expectEqual(@as(usize, 5), currentThread());
+    try std.testing.expectEqual(@as(u64, 88), frame.rax);
+    try std.testing.expect(migrateRunnableThreadGeneration(4, 1, 1));
+    try std.testing.expectEqual(@as(usize, 1), initial_thread_contexts[4].cpu_slot);
+    try std.testing.expectEqual(@as(i64, 2000), source.entity.vruntime - remote.virtual_time);
+    try std.testing.expectEqual(@as(i64, 100002000), source.entity.service_ns);
+    const before = source.entity;
+    @atomicStore(u32, &scheduler_state.verified.log_count, 16, .release);
+    setCpuVirtualTime(local, std.math.maxInt(i64));
+    try std.testing.expect(!migrateRunnableThreadGeneration(4, 1, 0));
+    try std.testing.expectEqualDeep(before, source.entity);
+    try std.testing.expectEqual(@as(usize, 1), source.cpu_slot);
+    try std.testing.expectEqual(@as(usize, 1), initial_thread_contexts[4].cpu_slot);
+    try std.testing.expectEqual(.runnable, source.ownership);
+    try std.testing.expect(remote.runqueue.contains(source));
+    try std.testing.expectEqual(@as(usize, 1), remote.runqueue.count);
+    try std.testing.expect(!local.runqueue.contains(source));
+}
+
+test "wake preemption empty accounting carries forward and in place overflow retains checkpoint" {
+    try PlainWakeTestSupport.start();
+    defer PlainWakeTestSupport.end();
+    defer RuntimeAccountingTest.now_ns = null;
+    scheduler_state.cpu_count = 1;
+    const cpu = &scheduler_state.cpus[0];
+    const owner = &initial_scheduler_entities[4];
+    cpu.runtime_accounting.start(700);
+    cpu.runtime_accounting.credit_ns = 321;
+    RuntimeAccountingTest.now_ns = 2000;
+    const saved_entity = owner.entity;
+    const saved_accounting = cpu.runtime_accounting;
+    var frame = std.mem.zeroes(TrapFrame);
+    frame.cs = 0x23; frame.ss = 0x1b; frame.rax = 99;
+    @atomicStore(u8, &cpu.wake_reschedule, 1, .release);
+    try std.testing.expect(!consumeWakeReschedule(&frame));
+    try std.testing.expectEqualDeep(saved_entity, owner.entity);
+    try std.testing.expectEqualDeep(saved_accounting, cpu.runtime_accounting);
+    RuntimeAccountingTest.now_ns = 2500;
+    try std.testing.expectEqual(SliceDecision.continue_running, verifiedExpireSlice(0, 4, 1, 4000000));
+    try std.testing.expectEqual(@as(i64, 1800), owner.entity.service_ns);
+    try std.testing.expectEqual(@as(?u64, 2500), cpu.runtime_accounting.checkpoint_ns);
+    try std.testing.expectEqual(@as(u64, 0), cpu.runtime_accounting.credit_ns);
+    try std.testing.expectEqual(KeyedWakeResult.woke, wakeIfWaitingTokenGenerationWithRax(5, 17, default_process_principal, 11, 0));
+    owner.entity.service_ns = std.math.maxInt(i64);
+    const before = owner.entity;
+    const before_clock = cpu.runtime_accounting;
+    RuntimeAccountingTest.now_ns = 3000;
+    try std.testing.expect(!consumeWakeReschedule(&frame));
+    try std.testing.expectEqualDeep(before, owner.entity);
+    try std.testing.expectEqualDeep(before_clock, cpu.runtime_accounting);
+    try std.testing.expectEqual(@as(usize, 4), currentThread());
+    try std.testing.expectEqual(@as(u8, 1), @atomicLoad(u8, &cpu.wake_reschedule, .acquire));
+}
+
+test "wake preemption exact cache matches independent full search across query and mutation" {
+    var cpu: CpuSchedulerState = .{};
+    var nodes: [17]scheduler_runqueue.Node = @splat(.{});
+    for (&nodes, 0..) |*node, i| {
+        node.reset(i + 1, 1);
+        node.ownership = .runnable;
+        try std.testing.expectEqual(.ok, verified_sched.pacha_eevdf_entity_init(@intCast(i + 1), 1, 1024, 4000000, @intCast(i * 13), &node.entity));
+        node.entity.eligible_time += @intCast((i % 3) * 7);
+        node.entity.deadline = node.entity.eligible_time + 4000000;
+        try std.testing.expect(cpu.runqueue.insert(node));
+    }
+    for ([_]i64{ 0, 1, 7, 50, 500, 1000, 9999 }) |v| {
+        setCpuVirtualTime(&cpu, v);
+        for ([_]i64{ v, v + 1, 0 }) |query| {
+            try std.testing.expectEqual(cpu.runqueue.bestEligible(query), bestEligibleForWake(&cpu, query));
+        }
+    }
+    for (&nodes) |*node| {
+        try std.testing.expect(cpu.runqueue.remove(node));
+        for ([_]i64{ 0, 100, 9999, 10000 }) |query| {
+            try std.testing.expectEqual(cpu.runqueue.bestEligible(query), bestEligibleForWake(&cpu, query));
+        }
+    }
+    try std.testing.expect(bestEligibleForWake(&cpu, 9999) == null);
+    std.debug.print("mc13 policy memory entity={} cpu={} node={}\n", .{ @sizeOf(verified_sched.Entity), @sizeOf(CpuSchedulerState), @sizeOf(scheduler_runqueue.Node) });
+}
+
+test "wake preemption birth and refresh do not copy future queue debt" {
+    try PlainWakeTestSupport.start();
+    defer PlainWakeTestSupport.end();
+    try PlainWakeTestSupport.secondPeer();
+    scheduler_state.thread_table.lock();
+    defer scheduler_state.thread_table.unlock();
+    const cpu = &scheduler_state.cpus[0];
+    const current = cpu.current_entity.?;
+    cpu.runqueue_lock.lock();
+    try std.testing.expectEqual(@as(usize, 0), cpu.runqueue.count);
+    setCpuVirtualTime(cpu, 10_000_000);
+    current.entity.vruntime = 10_000_000;
+    current.entity.eligible_time = 10_000_000;
+    current.entity.deadline = 14_000_000;
+    const future = &initial_scheduler_entities[5];
+    try std.testing.expectEqual(.ok, verified_sched.pacha_eevdf_entity_wake(&future.entity, 100_000_000, &future.entity));
+    future.ownership = .runnable;
+    try std.testing.expect(cpu.runqueue.insert(future));
+    initial_thread_contexts[5].ready = true;
+    refreshCpuVirtualTime(cpu);
+    try std.testing.expectEqual(@as(i64, 10_000_000), cpu.virtual_time);
+    cpu.runqueue_lock.unlock();
+    for (0..64) |_| {
+        try std.testing.expect(verifiedAddThreadLocked(6, 17, false));
+        const child = &initial_scheduler_entities[6].entity;
+        try std.testing.expectEqual(@as(i64, 10_000_000), child.vruntime);
+        try std.testing.expectEqual(@as(i64, 0), child.service_ns);
+        try std.testing.expectEqual(.blocked, child.state);
+        try std.testing.expectEqual(@as(i64, 100_000_000), future.entity.vruntime);
+    }
+    cpu.runqueue_lock.lock();
+    defer cpu.runqueue_lock.unlock();
+    setCpuVirtualTime(cpu, 20_000_000);
+    refreshCpuVirtualTime(cpu); // Already past current: no rewind.
+    try std.testing.expectEqual(@as(i64, 20_000_000), cpu.virtual_time);
+    cpu.current_entity = null;
+    refreshCpuVirtualTime(cpu); // Idle advancement still works.
+    try std.testing.expectEqual(@as(i64, 100_000_000), cpu.virtual_time);
+    try std.testing.expect(cpu.runqueue.remove(future));
+    refreshCpuVirtualTime(cpu);
+    try std.testing.expectEqual(@as(i64, 100_000_000), cpu.virtual_time);
+}
+
+test "wake preemption zero service birth pump negative controls and bounded domains" {
+    // Two recycled child slots, no charge: old birth copies free positive
+    // lag; old refresh ignores the executing owner and ratchets destination V.
+    for ([_]bool{ false, true }) |fix_birth| for ([_]bool{ false, true }) |fix_refresh| {
+        var a: CpuSchedulerState = .{};
+        var b: CpuSchedulerState = .{};
+        var anchor: scheduler_runqueue.Node = .{};
+        anchor.reset(1, 1);
+        try std.testing.expectEqual(.ok, verified_sched.pacha_eevdf_entity_init(1, 1, 1024, 4_000_000, 10_000_000, &anchor.entity));
+        anchor.ownership = .runnable;
+        try std.testing.expect(a.runqueue.insert(&anchor));
+        var running: scheduler_runqueue.Node = .{};
+        try std.testing.expectEqual(.ok, verified_sched.pacha_eevdf_entity_init(2, 1, 512, 4_000_000, 10_000_000, &running.entity));
+        b.current_entity = &running;
+        setCpuVirtualTime(&b, 10_000_000);
+        var slots: [2]scheduler_runqueue.Node = .{ .{}, .{} };
+        for (0..64) |iteration| {
+            const node = &slots[iteration % 2];
+            node.reset(3 + iteration % 2, @intCast(iteration + 1));
+            const floor = if (fix_birth) cpuWakePlacementFloor(&a) else cpuRunqueueFloor(&a);
+            try std.testing.expectEqual(.ok, verified_sched.pacha_eevdf_entity_init(@intCast(3 + iteration % 2), @intCast(iteration + 1), 1024, 4_000_000, floor, &node.entity));
+            try std.testing.expectEqual(.ok, verified_sched.pacha_eevdf_entity_block(&node.entity, &node.entity));
+            try std.testing.expectEqual(.ok, placeEntityInCpuDomain(.wake, &node.entity, a.virtual_time, b.virtual_time, cpuWakePlacementFloor(&b), true, &node.entity));
+            node.ownership = .runnable;
+            try std.testing.expect(b.runqueue.insert(node));
+            if (iteration != 0) try std.testing.expect(b.runqueue.remove(&slots[(iteration - 1) % 2]));
+            if (fix_refresh) refreshCpuVirtualTime(&b) else if (b.runqueue.minimumVruntime()) |minimum| {
+                if (minimum > b.virtual_time) setCpuVirtualTime(&b, minimum);
+            }
+            try std.testing.expectEqual(@as(i64, 0), node.entity.service_ns);
+        }
+        try std.testing.expectEqual(@as(i64, if (!fix_birth and !fix_refresh) 650_000_000 else 10_000_000), b.virtual_time);
+        try std.testing.expectEqual(@as(usize, 1), b.runqueue.count);
+        try std.testing.expectEqual(@as(i64, 0), running.entity.service_ns);
+    };
+}
+
+test "wake preemption fast handoffs preserve remote lag and rollback domain" {
+    try PlainWakeTestSupport.start();
+    defer PlainWakeTestSupport.end();
+    defer RuntimeAccountingTest.now_ns = null;
+    for ([_]bool{ false, true }) |notify| for (0..2) |old_cpu| for (0..3) |failure| {
+        const request = try initializeWakeWaitTest(old_cpu);
+        const vs: i64 = if (old_cpu == 0) 94_582_219 else 522_807_848;
+        const vd: i64 = 94_582_219;
+        setCpuVirtualTime(&scheduler_state.cpus[old_cpu], vs);
+        setCpuVirtualTime(&scheduler_state.cpus[0], vd);
+        const peer = &initial_scheduler_entities[5];
+        const current = &initial_scheduler_entities[4];
+        current.entity.vruntime = vd;
+        current.entity.eligible_time = vd;
+        current.entity.deadline = vd + 4_000_000;
+        try std.testing.expectEqual(.ok, verified_sched.pacha_eevdf_entity_init(peer.entity.thread_id, 17, 512, 4_000_000, vs + 377_082, &peer.entity));
+        try std.testing.expectEqual(.ok, verified_sched.pacha_eevdf_entity_block(&peer.entity, &peer.entity));
+        peer.entity.eligible_time += 7000;
+        peer.entity.deadline += 7000;
+        const before = peer.entity;
+        var expected: verified_sched.Entity = undefined;
+        try std.testing.expectEqual(.ok, placeEntityInCpuDomain(.wake, &before, vs, vd, vd, old_cpu != 0, &expected));
+        RuntimeAccountingTest.now_ns = 0;
+        scheduler_state.cpus[0].runtime_accounting.start(0);
+        var frame = std.mem.zeroes(TrapFrame);
+        frame.rax = 91;
+        frame.rdx = 92;
+        FusedWakeTestInstaller.fail = failure != 0;
+        WakeWaitTestInstaller.failure = @intCast(failure);
+        scheduler_state.thread_table.lock();
+        const result = if (notify)
+            tryFusedIpcNotifyWakeLocked(FusedWakeTestInstaller.install, &frame, 5, 17, default_process_principal, 11, 77, 88)
+        else
+            tryWakeWaitTransferLocked(ContextTransferTestRegisters, WakeWaitTestInstaller.install, &frame, request);
+        scheduler_state.thread_table.unlock();
+        try std.testing.expectEqual(@as(?bool, failure == 0), result);
+        try std.testing.expectEqual(expected.vruntime, peer.entity.vruntime);
+        try std.testing.expectEqual(expected.eligible_time, peer.entity.eligible_time);
+        try std.testing.expectEqual(expected.deadline, peer.entity.deadline);
+        try std.testing.expectEqual(before.service_ns, peer.entity.service_ns);
+        try std.testing.expectEqual(before.weight, peer.entity.weight);
+        try std.testing.expectEqual(@as(usize, 0), peer.cpu_slot);
+        try std.testing.expectEqual(if (failure == 0) scheduler_runqueue.Ownership.running else .runnable, peer.ownership);
+        if (!notify) {
+            try std.testing.expectEqual(@as(u64, 1), initial_thread_contexts[4].frame.rdx);
+            try std.testing.expectEqual(@as(u64, 2), initial_thread_contexts[4].frame.rax);
+        }
+    };
+}
+
+test "wake preemption raw fast then normalized return amplifies debt negative control" {
+    for ([_]bool{ false, true }) |normalize_fast| {
+        var high_v: i64 = 10_000_000;
+        var peer: verified_sched.Entity = undefined;
+        for (0..16) |_| {
+            try std.testing.expectEqual(.ok, verified_sched.pacha_eevdf_entity_init(1, 1, 1024, 4_000_000, high_v, &peer));
+            try std.testing.expectEqual(.ok, verified_sched.pacha_eevdf_entity_block(&peer, &peer));
+            if (normalize_fast) {
+                try std.testing.expectEqual(.ok, placeEntityInCpuDomain(.wake, &peer, high_v, 0, 0, true, &peer));
+            } else try std.testing.expectEqual(.ok, verified_sched.pacha_eevdf_entity_wake(&peer, 0, &peer));
+            try std.testing.expectEqual(.ok, placeEntityInCpuDomain(.migrate, &peer, 0, high_v, high_v, true, &peer));
+            high_v = peer.vruntime;
+            try std.testing.expectEqual(@as(i64, 0), peer.service_ns);
+        }
+        try std.testing.expectEqual(@as(i64, if (normalize_fast) 10_000_000 else 655_360_000_000), high_v);
+    }
+}
+
+test "wake preemption fast cross domain overflow rejects before completion mutation" {
+    try PlainWakeTestSupport.start();
+    defer PlainWakeTestSupport.end();
+    defer RuntimeAccountingTest.now_ns = null;
+    for ([_]bool{ false, true }) |notify| {
+        const request = try initializeWakeWaitTest(1);
+        setCpuVirtualTime(&scheduler_state.cpus[1], 0);
+        setCpuVirtualTime(&scheduler_state.cpus[0], 20_000_000);
+        const peer = &initial_scheduler_entities[5];
+        try std.testing.expectEqual(.ok, verified_sched.pacha_eevdf_entity_init(peer.entity.thread_id, 17, 1024, 4_000_000, std.math.maxInt(i64) - 8_000_000, &peer.entity));
+        try std.testing.expectEqual(.ok, verified_sched.pacha_eevdf_entity_block(&peer.entity, &peer.entity));
+        const old_peer = peer.entity;
+        const old_source = initial_scheduler_entities[4].entity;
+        var frame = std.mem.zeroes(TrapFrame);
+        frame.rax = 91;
+        frame.rdx = 92;
+        const old_frame = frame;
+        RuntimeAccountingTest.now_ns = 0;
+        scheduler_state.cpus[0].runtime_accounting.start(0);
+        @atomicStore(u32, &scheduler_state.verified.log_count, 16, .release); // Expected scalar rejection; no host UART.
+        scheduler_state.thread_table.lock();
+        const result = if (notify)
+            tryFusedIpcNotifyWakeLocked(FusedWakeTestInstaller.install, &frame, 5, 17, default_process_principal, 11, 77, 88)
+        else
+            tryWakeWaitTransferLocked(ContextTransferTestRegisters, WakeWaitTestInstaller.install, &frame, request);
+        scheduler_state.thread_table.unlock();
+        try std.testing.expect(result == null);
+        try std.testing.expectEqualDeep(old_peer, peer.entity);
+        try std.testing.expectEqualDeep(old_source, initial_scheduler_entities[4].entity);
+        try std.testing.expectEqualDeep(old_frame, frame);
+        try std.testing.expectEqual(@as(usize, 1), peer.cpu_slot);
+        try std.testing.expectEqual(@as(u64, 11), initial_thread_contexts[5].active_wait_token);
+        try std.testing.expect(!initial_thread_contexts[5].ready);
+        try std.testing.expectEqual(@as(usize, 0), FusedWakeTestInstaller.calls);
+        try std.testing.expectEqual(@as(usize, 0), WakeWaitTestInstaller.calls);
+    }
 }

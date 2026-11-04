@@ -541,6 +541,30 @@ pub fn WithQuarantine(comptime quarantined: fn (u64, usize) bool) type {
         pub fn seedContiguousRange(self: *FreePageList, start: u64, pages: usize) KernelError!void {
             return self.appendContiguousRange(start, pages);
         }
+        /// Diagnostic only. A later quarantine publication can still reject
+        /// appendPage; the detached owner must retain that failed return.
+        pub fn validateReturnPage(self: *FreePageList, pa: u64) KernelError!void {
+            if (pa == 0 or pa & 4095 != 0 or pa > std.math.maxInt(u64) - 4096) return error.InvalidState;
+            if (quarantined(pa, 1)) return error.PageQuarantined;
+            _ = checkedDescriptor(pa) orelse return error.InvalidState;
+            if (self.caches.len != 0) {
+                const span = try self.ownership.span(pa, 1);
+                if (self.ownership.get(span.first) != .allocated) return error.FreeRangeOverlap;
+                return;
+            }
+            self.lock();
+            defer self.unlock();
+            const regions = self.regions orelse return error.InvalidState;
+            var found = false;
+            for (regions) |region| if (region.start <= pa and pa + 4096 <= region.end) { found = true; break; };
+            if (!found) return error.RegionNotFound;
+            var cursor = self.index.root;
+            while (cursor) |base| {
+                const range = descriptor(base).?.*;
+                if (pa >= base and pa < endOf(range)) return error.FreeRangeOverlap;
+                cursor = range.tree.child[@intFromBool(pa >= base)];
+            }
+        }
         pub fn appendPage(self: *FreePageList, pa: u64) KernelError!void {
             return self.appendContiguousRange(pa, 1);
         }

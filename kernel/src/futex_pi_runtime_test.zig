@@ -164,7 +164,7 @@ pub fn mixed(comptime Front: type) !void {
     const address = fixture.key.address;
     Front.normal(0, .{ .active = true, .principal = owner, .thread_index = 6, .thread_generation = 17, .user_va = address + 4096, .wait_token = 99 });
     const negative_invalid = 0 -% sc.syscall_err_invalid;
-    try std.testing.expectEqual(negative_invalid, Front.wake(P.wake, owner, address, 1, null));
+    try std.testing.expectEqual(negative_invalid, Front.wake(P.wake, owner, address, 1));
     try std.testing.expectEqual(negative_invalid, Front.requeue(P.wake, owner, address, 1, 1, address + 4096));
     try std.testing.expectEqual(negative_invalid, Front.requeue(P.wake, owner, address + 4096, 1, 1, address));
     try std.testing.expectEqual(@as(usize, 0), P.wakes);
@@ -175,7 +175,7 @@ pub fn mixed(comptime Front: type) !void {
     try std.testing.expect(scheduler.futexPiHasAddress(owner, address));
     // A legitimate positive count of one must remain distinguishable from
     // native INVALID=1, even while an unrelated PI queue exists.
-    try std.testing.expectEqual(@as(u64, 1), Front.wake(P.wake, owner, address + 4096, 1, null));
+    try std.testing.expectEqual(@as(u64, 1), Front.wake(P.wake, owner, address + 4096, 1));
     try std.testing.expectEqual(@as(usize, 1), P.wakes);
     try std.testing.expect(!Front.normalValue(0).active and !Front.locked());
     try std.testing.expect(scheduler.waitTokenIsCurrent(owner, 5, 17, token));
@@ -231,4 +231,46 @@ pub fn identity(comptime Front: type) !void {
     // it must nevertheless be impossible to claim that completion twice.
     try std.testing.expectEqual(scheduler.WaitTokenClaimResult.stale, scheduler.claimWaitTokenCompletion(5, 17, owner, token));
     try std.testing.expect(!P.locked and !Front.locked());
+}
+
+pub fn discardIdentity(comptime Front: type) !void {
+    const retire = @import("memory/discard_pages.zig");
+    const discard = @import("state/discard.zig");
+    const storage = @import("memory/owned_storage.zig");
+    const backing = @import("memory/vmo_backing.zig");
+    try fixture.start();
+    defer fixture.end();
+    Front.reset();
+    defer Front.reset();
+    const token = try fixture.queue(5);
+    try expectDone(fixture.operation(4, .try_lock), .deadlock);
+    const word = fixture.word;
+    Front.normal(0, .{ .active = true, .principal = owner, .thread_index = 6, .thread_generation = 17, .user_va = fixture.key.address + 4096, .wait_token = 99 });
+    const normal = Front.normalValue(0);
+    var issuer: storage.TestAllocator = .{};
+    defer issuer.deinit();
+    var store: backing.Store = .{};
+    const ref = store.init(17);
+    defer std.debug.assert(store.clear(ref));
+    try store.prepare(ref, 0, issuer.interface());
+    store.putLocked(0, 4096);
+    const Return = struct {
+        fn give(_: *anyopaque, _: u64) bool { return true; }
+        fn invalidate(_: *anyopaque, _: u64, _: u64) bool { return true; }
+    };
+    var context: u8 = 0;
+    const batch = try retire.prepare(issuer.interface(), &context, Return.give, ref, 1, &.{.{ .index = 0, .paddr = 4096 }});
+    var plan: discard.Plan = .{ .head = batch, .start = fixture.key.address, .prefix_end = fixture.key.address + 4096, .end = fixture.key.address + 4096 };
+    try plan.commit(@as(*anyopaque, &context), Return.invalidate);
+    var queue: retire.Queue = .{};
+    plan.retireBatches(&queue);
+    _ = queue.reclaim();
+    try std.testing.expectEqual(@as(u64, 0), store.getLocked(0));
+    // The actual detach/retire helpers never wake, requeue or rewrite keys.
+    // Both the ordinary registration and PI ownership queue remain intact.
+    try std.testing.expectEqualDeep(normal, Front.normalValue(0));
+    try std.testing.expect(scheduler.waitTokenIsCurrent(owner, 5, 17, token));
+    try std.testing.expect(scheduler.futexPiHasAddress(owner, fixture.key.address));
+    try std.testing.expectEqual(word, fixture.word);
+    try expectDone(fixture.operation(4, .try_lock), .deadlock);
 }

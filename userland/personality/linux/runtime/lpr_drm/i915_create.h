@@ -31,7 +31,11 @@ static __attribute__((noinline)) int64_t lpr_i915_create_ext_ioctl(uint64_t hand
     if(page_fd<0) return page_fd;
     int64_t status=0;
     if(count) {
-        status=lpr_drm_aux_create(count*4,0,&aux_fd,&aux,&aux_size);
+        /* Only a cached, serialized wire-page owner may borrow its bound
+         * auxiliary buffer. Temporary/concurrent owners keep exact-size VMOs.
+         * call_transfer already validates/binds this cache and its lifetime. */
+        const int reusable=page_fd==lpr_tty_wire_page_fd && page==lpr_tty_wire_page;
+        status=lpr_drm_aux_create(count*4,reusable,&aux_fd,&aux,&aux_size);
         if(status) goto done;
         lpr_memcpy(aux,regions,count*4);
     }

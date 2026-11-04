@@ -1,6 +1,9 @@
 /* SPDX-License-Identifier: MIT */
 #define _GNU_SOURCE
-#include "../src/snapshot_cache.c"
+#ifndef SNAPSHOT_CACHE_IMPLEMENTATION
+#define SNAPSHOT_CACHE_IMPLEMENTATION "../src/snapshot_cache.c"
+#endif
+#include SNAPSHOT_CACHE_IMPLEMENTATION
 #include <assert.h>
 #include <errno.h>
 #include <pthread.h>
@@ -73,6 +76,18 @@ static void *requests(void *unused)
 }
 int main(void)
 {
+    {
+        filed_snapshot_cache_t memory_cache={.limit=32768};
+        filed_storage_stat_t memory_stat=stat;memory_stat.memory_backed=1;
+        pacha_fd_t original=source(3);uint64_t resident=4096;
+        filed_snapshot_cache_put_pager(&memory_cache,&memory_stat,0,16384,
+            original,(struct filed_pager_record *)&resident,0);
+        assert(!memory_cache.count && objects[3].references==1);
+        /* Byte-only snapshots have no Linux source handle to pin. */
+        filed_snapshot_cache_put(&memory_cache,&memory_stat,0,16384,original);
+        assert(memory_cache.count==1 && objects[3].references==2);
+        filed_snapshot_cache_clear(&memory_cache);assert(!pacha_fd_close(original));
+    }
     filed_snapshot_cache_t cache={.limit=32768};
     filed_snapshot_cache_observe(&cache,1,&stat);
     pacha_fd_t a=source(1),b=source(2),fd=-1;uint64_t offset=99;

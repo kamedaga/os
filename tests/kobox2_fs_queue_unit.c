@@ -438,11 +438,31 @@ static int mock_destroy(struct kobox_linux_fs_workers *pool) {
     assert(pool == (void *)2468 && !mock_outstanding && !mock_jobs); return 0;
 }
 
+static int mock_pressure_start(int (*wake)(void *), void *context) {
+    assert(wake && context); return 0;
+}
+static int mock_pressure_submit(uint64_t pages, uint64_t budget) {
+    (void)pages; (void)budget; abort();
+}
+static int mock_pressure_collect(struct kobox_linux_pressure_result *result) {
+    (void)result; return -EAGAIN;
+}
+static void mock_pressure_stop(void) {}
+long pacha_ipc_registers(uint64_t nr, uint64_t fd, uint64_t flags,
+    uint64_t timeout, uint64_t words[4], struct pacha_ipc_extension *extension, int *committed) {
+    (void)nr; (void)fd; (void)flags; (void)timeout; (void)words; (void)extension; (void)committed;
+    abort(); /* These FS-only cases never bind a pressure endpoint. */
+}
+
 void *ph_image_lookup(void *core, const char *name) {
     assert(core == (void *)5678);
     void *symbol = NULL;
 #define EXPORT(entry, function) if (!strcmp(name, entry)) { \
     __auto_type address = &function; memcpy(&symbol, &address, sizeof(symbol)); return symbol; }
+    EXPORT("kobox_linux_pressure_start", mock_pressure_start)
+    EXPORT("kobox_linux_pressure_submit", mock_pressure_submit)
+    EXPORT("kobox_linux_pressure_collect", mock_pressure_collect)
+    EXPORT("kobox_linux_pressure_stop", mock_pressure_stop)
     EXPORT("kobox_linux_fs_workers_create", mock_create)
     EXPORT("kobox_linux_fs_service_shared_bind", mock_shared_bind)
     EXPORT("kobox_linux_fs_service_shared_close", mock_shared_close)

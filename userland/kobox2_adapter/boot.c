@@ -215,6 +215,13 @@ void ph_boot_log_gpu_protocol_failure(unsigned long line, unsigned long lane,
 #endif
 }
 
+void ph_boot_log_gpu_export_ready(void) {
+#if PH_SANDBOX_AMDGPU || PH_SANDBOX_I915
+    const struct gpu_log_field fields[] = {{"kobox-drm: export headroom enabled=0x", 1}};
+    gpu_log_fields(fields, sizeof(fields) / sizeof(fields[0]));
+#endif
+}
+
 void ph_boot_log_gpu_map_failure(unsigned long stage, long status,
     unsigned long handle, unsigned long bytes) {
 #if PH_SANDBOX_AMDGPU || PH_SANDBOX_I915 || PH_SANDBOX_WIFI || PH_SANDBOX_USB_HID
@@ -409,7 +416,20 @@ void ph_boot_log_irq_ready(unsigned long received,
 
 static void console_write(void *context, const char *text, size_t length) {
     (void)context;
+#if PH_ARENA_LAZY
+    /* Attribute supply/discard evidence to the sandbox that emitted it. One
+     * syscall keeps the prefix and Linux log record together on serial. */
+    const char *prefix = PH_SANDBOX_FS ? "[storage] " :
+        (PH_SANDBOX_WIFI ? "[wifi] " : "[gpu] ");
+    char record[2048];
+    size_t prefix_size = strlen(prefix);
+    if (length <= sizeof(record)-prefix_size) {
+        memcpy(record,prefix,prefix_size);memcpy(record+prefix_size,text,length);
+        (void)pacha_syscall2(1,(uintptr_t)record,prefix_size+length);
+    } else (void)pacha_syscall2(1,(uintptr_t)text,length);
+#else
     (void)pacha_syscall2(1, (uintptr_t)text, length);
+#endif
     ph_tail_console(text, length);
 #if PH_SANDBOX_AMDGPU || PH_SANDBOX_I915 || PH_SANDBOX_WIFI || PH_SANDBOX_USB_HID
     gpu_log_copy(text, length);

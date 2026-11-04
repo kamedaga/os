@@ -6,14 +6,31 @@
 #include "../userland/personality/linux/runtime/lpr_epoll.c"
 
 lpr_state_t lpr_state;
-static lpr_fd_entry_t entries[6];
-static lpr_ofd_t objects[2];
-static lpr_backend_record_t backends[2];
+static lpr_fd_entry_t entries[8];
+static lpr_ofd_t objects[4];
+static lpr_backend_record_t backends[4];
 static lpr_epoll_backend_t epoll_backend;
 static union { max_align_t align; unsigned char bytes[LPR_EPOLL_INSTANCE_BYTES]; } storage;
 static struct unix_poll_sequence unix_sequence;
 static uint32_t ready_events;
-static unsigned notifications, failures, locked;
+static lpr_socket_backend_t mock_socket;
+static lpr_event_backend_t mock_event;
+static uint64_t event_counter_state[3];
+static unsigned locked;
+int lpr_fd_table_pin(lpr_fd_table_t *table, lpr_linux_fd_t fd, lpr_fd_pin_t *pin)
+{
+    assert(!locked);
+    if (fd >= table->entry_count || !table->entries[fd].active) return -1;
+    lpr_ofd_t *object = &table->ofds[table->entries[fd].ofd_index];
+    *pin = (lpr_fd_pin_t){.ops_id=lpr_ofd_ops_id(object),
+        .state=lpr_backend_state_from_ofd(object)};
+    return 0;
+}
+void lpr_fd_unpin(const lpr_fd_pin_t *pin) { (void)pin; assert(!locked); }
+static struct lpr_unix_socket mock_unix = {.mapped=1};
+static int delayed_fd=-1, sequence_error_fd=-1, unix_ready_override=-1;
+static unsigned delayed_queries;
+static unsigned notifications, failures;
 
 void *lpr_memset(void *dst, int value, size_t bytes) { return memset(dst, value, bytes); }
 void lpr_fd_table_lock(lpr_fd_table_t *table) { (void)table; assert(!locked); locked = 1; }
@@ -33,7 +50,8 @@ int64_t lpr_linux_poll_current(uint64_t raw, uint64_t count, unsigned *wait_not_
     assert(!locked);
     int64_t ready = 0;
     for (uint64_t i = 0; i < count; ++i) {
-        fds[i].revents = (int16_t)(ready_events & (uint16_t)fds[i].events);
+        if (fds[i].fd == delayed_fd) { delayed_queries++; fds[i].revents=0; }
+        else fds[i].revents = (int16_t)(ready_events & (uint16_t)fds[i].events);
         ready += fds[i].revents != 0;
     }
     return ready;
@@ -48,8 +66,19 @@ int64_t lpr_unix_socket_poll_sequence(uint64_t fd, uint32_t events,
 {
     (void)fd;
     assert(!locked);
+    if ((int)fd == sequence_error_fd) return -LPR_LINUX_EBADF;
     *sequence = unix_sequence;
-    return ready_events & events;
+    return (unix_ready_override < 0 ? ready_events : (uint32_t)unix_ready_override) & events;
+}
+
+lpr_socket_backend_t *lpr_socket_backend(uint64_t fd) { (void)fd; return NULL; }
+int64_t lpr_socket_poll_sequence(uint64_t fd, uint32_t events, struct unix_poll_sequence *sequence)
+{ return lpr_unix_socket_poll_sequence(fd, events, sequence); }
+
+int64_t lpr_input_poll_sequence(uint64_t fd, uint32_t events,
+    struct unix_poll_sequence *sequence)
+{
+    return lpr_unix_socket_poll_sequence(fd, events, sequence);
 }
 
 static void expect(int condition, const char *name)
@@ -75,7 +104,9 @@ static void setup(uint32_t events)
     entries[4] = (lpr_fd_entry_t){.active=1, .ofd_index=1, .ofd_generation=9};
     objects[0] = (lpr_ofd_t){.active=1, .generation=7, .backend={.index=0}};
     objects[1] = (lpr_ofd_t){.active=1, .generation=9, .backend={.index=1}};
-    backends[0].ops_id = LPR_FD_OPS_SOCKET;
+    backends[0].ops_id = LPR_FD_OPS_SOCKET; backends[0].state=&mock_socket;
+    backends[0].state = &mock_unix;
+    delayed_fd=-1; sequence_error_fd=-1; unix_ready_override=-1; delayed_queries=0;
     backends[1].ops_id = LPR_FD_OPS_EPOLL;
     backends[1].state = &epoll_backend;
     epoll_backend.instance = (uint64_t)(uintptr_t)&storage;
@@ -161,6 +192,22 @@ int main(void)
     unix_sequence.read++;
     expect(take_event() == 0, "remote progress does not rearm ONESHOT");
 
+    setup(LPR_EPOLLIN | LPR_EPOLLET);
+    backends[0].ops_id = LPR_FD_OPS_INPUT;
+    unix_sequence = (struct unix_poll_sequence){.source=7,.read=3};
+    ready_events = LPR_EPOLLIN;
+    expect(take_event() == LPR_EPOLLIN && take_event() == 0,
+        "input report stamp consumed once");
+    unix_sequence.read += 3;
+    expect(take_event() == LPR_EPOLLIN && take_event() == 0,
+        "new input report triggers ET with unread old records");
+    setup(LPR_EPOLLIN | LPR_EPOLLET | LPR_EPOLLONESHOT);
+    backends[0].ops_id = LPR_FD_OPS_INPUT;
+    ready_events = LPR_EPOLLIN;
+    expect(take_event() == LPR_EPOLLIN, "input one-shot initial event");
+    unix_sequence.read += 3;
+    expect(take_event() == 0, "input progress does not rearm disabled ONESHOT");
+
     setup(LPR_EPOLLIN);
     lpr_epoll_snapshot_t old[LPR_EPOLL_MAX_INTERESTS];
     uint32_t count, report;
@@ -205,6 +252,92 @@ int main(void)
     entries[4].ofd_generation++;
     expect(!lpr_epoll_wait_should_retry(4, &epoch, -LPR_LINUX_EBADF),
         "reused root descriptor does not retry");
+    setup(LPR_EPOLLIN);
+    backends[0].ops_id = LPR_FD_OPS_UNIX;
+    lpr_control_fd_table.entry_count=8;
+    lpr_control_fd_table.ofd_count=3;
+    lpr_control_fd_table.backend_count=3;
+    entries[6]=(lpr_fd_entry_t){.active=1,.ofd_index=2,.ofd_generation=11};
+    objects[2]=(lpr_ofd_t){.active=1,.generation=11,.backend={.index=2}};
+    backends[2].ops_id=LPR_FD_OPS_SOCKET; backends[2].state=&mock_socket;
+    instance=(void *)&storage;
+    instance->count=2;
+    instance->interests[1]=(lpr_epoll_interest_t){.target_fd=6,.target_ofd_index=2,
+        .target_generation=11,.events=LPR_EPOLLIN,.data=5678};
+    ready_events=LPR_EPOLLIN;delayed_fd=6;
+    expect(take_event()==LPR_EPOLLIN && delayed_queries==0,
+        "observed local readiness is not delayed by an unrelated broker query");
+    expect(take_event()==LPR_EPOLLIN && delayed_queries==1,
+        "deferred broker interest gets first service next call");
+    delayed_fd=-1;
+    lpr_epoll_snapshot_t fair[LPR_EPOLL_MAX_INTERESTS];
+    lpr_linux_epoll_event_t returned;
+    uint64_t first_data=0;
+    for(unsigned i=0;i<4;i++) {
+        assert(!lpr_epoll_snapshot(4,fair,&count,NULL));
+        assert(lpr_epoll_scan(4,fair,count,&returned,1,1,1,0)==1);
+        if(!i)first_data=returned.data;
+        expect(returned.data==(i%2? (first_data==1234?5678:1234):first_data),
+            "maxevents=1 rotates continuously ready interests");
+    }
+    instance->scan_cursor=0;
+    backends[2].ops_id=LPR_FD_OPS_UNIX;backends[2].state=&mock_unix;
+    instance->interests[0].events=LPR_EPOLLIN | LPR_EPOLLET;
+    instance->interests[0].state=0;
+    sequence_error_fd=6;
+    lpr_linux_epoll_event_t batch[2];
+    assert(!lpr_epoll_snapshot(4,fair,&count,NULL));
+    expect(lpr_epoll_scan(4,fair,count,batch,2,1,1,0)==1 && batch[0].data==1234,
+        "later query failure does not discard an already consumed ET event");
+    sequence_error_fd=-1;unix_ready_override=0;instance->scan_cursor=0;
+    backends[2].ops_id=LPR_FD_OPS_SOCKET; backends[2].state=&mock_socket;
+    assert(!lpr_epoll_snapshot(4,fair,&count,NULL));
+    expect(lpr_epoll_scan(4,fair,count,batch,2,1,1,0)==1 && batch[0].data==5678,
+        "without local readiness the remaining broker sources are queried");
+
+    union { max_align_t align; unsigned char bytes[LPR_EPOLL_INSTANCE_BYTES]; } child_storage;
+    memset(&child_storage,0,sizeof child_storage);
+    lpr_epoll_backend_t child_backend={.instance=(uintptr_t)&child_storage,
+        .map_bytes=LPR_EPOLL_INSTANCE_BYTES};
+    lpr_epoll_instance_t *child_instance=(void *)&child_storage;
+    child_instance->magic=LPR_EPOLL_INSTANCE_MAGIC;child_instance->generation=1;
+    child_instance->capacity=LPR_EPOLL_MAX_INTERESTS;child_instance->count=1;
+    child_instance->interests[0]=(lpr_epoll_interest_t){.target_fd=3,.target_ofd_index=0,
+        .target_generation=7,.events=LPR_EPOLLIN|LPR_EPOLLET,.data=1234};
+    lpr_control_fd_table.ofd_count=4;lpr_control_fd_table.backend_count=4;
+    entries[6]=(lpr_fd_entry_t){.active=1,.ofd_index=3,.ofd_generation=13};
+    objects[3]=(lpr_ofd_t){.active=1,.generation=13,.backend={.index=3}};
+    backends[3].ops_id=LPR_FD_OPS_EPOLL;backends[3].state=&child_backend;
+    instance->interests[0].state=LPR_EPOLL_STATE_ONESHOT_DISABLED;
+    instance->interests[1]=(lpr_epoll_interest_t){.target_fd=6,.target_ofd_index=3,
+        .target_generation=13,.events=LPR_EPOLLIN,.data=5678};
+    unix_ready_override=-1;instance->scan_cursor=0;
+    assert(!lpr_epoll_snapshot(4,fair,&count,NULL));
+    expect(lpr_epoll_scan(4,fair,count,batch,2,1,1,0)==1 && batch[0].data==5678 &&
+        (child_instance->interests[0].state & LPR_EPOLL_STATE_PENDING_MASK),
+        "nested epoll reports child readiness without consuming its ET event");
+    expect(lpr_epoll_scan_fd(6,batch,1,1,1,0)==1 && batch[0].data==1234,
+        "child ET event remains available after parent observation");
+    setup(LPR_EPOLLIN | LPR_EPOLLET);
+    backends[0].ops_id=LPR_FD_OPS_EVENT;backends[0].state=&mock_event;
+    memset(event_counter_state,0,sizeof(event_counter_state));
+    mock_event=(lpr_event_backend_t){.active=1,.subtype=LPR_EVENT_BACKEND_EVENTFD,
+        .counter_map=(uint64_t)(uintptr_t)event_counter_state};
+    event_counter_state[0]=1;lpr_event_counter_publish(&mock_event,1);
+    expect(take_event()==LPR_EPOLLIN && take_event()==0,"eventfd initial edge consumed once");
+    event_counter_state[0]++;lpr_event_counter_publish(&mock_event,1);
+    expect(take_event()==LPR_EPOLLIN && take_event()==0,
+        "eventfd write repeats edge without clearing readable counter");
+    instance=(void *)&storage;instance->interests[0].events |= LPR_EPOLLONESHOT;
+    lpr_event_counter_publish(&mock_event,1);
+    expect(take_event()==LPR_EPOLLIN,"eventfd one-shot consumes progress");
+    lpr_event_counter_publish(&mock_event,1);
+    expect(take_event()==0,"eventfd progress cannot rearm disabled one-shot");
+    instance->interests[0].events=LPR_EPOLLOUT | LPR_EPOLLET;
+    instance->interests[0].state=0;
+    expect(take_event()==LPR_EPOLLOUT && take_event()==0,"eventfd initial writable edge");
+    event_counter_state[0]=0;lpr_event_counter_publish(&mock_event,4);
+    expect(take_event()==LPR_EPOLLOUT && take_event()==0,"eventfd read repeats writable edge");
     if (failures) return 1;
     puts("LPR_EPOLL_IO_RACE_UNIT=OK");
     return 0;

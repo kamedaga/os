@@ -7,6 +7,8 @@ int64_t lpr_linux_munlock(uint64_t address,uint64_t length);
 /* Serialize application mapping replacement with the small set of locked
  * intervals. Successful begin owns the lock and reserves one possible split. */
 int64_t lpr_mlock_vm_begin(void);
+/* Read-only metadata hold through native discard; no split capacity allocation. */
+int64_t lpr_mlock_madvise_begin(uint64_t address,uint64_t length);
 void lpr_mlock_vm_end(void);
 void lpr_mlock_forget(uint64_t address,uint64_t length);
 int lpr_mlock_overlaps(uint64_t address,uint64_t length);

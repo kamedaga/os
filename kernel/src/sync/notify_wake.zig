@@ -50,3 +50,23 @@ test "notify wake failed send can retry and CPU tokens are independent" {
     try std.testing.expect(!tokens[0].request());
     try std.testing.expect(tokens[1].request());
 }
+
+test "wake preemption ring0 edge acknowledges token without clearing scheduling work" {
+    var token: Token = .{};
+    var scheduler_pending = true;
+    try std.testing.expect(token.request());
+    try std.testing.expect(!token.request()); // Publications share the first edge.
+    token.received(); // Ring-0 entry acknowledges; it cannot switch context.
+    try std.testing.expect(scheduler_pending);
+    try std.testing.expect(token.request()); // Later idle publication needs an edge.
+    token.received(); // Unrelated maintenance is an idempotent acknowledgement.
+    token.received();
+    try std.testing.expect(token.request());
+    // A committed K-deferred send is unconditional even if an intervening
+    // maintenance arrival cleared its token. Its arrival clears the newer
+    // token too, but every publication still has a real, outstanding edge.
+    token.received();
+    try std.testing.expect(token.request());
+    scheduler_pending = false; // Only a safe policy consumer settles the work.
+    try std.testing.expect(!scheduler_pending);
+}

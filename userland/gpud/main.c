@@ -1,3 +1,4 @@
+#include "pressure_owner.h"
 /* SPDX-License-Identifier: MIT */
 #include <gpud/boot_config.h>
 #include "bootstrap.h"
@@ -58,7 +59,7 @@ static void log_runtime_event(const struct gpud_boot_config *config,
         printf("[gpud] %s\n", line);
 }
 
-/* 0: absent/incomplete, 1: probe, 2: stop. A truncated shell write is not
+/* 0: absent/incomplete, 1: probe, 2: stop, 3: diagnostic trace arm. A truncated shell write is not
  * a command. The file lives only in the RAM root and is never an authority
  * to select a PCI function or bypass package/firmware verification. */
 static int manual_control(pacha_fd_t filed_fd) {
@@ -70,6 +71,9 @@ static int manual_control(pacha_fd_t filed_fd) {
     int command = image.size == 6 &&
         !memcmp(image.data, "probe\n", 6) ? 1 :
         image.size == 5 && !memcmp(image.data, "stop\n", 5) ? 2 : 0;
+#if defined(GPUD_DRM_RPC_PROFILE) && GPUD_DRM_RPC_PROFILE
+    if (image.size == 6 && !memcmp(image.data, "trace\n", 6)) command = 3;
+#endif
     filed_client_release_module_image(&image);
     return command;
 }
@@ -409,6 +413,11 @@ static int retire_drm_generation(
         return -EINVAL;
     struct gpud_drm_service *service = &generation->service;
     *handle_sequence = service->files.handle_sequence;
+    {
+        int e = gpud_drm_service_stop_ready(service);
+        if (e)
+            return e;
+    }
     for (size_t i = 0; i < GPUD_DRM_REFERENCES_MAX; ++i) {
         struct gpud_drm_watch *watch = &service->watches[i];
         if (!watch->handle)
@@ -778,6 +787,10 @@ static int start_generation(const struct gpud_boot_config *config,
         }
     }
 
+    static pacha_fd_t pressure_liveness = -1;
+    error = gpud_export_pressure(&current->ipc, current->launch.process.fd, &pressure_liveness);
+    if (error) return error;
+    printf("[gpud] pressure endpoint exported owner_generation=%llu\n", (unsigned long long)generation);
     const uint64_t gpu_rights = PH_GPU_QUERY_RIGHTS | PACHA_FD_RIGHT_TRANSFER;
     current->gpu_fd = pacha_vmo_create(
         GPUD_GPU_CHANNEL_SIZE, gpu_rights, 0);
@@ -837,6 +850,9 @@ static int serve_generation(
     *forced = 0;
     *stop_requested = 0;
     struct gpud_control_poll command_poll = {0};
+#if defined(GPUD_DRM_RPC_PROFILE) && GPUD_DRM_RPC_PROFILE
+    int trace_seen = 0;
+#endif
     for (;;) {
         if (inspect) {
             struct timespec now;
@@ -846,6 +862,15 @@ static int serve_generation(
                 (uint64_t)now.tv_nsec / 1000000;
             if (gpud_control_poll_due(&command_poll, now_ms)) {
                 int command = manual_control(filed_fd);
+#if defined(GPUD_DRM_RPC_PROFILE) && GPUD_DRM_RPC_PROFILE
+                /* Reuse the existing one-second diagnostic control check.
+                 * A stable trace command arms once, never resets every poll. */
+                if (command == 3 && !trace_seen)
+                    gpud_drm_service_profile_arm(current->service.log_endpoint_fd);
+                if (command != 3 && trace_seen)
+                    gpud_drm_service_profile_disarm();
+                trace_seen = command == 3;
+#endif
                 if (command == 2) {
                     log_runtime_event(config, "stop requested by manual control", 0);
                     *stop_requested = 1;

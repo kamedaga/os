@@ -238,6 +238,20 @@ int main(void)
     assert(!lpr_drm_aux_create(7276, 1, &aux_fd, &mapping, &bytes));
     for (int i = 0; i < 7276; ++i) assert(auxiliary[i] == 0);
     assert(maps == saved_maps && vmo_creates == saved_creates);
+    /* CREATE_EXT's small regions payload now uses this same serialized cache:
+     * 4096 requests add no VMO/map/unmap/FD-close operations after warm-up. */
+    lpr_drm_aux_destroy(aux_fd, mapping, bytes);
+    saved_maps=maps;saved_unmaps=unmaps;saved_creates=vmo_creates;
+    for(unsigned i=0;i<4096;i++) {
+        assert(!lpr_drm_aux_create(4,1,&aux_fd,&mapping,&bytes));
+        assert(aux_fd==91 && bytes==sizeof(auxiliary));
+        assert(*(uint32_t*)mapping==0);
+        *(uint32_t*)mapping=i+1;
+        lpr_drm_aux_destroy(aux_fd,mapping,bytes);
+    }
+    assert(maps==saved_maps && unmaps==saved_unmaps && vmo_creates==saved_creates);
+    assert(!lpr_drm_aux_create(7276,1,&aux_fd,&mapping,&bytes));
+    puts("CREATE_EXT regions reuse: 4096 serialized borrows, zero extra VMO/map/unmap PASS");
     /* A concurrent owner, a temporary control page, and an oversized payload
      * all keep the exact-size temporary path; the cache budget is not a limit. */
     pacha_fd_t tmp_fd; void *tmp; uint64_t tmp_bytes;

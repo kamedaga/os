@@ -12,6 +12,7 @@
 #include "personality/linux_lpr.h"
 #include "personality/lpr_manifest.h"
 #include "pacha/root_handoff.h"
+#include "pacha/pressure.h"
 #include "pacha/live_bootstrap.h"
 #include "pacha/capsule.h"
 #include "live_console.h"
@@ -2533,6 +2534,43 @@ static void seed0root_close_root_devices(struct seed0root_root_devices *devices)
     memset(devices, 0, sizeof(*devices));
 }
 
+static pacha_fd_t storage_pressure_export = -1;
+static pacha_fd_t pressure_manager_export = -1;
+static int seed0root_register_pressure(pacha_fd_t manager_fd) {
+    if (storage_pressure_export < 16) return -22;
+    struct pacha_ipc_fd fds[PACHA_IPC_MAX_TRANSFER_FDS] = {0};
+    struct pacha_ipc_msg message = {.fds=fds, .fd_capacity=PACHA_IPC_MAX_TRANSFER_FDS};
+    int status = pacha_ipc_recv_wait(storage_pressure_export, &message, 120000);
+    if (!status && (message.word0 != PACHA_PRESSURE_REGISTER || !message.word1 ||
+        message.word2 || message.word3 || message.fd_count != 2)) status = -22;
+    uint64_t watch = PACHA_FD_RIGHT_INSPECT | PACHA_FD_RIGHT_WAIT | PACHA_FD_RIGHT_POLL | PACHA_FD_RIGHT_CLOSE;
+    if (!status) {
+        for (unsigned i=0; i<2; ++i) {
+            struct pacha_fd_info info = {0};
+            uint64_t rights = i ? watch : PACHA_PRESSURE_RIGHTS;
+            if (pacha_fd_get_info(fds[i].fd, &info) ||
+                info.kind != (i ? PACHA_FD_KIND_PROCESS : PACHA_FD_KIND_CHANNEL) ||
+                (info.rights & (rights|PACHA_FD_RIGHT_TRANSFER)) != (rights|PACHA_FD_RIGHT_TRANSFER)) {
+                status = -13; break;
+            }
+            fds[i].rights = rights;
+            fds[i].flags = PACHA_FD_FLAG_CLOEXEC;
+            fds[i].transfer_flags = 0;
+        }
+    }
+    uint64_t received = message.fd_count;
+    if (!status) {
+        fds[2] = (struct pacha_ipc_fd){.fd=storage_pressure_export, .rights=watch,
+            .flags=PACHA_FD_FLAG_CLOEXEC};
+        message.fd_count = 3;
+        status = pacha_ipc_send(manager_fd, &message);
+    }
+    for (uint64_t i=0; i<received; ++i) if (fds[i].fd>=16) (void)pacha_fd_close(fds[i].fd);
+    (void)pacha_fd_close(storage_pressure_export); storage_pressure_export = -1;
+    printf("[seed0root] pressure registration status=%d\n", status);
+    return status;
+}
+
 static int seed0root_receive_root_handoff(
     pacha_fd_t channel_fd,
     struct seed0root_root_devices *out)
@@ -2660,7 +2698,10 @@ fail_batch:
         fprintf(stderr, "[seed0root] invalid root capability handoff status=%d\n", status);
         return status;
     }
-    (void)pacha_fd_close(channel_fd);
+    status = seed0root_register_pressure(channel_fd);
+    if (!status) pressure_manager_export = channel_fd;
+    else (void)pacha_fd_close(channel_fd);
+    if (status) { seed0root_close_root_devices(out); return status; }
     printf("[seed0root] root capability handoff received devices=%llu\n",
         (unsigned long long)out->metadata.device_count);
     fflush(stdout);
@@ -3168,6 +3209,9 @@ static int seed0root_start_optional_gpu_probe(pacha_fd_t filed_fd,
     if (drm_endpoint < 16) { status = -5; goto fail; }
     config.drm_endpoint_fd = SEED0ROOT_SERVICE_ENDPOINT_FD;
     struct pacha_process_fd_grant grants[] = {
+        {.source_fd=pressure_manager_export,.target_fd=PACHA_PRESSURE_EXPORT_FD,
+            .rights=PACHA_FD_RIGHT_INSPECT|PACHA_FD_RIGHT_CLOSE|PACHA_FD_RIGHT_SEND|PACHA_FD_RIGHT_TRANSFER,
+            .flags=PACHA_FD_FLAG_PRIVATE|PACHA_FD_FLAG_CLOEXEC},
         PACHA_LAUNCH_GRANT(devices->fds[selected], SEED0ROOT_SERVICE_DEVICE_FD,
             PACHA_LAUNCH_DEVICE_DRIVER | PACHA_FD_RIGHT_TRANSFER),
         PACHA_LAUNCH_GRANT(drm_endpoint, SEED0ROOT_SERVICE_ENDPOINT_FD,
@@ -3181,7 +3225,7 @@ static int seed0root_start_optional_gpu_probe(pacha_fd_t filed_fd,
             PACHA_LAUNCH_SIGNAL | PACHA_FD_RIGHT_TRANSFER),
     };
     status = seed0root_exec_native_service(filed_fd, "/srv/gpud.elf",
-        &config, sizeof(config), grants, log_fd >= 16 ? 6 : 5,
+        &config, sizeof(config), grants, log_fd >= 16 ? 7 : 6,
         0x5eed2012u);
     if (status)
         goto fail;
@@ -3342,6 +3386,9 @@ static int seed0root_launch_root_services(
             SEED0ROOT_SERVICE_LOG_FD : 0;
         /* netd owns network policy; this handoff grants an Ethernet function. */
         const struct pacha_process_fd_grant netd_grants[] = {
+        {.source_fd=pressure_manager_export,.target_fd=PACHA_PRESSURE_EXPORT_FD,
+            .rights=PACHA_FD_RIGHT_INSPECT|PACHA_FD_RIGHT_CLOSE|PACHA_FD_RIGHT_SEND|PACHA_FD_RIGHT_TRANSFER,
+            .flags=PACHA_FD_FLAG_PRIVATE|PACHA_FD_FLAG_CLOEXEC},
             PACHA_LAUNCH_GRANT(devices->fds[net], SEED0ROOT_SERVICE_DEVICE_FD,
                 PACHA_LAUNCH_DEVICE_DRIVER | PACHA_FD_RIGHT_TRANSFER),
             PACHA_LAUNCH_GRANT(netd_endpoint, SEED0ROOT_SERVICE_ENDPOINT_FD, PACHA_LAUNCH_SERVER),
@@ -3353,7 +3400,7 @@ static int seed0root_launch_root_services(
         };
         status = seed0root_exec_native_service(filed_endpoint_fd, "/srv/netd.elf",
             &netd_cfg, sizeof(netd_cfg), netd_grants,
-            live_mode ? (log_endpoint_fd >= 16 ? 5 : 4) : 3,
+            live_mode ? (log_endpoint_fd >= 16 ? 6 : 5) : 4,
             0x5eed2003u);
         if (net_ready.b >= 16) (void)pacha_fd_close(net_ready.b);
         if (status == 0)
@@ -3716,6 +3763,9 @@ static int seed0root_launch_root_services(
     gpud_cfg.control_channel_fd = SEED0ROOT_SERVICE_NETD_FD;
     gpud_cfg.ready_channel_fd = SEED0ROOT_SERVICE_READY_FD;
     const struct pacha_process_fd_grant gpud_grants[] = {
+        {.source_fd=pressure_manager_export,.target_fd=PACHA_PRESSURE_EXPORT_FD,
+            .rights=PACHA_FD_RIGHT_INSPECT|PACHA_FD_RIGHT_CLOSE|PACHA_FD_RIGHT_SEND|PACHA_FD_RIGHT_TRANSFER,
+            .flags=PACHA_FD_FLAG_PRIVATE|PACHA_FD_FLAG_CLOEXEC},
         PACHA_LAUNCH_GRANT(devices->fds[gpu], SEED0ROOT_SERVICE_DEVICE_FD,
             PACHA_LAUNCH_DEVICE_DRIVER | PACHA_FD_RIGHT_TRANSFER),
         PACHA_LAUNCH_GRANT(gpud_drm_endpoint, SEED0ROOT_SERVICE_ENDPOINT_FD, PACHA_LAUNCH_SERVER),
@@ -3725,7 +3775,7 @@ static int seed0root_launch_root_services(
         PACHA_LAUNCH_GRANT(filed_endpoint_fd, 240, PACHA_LAUNCH_CLIENT),
     };
     status = seed0root_exec_native_service(filed_endpoint_fd, "/srv/gpud.elf",
-        &gpud_cfg, sizeof(gpud_cfg), gpud_grants, 5, 0x5eed2005u);
+        &gpud_cfg, sizeof(gpud_cfg), gpud_grants, 6, 0x5eed2005u);
     (void)pacha_fd_close(ready.b); ready.b = -1;
     (void)pacha_fd_close(gpud_control.b); gpud_control.b = -1;
     if (status != 0) goto out;
@@ -4783,7 +4833,15 @@ static int launch_filed_with_path(const storage_seed0root_bootstrap_t *bootstrap
     printf("[seed0root] filed bootstrap fd=%ld\n", bootstrap_fd);
     fflush(stdout);
     struct seed0root_loaded_process loaded;
-    struct pacha_process_fd_grant grants[7] = {
+    struct pacha_ipc_channel_pair pressure_export = {.a=-1, .b=-1};
+    status = pacha_ipc_channel_create(&pressure_export,
+        PACHA_PRESSURE_RIGHTS | PACHA_FD_RIGHT_TRANSFER, 0);
+    if (status) return status;
+    storage_pressure_export = pressure_export.a;
+    struct pacha_process_fd_grant grants[8] = {
+        {.source_fd=pressure_export.b, .target_fd=PACHA_PRESSURE_EXPORT_FD,
+            .rights=PACHA_PRESSURE_RIGHTS | PACHA_FD_RIGHT_TRANSFER,
+            .flags=PACHA_FD_FLAG_PRIVATE | PACHA_FD_FLAG_CLOEXEC},
         PACHA_LAUNCH_LOG_GRANTS(PACHA_FD_RIGHT_TRANSFER),
         PACHA_LAUNCH_GRANT(bootstrap->device_fd, bootstrap->device_fd,
             PACHA_LAUNCH_DEVICE_DRIVER | PACHA_FD_RIGHT_TRANSFER),
@@ -4798,7 +4856,8 @@ static int launch_filed_with_path(const storage_seed0root_bootstrap_t *bootstrap
             PACHA_LAUNCH_BLOB | PACHA_FD_RIGHT_TRANSFER),
     };
     status = load_elf_process("/sbin/filed.elf", image, bootstrap->filed_image_size,
-        grants, 7, &loaded);
+        grants, 8, &loaded);
+    (void)pacha_fd_close(pressure_export.b);
     (void)pacha_munmap(image, filed_map_size);
     (void)pacha_fd_close((pacha_fd_t)bootstrap->filed_image_fd);
     if (status != 0) {
@@ -4832,6 +4891,12 @@ static int launch_filed_with_path(const storage_seed0root_bootstrap_t *bootstrap
     }
     printf("[seed0root] storage ready signal sent\n");
     fflush(stdout);
+    /* Register storage before optional rootfs services. The manager must
+     * survive a headless root or a failed desktop/native service launch. */
+    struct seed0root_root_devices root_devices;
+    status = seed0root_receive_root_handoff(
+        (pacha_fd_t)bootstrap->service_ready_channel_fd, &root_devices);
+    if (status) { (void)pacha_fd_close(filed_client_fd); return status; }
     /* Local IPC and its trusted authority do not depend on NIC/device
      * discovery. The admin capability is not registered as a filed service
      * endpoint and is never part of a Linux exec manifest. */
@@ -4850,15 +4915,7 @@ static int launch_filed_with_path(const storage_seed0root_bootstrap_t *bootstrap
     if (status != 0) {
         (void)pacha_fd_close(filed_client_fd);
         fprintf(stderr, "[seed0root] local IPC bootstrap failed status=%d\n", status);
-        return status;
-    }
-    struct seed0root_root_devices root_devices;
-    status = seed0root_receive_root_handoff(
-        (pacha_fd_t)bootstrap->service_ready_channel_fd,
-        &root_devices);
-    if (status != 0) {
-        (void)pacha_fd_close(lpr_supervisor_endpoint_fd);
-        (void)pacha_fd_close(filed_client_fd);
+        seed0root_close_root_devices(&root_devices);
         return status;
     }
     char installed_profile[128];
@@ -5110,6 +5167,58 @@ static int launch_filed(const storage_seed0root_bootstrap_t *bootstrap)
     return status;
 }
 
+/* Explicit BootFS test profile: run the real virtio/virgl owner on the
+ * imported RAM root without requiring a desktop or copying a disk rootfs. */
+static int seed0root_stage5_gpu(pacha_fd_t filed_fd,
+    const struct seed0root_root_devices *devices) {
+    int gpu = seed0root_find_root_device(devices, 0x1af4, 0x1010, 0x1050);
+    if (gpu < 0) return -19;
+    struct pacha_ipc_channel_pair ready = {.a=-1,.b=-1};
+    struct pacha_ipc_channel_pair control = {.a=-1,.b=-1};
+    pacha_fd_t endpoint = -1;
+    int status = pacha_ipc_channel_create(&ready, seed0root_channel_rights, 0);
+    if (!status) status = pacha_ipc_channel_create(&control, seed0root_channel_rights, 0);
+    if (!status) {
+        endpoint = pacha_ipc_endpoint_create(seed0root_channel_rights, 0);
+        if (endpoint < 16) status = -12;
+    }
+    if (!status) {
+        struct gpud_boot_config config = {.magic=GPUD_BOOT_CONFIG_MAGIC,
+            .size=sizeof(config),.backend=GPUD_BACKEND_VIRTIO,
+            .device_fd=SEED0ROOT_SERVICE_DEVICE_FD,
+            .drm_endpoint_fd=SEED0ROOT_SERVICE_ENDPOINT_FD,
+            .filed_endpoint_fd=240,.control_channel_fd=SEED0ROOT_SERVICE_NETD_FD,
+            .ready_channel_fd=SEED0ROOT_SERVICE_READY_FD};
+        memcpy(config.package_root,"/srv/kobox2",sizeof("/srv/kobox2"));
+        struct pacha_process_fd_grant grants[] = {
+            PACHA_LAUNCH_GRANT(devices->fds[gpu],SEED0ROOT_SERVICE_DEVICE_FD,
+                PACHA_LAUNCH_DEVICE_DRIVER|PACHA_FD_RIGHT_TRANSFER),
+            PACHA_LAUNCH_GRANT(endpoint,SEED0ROOT_SERVICE_ENDPOINT_FD,PACHA_LAUNCH_SERVER),
+            PACHA_LAUNCH_GRANT(filed_fd,240,PACHA_LAUNCH_CLIENT),
+            PACHA_LAUNCH_GRANT(control.b,SEED0ROOT_SERVICE_NETD_FD,PACHA_LAUNCH_SERVER|PACHA_FD_RIGHT_SEND),
+            PACHA_LAUNCH_GRANT(ready.b,SEED0ROOT_SERVICE_READY_FD,PACHA_LAUNCH_SIGNAL),
+            {.source_fd=pressure_manager_export,.target_fd=PACHA_PRESSURE_EXPORT_FD,
+            .rights=PACHA_FD_RIGHT_INSPECT|PACHA_FD_RIGHT_CLOSE|PACHA_FD_RIGHT_SEND|PACHA_FD_RIGHT_TRANSFER,
+            .flags=PACHA_FD_FLAG_PRIVATE|PACHA_FD_FLAG_CLOEXEC}};
+        status = seed0root_exec_native_service(filed_fd,"/srv/gpud.elf",&config,sizeof(config),
+            grants,sizeof(grants)/sizeof(grants[0]),0x5eed5000u);
+    }
+    if (ready.b>=16) (void)pacha_fd_close(ready.b);
+    if (control.b>=16) (void)pacha_fd_close(control.b);
+    if (!status) status = seed0root_wait_service_ready(ready.a,GPUD_BOOT_READY_MAGIC,"stage5-gpud");
+    printf("[stage5] GPU sandbox ready status=%d\n",status);
+    fflush(stdout);
+    if (ready.a>=16) (void)pacha_fd_close(ready.a);
+    if (endpoint>=16) (void)pacha_fd_close(endpoint);
+    /* Retain the owner control peer while pressure is observed. */
+    if (!status) for (;;) {
+        uint64_t delay[2] = {1,0};
+        (void)pacha_syscall1(PACHA_RUNTIME_SYSCALL_NANOSLEEP,(uintptr_t)delay);
+    }
+    if (control.a>=16) (void)pacha_fd_close(control.a);
+    return status;
+}
+
 static int launch_live(const pacha_live_root_bootstrap_t *bootstrap)
 {
     if (bootstrap == NULL ||
@@ -5131,13 +5240,26 @@ static int launch_live(const pacha_live_root_bootstrap_t *bootstrap)
     struct live_console *console = NULL;
     struct seed0root_live_usb_ready usb_ready = {0};
     usb_ready.net_fd = -1;
-    int status = seed0root_start_unixd(filed_fd,
+    storage_pressure_export = PACHA_PRESSURE_EXPORT_FD;
+    struct seed0root_root_devices devices;
+    int status = seed0root_receive_root_handoff(
+        (pacha_fd_t)bootstrap->root_handoff_fd, &devices);
+    if (status) return status;
+    char stage5_profile[32];
+    int stage5_status = seed0root_read_filed_text(filed_fd,
+        "/etc/pacha/stage5-gpu",stage5_profile,sizeof(stage5_profile));
+    if (!stage5_status) {
+        if (strcmp(stage5_profile,"virtio-gpu/virgl\n")) return -22;
+        return seed0root_stage5_gpu(filed_fd,&devices);
+    }
+    if (stage5_status != -2) return stage5_status;
+    status = seed0root_start_unixd(filed_fd,
         (pacha_fd_t)bootstrap->unix_path_fd, &unix_admin_fd);
     if (status == 0) status = seed0root_start_lpr_supervisor(
         filed_fd, unix_admin_fd, (pacha_fd_t)bootstrap->power_channel_fd, &supervisor_fd);
     (void)pacha_fd_close((pacha_fd_t)bootstrap->power_channel_fd);
     if (unix_admin_fd >= 16) (void)pacha_fd_close(unix_admin_fd);
-    if (status != 0) return status;
+    if (status != 0) { seed0root_close_root_devices(&devices); return status; }
     /* Diagnostic storage is optional: failure must not prevent an offline
      * live shell, and producers retain their early serial fallback. */
     const int log_status = seed0root_start_logd(filed_fd, &log_endpoint_fd);
@@ -5145,9 +5267,6 @@ static int launch_live(const pacha_live_root_bootstrap_t *bootstrap)
         log_status == 0 ? "/run/pacha/service.log" : "unavailable",
         log_status == 0 ? "" : " (serial fallback)");
     fflush(stdout);
-    struct seed0root_root_devices devices;
-    status = seed0root_receive_root_handoff(
-        (pacha_fd_t)bootstrap->root_handoff_fd, &devices);
     if (status == 0) {
         printf("[seed0root] live framebuffer paddr=0x%llx size=%llu %llux%llu pitch=%llu\n",
             (unsigned long long)bootstrap->framebuffer_paddr,

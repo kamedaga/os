@@ -17,6 +17,7 @@ struct ph_gpu_queue {
     int cpu_sync_result;
 
     struct ph_gpu_session_service service;
+    struct kobox_linux_drm_service *active_service;
     struct gpud_gpu_channel channel;
     kb2_vq_atomic_ops_t atomics;
     kb2_vq_segment_t segments[GPUD_GPU_QUEUE_SIZE];

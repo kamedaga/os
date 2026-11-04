@@ -5,7 +5,7 @@
 
 /* Conservative per-process fast path: once record locks are used, every
  * descriptor close must release that inode's POSIX locks, including dup aliases. */
-static volatile uint32_t lpr_posix_locks_used;
+volatile uint32_t lpr_posix_locks_used;
 
 int64_t lpr_filed_close_posix_locks(const lpr_fd_pin_t *pin)
 {
@@ -128,7 +128,10 @@ int64_t lpr_backend_write(uint64_t fd, uint64_t buf, uint64_t count, unsigned *w
                         __ATOMIC_ACQ_REL,
                         __ATOMIC_ACQUIRE))
                 {
-                    if (value != 0) lpr_event_backend_notify(event);
+                    /* eventfd wakes EPOLLIN on every successful write, even
+                     * while already readable (for example mio::Waker). */
+                    lpr_event_counter_publish(event, 1u);
+                    lpr_event_backend_notify(event);
 #if defined(LPR_GLYCIN_DIAG) && LPR_GLYCIN_DIAG
                     if (__atomic_load_n(
                             &lpr_glycin_diag_armed,
@@ -389,10 +392,20 @@ int64_t lpr_linux_lseek(uint64_t fd, uint64_t offset, uint64_t whence)
     if (pin.ops_id != LPR_FD_OPS_FILED || pin.state == 0) {
         goto out;
     }
+    lpr_filed_backend_t *filed = (lpr_filed_backend_t *)pin.state;
+    if (filed->reserved1 & LPR_FILED_PROC_FD_DIRECTORY) {
+        /* Synthetic directory cookies live in the shared OFD, not the
+         * backing /proc inode. rewinddir/seekdir must update that same cookie. */
+        uint64_t next = 0;
+        result = whence <= 1 &&
+            lpr_fd_table_seek_pinned(&lpr_control_fd_table, &pin,
+                (int64_t)offset, (uint32_t)whence, &next) == 0 && next <= INT64_MAX ?
+            (int64_t)next : -LPR_LINUX_EINVAL;
+        goto out;
+    }
     result = lpr_filed_endpoint_ready();
     if (result) goto out;
 
-    lpr_filed_backend_t *filed = (lpr_filed_backend_t *)pin.state;
 #if defined(LPR_GUI_PROFILE) && LPR_GUI_PROFILE
     if (gui_profile) {
         lpr_gui_profile_file(8, whence, filed->flags, 0,
@@ -607,46 +620,8 @@ int64_t lpr_linux_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg)
     if (!lpr_fd_is_filed(fd)) {
         return -LPR_LINUX_EBADF;
     }
-    if (cmd==LPR_LINUX_F_SETLK || cmd==LPR_LINUX_F_SETLKW) {
-        /* Linux x86_64 flock is a userspace record, never a sandbox pointer.
-         * Resolve relative ranges once before an interruptible blocking wait. */
-        struct { int16_t type,whence;int32_t pad;int64_t start,length;int32_t pid,tail; } range;
-        if (arg<4096 || arg>UINT64_MAX-sizeof(range)) return -LPR_LINUX_EFAULT;
-        lpr_memcpy(&range,(const void *)(uintptr_t)arg,sizeof(range));
-        int64_t base=0;
-        if (range.whence==1) {
-            base=lpr_linux_lseek(fd,0,1);
-            if (base<0) return base;
-        } else if (range.whence==2) {
-            lpr_linux_stat_t stat;
-            int64_t status=lpr_linux_fstat(fd,(uint64_t)(uintptr_t)&stat,0);
-            if (status) return status;
-            base=stat.st_size;
-        } else if (range.whence) return -LPR_LINUX_EINVAL;
-        if (__builtin_add_overflow(base,range.start,&range.start)) return -LPR_LINUX_EOVERFLOW;
-        if (range.start<0) return -LPR_LINUX_EINVAL;
-        __atomic_store_n(&lpr_posix_locks_used,1,__ATOMIC_RELEASE);
-        for (;;) {
-            const int64_t binding_status=lpr_filed_fd_binding(fd);
-            if (binding_status) return binding_status;
-            const lpr_filed_backend_t *file=lpr_filed_backend(fd);
-            if (!file) return -LPR_LINUX_EBADF;
-            kb2_fs_request_t request={.opcode=KB2_FILESYSTEM_OP_FCNTL,
-                .handle=file->handle,.flags=LPR_LINUX_F_SETLK,.mode=(uint16_t)range.type,
-                .offset=range.start,.length=(uint64_t)range.length};
-            kb2_fs_response_t response;
-            int64_t status=lpr_fs_call(&request,0,0,0,0,0,0,&response,-1,0);
-            if (cmd!=LPR_LINUX_F_SETLKW || status!=-LPR_LINUX_EAGAIN)
-                return status;
-            /* Keep a potentially long client wait out of storage workers.
-             * Each attempt releases its request before sleeping, so process
-             * death cannot leave a queued request acquiring an orphan lock. */
-            const struct pachaos_timespec delay={.tv_sec=0,.tv_nsec=1000000};
-            unsigned wait_not_ready=0;
-            status=lpr_linux_nanosleep((uint64_t)(uintptr_t)&delay,0,&wait_not_ready);
-            if (status) return status;
-        }
-    }
+    if (cmd==LPR_LINUX_F_GETLK || cmd==LPR_LINUX_F_SETLK || cmd==LPR_LINUX_F_SETLKW)
+        return lpr_filed_record_lock(fd,cmd,arg);
     switch (cmd) {
     case LPR_LINUX_F_GETFD: return lpr_control_get_fd_flags(fd);
     case LPR_LINUX_F_SETFD: return lpr_control_set_fd_flags(fd, arg);
@@ -666,21 +641,6 @@ int64_t lpr_linux_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg)
     }
 }
 
-int64_t lpr_linux_flock(uint64_t fd, uint64_t operation)
-{
-    if (!lpr_fd_is_filed(fd) && !lpr_linux_eventfd_active(fd) && !lpr_linux_tty_fd_active(fd)) {
-        return -LPR_LINUX_EBADF;
-    }
-    const uint64_t lock_op = operation & ~(uint64_t)LPR_LINUX_LOCK_NB;
-    switch (lock_op) {
-    case LPR_LINUX_LOCK_SH:
-    case LPR_LINUX_LOCK_EX:
-    case LPR_LINUX_LOCK_UN:
-        return 0;
-    default:
-        return -LPR_LINUX_EINVAL;
-    }
-}
 
 int64_t lpr_backend_ioctl(uint64_t fd, uint64_t request, uint64_t arg, unsigned *wait_not_ready __attribute__((unused)))
 {

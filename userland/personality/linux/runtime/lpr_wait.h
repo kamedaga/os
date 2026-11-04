@@ -28,7 +28,7 @@ typedef struct lpr_wait_graph {
     uint32_t logical_fds[LPR_WAIT_GRAPH_MAX_LEAVES];
     uint8_t drain_modes[LPR_WAIT_GRAPH_MAX_LEAVES];
     uint32_t leaf_count;
-    uint32_t reserved0;
+    uint32_t immediate_ready;
     uint64_t relative_deadline_ns;
     /* Deferred UNIX interests: no pin, capability, or shared slot is held
      * until block(), so graph construction can fail without cleanup. */
@@ -36,6 +36,10 @@ typedef struct lpr_wait_graph {
         struct unix_poll_sequence sequence;
     } unix_interests[LPR_WAIT_GRAPH_MAX_LEAVES];
     uint32_t unix_count;
+    struct { uint32_t fd, events, ignore_ready;
+        struct unix_poll_sequence sequence;
+    } netlink_interests[LPR_WAIT_GRAPH_MAX_LEAVES];
+    uint32_t netlink_count;
 } lpr_wait_graph_t;
 
 void lpr_wait_graph_init(lpr_wait_graph_t *graph);
@@ -71,3 +75,10 @@ int64_t lpr_wait_deadline_expired(
 int64_t lpr_wait_graph_block(
     lpr_wait_graph_t *graph,
     const lpr_wait_deadline_t *deadline, unsigned *wait_not_ready __attribute__((unused)));
+
+int64_t lpr_wait_graph_add_input(lpr_wait_graph_t *graph, uint64_t fd, uint32_t events, uint32_t ignore, const struct unix_poll_sequence *sequence);
+
+int64_t lpr_wait_graph_add_netlink(lpr_wait_graph_t *, uint32_t, uint32_t,
+    uint32_t, const struct unix_poll_sequence *);
+int64_t lpr_netlink_poll_block(lpr_wait_graph_t *, const lpr_wait_deadline_t *,
+    int64_t (*)(lpr_wait_graph_t *, const lpr_wait_deadline_t *));

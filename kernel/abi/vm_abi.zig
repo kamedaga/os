@@ -1,12 +1,12 @@
-pub const syscall_vm_first: u64 = 74;
+pub const syscall_vm_first: u64 = 75;
 // Self-only, containing-or-next VMA. The cursor never grants access to a
 // different address space; EMPTY terminates enumeration without a record.
-pub const syscall_vm_query: u64 = 74;
-pub const syscall_mmap: u64 = 75;
-pub const syscall_munmap: u64 = 76;
-pub const syscall_mprotect: u64 = 77;
-pub const syscall_mremap: u64 = 78;
-pub const syscall_madvise: u64 = 79;
+pub const syscall_vm_query: u64 = 75;
+pub const syscall_mmap: u64 = 76;
+pub const syscall_munmap: u64 = 77;
+pub const syscall_mprotect: u64 = 78;
+pub const syscall_mremap: u64 = 79;
+pub const syscall_madvise: u64 = 80;
 pub const syscall_vm_last: u64 = syscall_madvise;
 pub const syscall_vm_count: u64 = syscall_vm_last - syscall_vm_first + 1;
 

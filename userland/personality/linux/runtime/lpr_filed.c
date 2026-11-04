@@ -44,7 +44,8 @@ lpr_state_t lpr_state = {
 
 /* The sole live thread's slot is stable until fork or a thread-count
  * transition. Those paths clear this before publishing count==1 again. */
-static lpr_signal_thread_state_t *lpr_single_thread_signal_state;
+lpr_signal_thread_state_t *lpr_single_thread_signal_state;
+uintptr_t lpr_entry_single_stack_top;
 
 lpr_signal_thread_state_t *lpr_signal_thread_state_single_cached(void)
 {
@@ -58,6 +59,9 @@ void lpr_signal_thread_state_single_publish(lpr_signal_thread_state_t *state)
 
 void lpr_signal_thread_state_single_invalidate(void)
 {
+    /* Clear private-stack identity too, before any transition publishes a sole
+     * survivor. Retained thread capabilities still own/reclaim the stacks. */
+    __atomic_store_n(&lpr_entry_single_stack_top, 0, __ATOMIC_RELEASE);
     __atomic_store_n(&lpr_single_thread_signal_state, 0, __ATOMIC_RELEASE);
 }
 
@@ -74,7 +78,7 @@ _Static_assert(
 
 static uint32_t lpr_signal_thread_tid(void)
 {
-    const int64_t raw_tid = lpr_pacha_syscall0(PACHAOS_SYSCALL_GETTID);
+    const int64_t raw_tid = lpr_linux_gettid();
     if (raw_tid <= 0 || raw_tid > UINT32_MAX) {
         lpr_signal_thread_state_exhausted();
     }

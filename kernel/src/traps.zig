@@ -160,10 +160,10 @@ var bootstrap_user_return_flush: [1]u8 = .{0};
 var user_return_flush: []u8 = &bootstrap_user_return_flush;
 
 pub export fn userReturnCr3ForCurrentCpuFromAsm() callconv(.c) u64 {
-    @import("wake_trace.zig").record(.user_return, 0, 0, scheduler.currentThread());
     scheduler.notifyDiagnosticUserReturn();
     const cr3 = scheduler.currentCr3();
     const cpu = boundedCurrentCpuSlot();
+    scheduler.publishIdentityForUserReturn(cpu, cr3);
     const force_flush = user_return_flush[cpu] != 0;
     user_return_flush[cpu] = 0;
     return x86_platform.userReturnCr3(cr3, force_flush);
@@ -714,7 +714,7 @@ pub export fn pageFaultDispatch(frame: *ExceptionTrapFrame) callconv(.winapi) u6
     const ec = frame.error_code;
     const user_mode = (ec & (1 << 2)) != 0;
     if (!user_mode or !user_vm.isUserCanonicalVa(cr2)) return page_fault_unhandled;
-    @import("wake_trace.zig").record(.page_fault, cr2, ec, scheduler.currentThread());
+    if (comptime @import("wake_trace.zig").enabled) @import("wake_trace.zig").record(.page_fault, cr2, ec, scheduler.currentThread());
     if (!kernel_runtime.kernel_state_ready) return page_fault_unhandled;
     const principal = scheduler.currentPrincipal();
     const fault_page_va = cr2 & ~@as(u64, 4095);
@@ -907,7 +907,7 @@ pub export fn exceptionWithErrorCommon(vec: u64, frame: *const ExceptionTrapFram
 
 pub export fn fatalUserExceptionWithErrorDispatch(vec: u64, frame: *const ExceptionTrapFrame) callconv(.winapi) void {
     asm volatile ("cli");
-    if (vec == 7) @import("wake_trace.zig").record(.device_not_available, frame.rip, frame.error_code, scheduler.currentThread());
+    if (vec == 7) if (comptime @import("wake_trace.zig").enabled) @import("wake_trace.zig").record(.device_not_available, frame.rip, frame.error_code, scheduler.currentThread());
     var context: TrapFrame = undefined;
     inline for (std.meta.fields(TrapFrame)) |field| @field(context, field.name) = @field(frame, field.name);
     const address = if (vec == 14) asm volatile ("mov %%cr2, %[value]"
@@ -1092,11 +1092,13 @@ fn stageFaultForUserReturn(vector: u64, error_code: u64, address: u64, frame: *T
 }
 
 pub export fn timerInterruptDispatch(frame: *TrapFrame) callconv(.winapi) void {
+    if (comptime @import("wake_trace.zig").enabled) @import("wake_trace.zig").record(.timer_receive, frame.cs & 3, 0, scheduler.currentThread());
     const diagnostic_scope = lock_diagnostics.enterInterrupt((frame.cs & 3) == 3);
     const profile_from_user = if (@import("lock_profile.zig").enabled) (frame.cs & 3) == 3 else false;
     if (comptime @import("lock_profile.zig").enabled) @import("lock_profile.zig").irqEnter(profile_from_user);
     defer if (comptime @import("lock_profile.zig").enabled) @import("lock_profile.zig").irqLeave(profile_from_user);
     defer diagnostic_scope.end();
+    @import("realtime_clock.zig").serviceTimerClock();
     lapic.eoiLegacyPicMaster();
     lapic.eoi();
     const user_mode = ((frame.cs & 0x3) == 0x3) and ((frame.ss & 0x3) == 0x3);
@@ -1113,6 +1115,7 @@ pub export fn timerInterruptDispatch(frame: *TrapFrame) callconv(.winapi) void {
             // Stage pending state in the outgoing frame before preemption
             // transfers CPU ownership. AP redispatch also stages signals
             // which arrive after this snapshot or while the thread is idle.
+            _ = scheduler.consumeWakeReschedule(frame);
             stagePendingSignalForUserReturn(frame);
             switch (scheduler.preemptApUserThread(boot_static.scheduler_slice_ticks, frame)) {
                 .continue_running => {},
@@ -1128,14 +1131,14 @@ pub export fn timerInterruptDispatch(frame: *TrapFrame) callconv(.winapi) void {
                     smp.returnCurrentApAfterTimerInterrupt();
                 },
             }
-            _ = lapic.armTimer(lapic.timerInitialCount(boot_static.lapic_timer_initial_count) * @as(u32, @intCast(boot_static.scheduler_slice_ticks)));
+            _ = lapic.armTimer(lapic.timerSliceCount(boot_static.lapic_timer_initial_count, @intCast(boot_static.scheduler_slice_ticks)));
             return;
         }
         // AP timer interrupts can arrive while a user thread is executing a
         // syscall or another kernel path. That CPU is not idle; keep its
         // current thread/cr3 intact and return to the interrupted kernel frame.
         scheduler.deferApUserSlice(boot_static.scheduler_slice_ticks);
-        _ = lapic.armTimer(lapic.timerInitialCount(boot_static.lapic_timer_initial_count) * @as(u32, @intCast(boot_static.scheduler_slice_ticks)));
+        _ = lapic.armTimer(lapic.timerSliceCount(boot_static.lapic_timer_initial_count, @intCast(boot_static.scheduler_slice_ticks)));
         return;
     }
     const clock = @import("realtime_clock.zig");
@@ -1143,13 +1146,20 @@ pub export fn timerInterruptDispatch(frame: *TrapFrame) callconv(.winapi) void {
     const now_ns = clock.monotonicNs();
     const next_tick = if (now_ns) |now| now / 1_000_000 else clock.bootstrapFallbackTick(scheduler.lapic_tick_count);
     const tick_elapsed = next_tick > scheduler.lapic_tick_count;
+    clockevent.recordTimerInterrupt(now_ns, tick_elapsed);
     if (tick_elapsed) scheduler.lapic_tick_count = next_tick;
     defer clockevent.rearmAfterTimerInterrupt();
     @import("realtime_clock.zig").updateFromBootstrapTimer();
     if (!kernel_runtime.kernel_state_ready) return;
     syscalls.completePendingTimerFdWaitersFromInterrupt(now_ns orelse next_tick *| 1_000_000, user_mode);
     // A sub-ms deadline IRQ is not a scheduler tick.
-    if (!tick_elapsed) return;
+    if (!tick_elapsed) {
+        if (user_mode) {
+            _ = scheduler.consumeWakeReschedule(frame);
+            stagePendingSignalForUserReturn(frame);
+        }
+        return;
+    }
     syscalls.completeProcessSignalTimersFromInterrupt(scheduler.lapic_tick_count, user_mode);
     syscalls.completePendingIrqFdWaitersFromInterrupt(user_mode);
     scheduler.retryPendingThreadMaintenance();
@@ -1158,6 +1168,7 @@ pub export fn timerInterruptDispatch(frame: *TrapFrame) callconv(.winapi) void {
     if (boot_static.scheduler_slice_ticks != 0) {
         _ = scheduler.preemptBootstrapThread(boot_static.scheduler_slice_ticks, frame);
     }
+    _ = scheduler.consumeWakeReschedule(frame);
     stagePendingSignalForUserReturn(frame);
 }
 
@@ -1187,15 +1198,32 @@ pub export fn deviceInterruptDispatch(frame: *TrapFrame) callconv(.winapi) void 
         _ = kernel_runtime.kernel_state_global.recordDeviceInterruptEvent(route.device, route.entry, ignored_wake_owners[0..]);
     }
     syscalls.completeDeviceIrqFdWaitersFromInterrupt((frame.cs & 3) == 3 and (frame.ss & 3) == 3);
+    if ((frame.cs & 3) == 3 and (frame.ss & 3) == 3) {
+        _ = scheduler.consumeWakeReschedule(frame);
+        stagePendingSignalForUserReturn(frame);
+    }
 }
 
 pub export fn schedulerMaintenanceIpiDispatch(frame: *TrapFrame) callconv(.winapi) void {
+    // The assembly wake stub sends ring-0 arrivals here, not to the ring-3
+    // scheduler dispatcher. Count them once; nested user maintenance is RPL3.
+    if ((frame.cs & 3) != 3) {
+        if (comptime @import("wake_trace.zig").enabled) @import("wake_trace.zig").record(.ipi_receive, 0, 0, scheduler.currentThread());
+        // A ring-0 vector consumed the hardware edge too. Clear only the
+        // NOTIFY token so a later idle publication gets a fresh edge; leave
+        // the scheduler request pending until a safe user return boundary.
+        smp.receiveNotifyWake();
+    }
     const diagnostic_scope = lock_diagnostics.enterInterrupt((frame.cs & 3) == 3);
     const profile_from_user = if (@import("lock_profile.zig").enabled) (frame.cs & 3) == 3 else false;
     if (comptime @import("lock_profile.zig").enabled) @import("lock_profile.zig").irqEnter(profile_from_user);
     defer if (comptime @import("lock_profile.zig").enabled) @import("lock_profile.zig").irqLeave(profile_from_user);
     defer diagnostic_scope.end();
     schedulerMaintenanceIpiBody();
+    if ((frame.cs & 3) == 3 and (frame.ss & 3) == 3) {
+        _ = scheduler.consumeWakeReschedule(frame);
+        stagePendingSignalForUserReturn(frame);
+    }
 }
 
 inline fn schedulerMaintenanceIpiBody() void {
@@ -1206,7 +1234,7 @@ inline fn schedulerMaintenanceIpiBody() void {
 }
 
 pub export fn schedulerWakeIpiDispatch(frame: *TrapFrame) callconv(.winapi) void {
-    @import("wake_trace.zig").record(.ipi_receive, 0, 0, scheduler.currentThread());
+    if (comptime @import("wake_trace.zig").enabled) @import("wake_trace.zig").record(.ipi_receive, 0, 0, scheduler.currentThread());
     smp.receiveNotifyWake();
     const diagnostic_scope = lock_diagnostics.enterInterrupt((frame.cs & 3) == 3);
     const profile_from_user = if (@import("lock_profile.zig").enabled) (frame.cs & 3) == 3 else false;
@@ -1215,11 +1243,7 @@ pub export fn schedulerWakeIpiDispatch(frame: *TrapFrame) callconv(.winapi) void
     defer diagnostic_scope.end();
     // This is a direct helper call, not another hardware IRQ entry. Enter the
     // diagnostic context only once for the wake vector's maintenance work.
-    if (comptime lock_diagnostics.enabled) {
-        schedulerMaintenanceIpiBody();
-    } else {
-        schedulerMaintenanceIpiDispatch(frame);
-    }
+    schedulerMaintenanceIpiBody();
     // A lifecycle IPI can interrupt a target while it is executing a syscall
     // and holding kernel locks.  Saving that ring-0 trap frame as a stopped
     // user context would abandon the syscall before its deferred unlocks run.

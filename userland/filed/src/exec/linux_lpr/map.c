@@ -464,16 +464,28 @@ static int prepare_image(const lpr_exec_image_t *image, uint64_t dyn_base,
          * hole; later PT_LOAD mappings own overlapping page protections. */
         for (uint64_t page = (lpr_exec_align_down(va)-low)/4096;
              page < (end-low)/4096; ++page) protections[page] = prot | (1ull<<63);
+#if defined(FILED_EXEC_STAGE_REPORT) && FILED_EXEC_STAGE_REPORT
+        uint64_t copy_start = lpr_exec_now_cycles();
+#endif
         if (filesz) memcpy(mapped + va-low, image->bytes + off, (size_t)filesz);
         memset(mapped + va-low + filesz, 0, (size_t)(memsz-filesz));
+#if defined(FILED_EXEC_STAGE_REPORT) && FILED_EXEC_STAGE_REPORT
+        lpr_exec_metric_cycles("copy_zero", copy_start, lpr_exec_now_cycles());
+#endif
         if (patch_text && textsize && (prot & PACHA_PROT_EXEC)) {
             uint64_t from = off > textoff ? off : textoff;
             uint64_t until = off+filesz < textoff+textsize ? off+filesz : textoff+textsize;
             if (until > from) {
                 uint64_t patched = 0;
+#if defined(FILED_EXEC_STAGE_REPORT) && FILED_EXEC_STAGE_REPORT
+                uint64_t patch_start = lpr_exec_now_cycles();
+#endif
                 status = lpr_exec_patch_syscalls(image, from,
                                                  mapped + va-low + from-off,
                                                  until-from, &patched);
+#if defined(FILED_EXEC_STAGE_REPORT) && FILED_EXEC_STAGE_REPORT
+                lpr_exec_metric_cycles("patch_text", patch_start, lpr_exec_now_cycles());
+#endif
                 if (status) goto done;
             }
         }

@@ -18,7 +18,7 @@ static void add(struct gpud_discovery *d, enum gpud_discovery_kind kind,
 int gpud_discovery_prepare(struct gpud_discovery *d, pacha_fd_t device_fd, int primary)
 {
     struct pacha_capsule_info cap = {0};
-    uint32_t id, sub, revision, header;
+    uint32_t id, sub, class_revision, header;
     if (!d) return -EINVAL;
     memset(d, 0, sizeof(*d));
     int err = pacha_capsule_query(device_fd, &cap);
@@ -29,14 +29,15 @@ int gpud_discovery_prepare(struct gpud_discovery *d, pacha_fd_t device_fd, int p
         (cap.device & UINT64_C(0xffffffff00000000)) != UINT64_C(0x5043490000000000) ||
         (cap.device & UINT64_C(0xff00e0f8))) return -ENODEV;
     if ((err = pacha_capsule_pci_config_read(device_fd, 0, 4, &id)) ||
-        (err = pacha_capsule_pci_config_read(device_fd, 8, 1, &revision)) ||
+        (err = pacha_capsule_pci_config_read(device_fd, 8, 4, &class_revision)) ||
         (err = pacha_capsule_pci_config_read(device_fd, 14, 1, &header)) ||
         (err = pacha_capsule_pci_config_read(device_fd, 44, 4, &sub))) return err;
     if ((id & 0xffffu) == 0xffffu || (header & 0x7f)) return -ENODEV;
     /* Both standard indexes exist even when this publisher provides only
      * character devices; an absent block index aborts libudev enumeration. */
     const char *parents[] = {"/sys", "/sys/dev", "/sys/dev/char", "/sys/dev/block",
-        "/sys/bus", "/sys/bus/pci", "/sys/class", "/sys/class/drm", "/dev/dri"};
+        "/sys/bus", "/sys/bus/pci", "/sys/class", "/sys/class/drm", "/dev/dri",
+        "/sys/bus/pci/devices"};
     d->ancestor_count = sizeof(parents)/sizeof(*parents);
     for (size_t i = 0; i < d->ancestor_count; ++i)
         add(d, GPUD_DISC_DIR, parents[i], NULL, 0);
@@ -56,13 +57,19 @@ int gpud_discovery_prepare(struct gpud_discovery *d, pacha_fd_t device_fd, int p
         (unsigned)(cap.device >> 16) & 255, (unsigned)(cap.device >> 8) & 31,
         (unsigned)cap.device & 7, id & 65535, id >> 16);
     add(d, GPUD_DISC_TEXT, path, value, 0);
-    const char *names[] = {"vendor", "device", "subsystem_vendor", "subsystem_device", "revision"};
-    const uint32_t values[] = {id & 65535, id >> 16, sub & 65535, sub >> 16, revision};
+    const char *names[] = {"vendor", "device", "subsystem_vendor", "subsystem_device", "revision", "class"};
+    const uint32_t values[] = {id & 65535, id >> 16, sub & 65535, sub >> 16, class_revision & 255u, class_revision >> 8};
     for (size_t i = 0; i < sizeof(names)/sizeof(*names); ++i) {
         snprintf(path, sizeof(path), "%s/device/%s", base, names[i]);
-        snprintf(value, sizeof(value), "0x%04x\n", values[i]);
+        snprintf(value, sizeof(value), i == 5 ? "0x%06x\n" : "0x%04x\n", values[i]);
         add(d, GPUD_DISC_TEXT, path, value, 0);
     }
+    /* libpci enumerates this index before EGL/GLX probing. Publish only the
+     * PCI function granted to this gpud, with class read from its capability. */
+    snprintf(path, sizeof(path), "/sys/bus/pci/devices/0000:%02x:%02x.%u",
+        (unsigned)(cap.device >> 16) & 255, (unsigned)(cap.device >> 8) & 31,
+        (unsigned)cap.device & 7);
+    add(d, GPUD_DISC_LINK, path, "/sys/dev/char/226:128/device", 0);
     snprintf(path, sizeof(path), "%s/dev", base);
     add(d, GPUD_DISC_TEXT, path, "226:128\n", 0);
     /* libdrm resolves an already-open DRM fd through the node's DEVNAME,

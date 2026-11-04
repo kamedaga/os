@@ -20,6 +20,8 @@ struct gpud_gpu_rpc {
     struct ph_ipc_packet incoming;
     struct ph_ipc_packet attachment;
     int error, event_started, event_notification;
+    /* Diagnostic owner-only counters, never part of a wire or shared ABI. */
+    uint64_t profile_calls, profile_prepare, profile_notify, profile_wait, profile_copy;
     /* Native-only first-failure site; never sent to the sandbox or clients. */
     unsigned int failure_line;
 };

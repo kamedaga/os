@@ -1,5 +1,7 @@
 /* SPDX-License-Identifier: MIT */
 #include "host.h"
+#include "arena_prefault.h"
+#include "memory/resident_policy.h"
 #include "boot.h"
 #include "arch/x86_64/fp_entry.h"
 #if defined(PH_SANDBOX_DEVICE) && PH_SANDBOX_DEVICE
@@ -127,6 +129,7 @@ static int memory_map_pages(void *opaque, size_t offset, void *backing,
     if (!window || !image || image->ram_fd < 16 || !page_indices ||
         !mapped_out || !page_count ||
         page_count > KOBOX_LINUX_MEMORY_SCATTER_PAGES ||
+        page_count > SIZE_MAX / PH_PAGE_SIZE ||
         (protection & ~PH_PROTECTION_MASK) != 0 ||
         (protection & KOBOX_IMAGE_READ) == 0 ||
         (protection & KOBOX_IMAGE_EXECUTE) != 0 ||
@@ -135,9 +138,8 @@ static int memory_map_pages(void *opaque, size_t offset, void *backing,
         return 1;
     }
     size = page_count * PH_PAGE_SIZE;
-    for (size_t i = 0; i < page_count; ++i) {
-        if (page_indices[i] >= image->ram_size / PH_PAGE_SIZE) return 1;
-    }
+    if (ph_arena_prefault(image->direct, image->ram_size,
+            page_indices, page_count, false)) return 1;
 
     PH_OK(ph_notifications_save(&previous_mask));
     ph_lock(&window->lock);
@@ -307,6 +309,43 @@ static int memory_cache_flush(void) {
     return cache_image && cache_image->cache_drain_completed ? 0 : 1;
 }
 
+#if PH_ARENA_LAZY
+/* Sleepable Linux reporting worker, with no window lock or notification mask.
+ * The VMO syscall completes synchronously; preserve partial NOT_READY/errors.
+ */
+static size_t initial_resident_size;
+static int memory_populate(void *backing, uint64_t first, uint64_t count) {
+    struct ph_image *image = backing;
+    if (!image || !count || first >= image->ram_size / PH_PAGE_SIZE ||
+        count > image->ram_size / PH_PAGE_SIZE - first) return PACHA_ERR_INVALID;
+    long status = pacha_syscall3(PACHA_VM_SYSCALL_MADVISE,
+        (uintptr_t)image->direct + first * PH_PAGE_SIZE,
+        count * PH_PAGE_SIZE, PACHA_VM_MADV_POPULATE_WRITE);
+    /* Raw native status is positive; the hosted contract uses negative errors. */
+    return status > 0 ? -(int)status : (int)status;
+}
+static int memory_discard(void *backing,
+    const struct kobox_linux_memory_range *ranges, size_t count) {
+    struct ph_image *image = backing;
+    struct pacha_vmo_discard_range native[32];
+    uint64_t total = 0, end = 0;
+    if (!image || image->ram_fd < 16 || !ranges || !count || count > 32)
+        return PACHA_ERR_INVALID;
+    for (size_t i = 0; i < count; ++i) {
+        uint64_t first = ranges[i].first_page, pages = ranges[i].page_count;
+        uint64_t arena_pages = image->ram_size / PH_PAGE_SIZE;
+        if (!pages || first >= arena_pages || pages > arena_pages - first ||
+            first < end || pages > 1024 - total)
+            return PACHA_ERR_INVALID;
+        native[i] = (struct pacha_vmo_discard_range){first, pages};
+        total += pages;
+        end = first + pages;
+    }
+    int status = pacha_vmo_discard(image->ram_fd, native, count);
+    return status > 0 ? -status : status;
+}
+#endif
+
 const struct kobox_linux_memory_host_operations ph_memory_ops = {
     .size = sizeof(ph_memory_ops),
     .identity = KOBOX_LINUX_MEMORY_HOST_IDENTITY,
@@ -316,6 +355,10 @@ const struct kobox_linux_memory_host_operations ph_memory_ops = {
     .protect = memory_protect,
     .set_cache = memory_set_cache,
     .cache_flush = memory_cache_flush,
+#if PH_ARENA_LAZY
+    .populate = memory_populate,
+    .discard = memory_discard,
+#endif
 };
 
 /* A range inside image->size may still be in a hole between PT_LOAD segments. */
@@ -398,7 +441,8 @@ static void allocate_image_memory(struct ph_image *image) {
         PACHA_FD_RIGHT_REVOKE | PACHA_FD_RIGHT_SHARE | PACHA_FD_RIGHT_INSPECT |
         PACHA_FD_RIGHT_CACHE_POLICY;
 
-    image->ram_fd = (pacha_fd_t)pacha_syscall3(PACHA_FD_SYSCALL_VMO_CREATE, image->ram_size, rights, 0);
+    image->ram_fd = (pacha_fd_t)pacha_syscall3(PACHA_FD_SYSCALL_VMO_CREATE, image->ram_size, rights,
+        PH_ARENA_LAZY ? PACHA_VMO_CREATE_ZERO_ON_DEMAND : 0);
     PH_CHECK(image->ram_fd >= 16);
     image->ram_cache_modes = ph_alloc(image->ram_size / PH_PAGE_SIZE);
     PH_CHECK(image->ram_cache_modes != NULL);
@@ -412,8 +456,14 @@ static void allocate_image_memory(struct ph_image *image) {
      * three reservations are present. */
     image->window = reserve_window_mapping(
         (void *)(uintptr_t)image->fixed.link_base, image->size);
-    vmemmap_window = reserve_window_mapping(
-        (void *)(uintptr_t)KOBOX_CORE_VMEMMAP_BASE, KOBOX_CORE_VMEMMAP_SIZE);
+    /* Struct-page metadata scales with the target arena. A fixed 64 MiB
+     * window silently capped otherwise valid RAM policy at about 4 GiB.
+     * Linux receives this base at boot; it need not occupy low code-model VA.
+     * Reserve only VA, and fault backing only when Linux populates metadata. */
+    PH_CHECK(image->ram_size / PH_PAGE_SIZE <= SIZE_MAX / KOBOX_CORE_PAGE_METADATA_MAX_BYTES);
+    size_t metadata_bytes=(image->ram_size / PH_PAGE_SIZE *
+        KOBOX_CORE_PAGE_METADATA_MAX_BYTES + PH_PAGE_SIZE-1) & ~(size_t)(PH_PAGE_SIZE-1);
+    vmemmap_window = reserve_window_mapping(NULL, metadata_bytes);
     vmalloc_window = reserve_window_mapping(
         (void *)(uintptr_t)KOBOX_CORE_VMALLOC_BASE, KOBOX_CORE_VMALLOC_SIZE);
     initialize_window_tracking(&image->window);
@@ -423,6 +473,15 @@ static void allocate_image_memory(struct ph_image *image) {
     direct_window = reserve_window(image->ram_size);
     PH_OK(memory_map(&direct_window, 0, image, 0, image->ram_size,
         KOBOX_IMAGE_READ | KOBOX_IMAGE_WRITE, &image->direct));
+#if PH_ARENA_LAZY
+    /* Populate before image permissions are tightened. All early memblock
+     * allocations (including the complete vmemmap) are confined to this pool.
+     * Stage1 selected prefaults remain harmless resident reads thereafter. */
+    size_t image_end = PH_IMAGE_PHYSICAL_BASE + image->size;
+    initial_resident_size = kobox_resident_initial_bytes(image->ram_size, image_end, metadata_bytes);
+    PH_CHECK(initial_resident_size != 0);
+    PH_OK(memory_populate(image, 0, initial_resident_size / PH_PAGE_SIZE));
+#endif
     image->base = image->window.base;
     void *mapped;
     PH_OK(memory_map(&image->window, 0, image, PH_IMAGE_PHYSICAL_BASE,
@@ -556,6 +615,9 @@ void ph_layout_init(struct ph_image *image, struct kobox_linux_boot_layout *layo
                 .vmalloc_window = &vmalloc_window,
                 .direct_map = image->direct,
                 .ram_size = image->ram_size,
+#if PH_ARENA_LAZY
+                .initial_resident_size = initial_resident_size,
+#endif
                 .vmemmap_base = vmemmap_window.base,
                 .vmemmap_size = vmemmap_window.size,
                 .vmalloc_base = vmalloc_window.base,

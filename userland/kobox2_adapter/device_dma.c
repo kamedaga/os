@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: MIT */
+#include "arena_prefault.h"
 #include "device_dma.h"
 #include "host.h"
 #include "boot.h"
@@ -331,6 +332,9 @@ static int dma_map_page_list(void *context, uint64_t iova,
     if (contiguous)
         return dma_map(context, iova, ram_pages[0] * PH_PAGE_SIZE,
             length, protection);
+
+    if (ph_arena_prefault(config->ram, config->ram_length,
+            ram_pages, page_count, false)) return -ERANGE;
 
     dma_lock(dma);
     if (!dma->admitted) {

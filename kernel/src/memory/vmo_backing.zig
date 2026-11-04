@@ -41,6 +41,8 @@ pub const Lock = struct {
 
 pub const Leaf = struct {
     pages: [256]u64 = .{0} ** 256,
+    view_refs: [256]u16 = .{0} ** 256,
+    parent_index: [256]u32 = .{0} ** 256,
     used: u32 = 0,
     // Survives removal of the last CPU alias; metadata is reserved alongside
     // PFNs, so retiring mappings never needs an allocation to retain writes.
@@ -68,6 +70,11 @@ pub const Ref = struct { store: ?*Store = null, owner: u64 = 0 };
 var pending_lock: Lock = .{};
 var pending: ?*Page = null;
 var pending_pages: usize = 0;
+// Kept separate from pending: its drain can run under K/AS/shared VM. These
+// detached grants may call PMM only after those outer exclusions have ended.
+var deferred_lock: @import("slot_table.zig").Leaf = .{};
+var deferred: ?*Page = null;
+var deferred_pages: usize = 0;
 var used_pages: u64 = 0;
 var metadata_pages: u64 = 0;
 var allocations: u64 = 0;
@@ -77,6 +84,8 @@ pub fn resetForTest() void {
     if (!builtin.is_test) @compileError("test-only reset");
     // Serial fixture teardown: all former body loans ended before this call.
     reclaim();
+    reclaimDeferred();
+    std.debug.assert(!hasPending() and !hasDeferred());
     while (test_pages) |page| release(page);
     used_pages = 0;
     allocations = 0;
@@ -100,15 +109,20 @@ fn acquire(allocator: storage.Allocator, leaf: bool) Error!*Page {
     }
     return p;
 }
-fn release(p: *Page) void {
-    const allocator = p.allocator;
-    const grant = p.grant;
-    // Test fixture registry is detached before release can invalidate the page.
+// Queue-neutral return: callback success invalidates the grant immediately.
+// The registry must be withdrawn before that callback, and accounting changes
+// only on success. Both retry domains share these responsibilities.
+fn releaseGrant(allocator: storage.Allocator, grant: storage.PhysicalExtent) bool {
     if (builtin.is_test) {
         pending_lock.lock();
         var link = &test_pages;
         while (link.*) |page| {
-            if (page == p) {
+            // Host issuers can use equal synthetic PA tokens for different
+            // mapped grants. Unregister the exact issuer/grant, never a page
+            // belonging to another live owner before its callback runs.
+            if (page.allocator.context == allocator.context and page.allocator.acquire == allocator.acquire and
+                page.allocator.release == allocator.release and page.allocator.release_mapped == allocator.release_mapped and
+                page.grant.physical.toInt() == grant.physical.toInt() and page.grant.pages == grant.pages and page.grant.region_id == grant.region_id) {
                 link.* = page.test_next;
                 break;
             }
@@ -116,14 +130,45 @@ fn release(p: *Page) void {
         }
         pending_lock.unlock();
     }
-    if (allocator.release(allocator.context, grant)) {
-        _ = @atomicRmw(u64, &metadata_pages, .Sub, 1, .monotonic);
-    } else {
-        pending_lock.lock();
-        p.next = pending;
-        pending = p;
-        _ = @atomicRmw(usize, &pending_pages, .Add, 1, .release);
-        pending_lock.unlock();
+    if (!allocator.release(allocator.context, grant)) return false;
+    _ = @atomicRmw(u64, &metadata_pages, .Sub, 1, .monotonic);
+    return true;
+}
+fn release(p: *Page) void {
+    const allocator = p.allocator;
+    const grant = p.grant;
+    if (releaseGrant(allocator, grant)) return;
+    pending_lock.lock();
+    p.next = pending;
+    pending = p;
+    _ = @atomicRmw(usize, &pending_pages, .Add, 1, .release);
+    pending_lock.unlock();
+}
+fn enqueueDeferred(p: *Page) void {
+    const irq = deferred_lock.lock();
+    p.next = deferred;
+    deferred = p;
+    _ = @atomicRmw(usize, &deferred_pages, .Add, 1, .release);
+    deferred_lock.unlock(irq);
+    // Publication transfers ownership; another CPU may already have freed p.
+}
+pub fn hasDeferred() bool {
+    return @atomicLoad(usize, &deferred_pages, .acquire) != 0;
+}
+pub fn reclaimDeferred() void {
+    const irq = deferred_lock.lock();
+    var list = deferred;
+    deferred = null;
+    @atomicStore(usize, &deferred_pages, 0, .release);
+    deferred_lock.unlock(irq);
+    // Each invocation owns a finite snapshot. A forbidden callback reentry
+    // can see only the public queue, never this invocation's remaining pages.
+    while (list) |p| {
+        const next = p.next;
+        const allocator = p.allocator;
+        const grant = p.grant;
+        if (!releaseGrant(allocator, grant)) enqueueDeferred(p);
+        list = next;
     }
 }
 pub fn hasPending() bool {
@@ -310,6 +355,105 @@ pub const Store = struct {
             _ = @atomicRmw(u64, &used_pages, .Sub, 1, .monotonic);
         }
     }
+    pub fn viewRefsLocked(self: *Store, index: u32) u16 {
+        const leaf = Directory.get(self.root, index >> 8, levels) orelse return 0;
+        return leaf.view_refs[index & 255];
+    }
+    pub fn parentIndexLocked(self: *Store, index: u32) u32 {
+        const leaf = Directory.get(self.root, index >> 8, levels) orelse return 0;
+        return leaf.parent_index[index & 255];
+    }
+    /// Outer K/AS/shared exclusion keeps destinations unchanged between the
+    /// three stages. Never nest parent and view Store locks: scatter indices
+    /// can reach any parent leaf, and allocation must precede either publish.
+    pub fn installView(self: *Store, ref: Ref, count: u32, offset: usize, parent: Ref, parent_count: u32, indices: []const u64, sparse: bool, allocator: storage.Allocator) Error!void {
+        if (indices.len == 0 or indices.len > 64 or offset > count or indices.len > count - offset or self == parent.store) return error.InvalidState;
+        const source = parent.store orelse return error.InvalidState;
+        for (0..indices.len) |i| try self.prepare(ref, @intCast(offset + i), allocator);
+        self.lock.lock();
+        var valid = self.matches(ref, ref.owner);
+        for (0..indices.len) |i| {
+            const index: u32 = @intCast(offset + i);
+            if (self.getLocked(index) != 0 or self.parentIndexLocked(index) != 0) valid = false;
+        }
+        self.lock.unlock();
+        if (!valid) return error.InvalidState;
+        var pages: [64]u64 = @splat(0);
+        source.lock.lock();
+        if (!source.matches(parent, parent.owner)) {
+            source.lock.unlock();
+            return error.InvalidState;
+        }
+        // Validate the entire chunk, including multiplicity, before the first
+        // increment. A late hole/index/overflow cannot leak an unrecorded ref.
+        for (indices, 0..) |index, i| {
+            if (index == std.math.maxInt(u64) and sparse) continue;
+            if (index >= parent_count) {
+                source.lock.unlock();
+                return error.InvalidState;
+            }
+            const ix: u32 = @intCast(index);
+            const pa = source.getLocked(ix);
+            if (pa == 0 or pa & 4095 != 0) {
+                source.lock.unlock();
+                return error.InvalidState;
+            }
+            var multiplicity: u32 = 0;
+            for (indices) |other| if (other == index) {
+                multiplicity += 1;
+            };
+            if (@as(u32, source.viewRefsLocked(ix)) + multiplicity > std.math.maxInt(u16)) {
+                source.lock.unlock();
+                return error.OutOfMemory;
+            }
+            pages[i] = pa;
+        }
+        for (indices, pages[0..indices.len]) |index, pa| {
+            if (pa == 0) continue;
+            const leaf = Directory.get(source.root, @as(u32, @intCast(index)) >> 8, levels).?;
+            leaf.view_refs[index & 255] += 1;
+        }
+        source.lock.unlock();
+        self.lock.lock();
+        defer self.lock.unlock();
+        std.debug.assert(self.matches(ref, ref.owner));
+        for (indices, pages[0..indices.len], 0..) |index, pa, i| {
+            if (pa == 0) continue;
+            const dest: u32 = @intCast(offset + i);
+            self.putLocked(dest, pa);
+            Directory.get(self.root, dest >> 8, levels).?.parent_index[dest & 255] = @intCast(index + 1);
+        }
+    }
+    /// The dying view still retains its parent, but has no readers. Snapshot
+    /// one chunk under its own lock before taking the parent lock, so no two
+    /// stores are held together and every committed reference is dropped once.
+    pub fn releaseViewRefs(self: *Store, ref: Ref, parent: Ref, count: u32) void {
+        const source = parent.store orelse @panic("view parent missing");
+        var next: usize = 0;
+        var pages: [64]BackedPage = undefined;
+        var indices: [64]u32 = undefined;
+        while (next < count) {
+            self.lock.lock();
+            std.debug.assert(self.matches(ref, ref.owner));
+            const n = self.snapshotLocked(next, count, &pages);
+            for (pages[0..n], 0..) |page, i| {
+                indices[i] = self.parentIndexLocked(page.index);
+                std.debug.assert(indices[i] != 0);
+            }
+            self.lock.unlock();
+            if (n == 0) break;
+            source.lock.lock();
+            std.debug.assert(source.matches(parent, parent.owner));
+            for (indices[0..n], pages[0..n]) |encoded, page| {
+                const index = encoded - 1;
+                const leaf = Directory.get(source.root, index >> 8, levels) orelse @panic("view parent leaf missing");
+                if (leaf.pages[index & 255] != page.paddr or leaf.view_refs[index & 255] == 0) @panic("view reference mismatch");
+                leaf.view_refs[index & 255] -= 1;
+            }
+            source.lock.unlock();
+            next = @as(usize, pages[n - 1].index) + 1;
+        }
+    }
     pub fn markDirtyLocked(self: *Store, index: u32) bool {
         const leaf = Directory.get(self.root, index >> 8, levels) orelse return false;
         leaf.dirty[(index & 255) >> 6] |= @as(u64, 1) << @intCast(index & 63);
@@ -319,6 +463,11 @@ pub const Store = struct {
     pub fn dirtyWordLocked(self: *Store, word: u32) u64 {
         const leaf = Directory.get(self.root, word >> 2, levels) orelse return 0;
         return leaf.dirty[word & 3];
+    }
+
+    pub fn clearDirtyPageLocked(self: *Store, index: u32) void {
+        const leaf = Directory.get(self.root, index >> 8, levels) orelse return;
+        leaf.dirty[(index & 255) >> 6] &= ~(@as(u64, 1) << @as(u6, @intCast(index & 63)));
     }
 
     pub fn clearDirtyWordLocked(self: *Store, word: u32) void {
@@ -392,6 +541,19 @@ pub const Store = struct {
         while (list) |p| {
             list = p.next;
             release(p);
+        }
+    }
+    pub fn pruneEmptyDeferred(self: *Store, ref: Ref, index: u32) void {
+        var list: ?*Page = null;
+        self.lock.lock();
+        if (self.matches(ref, ref.owner)) prune(&self.root, index, 0, &list);
+        self.lock.unlock();
+        // No callback under the caller's outer VM transaction. Capture next
+        // before publication, after which the Page belongs solely to queue.
+        while (list) |p| {
+            const next = p.next;
+            enqueueDeferred(p);
+            list = next;
         }
     }
     fn destroyNode(self: *Store, node: *Node, depth: usize) void {
@@ -749,4 +911,153 @@ test "VMO radix concurrent path growth keeps every key and returns losing drafts
     for (0..4096) |i| try std.testing.expectEqual(@as(u64, (i + 1) * 4096), store.getLocked(@intCast(i)));
     try std.testing.expect(store.clear(ref));
     try std.testing.expectEqual(@as(usize, 0), allocator.live);
+}
+
+test "shared discard view install all or nothing duplicate sparse and late failure" {
+    var allocator: storage.TestAllocator = .{};
+    defer allocator.deinit();
+    var parent: Store = .{};
+    const root_ref = parent.init(11);
+    var view: Store = .{};
+    const view_ref = view.init(12);
+    defer { _ = view.clear(view_ref); _ = parent.clear(root_ref); reclaim(); }
+    for ([_]u32{ 0, 256, 512 }) |index| {
+        try parent.prepare(root_ref, index, allocator.interface());
+        parent.putLocked(index, (@as(u64, index) + 1) * 4096);
+    }
+    try view.installView(view_ref, 8, 0, root_ref, 513, &.{ 0, 256, 0, std.math.maxInt(u64) }, true, allocator.interface());
+    // Independent expectation comes from recorded view indices AND PA, never
+    // from the helper's increments. Index zero is encoded as one.
+    for ([_]u32{ 0, 256, 512 }) |index| {
+        var expected: u16 = 0;
+        for (0..8) |i| {
+            const encoded = view.parentIndexLocked(@intCast(i));
+            if (encoded == 0) { try std.testing.expectEqual(@as(u64, 0), view.getLocked(@intCast(i))); continue; }
+            try std.testing.expectEqual(parent.getLocked(encoded - 1), view.getLocked(@intCast(i)));
+            if (encoded - 1 == index) expected += 1;
+        }
+        try std.testing.expectEqual(expected, parent.viewRefsLocked(index));
+    }
+    try std.testing.expectError(error.InvalidState, view.installView(view_ref, 8, 4, root_ref, 513, &.{ 512, 511 }, false, allocator.interface()));
+    try std.testing.expectEqual(@as(u16, 0), parent.viewRefsLocked(512));
+    try std.testing.expectError(error.InvalidState, view.installView(view_ref, 8, 0, root_ref, 513, &.{512}, false, allocator.interface()));
+    try std.testing.expectEqual(@as(u16, 0), parent.viewRefsLocked(512));
+    const leaf = Directory.get(parent.root, 2, levels).?;
+    leaf.view_refs[0] = std.math.maxInt(u16) - 1;
+    try std.testing.expectError(error.OutOfMemory, view.installView(view_ref, 8, 4, root_ref, 513, &.{ 512, 512 }, false, allocator.interface()));
+    try std.testing.expectEqual(std.math.maxInt(u16) - 1, leaf.view_refs[0]);
+    leaf.view_refs[0] = 0;
+    view.releaseViewRefs(view_ref, root_ref, 8);
+    try std.testing.expectEqual(@as(u16, 0), parent.viewRefsLocked(0));
+    try std.testing.expectEqual(@as(u16, 0), parent.viewRefsLocked(256));
+}
+
+test "shared discard deferred rejects outside lock and survives forbidden one level reentry" {
+    var issuer: storage.TestAllocator = .{};
+    defer issuer.deinit();
+    const Probe = struct {
+        var reenter = true;
+        fn release(context: *anyopaque, grant: storage.PhysicalExtent) bool {
+            lock_diagnostics.assertRootEmpty();
+            if (reenter) { reenter = false; reclaimDeferred(); }
+            const allocator: *storage.TestAllocator = @ptrCast(@alignCast(context));
+            return allocator.interface().release(context, grant);
+        }
+    };
+    Probe.reenter = true;
+    var allocator = issuer.interface();
+    allocator.release = Probe.release;
+    var store: Store = .{};
+    const ref = store.init(99);
+    try store.prepare(ref, 0, allocator);
+    store.putLocked(0, 4096);
+    store.putLocked(0, 0);
+    store.pruneEmptyDeferred(ref, 0);
+    try std.testing.expect(hasDeferred());
+    issuer.fail_return = true;
+    reclaim(); // Existing pending drain cannot reach the deferred domain.
+    try std.testing.expectEqual(@as(usize, 0), issuer.returns);
+    reclaimDeferred();
+    try std.testing.expect(hasDeferred());
+    _ = store.clear(ref);
+    issuer.fail_return = false;
+    reclaimDeferred();
+    try std.testing.expect(!hasDeferred());
+    try std.testing.expectEqual(@as(usize, 0), issuer.active());
+}
+
+test "shared discard concurrent deferred enqueue and finite snapshot reclaim" {
+    const Context = struct {
+        issuer: storage.TestAllocator = .{},
+        gate: bool = false,
+        fn acquire(context: *anyopaque, pages: usize) ?storage.MappedExtent {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            const allocator = self.issuer.interface();
+            return allocator.acquire(allocator.context, pages);
+        }
+        fn release(context: *anyopaque, grant: storage.PhysicalExtent) bool {
+            lock_diagnostics.assertRootEmpty();
+            const self: *@This() = @ptrCast(@alignCast(context));
+            while (@cmpxchgWeak(bool, &self.gate, false, true, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
+            defer @atomicStore(bool, &self.gate, false, .release);
+            const allocator = self.issuer.interface();
+            return allocator.release(allocator.context, grant);
+        }
+    };
+    const Worker = struct {
+        store: *Store,
+        ref: Ref,
+        start: *bool,
+        fn run(self: *@This()) void {
+            const root = @import("root");
+            if (@hasDecl(root, "setTestLockDiagnosticsCpu")) root.setTestLockDiagnosticsCpu(1);
+            while (!@atomicLoad(bool, self.start, .acquire)) std.atomic.spinLoopHint();
+            self.store.pruneEmptyDeferred(self.ref, 0);
+            reclaimDeferred();
+        }
+    };
+    var context: Context = .{};defer context.issuer.deinit();
+    const allocator = storage.Allocator{ .context = &context, .acquire = Context.acquire, .release = Context.release };
+    var stores = [_]Store{ .{}, .{} };
+    var refs: [2]Ref = undefined;
+    for (&stores, 0..) |*store, i| {
+        refs[i] = store.init(@intCast(i + 1));
+        try store.prepare(refs[i], 0, allocator);
+        store.putLocked(0, 4096);store.putLocked(0, 0);
+    }
+    var start = false;
+    var worker = Worker{ .store = &stores[1], .ref = refs[1], .start = &start };
+    const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
+    @atomicStore(bool, &start, true, .release);
+    stores[0].pruneEmptyDeferred(refs[0], 0);
+    reclaimDeferred();
+    thread.join();
+    reclaimDeferred();
+    try std.testing.expect(!hasDeferred());
+    try std.testing.expectEqual(@as(usize, 0), context.issuer.active());
+}
+
+
+test "shared discard releaseGrant unregisters exact issuer with equal synthetic PA tokens" {
+    var first: storage.TestAllocator = .{};defer first.deinit();
+    var second: storage.TestAllocator = .{};defer second.deinit();
+    var a: Store = .{};
+    var b: Store = .{};
+    const ar = a.init(1);
+    const br = b.init(2);
+    try a.prepare(ar, 0, first.interface());
+    try b.prepare(br, 0, second.interface());
+    // Each issuer deliberately starts its token sequence at the same PA.
+    // Releasing a must leave b's registry nodes intact, and no freed a node.
+    _ = a.clear(ar);
+    var cursor = test_pages;
+    var count: usize = 0;
+    while (cursor) |page| : (cursor = page.test_next) {
+        try std.testing.expect(page.allocator.context != @as(*anyopaque, &first));
+        if (page.allocator.context == @as(*anyopaque, &second)) count += 1;
+    }
+    try std.testing.expectEqual(second.active(), count);
+    _ = b.clear(br);
+    try std.testing.expectEqual(@as(usize, 0), first.active());
+    try std.testing.expectEqual(@as(usize, 0), second.active());
 }

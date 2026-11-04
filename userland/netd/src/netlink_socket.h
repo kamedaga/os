@@ -21,3 +21,6 @@ void netd_netlink_socket_reap_hangups(
     const struct pacha_service_wait_set *wait_set);
 
 int netd_netlink_socket_send(const netd_io_t *request, size_t *out_sent);
+
+int netd_netlink_socket_readiness(uint64_t handle, pacha_fd_t *out);
+int netd_netlink_socket_arm(uint64_t handle, pacha_fd_t fd);

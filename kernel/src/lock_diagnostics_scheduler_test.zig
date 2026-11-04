@@ -4,3 +4,5 @@ comptime {
     // Import the module's tests, not every privileged production entry point.
     _ = scheduler.initializeStaticStorage;
 }
+const guards = @import("scheduler_test_trap_guards.zig");
+comptime { _ = guards; }

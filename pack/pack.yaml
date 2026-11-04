@@ -3,7 +3,7 @@ name: "CapabilityOS"
 artifacts: ".artifacts"
 state: ".artifacts/pack"
 storage:
-  sandboxRAMMiB: 512
+  sandboxRAMMiB: 0 # Auto: use runtime physical RAM; explicit values constrain the sandbox.
   queueSize: 64
   queueArenaMiB: 16
 kernel:

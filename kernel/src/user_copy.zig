@@ -35,34 +35,13 @@ pub const Hooks = struct {
 
 var user_copy_hooks_storage: Hooks = undefined;
 var user_copy_hooks_ready = false;
-var ram_cache_snapshot: ?*const ram_cache.Snapshot = null;
+const ram_cache_snapshot = @import("memory/ram_cache_snapshot.zig");
 
-/// Only the serialized physical-cache transition owner may publish. The
-/// snapshot and its slices stay immutable and mapped until an acknowledged
-/// all-CPU rendezvous after replacement; the caller owns their reclamation.
-pub fn publishRamCacheSnapshot(snapshot: ?*const ram_cache.Snapshot) void {
-    @atomicStore(?*const ram_cache.Snapshot, &ram_cache_snapshot, snapshot, .release);
-}
-
-/// Writer-side identity check without lending out the immutable snapshot.
-pub fn ramCacheSnapshotIsCurrent(snapshot: ?*const ram_cache.Snapshot) bool {
-    return @atomicLoad(?*const ram_cache.Snapshot, &ram_cache_snapshot, .acquire) == snapshot;
-}
-
-/// Caller holds either its IRQ-disabled copy guard or an address-space lock
-/// included in every writer's all-VM transaction. Return values own no borrow
-/// into a snapshot, so they remain valid after the short lookup completes.
-pub fn ramCachePolicyForLockedPage(paddr: u64) ram_cache.Snapshot.Decision {
-    const snapshot = @atomicLoad(?*const ram_cache.Snapshot, &ram_cache_snapshot, .acquire) orelse
-        return .ordinary;
-    return snapshot.query(paddr);
-}
-
-/// Same exclusion as the per-page lookup; pending-only snapshots are active.
-pub fn hasRamCachePolicyLocked() bool {
-    const snapshot = @atomicLoad(?*const ram_cache.Snapshot, &ram_cache_snapshot, .acquire) orelse return false;
-    return snapshot.policy.len != 0 or snapshot.pending.len != 0;
-}
+// The snapshot lives in its own module; these names keep existing callers.
+pub const publishRamCacheSnapshot = ram_cache_snapshot.publish;
+pub const ramCacheSnapshotIsCurrent = ram_cache_snapshot.isCurrent;
+pub const ramCachePolicyForLockedPage = ram_cache_snapshot.policyForLockedPage;
+pub const hasRamCachePolicyLocked = ram_cache_snapshot.hasPolicyLocked;
 
 // The guard is returned by value. Its intrusive record must stay at a
 // stable per-CPU address, not move with the caller's guard value.
@@ -333,6 +312,79 @@ test "shootdown interrupt guard is CPU local and clears independently" {
     try std.testing.expectEqual(@as(u8, 1), tlb_shootdown_active[other]);
 }
 
+// Fork diagnostics borrow numeric cumulative evidence only, never VM state.
+// The sender keeps its kernel continuation on this CPU; ACK IRQs update only
+// mailbox ACKs. Per-CPU atomics tolerate cold snapshots without another lock.
+pub const ForkProfile = struct {
+    pub const enabled = perf.enabled;
+    pub const Counter = enum { requests, targets, lock_wait, prepare, send, ack, retries, full, parent_flush, pte_target, pte_present, pte_changed, pt_lookups, cow_vmas, parent_flush_calls, overflow, vma_validate, vma_prepare, vma_retain, vma_install, claim_entry, claim_reference, claim_active };
+    pub const Row = [24]u64;
+    var rows: [if (enabled) 64 else 0]Row align(128) = @splat(@splat(0));
+    var sequence: if (enabled) u64 else void = if (enabled) 0 else {};
+    var dropped: if (enabled) u64 else void = if (enabled) 0 else {};
+    comptime {
+        if (enabled) @export(&rows, .{ .name = "mc_k1_fork_counters" });
+        if (enabled) @export(&sequence, .{ .name = "mc_k1_fork_sequence" });
+        if (enabled) @export(&dropped, .{ .name = "mc_k1_fork_dropped" });
+    }
+    pub fn cpu() usize {
+        if (comptime !enabled) return 0;
+        return smp.currentCpuSlot();
+    }
+    pub fn stamp() u64 {
+        if (comptime !enabled) return 0;
+        return perf.timestamp();
+    }
+    pub fn add(comptime field: Counter, value: u64) void {
+        if (comptime !enabled) return;
+        const c = cpu();
+        if (c >= rows.len) { @atomicStore(u64, &dropped, std.math.maxInt(u64), .monotonic); return; }
+        const old = @atomicRmw(u64, &rows[c][@intFromEnum(field)], .Add, value, .monotonic);
+        if (old > std.math.maxInt(u64) - value) @atomicStore(u64, &rows[c][@intFromEnum(Counter.overflow)], 1, .monotonic);
+    }
+    pub fn interval(comptime field: Counter, start: u64, end: u64) void {
+        if (comptime !enabled) return;
+        if (end < start) add(.overflow, 1) else add(field, end - start);
+    }
+    pub fn snapshot() Row {
+        var result: Row = @splat(0);
+        if (comptime !enabled) return result;
+        const c = cpu();
+        if (c >= rows.len) { result[@intFromEnum(Counter.overflow)] = 1; return result; }
+        for (&result, 0..) |*v, i| v.* = @atomicLoad(u64, &rows[c][i], .monotonic);
+        return result;
+    }
+    pub fn accumulate(total: *u64, start: u64, end: u64) bool {
+        if (end < start) return false;
+        const sum = @addWithOverflow(total.*, end - start);
+        total.* = sum[0];
+        return sum[1] == 0;
+    }
+    pub fn difference(before: Row, after: Row) ?Row {
+        var result: Row = @splat(0);
+        if (before[@intFromEnum(Counter.overflow)] != 0 or after[@intFromEnum(Counter.overflow)] != 0) return null;
+        for (&result, 0..) |*v, i| {
+            if (after[i] < before[i]) return null;
+            v.* = after[i] - before[i];
+        }
+        return result;
+    }
+    pub fn nextReport() u64 {
+        if (comptime !enabled) return 0;
+        // K serializes ordinary callers; CAS also makes diagnostic exhaustion
+        // saturate if another admitted clone is suspended in a remote wait.
+        for (0..16) |_| {
+            const old = @atomicLoad(u64, &sequence, .monotonic);
+            if (old == std.math.maxInt(u64)) return 0;
+            if (@cmpxchgWeak(u64, &sequence, old, old + 1, .monotonic, .monotonic) != null) continue;
+            if (old >= 256) _ = @atomicRmw(u64, &dropped, .Max, old - 255, .monotonic);
+            return old + 1;
+        }
+        @atomicStore(u64, &dropped, std.math.maxInt(u64), .monotonic);
+        return 0;
+    }
+};
+
 fn staticStorageEnd(comptime T: type, ptr: *T) usize {
     return @intFromPtr(ptr) + @sizeOf(T);
 }
@@ -343,10 +395,13 @@ fn maxStaticEnd(a: usize, b: usize) usize {
 
 pub fn kernelStaticStorageEndAddr() usize {
     var end: usize = 0;
+    if (comptime ForkProfile.enabled) {
+        inline for (.{ &ForkProfile.rows, &ForkProfile.sequence, &ForkProfile.dropped }) |ptr| end = maxStaticEnd(end, @intFromPtr(ptr) + @sizeOf(@TypeOf(ptr.*)));
+    }
     if (comptime lock_diagnostics.enabled) end = maxStaticEnd(end, staticStorageEnd(@TypeOf(copy_window_records), &copy_window_records));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(user_copy_hooks_storage), &user_copy_hooks_storage));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(user_copy_hooks_ready), &user_copy_hooks_ready));
-    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(ram_cache_snapshot), &ram_cache_snapshot));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(ram_cache_snapshot.current), &ram_cache_snapshot.current));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(tlb_shootdown_lock), &tlb_shootdown_lock));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(tlb_cost_measured), &tlb_cost_measured));
     if (comptime lock_diagnostics.enabled) end = maxStaticEnd(end, staticStorageEnd(@TypeOf(tlb_range_checked_limit), &tlb_range_checked_limit));
@@ -360,12 +415,15 @@ pub fn kernelStaticStorageEndAddr() usize {
 }
 
 pub fn mapKernelRuntimeStorage(map_identity_range: *const fn (u64, usize) bool) bool {
+    if (comptime ForkProfile.enabled) {
+        inline for (.{ &ForkProfile.rows, &ForkProfile.sequence, &ForkProfile.dropped }) |ptr| if (!map_identity_range(@intFromPtr(ptr), @sizeOf(@TypeOf(ptr.*)))) return false;
+    }
     if (comptime lock_diagnostics.enabled) {
         if (!map_identity_range(@intFromPtr(&copy_window_records), @sizeOf(@TypeOf(copy_window_records)))) return false;
     }
     if (!map_identity_range(@intFromPtr(&user_copy_hooks_storage), @sizeOf(@TypeOf(user_copy_hooks_storage)))) return false;
     if (!map_identity_range(@intFromPtr(&user_copy_hooks_ready), @sizeOf(@TypeOf(user_copy_hooks_ready)))) return false;
-    if (!map_identity_range(@intFromPtr(&ram_cache_snapshot), @sizeOf(@TypeOf(ram_cache_snapshot)))) return false;
+    if (!map_identity_range(@intFromPtr(&ram_cache_snapshot.current), @sizeOf(@TypeOf(ram_cache_snapshot.current)))) return false;
     if (!map_identity_range(@intFromPtr(&tlb_shootdown_lock), @sizeOf(@TypeOf(tlb_shootdown_lock)))) return false;
     if (!map_identity_range(@intFromPtr(&tlb_cost_measured), @sizeOf(@TypeOf(tlb_cost_measured)))) return false;
     if (comptime lock_diagnostics.enabled) {
@@ -732,31 +790,15 @@ pub fn resolveNativeVmaFaultMappingWithAddressSpaceLocked(
             .allocate_zero => {},
             .allocate_copy, .locked_slow_path => return null,
         }
-        const candidate = allocatePreparedFaultPage(state, free_list, plan) orelse {
-            const store = kernel.vmObjectBackingStoreStats();
-            kernel_log.writeFmt(
-                "vm: fault allocation failed principal={} va=0x{x} free_pages={} store_used={} store_free={}\n",
-                .{ @intFromEnum(principal), page_va, free_list.pageCount(), store.used_entries, store.free_entries },
-            );
-            return null;
-        };
         const mapping = blk: {
             user_vm.lockSharedVmObjects();
             defer user_vm.unlockSharedVmObjects();
-            break :blk state.commitNativeVmaFaultMapping(principal, plan, candidate, free_list);
+            break :blk state.commitFreshNativeVmaFaultMapping(principal, plan, free_list);
         };
-        if (mapping) |resolved| {
-            if (resolved.paddr != candidate) free_list.appendPage(candidate) catch |err| switch (err) {
-                error.PageQuarantined => {},
-                else => @panic("invalid PMM return"),
-            };
-            return resolved;
+        if (mapping) |resolved| return resolved else |err| {
+            if (err != error.Revalidate) return null;
         }
-        kernel_log.writeFmt("vm: fault commit retry principal={} va=0x{x} attempt={}\n", .{ @intFromEnum(principal), page_va, attempt });
-        free_list.appendPage(candidate) catch |err| switch (err) {
-            error.PageQuarantined => {},
-            else => @panic("invalid PMM return"),
-        };
+
     }
     return null;
 }
@@ -827,6 +869,19 @@ pub const ProbeResult = union(enum) {
 /// exclusion, then the locks are dropped. The caller returns its VA to user
 /// mode, where a read fault supplies the page before the syscall is retried.
 pub fn probeUserRange(principal: kernel.PrincipalId, start_va: u64, length: usize, write_access: bool) ProbeResult {
+    return probeRange(principal, start_va, length, write_access, false);
+}
+
+pub const PopulateResult = union(enum) { resident, invalid_address, backing_absent: u64, out_of_memory };
+
+/// Only shared anonymous WB zero-on-demand pages expose allocation failure.
+/// A failed range retains its resident prefix and any committed VMO backing;
+/// callers may retry without transferring ownership of that backing.
+pub fn populateUserRange(principal: kernel.PrincipalId, start_va: u64, length: usize, write_access: bool) PopulateResult {
+    return probeRange(principal, start_va, length, write_access, true);
+}
+
+fn probeRange(principal: kernel.PrincipalId, start_va: u64, length: usize, write_access: bool, comptime populate: bool) if (populate) PopulateResult else ProbeResult {
     if (length == 0) return .resident;
     const last, const overflow = @addWithOverflow(start_va, @as(u64, @intCast(length - 1)));
     if (overflow != 0) return .invalid_address;
@@ -840,23 +895,88 @@ pub fn probeUserRange(principal: kernel.PrincipalId, start_va: u64, length: usiz
     const last_page = last & ~@as(u64, 4095);
     while (true) {
         if (!user_vm.lockAddressSpace(principal)) return .invalid_address;
-        const page = address_types.UserVirtualAddress.fromInt(page_va);
-        const mapped = profileResolve(principal, page, write_access);
-        if (mapped == null) {
-            user_vm.lockSharedVmObjects();
-            const candidate = getHooks().state.pendingPagerFaultPage(principal, page_va, write_access, false);
-            const outcome = if (candidate) |fault|
-                getHooks().state.requestPagerFault(fault.vmo, fault.index, if (write_access) @import("kernel_abi_root").pager_abi.access_write else @import("kernel_abi_root").pager_abi.access_read, principal, 0, 0, 0, 0) catch .invalid
-            else
-                .invalid;
-            user_vm.unlockSharedVmObjects();
-            user_vm.unlockAddressSpace(principal);
-            if (outcome == .pending) return .{ .backing_absent = page_va };
-            if (outcome != .already_present) return .invalid_address;
-        } else user_vm.unlockAddressSpace(principal);
+        const result = if (populate) populateUserPageWithAddressSpaceLocked(principal, page_va, write_access) else probeUserPageWithAddressSpaceLocked(principal, page_va, write_access);
+        user_vm.unlockAddressSpace(principal);
+        switch (result) {
+            .resident => {},
+            else => return result,
+        }
         if (page_va == last_page) return .resident;
         page_va += 4096;
     }
+}
+
+fn populateUserPageWithAddressSpaceLocked(principal: kernel.PrincipalId, page_va: u64, write_access: bool) PopulateResult {
+    const h = getHooks();
+    // AS protects the entry through commit; shared VM protects the borrowed
+    // VMO attributes. Private mappings must retain the existing COW-first path.
+    const eligible = blk: {
+        user_vm.lockSharedVmObjects();
+        defer user_vm.unlockSharedVmObjects();
+        const entry = h.state.vmaEntryForVaConst(principal, page_va) orelse break :blk false;
+        const vmo = h.state.nativeVmoSlotConst(entry.vmo) orelse break :blk false;
+        if (vmo.ram_cache_state == .retiring) return .invalid_address;
+        break :blk !entry.flags.private and h.state.nativeVmoIsZeroOnDemand(entry.vmo) and (vmo.ram_cache_state == .wb or ordinary: {
+            const plan = h.state.prepareNativeVmaFaultMapping(principal, page_va, write_access, false);
+            break :ordinary plan.kind != .ready or ramCachePolicyForLockedPage(plan.mapping.paddr) == .ordinary;
+        });
+    };
+    if (!eligible) return switch (probeUserPageWithAddressSpaceLocked(principal, page_va, write_access)) {
+        .resident => .resident,
+        .invalid_address => .invalid_address,
+        .backing_absent => |va| .{ .backing_absent = va },
+    };
+    const page = address_types.UserVirtualAddress.fromInt(page_va);
+    if (user_vm.lookupUserPhysicalPageWithAddressSpaceLocked(principal, page, write_access, false) != null) return .resident;
+    var attempt: usize = 0;
+    while (attempt < 2) : (attempt += 1) {
+        const plan = blk: {
+            user_vm.lockSharedVmObjects();
+            defer user_vm.unlockSharedVmObjects();
+            break :blk h.state.prepareNativeVmaFaultMapping(principal, page_va, write_access, false);
+        };
+        const mapping = switch (plan.kind) {
+            .ready => plan.mapping,
+            .allocate_zero => blk: {
+                const resolved = commit: {
+                    user_vm.lockSharedVmObjects();
+                    defer user_vm.unlockSharedVmObjects();
+                    break :commit h.state.commitFreshNativeVmaFaultMapping(principal, plan, h.free_list);
+                };
+                const committed = resolved catch |err| switch (err) {
+                    error.Revalidate => continue,
+                    error.OutOfMemory => return .out_of_memory,
+                    error.Denied => return .invalid_address,
+                };
+                break :blk committed;
+            },
+            else => return .invalid_address,
+        };
+        // Once committed, backing belongs to the VMO even if PT allocation
+        // fails. A retry must classify PT OOM again through the ready plan.
+        user_vm.mapNativeVmaFaultPageResult(principal, page_va, mapping) catch |err| return if (err == error.OutOfFreePages) .out_of_memory else .invalid_address;
+        return .resident;
+    }
+    return .invalid_address;
+}
+
+// The caller owns AS exclusion. Coverage belongs to the whole range, never
+// to this helper: per-page registration would exhaust the 32 range slots.
+fn probeUserPageWithAddressSpaceLocked(principal: kernel.PrincipalId, page_va: u64, write_access: bool) ProbeResult {
+    const page = address_types.UserVirtualAddress.fromInt(page_va);
+    const mapped = profileResolve(principal, page, write_access);
+    if (mapped == null) {
+        user_vm.lockSharedVmObjects();
+        const candidate = getHooks().state.pendingPagerFaultPage(principal, page_va, write_access, false);
+        const outcome = if (candidate) |fault|
+            getHooks().state.requestPagerFault(fault.vmo, fault.index, if (write_access) @import("kernel_abi_root").pager_abi.access_write else @import("kernel_abi_root").pager_abi.access_read, principal, 0, 0, 0, 0) catch .invalid
+        else
+            .invalid;
+        user_vm.unlockSharedVmObjects();
+        if (outcome == .pending) return .{ .backing_absent = page_va };
+        if (outcome != .already_present) return .invalid_address;
+    }
+    return .resident;
 }
 
 fn ensureUserPageMappedForCopyWithAddressSpaceLocked(principal: kernel.PrincipalId, page: address_types.UserVirtualAddress, write_access: bool) ?CopyPage {
@@ -1002,9 +1122,39 @@ pub fn writePhysU8(addr: u64, value: u8) bool {
     return true;
 }
 
+/// Only a newly allocated, exclusively owned PMM page of ordinary WB RAM
+/// may use this API. DMA/cache leases retain the old owner's page until WB
+/// restoration, so such pages cannot be allocated here. Ownership, not this
+/// address conversion, proves cache compatibility and lifetime. General
+/// borrowed/device pages must continue through zeroPhysicalPage's checks.
+pub fn zeroOwnedPhysicalPage(page_paddr: u64) bool {
+    const stage_sample = if (comptime @import("lock_profile.zig").enabled) @import("lock_profile.zig").stageBegin() else {};
+    defer if (comptime @import("lock_profile.zig").enabled) @import("lock_profile.zig").stageEnd(.zero, stage_sample);
+    if (page_paddr == 0 or page_paddr & 0xFFF != 0) return false;
+    const direct: ?*[4096]u8 = if (@import("arch/x86_64/physical_layout.zig").identitySlice(u8, .fromInt(page_paddr), 4096)) |page| @ptrCast(page.ptr) else null;
+    return zeroOwnedPageWithDirectMapping(page_paddr, direct);
+}
+
+// The public boundary validates the owned PA; the mapping boundary supplies
+// exactly one page or null. Keeping selection separate lets host tests exercise
+// the real high-RAM fallback without installing a kernel direct map.
+fn zeroOwnedPageWithDirectMapping(page_paddr: u64, direct: ?*[4096]u8) bool {
+    if (direct) |page| {
+        @memset(page, 0);
+        return true;
+    }
+    // PMM can allocate RAM above the direct aperture; retain high-RAM support.
+    return zeroPhysicalPageInWindow(page_paddr);
+}
+
 pub fn zeroPhysicalPage(page_paddr: u64) bool {
     const stage_sample = if (comptime @import("lock_profile.zig").enabled) @import("lock_profile.zig").stageBegin() else {};
     defer if (comptime @import("lock_profile.zig").enabled) @import("lock_profile.zig").stageEnd(.zero, stage_sample);
+    return zeroPhysicalPageInWindow(page_paddr);
+}
+
+// Both public APIs account for zeroing once, including window fallback.
+fn zeroPhysicalPageInWindow(page_paddr: u64) bool {
     if ((page_paddr & 0xFFF) != 0) return false;
     const window = PhysCopyWindowGuard.lock();
     defer window.unlock();
@@ -1507,14 +1657,20 @@ fn flushCr3RangeOnCurrentCpu(target_cr3: u64, range: TlbRange) void {
     if (range.pages == 0) return flushCr3ContextOnCurrentCpu(target_cr3);
     if (h.read_cr3() == target_cr3) {
         for (0..@intCast(range.pages)) |page| h.invlpg(range.start + page * 4096);
+    } else if ((target_cr3 & 4095) == 0) {
+        // A different root cannot use this context. Its NEXT PCID-0 load
+        // must flush, even if PCIDE + a tagged NOFLUSH load retained old tag-0
+        // entries. INVPCID(0) is unnecessary; entry publication still matters.
+        // Full rendezvous above retains its serializing load/restore effect.
+        return;
     } else if (!builtin.is_test and @import("arch/x86_64/platform.zig").hasInvpcid()) {
         for (0..@intCast(range.pages)) |page|
             @import("arch/x86_64/platform.zig").invalidatePcidAddress(@truncate(target_cr3 & 0xfff), range.start + page * 4096);
     } else flushCr3ContextOnCurrentCpu(target_cr3);
 }
 
-// The requester cannot return/reuse pages until every CPU that may execute P
-// in user mode ACKs a post-PTE-change flush, and every other CPU owes a flushing
+// The requester cannot return/reuse pages until every exposed user/borrowed
+// root ACKs a post-PTE-change flush, and every other CPU owes a flushing
 // load before next executing P. Zero rows stay zero even after an IPI flush.
 fn shootdownTargetCpuSet(cr3: u64, force_all: bool) CpuSet {
     residency.fenceBeforeSnapshot();
@@ -1603,6 +1759,10 @@ fn shootdownCr3ContextWithOptions(target_cr3: u64, flush_caches: bool, retire_ba
     shootdownRequest(target_cr3, .{}, flush_caches, retire_base, retire_size, true);
 }
 
+fn requestNeedsAllCpus(force_all: bool, flush_caches: bool, retire_size: u64) bool {
+    return force_all or flush_caches or retire_size != 0;
+}
+
 fn shootdownRequest(target_cr3: u64, requested_range: TlbRange, flush_caches: bool, retire_base: u64, retire_size: u64, force_all: bool) void {
     if (target_cr3 == 0) return;
     // Check before taking X: a remote initiator can already need our ACK.
@@ -1627,6 +1787,9 @@ fn shootdownRequest(target_cr3: u64, requested_range: TlbRange, flush_caches: bo
     const lock_start = perf.timestamp();
     tlb_shootdown_lock.lock();
     perf.elapsed(.tlb_lock_wait_cycles, lock_start);
+    const fork_prepare_start = if (comptime ForkProfile.enabled) ForkProfile.stamp() else 0;
+    if (comptime ForkProfile.enabled) ForkProfile.interval(.lock_wait, lock_start, fork_prepare_start);
+
     perf.add(.tlb_requests, 1);
     defer tlb_shootdown_lock.unlock();
     if (comptime lock_diagnostics.enabled) {
@@ -1652,9 +1815,12 @@ fn shootdownRequest(target_cr3: u64, requested_range: TlbRange, flush_caches: bo
         }
     }
 
-    const all = force_all or (target_cr3 & 4095) == 0 or flush_caches or retire_size != 0;
+    // PCID=0 is a flushing-entry property, not a reason to wake idle CPUs.
+    // Only principal-private callers may request selective exposure targeting;
+    // generic/shared roots and lifetime/cache barriers retain rendezvous.
+    const all = requestNeedsAllCpus(force_all, flush_caches, retire_size);
     const targets = shootdownTargetCpuSet(target_cr3, all);
-    const range: TlbRange = if ((target_cr3 & 4095) == 0 or flush_caches or retire_size != 0) .{} else requested_range;
+    const range: TlbRange = if (all) .{} else requested_range;
     const local = smp.currentCpuSlot();
     for (0..targets.capacity) |cpu| {
         if (!targets.contains(cpu) or cpu == local) continue;
@@ -1674,6 +1840,13 @@ fn shootdownRequest(target_cr3: u64, requested_range: TlbRange, flush_caches: bo
     if (flush_caches) flushCurrentCpuCaches();
 
     const send_start = perf.timestamp();
+    if (comptime ForkProfile.enabled) {
+        ForkProfile.add(.requests, 1);
+        ForkProfile.add(.targets, targets.count() - @intFromBool(targets.contains(current_cpu)));
+        ForkProfile.add(.full, @intFromBool(range.pages == 0));
+        ForkProfile.interval(.prepare, fork_prepare_start, send_start);
+    }
+
     perf.add(.tlb_targets, targets.count() - @intFromBool(targets.contains(current_cpu)));
     var cpu_slot: usize = 0;
     const broadcast_sent = smp.interruptAllOtherOnlineCpus(targets);
@@ -1686,9 +1859,11 @@ fn shootdownRequest(target_cr3: u64, requested_range: TlbRange, flush_caches: bo
     }
 
     perf.elapsed(.tlb_send_cycles, send_start);
+    if (comptime ForkProfile.enabled) ForkProfile.interval(.send, send_start, ForkProfile.stamp());
     const ack_sample = if (comptime @import("lock_profile.zig").enabled) @import("lock_profile.zig").stageBegin() else {};
     defer if (comptime @import("lock_profile.zig").enabled) @import("lock_profile.zig").stageEnd(.ipi_ack, ack_sample);
     const ack_start = perf.timestamp();
+    defer if (comptime ForkProfile.enabled) ForkProfile.interval(.ack, ack_start, ForkProfile.stamp());
     defer perf.elapsed(.tlb_ack_wait_cycles, ack_start);
     cpu_slot = 0;
     while (cpu_slot < targets.capacity) : (cpu_slot += 1) {
@@ -1703,6 +1878,7 @@ fn shootdownRequest(target_cr3: u64, requested_range: TlbRange, flush_caches: bo
                 // timeout policy. Keep retransmitting until this generation
                 // is explicitly acknowledged.
                 _ = smp.interruptCpu(cpu_slot);
+                if (comptime ForkProfile.enabled) ForkProfile.add(.retries, 1);
             }
             asm volatile ("sti; pause; cli" ::: .{ .memory = true });
         }
@@ -1721,13 +1897,15 @@ pub fn synchronizeUserMemoryForPrincipal(principal: kernel.PrincipalId) bool {
     return true;
 }
 
+/// Generic roots include kernel/AP/shared page tables: never infer private
+/// lifetime from a CR3 tag or address. Only principal wrappers are selective.
 pub fn flushTlbForCr3Va(target_cr3: u64, va: u64) void {
-    shootdownRequest(target_cr3, TlbRange.init(va, 1), false, 0, 0, false);
+    shootdownRequest(target_cr3, TlbRange.init(va, 1), false, 0, 0, true);
 }
 
 pub fn flushTlbForCr3Range(target_cr3: u64, va: u64, size_bytes: usize) void {
     if (size_bytes == 0) return;
-    shootdownRequest(target_cr3, TlbRange.init(va, size_bytes), false, 0, 0, false);
+    shootdownRequest(target_cr3, TlbRange.init(va, size_bytes), false, 0, 0, true);
 }
 
 /// Final phase of a physical memory-type transition. All old aliases must
@@ -1753,16 +1931,33 @@ pub fn retireUserTlbForPrincipal(principal: kernel.PrincipalId) void {
     shootdownCr3Context(getHooks().user_space_cr3_for_principal(principal));
 }
 
+/// Detached user PT/PD/PDP pages of a LIVE principal-private root (not AS
+/// teardown or PCID reuse, which stay all-online above). The caller already
+/// zeroed the parent entries and releases the pages only after this returns.
+/// A stale walk needs a CPU that either currently uses this root or later
+/// reloads it with NOFLUSH. shootdownTargetCpuSet(false) closes both, after
+/// the requester MFENCE that orders the parent stores: (1) active/borrowed
+/// rows name every CPU that may be walking it -> full flush + ACK; (2) the
+/// retained-row CAS on every online CPU forces the next load of this PCID
+/// to flush TLB and paging-structure caches. PCID=0 loads always flush, and
+/// entries of a non-current PCID are never used for translation. The full
+/// range (pages=0) always reaches flushCr3ContextOnCurrentCpu's reload on
+/// receivers and locally, never the PCID-0 different-root range skip.
+pub fn retireUserPageTablesForPrincipal(principal: kernel.PrincipalId) void {
+    shootdownRequest(getHooks().user_space_cr3_for_principal(principal), .{}, false, 0, 0, false);
+}
+
 pub fn flushUserTlbForPrincipalVa(principal: kernel.PrincipalId, va: u64) void {
     const h = getHooks();
     const target_cr3 = h.user_space_cr3_for_principal(principal);
-    flushTlbForCr3Va(target_cr3, va);
+    shootdownRequest(target_cr3, TlbRange.init(va, 1), false, 0, 0, false);
 }
 
 pub fn flushUserTlbForPrincipalRange(principal: kernel.PrincipalId, va: u64, size_bytes: usize) void {
     const h = getHooks();
     const target_cr3 = h.user_space_cr3_for_principal(principal);
-    flushTlbForCr3Range(target_cr3, va, size_bytes);
+    if (size_bytes == 0) return;
+    shootdownRequest(target_cr3, TlbRange.init(va, size_bytes), false, 0, 0, false);
 }
 
 test "copy window reads writes and copies RAM above the identity limit" {
@@ -1985,7 +2180,7 @@ test "copy window preserves identical mappings and invalidates every semantic ch
     pt[2] = 0;
     window_non_wb_used[0] = 0;
 
-    const saved_policy = @atomicLoad(?*const ram_cache.Snapshot, &ram_cache_snapshot, .acquire);
+    const saved_policy = @atomicLoad(?*const ram_cache.Snapshot, &ram_cache_snapshot.current, .acquire);
     defer publishRamCacheSnapshot(saved_policy);
     const cached = [_]ram_cache.Span{.{
         .base = 0x12000,
@@ -2030,7 +2225,7 @@ test "copy-window retirement may cover sparse holes without changing other windo
         }
     };
     const saved: ?Hooks = if (user_copy_hooks_ready) user_copy_hooks_storage else null;
-    const saved_policy = @atomicLoad(?*const ram_cache.Snapshot, &ram_cache_snapshot, .acquire);
+    const saved_policy = @atomicLoad(?*const ram_cache.Snapshot, &ram_cache_snapshot.current, .acquire);
     defer {
         if (saved) |h| init(h) else user_copy_hooks_ready = false;
         publishRamCacheSnapshot(saved_policy);
@@ -2092,7 +2287,7 @@ test "copy window evicts round-robin only when every way holds another page" {
         }
     };
     const saved: ?Hooks = if (user_copy_hooks_ready) user_copy_hooks_storage else null;
-    const saved_policy = @atomicLoad(?*const ram_cache.Snapshot, &ram_cache_snapshot, .acquire);
+    const saved_policy = @atomicLoad(?*const ram_cache.Snapshot, &ram_cache_snapshot.current, .acquire);
     defer {
         if (saved) |h| init(h) else user_copy_hooks_ready = false;
         publishRamCacheSnapshot(saved_policy);
@@ -2314,4 +2509,130 @@ fn profileWindow(pa: u64, cpu: usize, cache: PhysWindowCache) ?MappedWindow {
     const start = copy_profile.copyTimestamp();
     defer copy_profile.copyEnd(.window, start);
     return mapPhysWindow(pa, cpu, cache);
+}
+
+test "fork diagnostics reject counter wrap backward stamps and invalid windows" {
+    var before: ForkProfile.Row = @splat(0);
+    var after = before;
+    after[0] = 9;
+    try std.testing.expectEqual(@as(u64, 9), ForkProfile.difference(before, after).?[0]);
+    before[0] = 10;
+    try std.testing.expect(ForkProfile.difference(before, after) == null);
+    before = @splat(0);
+    after[@intFromEnum(ForkProfile.Counter.overflow)] = 1;
+    try std.testing.expect(ForkProfile.difference(before, after) == null);
+    var sum: u64 = 7;
+    try std.testing.expect(!ForkProfile.accumulate(&sum, 10, 9));
+    try std.testing.expectEqual(@as(u64, 7), sum);
+    sum = std.math.maxInt(u64) - 3;
+    try std.testing.expect(!ForkProfile.accumulate(&sum, 10, 14));
+    sum = 0;
+    try std.testing.expect(ForkProfile.accumulate(&sum, 10, 14));
+    try std.testing.expectEqual(@as(u64, 4), sum);
+}
+
+test "private shootdown selection preserves shared cache and retirement rendezvous" {
+    try std.testing.expect(!requestNeedsAllCpus(false, false, 0));
+    try std.testing.expect(requestNeedsAllCpus(true, false, 0));
+    try std.testing.expect(requestNeedsAllCpus(false, true, 0));
+    try std.testing.expect(requestNeedsAllCpus(false, false, 4096));
+    try std.testing.expect(requestNeedsAllCpus(true, true, 4096));
+}
+
+test "PCID zero range receiver skips dormant roots but full barriers still reload" {
+    const Mock = struct {
+        var current: u64 = 0x8000;
+        var writes: usize = 0;
+        var pages: usize = 0;
+        fn read() u64 { return current; }
+        fn write(v: u64) void { current = v; writes += 1; }
+        fn invalidate(v: u64) void { std.debug.assert(v == 0x2000); pages += 1; }
+    };
+    const old = user_copy_hooks_storage;
+    const ready = user_copy_hooks_ready;
+    defer { user_copy_hooks_storage = old; user_copy_hooks_ready = ready; }
+    user_copy_hooks_storage = undefined;
+    user_copy_hooks_storage.read_cr3 = Mock.read;
+    user_copy_hooks_storage.write_cr3 = Mock.write;
+    user_copy_hooks_storage.invlpg = Mock.invalidate;
+    user_copy_hooks_ready = true;
+    flushCr3RangeOnCurrentCpu(0x1000, TlbRange.init(0x2000, 4096));
+    try std.testing.expectEqual(@as(usize, 0), Mock.writes + Mock.pages);
+    Mock.current = 0x1000;
+    flushCr3RangeOnCurrentCpu(0x1000, TlbRange.init(0x2000, 4096));
+    try std.testing.expectEqual(@as(usize, 1), Mock.pages);
+    try std.testing.expectEqual(@as(usize, 0), Mock.writes);
+    Mock.current = 0x8000;
+    flushCr3RangeOnCurrentCpu(0x1000, .{});
+    try std.testing.expectEqual(@as(usize, 2), Mock.writes);
+    try std.testing.expectEqual(@as(u64, 0x8000), Mock.current);
+}
+
+test "MMIO overlay owned PMM zero clears the complete page and rejects invalid addresses" {
+    const saved: ?Hooks = if (user_copy_hooks_ready) user_copy_hooks_storage else null;
+    defer {
+        if (saved) |h| init(h) else user_copy_hooks_ready = false;
+    }
+    var pt = [_]u64{0} ** 512;
+    init(.{
+        .state = undefined,
+        .free_list = undefined,
+        .physical_map_limit = 1 << 52,
+        .phys_copy_window_va = 0x400000,
+        .page_present = 1,
+        .page_rw = 2,
+        .kernel_cr3_value = undefined,
+        .user_space_cr3_for_principal = undefined,
+        .phys_copy_window_pt = &pt,
+        .read_cr3 = undefined,
+        .write_cr3 = undefined,
+        .invlpg = undefined,
+    });
+    // Outside the host fixture's direct aperture, fallback must fail safely
+    // at the window's own physical limit instead of dereferencing an alias.
+    try std.testing.expect(!zeroOwnedPhysicalPage(1 << 52));
+    var page: [4096]u8 align(4096) = @splat(0xa5);
+    try std.testing.expect(!zeroOwnedPhysicalPage(0));
+    try std.testing.expect(!zeroOwnedPhysicalPage(@intFromPtr(&page) + 1));
+    try std.testing.expectEqual(@as(u8, 0xa5), page[0]);
+    try std.testing.expect(zeroOwnedPhysicalPage(@intFromPtr(&page)));
+    for (page) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
+}
+
+test "MMIO overlay owned PMM zero high RAM fallback uses window and preserves failures" {
+    const Mock = struct {
+        var invalidations: usize = 0;
+        fn invalidate(_: u64) void { invalidations += 1; }
+    };
+    const saved: ?Hooks = if (user_copy_hooks_ready) user_copy_hooks_storage else null;
+    defer {
+        if (saved) |h| init(h) else user_copy_hooks_ready = false;
+    }
+    var page: [4096]u8 align(4096) = @splat(0xa5);
+    var pt = [_]u64{0} ** 512;
+    init(.{
+        .state = undefined,
+        .free_list = undefined,
+        .physical_map_limit = 1 << 46,
+        .phys_copy_window_va = @intFromPtr(&page),
+        .page_present = 1,
+        .page_rw = 2,
+        .kernel_cr3_value = undefined,
+        .user_space_cr3_for_principal = undefined,
+        .phys_copy_window_pt = &pt,
+        .read_cr3 = undefined,
+        .write_cr3 = undefined,
+        .invlpg = Mock.invalidate,
+    });
+    Mock.invalidations = 0;
+    // Model a successful PMM grant outside a smaller direct aperture. Passing
+    // null selects exactly the production fallback, not a replacement zeroer.
+    try std.testing.expect(zeroOwnedPageWithDirectMapping(1 << 40, null));
+    try std.testing.expectEqual(@as(usize, 1), Mock.invalidations);
+    try std.testing.expectEqual(@as(u64, (1 << 40) | 3), pt[0]);
+    for (page) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
+    @memset(&page, 0xa5);
+    try std.testing.expect(!zeroOwnedPageWithDirectMapping(1 << 46, null));
+    try std.testing.expectEqual(@as(usize, 1), Mock.invalidations);
+    for (page) |byte| try std.testing.expectEqual(@as(u8, 0xa5), byte);
 }

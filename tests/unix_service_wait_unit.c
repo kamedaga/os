@@ -13,12 +13,25 @@ static unsigned control_unmaps, fail_unmap;
 static int send_error;
 int pacha_munmap(void *page, uint64_t bytes)
 {
-    assert(page && bytes == UNIX_CONTROL_BYTES);
+    assert(page);
+    if (bytes == PACHA_READINESS_BYTES) { free(page); return 0; }
+    assert(bytes == UNIX_CONTROL_BYTES);
     if (fail_unmap) return -EIO;
     control_unmaps++;
     free(page);
     return 0;
 }
+
+pacha_fd_t pacha_vmo_create(uint64_t bytes, uint64_t rights, uint32_t flags)
+{
+    (void)rights; (void)flags; assert(bytes == PACHA_READINESS_BYTES);
+    for (int fd=16;fd<256;fd++) if (!native_fds[fd].kind) {
+        native_fds[fd].kind=PACHA_FD_KIND_VMO;return fd;
+    }
+    return -ENOMEM;
+}
+void *pacha_mmap(pacha_fd_t fd,uint64_t bytes,uint64_t prot,uint64_t flags,uint64_t offset)
+{ (void)fd;(void)prot;(void)flags;(void)offset;return calloc(1,bytes); }
 
 uint64_t pacha_service_wait_revents(const struct pacha_service_wait_set *set, pacha_fd_t fd)
 {
@@ -99,7 +112,7 @@ int main(void)
     struct unix_service service = { .next_waiter = 1 };
     struct unix_broker_platform platform = { .context = &service,
         .direction_create = direction_new, .direction_destroy = direction_free,
-        .notify = notify_socket };
+        .notify = notify_socket, .socket_destroy = release_readiness };
     service.broker = unix_broker_create(&platform);
     assert(service.broker);
     struct service_session parent = {0}, child = {0}, outsider = {0};
@@ -109,6 +122,33 @@ int main(void)
     assert(unix_broker_session_create(service.broker, &credentials, &child.session) == 0);
     credentials.pid++;
     assert(unix_broker_session_create(service.broker, &credentials, &outsider.session) == 0);
+    uint64_t listener, client, accepted;
+    assert(unix_broker_socket(service.broker,parent.session,UNIX_TRANSPORT_STREAM,0,&listener)==0);
+    struct unix_address address={.kind=UNIX_ADDRESS_ABSTRACT,.length=4,.bytes={'w','f','9','a'}};
+    assert(unix_broker_bind(service.broker,parent.session,listener,&address)==0);
+    assert(unix_broker_listen(service.broker,parent.session,listener,4)==0);
+    struct response view_caps={0};
+    assert(export_readiness(&service,&outsider,listener,&view_caps)==-EBADF);
+    assert(export_readiness(&service,&parent,listener,&view_caps)==0 && view_caps.count==1);
+    struct pacha_readiness *view=service.readiness->page;
+    assert(view->identity==listener && !(pacha_readiness_load(view)&1));
+    uint64_t initial=pacha_readiness_load(view);
+    notify_socket(&service,listener);assert(pacha_readiness_load(view)==initial);
+    assert(unix_broker_socket(service.broker,parent.session,UNIX_TRANSPORT_STREAM,0,&client)==0);
+    assert(unix_broker_connect(service.broker,parent.session,client,&address)==0);
+    assert((pacha_readiness_load(view)&1) && pacha_readiness_load(view)>initial);
+    assert(unix_broker_retain(service.broker,parent.session,listener,child.session)==0);
+    assert(unix_broker_close(service.broker,parent.session,listener)==0);
+    struct response child_caps={0};
+    assert(export_readiness(&service,&child,listener,&child_caps)==0);
+    assert(child_caps.capabilities[0].fd==view_caps.capabilities[0].fd);
+    assert(!(child_caps.capabilities[0].rights&PACHA_FD_RIGHT_MAP_WRITE));
+    assert(unix_broker_accept(service.broker,child.session,listener,&accepted)==0);
+    assert(!(pacha_readiness_load(view)&1));
+    assert(unix_broker_close(service.broker,child.session,accepted)==0);
+    assert(unix_broker_close(service.broker,parent.session,client)==0);
+    assert(unix_broker_close(service.broker,child.session,listener)==0);
+    assert(service.readiness==NULL);
     uint64_t old_token = 0;
     for (unsigned i = 0; i < 32; i++) {
         struct unix_control *page = calloc(1, UNIX_CONTROL_BYTES);

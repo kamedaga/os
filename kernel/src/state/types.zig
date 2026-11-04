@@ -282,7 +282,10 @@ pub const IrqSource = union(enum) {
         };
     }
     pub fn resourceId(self: IrqSource) u64 {
-        return switch (self) { .pci => |device| device, .platform => |grant| @intFromEnum(grant.device.resource) };
+        return switch (self) {
+            .pci => |device| device,
+            .platform => |grant| @intFromEnum(grant.device.resource),
+        };
     }
 };
 
@@ -1362,28 +1365,39 @@ pub const NativeVmoKind = enum(u8) {
     // Pages enter this VMO only through an authorized pager supply. In
     // particular an absent entry cannot take the anonymous zero-fill path.
     pager = 5,
+    // Owned resident RAM, unlike the permanently borrowed clock page. Only
+    // the matching AS incarnation may map it, shared RO and never inherited.
+    thread_page = 6,
 };
 
 pub const PagerPortRef = struct {
     index: u32 = 0,
     generation: u32 = 0,
-    pub fn isNull(self: PagerPortRef) bool { return self.generation == 0; }
+    pub fn isNull(self: PagerPortRef) bool {
+        return self.generation == 0;
+    }
 };
 
 pub const PagerRequestRef = struct {
     index: u32 = 0,
     generation: u32 = 0,
-    pub fn isNull(self: PagerRequestRef) bool { return self.generation == 0; }
+    pub fn isNull(self: PagerRequestRef) bool {
+        return self.generation == 0;
+    }
 };
 pub const PagerWaiterRef = struct {
     index: u32 = 0,
     generation: u32 = 0,
-    pub fn isNull(self: PagerWaiterRef) bool { return self.generation == 0; }
+    pub fn isNull(self: PagerWaiterRef) bool {
+        return self.generation == 0;
+    }
 };
 pub const PagerReleaseRef = struct {
     index: u32 = 0,
     generation: u32 = 0,
-    pub fn isNull(self: PagerReleaseRef) bool { return self.generation == 0; }
+    pub fn isNull(self: PagerReleaseRef) bool {
+        return self.generation == 0;
+    }
 };
 
 // K and the shared-VM lock can each enter pager state, but every list below
@@ -1474,6 +1488,9 @@ pub const NativeCowTableRef = struct {
 };
 
 pub const NativeVmoSlot = struct {
+    vma_alias_head: ?*VmaReferences = null,
+    kernel_edges: u32 = 0,
+    non_view_children: u32 = 0,
     parent_edge: references.Node = .{},
     references: references.Root = .{},
     // Failure-path scratch is prepared with the body, under the backing-store lock.
@@ -1501,6 +1518,7 @@ pub const NativeVmoSlot = struct {
     // Borrowed backing may be replaced, but neither a hole nor an attenuated
     // updater FD may enlarge the authority established at publication.
     page_view_sparse: bool = false,
+    thread_page_cookie: u64 = 0,
     // AS-local PTE retirement can run without the shared-VM lock. An atomic
     // conservative mark bridges disappearing aliases until all-AS collection.
     // This flag belongs to the view, not its replaceable backing radix root.
@@ -1557,6 +1575,8 @@ pub const MmapFlags = packed struct(u32) {
 };
 
 pub const VmaReferences = struct {
+    vmo_alias_prev: ?*VmaReferences = null,
+    vmo_alias_next: ?*VmaReferences = null,
     // Keep the address index in the already reserved reference body. Putting
     // it in VmaEntry halves SlotTable's entries per block (32 -> 16), adding
     // page grants under memory pressure. This placement keeps both densities.
@@ -1625,6 +1645,7 @@ pub const VmaEntry = struct {
 
 pub const VmaTable = struct {
     pinned_objects: references.Root = .{},
+    pinned_index: references.PinIndex = .{},
     reference_slots: slot_storage.SlotTable(VmaReferences) = .{},
     reference_owner: u32 = 0,
     reference_generation: u32 = 0,
@@ -2085,4 +2106,18 @@ test "IPC endpoint atomic retained authority survives concurrent drain releases"
     thread.join();
     try std.testing.expectEqual(@as(usize, 1), block.lifetime_refs.load(.acquire));
     try std.testing.expect(block.release());
+}
+
+comptime {
+    // Node links also affect VMA/holder metadata, not only DMA pins. Keep the
+    // measured production densities explicit; checked-host layouts add fields.
+    // VmaTable 616 -> 640: each of its three SlotTables gained the 8-byte
+    // reclaim candidate head (one VmaTable per process; body density, i.e.
+    // block_slots, is unchanged because Block metadata is a separate grant).
+    if (!builtin.is_test and !lock_diagnostics.enabled) {
+        // Measured after the shared-discard alias/counter extension: both
+        // four-body grants still occupy one physical page including headers.
+        if (@sizeOf(NativeVmoSlot) != 424 or slot_storage.SlotTable(NativeVmoSlot).block_slots != 4 or slot_storage.SlotTable(VmaReferences).block_slots != 4) @compileError("shared discard metadata layout changed: remeasure density");
+        if (@sizeOf(ObjectReferences) != 184 or @sizeOf(VmaReferences) != 432 or @sizeOf(VmaTable) != 640) @compileError("pin metadata layout changed: remeasure pool density and memory overhead");
+    }
 }

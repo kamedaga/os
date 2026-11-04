@@ -168,7 +168,13 @@ static void cache_put(filed_snapshot_cache_t *cache,const filed_storage_stat_t *
 {
     refresh_bytes(cache);
     uint64_t charge=pager ? filed_pager_resident_bytes(pager) : length;
-    if (!stat->snapshot_valid || !stat->nlink || !length || charge>cache->limit) return;
+    /* A pager retains a Linux source handle as well as its native pages.
+     * On tmpfs that pins RAM/filesystem blocks after unlink even when no
+     * caller mapping survives, but resident_bytes charges only native pages.
+     * Keep such pagers only for their real users, never solely for reuse.
+     * Eager independent byte snapshots do not retain a source and remain safe. */
+    if (!stat->snapshot_valid || !stat->nlink || !length || charge>cache->limit ||
+        (pager && stat->memory_backed)) return;
     struct filed_snapshot_entry *e=malloc(sizeof(*e));
     if (!e) return;
     const uint64_t rights=PACHA_FD_RIGHT_INSPECT|PACHA_FD_RIGHT_CLOSE|

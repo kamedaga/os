@@ -293,12 +293,12 @@ fn prepareLastDmaClose(self: anytype, object_ref: KernelObjectRef) KernelError!v
         .dma_buffer => |*dma| {
             if (!releaseDmaIova(dma.device, dma.iova, dma.size)) return KernelError.InvalidState;
             dma.size = 0;
-            if (slot.reference_state.?.payload_edge.target != null) references.Root.update(&slot.reference_state.?.payload_edge, slot.reference_state.?.payload_edge.identity, .{ .start = dma.user_va, .size = 0 });
+            if (slot.reference_state.?.payload_edge.target != null) updatePinnedReference(self, &slot.reference_state.?.payload_edge, .{ .start = dma.user_va, .size = 0 });
         },
         .dma_mapping => |*dma| {
             if (!releaseDmaIova(dma.device, dma.iova, dma.size)) return KernelError.InvalidState;
             dma.size = 0;
-            if (slot.reference_state.?.payload_edge.target != null) references.Root.update(&slot.reference_state.?.payload_edge, slot.reference_state.?.payload_edge.identity, .{ .start = dma.user_va, .size = 0 });
+            if (slot.reference_state.?.payload_edge.target != null) updatePinnedReference(self, &slot.reference_state.?.payload_edge, .{ .start = dma.user_va, .size = 0 });
         },
         else => {},
     }
@@ -311,7 +311,9 @@ pub fn releaseIrqObject(self: anytype, irq: IrqObject) void {
     // and drain CPU-pending delivery before any subsequent route acquisition.
     // Failure leaves publication removed and reacquisition fail-closed.
     switch (irq.source) {
-        .pci => |device| { _ = @import("../pci.zig").releaseInterruptRoute(device, @intFromEnum(irq.kind), irq.vector); },
+        .pci => |device| {
+            _ = @import("../pci.zig").releaseInterruptRoute(device, @intFromEnum(irq.kind), irq.vector);
+        },
         .platform => |grant| @import("../platform_device.zig").closeIrq(grant),
     }
 }
@@ -373,7 +375,7 @@ fn resetKernelObjectSlot(self: anytype, slot: *KernelObjectSlot) void {
         self.irq_publish_slots.remove(publication, &self.object_directory_leaf);
     }
     if (slot.reference_state) |record| {
-        references.Root.disconnect(&record.payload_edge, false);
+        disconnectPinnedReference(self, &record.payload_edge);
         self.object_reference_slots.remove(record, null);
         slot.reference_state = null;
     }
@@ -387,8 +389,7 @@ fn resetKernelObjectSlot(self: anytype, slot: *KernelObjectSlot) void {
 }
 
 pub fn clearKernelObjectSlot(self: anytype, slot: *KernelObjectSlot) void {
-    @import("persistent_wait.zig").invalidateObject(self, .{ .kind = slot.kind,
-        .index = @intCast(@TypeOf(self.fd_objects).indexOf(slot)), .generation = slot.generation });
+    @import("persistent_wait.zig").invalidateObject(self, .{ .kind = slot.kind, .index = @intCast(@TypeOf(self.fd_objects).indexOf(slot)), .generation = slot.generation });
     slot.live.close();
     self.releaseKernelObjectPayload(slot);
     resetKernelObjectSlot(self, slot);
@@ -399,8 +400,7 @@ pub fn clearKernelObjectSlotWithFreeList(
     slot: *KernelObjectSlot,
     free_list: *FreePageList,
 ) void {
-    @import("persistent_wait.zig").invalidateObject(self, .{ .kind = slot.kind,
-        .index = @intCast(@TypeOf(self.fd_objects).indexOf(slot)), .generation = slot.generation });
+    @import("persistent_wait.zig").invalidateObject(self, .{ .kind = slot.kind, .index = @intCast(@TypeOf(self.fd_objects).indexOf(slot)), .generation = slot.generation });
     slot.live.close();
     self.releaseKernelObjectPayloadWithFreeList(slot, free_list);
     resetKernelObjectSlot(self, slot);
@@ -415,7 +415,7 @@ pub fn resetKernelObjectTable(self: anytype) void {
         // Payload storage is about to disappear; weak process pin links must
         // be detached first even when teardown bypasses ordinary last-close.
         if (item.value.kind != .vmo) if (item.value.reference_state) |record|
-            references.Root.disconnect(&record.payload_edge, false);
+            disconnectPinnedReference(self, &record.payload_edge);
         if (item.value.kind != .none) self.releaseKernelObjectPayload(item.value);
     }
     self.irq_publish_slots.deinit();
@@ -517,7 +517,7 @@ pub fn releaseKernelObject(self: anytype, object_ref: KernelObjectRef) void {
     if (slot.ref_count == 0) return;
     if (trackedReferenceKind(slot.kind)) slot.reference_state.?.holders.releaseTemporary();
     slot.ref_count -= 1;
-    if (slot.ref_count == 0 and slot.kind != .vmo) if (slot.reference_state) |record| references.Root.disconnect(&record.payload_edge, false);
+    if (slot.ref_count == 0 and slot.kind != .vmo) if (slot.reference_state) |record| disconnectPinnedReference(self, &record.payload_edge);
     if (slot.ref_count == 0) {
         self.unpublishIrqObject(object_ref);
         self.clearKernelObjectSlot(slot);
@@ -533,7 +533,7 @@ pub fn releaseKernelObjectWithFreeList(
     if (slot.ref_count == 0) return;
     if (trackedReferenceKind(slot.kind)) slot.reference_state.?.holders.releaseTemporary();
     slot.ref_count -= 1;
-    if (slot.ref_count == 0 and slot.kind != .vmo) if (slot.reference_state) |record| references.Root.disconnect(&record.payload_edge, false);
+    if (slot.ref_count == 0 and slot.kind != .vmo) if (slot.reference_state) |record| disconnectPinnedReference(self, &record.payload_edge);
     if (slot.ref_count == 0) {
         self.unpublishIrqObject(object_ref);
         self.clearKernelObjectSlotWithFreeList(slot, free_list);
@@ -1175,7 +1175,7 @@ pub fn publishMmioOverlayAddress(self: anytype, owner: PrincipalId, fd: Fd, user
     const node = &slot.reference_state.?.payload_edge;
     slot.payload.mmio_region.user_va = user_va;
     slot.payload.mmio_region.wc_window_lease_token = lease;
-    references.Root.update(node, node.identity, .{ .start = user_va, .size = slot.payload.mmio_region.size });
+    updatePinnedReference(self, node, .{ .start = user_va, .size = slot.payload.mmio_region.size });
 }
 
 /// The global KernelState lock serializes this check with MMIO FD publication
@@ -1249,6 +1249,10 @@ pub fn createDmaMappingFdWithBacking(
     min_fd: Fd,
     backing: []const u64,
 ) KernelError!Fd {
+    const dma_profile = @import("../lock_profile.zig");
+    const sample = if (comptime dma_profile.enabled) dma_profile.stageBegin() else {};
+    defer if (comptime dma_profile.enabled) dma_profile.stageEnd(.dma_fd_publish, sample);
+
     if (mapping.device == 0 or mapping.user_va == 0 or mapping.size == 0) return KernelError.InvalidState;
     var payload = mapping;
     payload.owner_principal_raw = @intFromEnum(owner);
@@ -1857,7 +1861,9 @@ pub fn nextTimerWaiterDeadline(self: anytype) ?u64 {
     var slots = self.task_fd_waiters.marked(1);
     while (slots.next()) |slot_index| {
         const waiter = (self.task_fd_waiters.get(@intCast(slot_index)).?);
-        if (waiter.binding.persistent) |item| { if (item.queued) continue; }
+        if (waiter.binding.persistent) |item| {
+            if (item.queued) continue;
+        }
         if (!waiter.active or waiter.binding.completion_pending or waiter.object.kind != .timer) continue;
         const slot = self.kernelObjectSlotConst(waiter.object) orelse continue;
         const deadline = slot.payload.timer.deadline_ns;
@@ -1912,8 +1918,7 @@ fn fdWaitIpcWaiterForRegistration(
 
 /// Construction uses the existing source admission transaction. Conversion
 /// strips its temporary group/token/VA before publishing the separate observer.
-pub fn makePersistentRegistration(self: anytype, registration: types.FdWaitRegistrationRef,
-    item: *@import("persistent_wait_types.zig").Item) void {
+pub fn makePersistentRegistration(self: anytype, registration: types.FdWaitRegistrationRef, item: *@import("persistent_wait_types.zig").Item) void {
     if (registration.kind == .task) {
         const waiter = fdWaitTaskWaiterForRegistration(self, registration).?;
         waiter.binding = .{ .persistent = item };
@@ -2348,5 +2353,40 @@ fn publishPinnedReference(self: anytype, slot: *KernelObjectSlot, object: Kernel
     const index = processIndexFromPrincipal(@enumFromInt(pinned.owner)) orelse unreachable;
     const table = self.vmaTableForProcessIndex(index) orelse unreachable;
     const generation = (self.processDescriptorSlotConst(index) orelse unreachable).generation;
+    const principal = processPrincipalFromIndex(index) orelse unreachable;
+    const locked = @import("vma.zig").lockPinIndex(principal);
+    defer @import("vma.zig").unlockPinIndex(principal, locked);
     table.pinned_objects.connect(&slot.reference_state.?.payload_edge, .{ .kind = .pinned_object, .container = @intFromEnum(slot.kind), .owner = @intCast(index), .owner_generation = generation, .index = object.index, .generation = object.generation }, pinned.range, false);
+    const class: references.PinClass = switch (slot.payload) {
+        .mmio_region => .mmio,
+        .dma_buffer => .buffer,
+        .dma_mapping => |mapping| if (mapping.page_count == 0) .linear else .scatter,
+        else => unreachable,
+    };
+    table.pinned_index.insert(&slot.reference_state.?.payload_edge, class);
+}
+
+// K pins the source/reference body; A pins the owner range transaction. Do not
+// hold a terminal reference leaf over tree traversal or later MMIO all-AS work.
+fn disconnectPinnedReference(self: anytype, node: *references.Node) void {
+    if (node.target == null or node.identity.kind != .pinned_object) {
+        references.Root.disconnect(node, false);
+        return;
+    }
+    const principal = processPrincipalFromIndex(node.identity.owner) orelse unreachable;
+    const locked = @import("vma.zig").lockPinIndex(principal);
+    defer @import("vma.zig").unlockPinIndex(principal, locked);
+    const table = self.getVmaTable(principal) orelse unreachable;
+    table.pinned_index.remove(node);
+    references.Root.disconnect(node, false);
+}
+fn updatePinnedReference(self: anytype, node: *references.Node, range: references.Range) void {
+    const principal = processPrincipalFromIndex(node.identity.owner) orelse unreachable;
+    const locked = @import("vma.zig").lockPinIndex(principal);
+    defer @import("vma.zig").unlockPinIndex(principal, locked);
+    const table = self.getVmaTable(principal) orelse unreachable;
+    const class = node.pin.class;
+    table.pinned_index.remove(node);
+    references.Root.update(node, node.identity, range);
+    table.pinned_index.insert(node, class);
 }

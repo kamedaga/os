@@ -11,6 +11,7 @@ include("${REPO_ROOT}/userland/cmake/pachaos_native.cmake")
 pachaos_native_executable(seed0boot
   SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/src/main.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/pressure_manager.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/bootfs_reader.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/next_stage_loader.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/pachaos_capsule_launcher.c"

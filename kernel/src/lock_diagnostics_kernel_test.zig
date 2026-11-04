@@ -64,7 +64,7 @@ test "lock admission Q actual device IRQ slot hold ends before completion" {
     const allocation = try state.allocatePool(&state.irq_publish_slots, &state.object_directory_leaf, 0xffffffff);
     const slot = allocation.value;
     slot.active = 1;
-    slot.device = 9;
+    slot.source = .{ .pci = 9 };
     var owners: [2]kernel.PrincipalId = undefined;
     _ = state.recordDeviceInterruptEvent(9, 0, &owners);
     try std.testing.expectEqual(d.order.Class.slot_directory, state.object_directory_leaf.byte.record.key.class);

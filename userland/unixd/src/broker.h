@@ -111,3 +111,6 @@ int unix_broker_dgram_head(struct unix_broker *broker, struct unix_session *sess
     uint64_t socket, struct unix_delivery *delivery, struct unix_direction *direction);
 int unix_broker_dgram_consume(struct unix_broker *broker, struct unix_session *session,
     uint64_t socket, uint64_t delivery, struct unix_read *read, int peek);
+
+/* Trusted service-only snapshot; never an application authorization path. */
+int unix_broker_listener_snapshot(struct unix_broker *, uint64_t, uint64_t *, struct unix_poll_sequence *);

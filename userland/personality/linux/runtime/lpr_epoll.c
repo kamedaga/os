@@ -58,7 +58,7 @@ typedef struct lpr_epoll_instance {
     uint64_t generation;
     uint32_t count;
     uint32_t capacity;
-    uint64_t reserved0;
+    uint64_t scan_cursor;
     lpr_epoll_interest_t interests[];
 } lpr_epoll_instance_t;
 
@@ -71,7 +71,7 @@ enum {
 typedef struct lpr_epoll_snapshot {
     int32_t fd;
     uint8_t kind;
-    uint8_t reserved0;
+    uint8_t local_poll;
     uint16_t interest_index;
     uint64_t instance_generation;
     uint32_t target_ofd_index;
@@ -481,7 +481,8 @@ static int64_t lpr_epoll_snapshot(
         .ofd_index = slot->ofd_index, .ofd_generation = slot->ofd_generation,
         .instance_generation = instance->generation,
     };
-    for (uint32_t i = 0; i < instance->count; i++) {
+    for (uint32_t offset = 0; offset < instance->count; offset++) {
+        const uint32_t i = (uint32_t)((instance->scan_cursor + offset) % instance->count);
         const lpr_epoll_interest_t *interest = &instance->interests[i];
         if ((interest->state & LPR_EPOLL_STATE_ONESHOT_DISABLED) != 0) {
             continue;
@@ -495,6 +496,18 @@ static int64_t lpr_epoll_snapshot(
         lpr_epoll_snapshot_t *item = &snapshot[*out_count];
         item->fd = target_fd;
         item->kind = lpr_ofd_ops_id(target);
+        item->local_poll = item->kind == LPR_FD_OPS_UNIX ?
+            __atomic_load_n(&((struct lpr_unix_socket *)lpr_backend_state_from_ofd(target))->mapped,
+                __ATOMIC_ACQUIRE) != 0 ||
+            __atomic_load_n(&((struct lpr_unix_socket *)lpr_backend_state_from_ofd(target))->readiness, __ATOMIC_ACQUIRE) != NULL :
+            (item->kind == LPR_FD_OPS_SOCKET &&
+             ((lpr_socket_backend_t *)lpr_backend_state_from_ofd(target))->domain == 16 &&
+             __atomic_load_n(&((lpr_socket_backend_t *)lpr_backend_state_from_ofd(target))->readiness_address, __ATOMIC_ACQUIRE)) ||
+            item->kind == LPR_FD_OPS_INPUT || item->kind == LPR_FD_OPS_PIPE ||
+            item->kind == LPR_FD_OPS_DRM ||
+            (item->kind == LPR_FD_OPS_EVENT &&
+             ((lpr_event_backend_t *)lpr_backend_state_from_ofd(target))->subtype !=
+                LPR_EVENT_BACKEND_INOTIFY);
         item->interest_index = (uint16_t)i;
         item->instance_generation = instance->generation;
         item->target_ofd_index = interest->target_ofd_index;
@@ -629,28 +642,37 @@ static int64_t lpr_epoll_scan(
     int cached_sockets,
     int consume, unsigned *wait_not_ready __attribute__((unused)))
 {
-    lpr_linux_pollfd_t pollfds[LPR_EPOLL_MAX_INTERESTS];
-    for (uint32_t i = 0; i < count; i++) {
-        pollfds[i].fd = (snapshot[i].kind == LPR_FD_OPS_EPOLL ||
-            snapshot[i].kind == LPR_FD_OPS_UNIX) ?
-            -1 : snapshot[i].fd;
-        pollfds[i].events = (int16_t)(snapshot[i].events | LPR_EPOLLERR | LPR_EPOLLHUP);
-        pollfds[i].revents = 0;
-    }
-    const int64_t poll_status = cached_sockets ?
-        lpr_linux_poll_cached((uint64_t)(uintptr_t)pollfds, count, wait_not_ready) :
-        lpr_linux_poll_current((uint64_t)(uintptr_t)pollfds, count, wait_not_ready);
-    if (poll_status < 0) {
-        return poll_status;
-    }
+    /* Probe one fair anchor, then batch local readiness. If anything is
+     * ready, returning that subset must not wait for unrelated broker RPCs.
+     * Every interest becomes the anchor in turn; slow sources cannot starve.
+     * Without local readiness, inspect all remaining sources before sleeping.
+     * No negative cache, timer, or permanent scan budget is involved. */
     uint32_t ready = 0;
-    for (uint32_t i = 0; i < count; i++) {
+    int64_t failure = 0;
+    for (uint32_t step = 0; step < 3u * count; step++) {
+        const uint32_t phase = step / count;
+        const uint32_t i = step % count;
+        if (phase == 0 && i != 0) continue;
+        if (phase == 1 && (i == 0 || !snapshot[i].local_poll)) continue;
+        if (phase == 2 && (i == 0 || snapshot[i].local_poll)) continue;
+        if (ready && (ready >= maxevents || phase == 2)) break;
         uint32_t current = 0;
         struct unix_poll_sequence sequence = {0};
         if (snapshot[i].kind == LPR_FD_OPS_UNIX) {
             int64_t observed = lpr_unix_socket_poll_sequence(snapshot[i].fd,
                 snapshot[i].events | LPR_EPOLLERR | LPR_EPOLLHUP, &sequence);
-            if (observed < 0) return observed;
+            if (observed < 0) { failure = observed; break; }
+            current = (uint32_t)observed;
+        } else if (snapshot[i].kind == LPR_FD_OPS_INPUT) {
+            int64_t observed = lpr_input_poll_sequence(snapshot[i].fd,
+                snapshot[i].events | LPR_EPOLLERR | LPR_EPOLLHUP, &sequence);
+            if (observed < 0) { failure = observed; break; }
+            current = (uint32_t)observed;
+        } else if (snapshot[i].kind == LPR_FD_OPS_SOCKET &&
+            lpr_socket_backend(snapshot[i].fd) && lpr_socket_backend(snapshot[i].fd)->domain == 16) {
+            int64_t observed = lpr_socket_poll_sequence(snapshot[i].fd,
+                snapshot[i].events | LPR_EPOLLERR | LPR_EPOLLHUP, &sequence);
+            if (observed < 0) { failure = observed; break; }
             current = (uint32_t)observed;
         } else if (snapshot[i].kind == LPR_FD_OPS_EPOLL) {
             lpr_linux_epoll_event_t nested_event;
@@ -661,21 +683,46 @@ static int64_t lpr_epoll_scan(
                 cached_sockets,
                 0, wait_not_ready);
             if (nested_ready < 0) {
-                return nested_ready;
+                failure = nested_ready;
+                break;
             }
             if (nested_ready > 0 && (snapshot[i].events & LPR_EPOLLIN) != 0) {
                 current = LPR_EPOLLIN;
             }
         } else {
-            current = (uint16_t)pollfds[i].revents &
-                (snapshot[i].events | LPR_EPOLLERR | LPR_EPOLLHUP) &
-                LPR_EPOLL_READY_BITS;
+            int eventfd_observed = 0;
+            if (snapshot[i].kind == LPR_FD_OPS_EVENT) {
+                lpr_fd_pin_t pin;
+                if (lpr_fd_table_pin(&lpr_control_fd_table, (uint32_t)snapshot[i].fd, &pin) != 0) {
+                    failure = -LPR_LINUX_EBADF;
+                    break;
+                }
+                const lpr_event_backend_t *event = pin.state;
+                if (pin.ops_id == LPR_FD_OPS_EVENT && event &&
+                    event->subtype == LPR_EVENT_BACKEND_EVENTFD) {
+                    current = lpr_event_counter_poll_sequence(event, snapshot[i].events, &sequence);
+                    eventfd_observed = 1;
+                }
+                lpr_fd_unpin(&pin);
+            }
+            if (!eventfd_observed) {
+                lpr_linux_pollfd_t pollfd = {.fd=snapshot[i].fd,
+                    .events=(int16_t)(snapshot[i].events | LPR_EPOLLERR | LPR_EPOLLHUP)};
+                int64_t status = cached_sockets ?
+                    lpr_linux_poll_cached((uintptr_t)&pollfd, 1, wait_not_ready) :
+                    lpr_linux_poll_current((uintptr_t)&pollfd, 1, wait_not_ready);
+                if (status < 0) { failure = status; break; }
+                current = (uint16_t)pollfd.revents &
+                    (snapshot[i].events | LPR_EPOLLERR | LPR_EPOLLHUP) &
+                    LPR_EPOLL_READY_BITS;
+            }
         }
         uint32_t report = 0;
         const int can_consume = consume && ready < maxevents;
         const int64_t observation = lpr_epoll_apply_observation(
             epfd, &snapshot[i], current, can_consume, &report,
-            snapshot[i].kind == LPR_FD_OPS_UNIX ? &sequence : NULL);
+            (snapshot[i].kind == LPR_FD_OPS_UNIX || snapshot[i].kind == LPR_FD_OPS_INPUT ||
+             sequence.source) ? &sequence : NULL);
 #if defined(LPR_GLYCIN_DIAG) && LPR_GLYCIN_DIAG
         if (__atomic_load_n(&lpr_glycin_diag_armed, __ATOMIC_ACQUIRE) != 0u &&
             __atomic_load_n(
@@ -697,7 +744,8 @@ static int64_t lpr_epoll_scan(
         }
 #endif
         if (observation != 0) {
-            return observation;
+            failure = observation;
+            break;
         }
         if (report == 0) {
             continue;
@@ -709,7 +757,21 @@ static int64_t lpr_epoll_scan(
         events[ready].data = snapshot[i].data;
         ready++;
     }
-    return ready;
+    if (consume && ready && count) {
+        lpr_fd_table_lock(&lpr_control_fd_table);
+        if (epfd < lpr_control_fd_table.entry_count &&
+            lpr_control_fd_table.entries[epfd].active) {
+            const lpr_fd_entry_t *slot = &lpr_control_fd_table.entries[epfd];
+            if (slot->ofd_index < lpr_control_fd_table.ofd_count) {
+                lpr_epoll_instance_t *instance = lpr_epoll_instance_for_object(
+                    &lpr_control_fd_table.ofds[slot->ofd_index]);
+                if (instance && instance->generation == snapshot[0].instance_generation)
+                    instance->scan_cursor = (uint64_t)snapshot[0].interest_index + 1;
+            }
+        }
+        lpr_fd_table_unlock(&lpr_control_fd_table);
+    }
+    return ready ? (int64_t)ready : failure;
 }
 
 static int64_t lpr_epoll_scan_fd(
@@ -767,6 +829,27 @@ int64_t lpr_epoll_add_wait_graph(
                     snapshot[i].events | LPR_EPOLLERR | LPR_EPOLLHUP, ignore,
                     &snapshot[i].unix_sequence);
                 if (status != 0) return status;
+                continue;
+            }
+            if (snapshot[i].kind == LPR_FD_OPS_INPUT) {
+                uint32_t state = snapshot[i].observed_state;
+                uint32_t ignore = snapshot[i].events & LPR_EPOLLET ?
+                    (state & LPR_EPOLL_STATE_READY_MASK) &
+                    ~((state & LPR_EPOLL_STATE_PENDING_MASK) >> LPR_EPOLL_STATE_PENDING_SHIFT) : 0;
+                status = lpr_wait_graph_add_input(graph, snapshot[i].fd, snapshot[i].events, ignore,
+                    &snapshot[i].unix_sequence);
+                if (status) return status;
+                continue;
+            }
+            if (snapshot[i].kind == LPR_FD_OPS_SOCKET &&
+                lpr_socket_backend(snapshot[i].fd) && lpr_socket_backend(snapshot[i].fd)->domain == 16) {
+                uint32_t state=snapshot[i].observed_state;
+                uint32_t ignore=snapshot[i].events & LPR_EPOLLET ?
+                    (state & LPR_EPOLL_STATE_READY_MASK) &
+                    ~((state & LPR_EPOLL_STATE_PENDING_MASK)>>LPR_EPOLL_STATE_PENDING_SHIFT):0;
+                status=lpr_wait_graph_add_netlink(graph,snapshot[i].fd,
+                    snapshot[i].events|LPR_EPOLLERR|LPR_EPOLLHUP,ignore,&snapshot[i].unix_sequence);
+                if(status) return status;
                 continue;
             }
             if (snapshot[i].kind != LPR_FD_OPS_EPOLL) {

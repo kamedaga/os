@@ -483,14 +483,34 @@ static int64_t lpr_proc_write_stat(uint64_t fd, unsigned *wait_not_ready __attri
     return status;
 }
 
-static int64_t lpr_proc_write_mounts(uint64_t fd, unsigned *wait_not_ready __attribute__((unused)))
+static int64_t lpr_proc_write_mounts(uint64_t fd, unsigned *wait_not_ready)
 {
-    return lpr_proc_write_string(
-        fd,
-        "rootfs / ext4 rw,relatime 0 0\n"
-        "tmpfs /run tmpfs rw,nosuid,nodev 0 0\n"
-        "tmpfs /dev/shm tmpfs rw,nosuid,nodev 0 0\n"
-        "proc /proc proc ro,nosuid,nodev,noexec,relatime 0 0\n", wait_not_ready);
+    lpr_linux_statfs_t root;
+    int64_t status=lpr_linux_statfs((uintptr_t)"/",(uintptr_t)&root);
+    if (status) return status;
+    const char *type=root.f_type==0x01021994 ? "tmpfs" : "ext4";
+    status=lpr_proc_write_string(fd,"rootfs / ",wait_not_ready);
+    if (!status) status=lpr_proc_write_string(fd,type,wait_not_ready);
+    if (!status) status=lpr_proc_write_string(fd," rw,relatime 0 0\n",wait_not_ready);
+    /* FileD has a fixed per-boot mount layout, not a personality mount API.
+     * Query mount identities so RAM roots do not advertise submounts that
+     * only exist with the disk root. statfs alone on a directory is not proof
+     * that the directory is a separate mount. */
+    const char *const paths[]={"/tmp","/run","/dev/shm","/sys","/dev/dri"};
+    for (unsigned i=0;!status && i<sizeof(paths)/sizeof(paths[0]);++i) {
+        lpr_linux_statfs_t part;
+        int64_t query=lpr_linux_statfs((uintptr_t)paths[i],(uintptr_t)&part);
+        if (query==-LPR_LINUX_ENOENT) continue;
+        if (query) return query;
+        if (part.f_type!=0x01021994 ||
+            (part.f_fsid[0]==root.f_fsid[0] && part.f_fsid[1]==root.f_fsid[1])) continue;
+        status=lpr_proc_write_string(fd,"tmpfs ",wait_not_ready);
+        if (!status) status=lpr_proc_write_string(fd,paths[i],wait_not_ready);
+        if (!status) status=lpr_proc_write_string(fd," tmpfs rw,nosuid,nodev 0 0\n",wait_not_ready);
+    }
+    if (!status) status=lpr_proc_write_string(fd,
+        "proc /proc proc ro,nosuid,nodev,noexec,relatime 0 0\n",wait_not_ready);
+    return status;
 }
 
 typedef struct lpr_proc_root_entry {
@@ -870,6 +890,40 @@ static int lpr_proc_emit_dirent(
     return 1;
 }
 
+/* Cookies encode the next FD number, not a dense index: concurrent close
+ * cannot shift remaining entries or make a close-all loop skip descriptors. */
+static int64_t lpr_proc_fd_getdents(uint64_t fd, uint64_t buf, uint64_t count)
+{
+    if (!buf && count) return -LPR_LINUX_EFAULT;
+    if (!count) return 0;
+    uint64_t offset = lpr_filed_control_offset(fd), written = 0;
+    for (;;) {
+        char name[24];
+        uint64_t mode = LPR_LINUX_S_IFDIR;
+        if (offset < 2) {
+            name[0] = '.';
+            name[1] = offset ? '.' : 0;
+            name[2] = 0;
+        } else {
+            uint64_t candidate = offset - 2;
+            while (candidate < lpr_fd_table_capacity && !lpr_control_fd_active(candidate))
+                ++candidate;
+            if (candidate >= lpr_fd_table_capacity) break;
+            offset = candidate + 2;
+            name[lpr_proc_format_u64(name, candidate)] = 0;
+            mode = LPR_LINUX_S_IFLNK;
+        }
+        if (!lpr_proc_emit_dirent((uint8_t *)(uintptr_t)buf, count, &written,
+                name, offset + 1, mode, offset + 1)) {
+            if (!written) return -LPR_LINUX_EINVAL;
+            break;
+        }
+        ++offset;
+    }
+    lpr_filed_control_set_offset(fd, offset);
+    return (int64_t)written;
+}
+
 int64_t lpr_linux_proc_getdents64(uint64_t fd, uint64_t buf, uint64_t count)
 {
     static const lpr_proc_root_entry_t fixed_entries[] = {
@@ -891,6 +945,8 @@ int64_t lpr_linux_proc_getdents64(uint64_t fd, uint64_t buf, uint64_t count)
     if (binding_status) return binding_status;
     const lpr_filed_backend_t *file = lpr_filed_backend(fd);
     if (!file) return -LPR_LINUX_ENOENT;
+    if (file->reserved1 & LPR_FILED_PROC_FD_DIRECTORY)
+        return lpr_proc_fd_getdents(fd, buf, count);
     char current_path[7];
     const int64_t path_bytes = lpr_filed_handle_path(file->handle,
         current_path, sizeof(current_path), 0);
@@ -1006,6 +1062,29 @@ int64_t lpr_linux_proc_snapshot_open(const char *path, uint64_t flags, unsigned 
         0, "proc-cpuinfo", "proc-meminfo", "proc-stat", "proc-mounts", "proc-version",
     };
     if (!path) return -LPR_LINUX_EFAULT;
+    uint64_t fd_pid = 0;
+    const char *fd_leaf = 0;
+    if (lpr_proc_pid_from_path(path, &fd_pid, &fd_leaf) &&
+        !lpr_strcmp(fd_leaf, "fd") && fd_pid == (uint64_t)lpr_linux_getpid())
+    {
+        if ((flags & LPR_LINUX_O_ACCMODE) != LPR_LINUX_O_RDONLY)
+            return -LPR_LINUX_EISDIR;
+        if (flags & (LPR_LINUX_O_CREAT | LPR_LINUX_O_TRUNC))
+            return -LPR_LINUX_EINVAL;
+        /* Borrow /proc's directory backing and offset ownership. Identity is
+         * carried by the OFD backend, so dup/fork keep the virtual listing. */
+        const int64_t fd = lpr_linux_openat_once((uint64_t)-100,
+            (uint64_t)(uintptr_t)"/proc", flags | LPR_LINUX_O_DIRECTORY,
+            0, 0, wait_not_ready);
+        if (fd < 0) return fd;
+        lpr_filed_backend_t *file = lpr_filed_backend((uint64_t)fd);
+        if (!file) {
+            (void)lpr_linux_close((uint64_t)fd);
+            return -LPR_LINUX_EIO;
+        }
+        file->reserved1 |= LPR_FILED_PROC_FD_DIRECTORY;
+        return fd;
+    }
     const enum lpr_proc_global_kind kind = lpr_proc_global_kind(path);
     const char *name = names[kind];
     if (kind == LPR_PROC_NONE) {

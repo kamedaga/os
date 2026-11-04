@@ -45,24 +45,33 @@ pub const syscall_vmo_create: u64 = 62;
 // VMO_GROW(fd, page-aligned capacity): append zeroed backing without replacing
 // live aliases. Requires RESIZE; shrinking and page-view growth are rejected.
 pub const syscall_vmo_grow: u64 = 63;
+// Shared discard keeps VMO identity while withdrawing unused owned pages;
+// REVOKE and private madvise cannot express that protection contract.
+pub const syscall_vmo_discard: u64 = 64;
+pub const VmoDiscardRange = extern struct { first_page: u64, page_count: u64 };
+pub const vmo_discard_max_ranges: usize = 32;
+pub const vmo_discard_max_pages: u64 = 1024;
+comptime {
+    if (@sizeOf(VmoDiscardRange) != 16 or @alignOf(VmoDiscardRange) != 8 or @offsetOf(VmoDiscardRange, "page_count") != 8) @compileError("discard ABI layout");
+}
 // Changes the physical cache type of populated canonical RAM, including
 // aliases held by other processes. Requires an explicit cache-policy right.
-pub const syscall_vmo_cache_policy: u64 = 64;
+pub const syscall_vmo_cache_policy: u64 = 65;
 pub const vmo_cache_wb: u64 = 0;
 pub const vmo_cache_uc_minus: u64 = 1;
 pub const vmo_cache_uc: u64 = 2;
 pub const vmo_cache_wc: u64 = 3;
-pub const syscall_vmo_create_page_view: u64 = 65;
+pub const syscall_vmo_create_page_view: u64 = 66;
 // Fixed-length borrowed backing replacement; requires both the revocation
 // capability and the same parent's SHARE + original maximum MAP authority.
-pub const syscall_vmo_refresh_page_view: u64 = 66;
+pub const syscall_vmo_refresh_page_view: u64 = 67;
 // VMO_COLLECT_DIRTY(view_fd, bitmap, word_count, flags=0). REVOKE controls
 // destructive acknowledgement of CPU-write evidence. Bits use logical view
 // page indices. Exact word count required; failed copyout retains all bits.
 // Output must not physically alias any page of the collected view. DMA writes
 // are outside this CPU-only contract; the DMA owner keeps its own protocol.
-pub const syscall_vmo_collect_dirty: u64 = 67;
-pub const syscall_vmo_revoke: u64 = 68;
+pub const syscall_vmo_collect_dirty: u64 = 68;
+pub const syscall_vmo_revoke: u64 = 69;
 pub const syscall_fd_last: u64 = syscall_vmo_revoke;
 pub const syscall_fd_count: u64 = syscall_fd_last - syscall_fd_first + 1;
 
@@ -83,7 +92,24 @@ pub const vmo_create_zero_on_demand: u64 = 1 << 4;
 // unpopulated pager VMO. A zero rights mask grants attach/map-read/map-write
 // in addition to the common control rights; EXEC requires explicit authority.
 pub const vmo_create_pager: u64 = 1 << 5;
-pub const vmo_create_known_flags_mask: u64 = known_flags_mask | vmo_create_zero_on_demand | vmo_create_pager;
+// VMO_CREATE(0, 0, CURRENT_THREAD_PAGE|PRIVATE|CLOEXEC) opens this address
+// space incarnation's identity VMO. It is shared/RO, self-map-only, and is
+// deliberately not inherited by fork or exec. No ABI version or syscall shift.
+pub const vmo_create_current_thread_page: u64 = 1 << 6;
+// Header is eight u64 words: magic,total_bytes,capacity,stride,enabled,
+// owner_cookie,reserved[2]. Slots start at byte64; each 64-byte slot holds
+// seq,current(native GETTID),reserved[6]. seq=0/odd is invalid; even sequence
+// advances before EVERY user return, never wraps (max odd closes that slot).
+// A departed CPU retains a stale value. This is a caller-identity snapshot,
+// not a system-wide running-thread list. Read CPU/seq/current/CPU/seq using
+// ordered loads (or the documented cpu2-before-current seqlock variant).
+// CPU must match, seq nonzero/even/equal, and enabled=1 before AND after.
+// Mapping is intentionally omitted by fork and exec; users must discard old
+// cached pointers before child helpers. CPU slots remain TSC_AUX values.
+pub const thread_page_magic: u64 = 0x5041_4348_5448_5244;
+pub const thread_page_header_size: u64 = 64;
+pub const thread_page_slot_stride: u64 = 64;
+pub const vmo_create_known_flags_mask: u64 = known_flags_mask | vmo_create_zero_on_demand | vmo_create_pager | vmo_create_current_thread_page;
 
 pub const right_inspect: u64 = 1 << 0;
 pub const right_dup: u64 = 1 << 1;

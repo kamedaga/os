@@ -15,6 +15,8 @@ typedef struct filed_storage_stat {
     uint32_t inode_generation, snapshot_valid;
     uint32_t rdev_major, rdev_minor;
     uint32_t mode, uid, gid, nlink;
+    /* Local cache classification, not wire metadata or access authority. */
+    uint32_t memory_backed;
 } filed_storage_stat_t;
 
 int filed_storage_exchange(struct filed_runtime *, const uint8_t *, size_t,
@@ -43,6 +45,7 @@ int filed_storage_pager_request_ex(struct filed_runtime *,uint64_t,uint64_t,
     kb2_fs_request_t *,const void *,size_t,kb2_fs_response_t *,void *,size_t);
 int filed_storage_pager_pread(struct filed_runtime *, uint64_t, uint64_t,
     uint64_t, uint64_t, void *, size_t, size_t *);
+int filed_storage_memory_backed(struct filed_runtime *, uint64_t);
 int filed_storage_executable_mapping(struct filed_runtime *, uint64_t);
 /* These handles belong only to the authenticated owner execution namespace.
  * Never return them to a client or pass them to ordinary file operations. */

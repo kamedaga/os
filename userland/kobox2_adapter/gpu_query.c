@@ -295,6 +295,21 @@ static int dispatch(void *context, void *linux_file) {
     return ph_gpu_query_dispatch(context, NULL, 0, linux_file);
 }
 
+/* PAGE_VIEW admission can fail because another DMA/native allocation used
+ * the last FD slot. Grow only when the table proves full, and retry once;
+ * a real memory refusal with free slots must remain an error. */
+static int export_fd_headroom(void) {
+    struct pacha_fd_table_info info = {0};
+    if (pacha_syscall2(PACHA_FD_SYSCALL_TABLE, 0, (uintptr_t)&info) || info.free_slots ||
+        info.capacity >= info.maximum || info.maximum > PACHA_THREAD_SELF_FD)
+        return 0;
+    uint64_t extra = info.maximum - info.capacity;
+    if (extra > 256)
+        extra = 256;
+    uint64_t wanted = info.capacity + extra;
+    return !pacha_syscall2(PACHA_FD_SYSCALL_TABLE, wanted, (uintptr_t)&info) &&
+           info.capacity >= wanted && info.free_slots;
+}
 int ph_gpu_query_publish_attachment(struct ph_gpu_query *query,
                                     struct ph_ipc *ipc) {
     if (!query || !ipc)
@@ -339,6 +354,10 @@ int ph_gpu_query_publish_attachment(struct ph_gpu_query *query,
         native_fd = pacha_syscall5(PACHA_FD_SYSCALL_VMO_CREATE_PAGE_VIEW,
             (uint64_t)ph_core.ram_fd, (uintptr_t)pages,
             query->result.mapping_page_count, rights, PACHA_FD_FLAG_CLOEXEC);
+        if (native_fd == PACHA_SYSCALL_ERR_ALLOC && export_fd_headroom())
+            native_fd = pacha_syscall5(
+                PACHA_FD_SYSCALL_VMO_CREATE_PAGE_VIEW, (uint64_t)ph_core.ram_fd, (uintptr_t)pages,
+                query->result.mapping_page_count, rights, PACHA_FD_FLAG_CLOEXEC);
         if (native_fd < 16)
             ph_boot_log_gpu_page_view_failure(native_fd,
                 (uint64_t)ph_core.ram_fd, rights, cache,
@@ -380,6 +399,37 @@ int ph_gpu_query_publish_attachment(struct ph_gpu_query *query,
     int closed = pacha_syscall1(PACHA_FD_SYSCALL_CLOSE,
         (uint64_t)fd) ? -EIO : 0;
     return result ? result : closed;
+}
+
+int ph_gpu_query_attachment_error(struct ph_gpu_query *q, int error,
+                                  struct kobox_linux_drm_service *owner,
+                                  int (*unmap)(struct kobox_linux_drm_service *, uint64_t)) {
+    uint32_t status = error == -ENOMEM                         ? KB2_GPU_STATUS_NO_MEMORY
+                      : (error == -EMFILE || error == -ENOSPC) ? KB2_GPU_STATUS_LIMIT
+                      : error == -EAGAIN                       ? KB2_GPU_STATUS_RETRY
+                                                               : 0;
+    if (!q || !status || !q->result.mapping_id || !owner || !unmap)
+        return error;
+    int rc = unmap(owner, q->result.mapping_id);
+    if (rc)
+        return rc;
+    /* The unmapped pin and failed native export never escaped. Do not expose
+     * stale map IDs, output regions, or an attachment on this error reply. */
+    memset(&q->result, 0, sizeof(q->result));
+    memset(q->output, 0, sizeof(q->output));
+    kb2_gpu_inline_completion_t completion = {.session_id = q->session_id, .status = status};
+    size_t size;
+    if (kb2_gpu_inline_completion_encode(q->reply + KB2_PROTOCOL_MESSAGE_ENVELOPE_SIZE,
+                                         sizeof(q->reply) - KB2_PROTOCOL_MESSAGE_ENVELOPE_SIZE,
+                                         &size, &completion))
+        return -EPROTO;
+    kb2_protocol_message_envelope_t e = {.protocol_id = KB2_GPU_PROTOCOL_ID,
+                                         .opcode = KB2_GPU_OPCODE_COMMAND,
+                                         .generation = q->generation,
+                                         .correlation_id = q->correlation,
+                                         .payload_length = size};
+    q->reply_size = KB2_PROTOCOL_MESSAGE_ENVELOPE_SIZE + size;
+    return kb2_protocol_message_envelope_encode(q->reply, q->reply_size, &e) ? -EPROTO : 0;
 }
 
 static int complete(void *context, struct ph_ipc *ipc) {

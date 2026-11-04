@@ -9,7 +9,10 @@
     "scratch_store": "never hardware published; AS exclusion ends borrowing",
     "detachEmptyUserParents": "detach only; caller retains assigned metadata until shared batch ACK",
     "retryRetiredAddressSpaces": "previous clear ACK; publication closed, all CPU/context users and AD loans ended before child and body returns",
-    "MmioWindow": "serial boot ownership; mappings sealed before user dispatch and retained for device/firmware borrow lifetime"
+    "MmioWindow": "serial boot ownership; mappings sealed before user dispatch and retained for device/firmware borrow lifetime",
+    "withdrawSharedDiscardRange": "K/target A/shared VM: collect stable Descriptor borrows before writes; no PT/table/bank retirement; coordinates from pml4/pdp/pd after index removal; caller ACKs each AS before backing detach",
+    "writeUserPteAt": "same occupancy/index update for slot and Descriptor writers; mandatory present implies user panic",
+    "populateUserPtPath": "stage4b populate: ensurePageChecked distinguishes OutOfFreePages (ALLOC) from InvalidState (MAP); prepared tables are never retired here"
   },
   "references": {
     "kernel/src/arch/x86_64/platform.zig": {
@@ -26,8 +29,8 @@
       "freeDetached": 10,
       "releasePageDetached": 7,
       "reclaimEmptyBanks": 7,
-      "ensurePageChecked": 1,
-      "ensurePage": 4
+      "ensurePageChecked": 2,
+      "ensurePage": 3
     },
     "kernel/src/mmio_overlay_test.zig": {
       "freeDetached": 4

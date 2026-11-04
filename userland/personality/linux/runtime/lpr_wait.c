@@ -137,6 +137,37 @@ int64_t lpr_wait_graph_add_unix_sequence(lpr_wait_graph_t *graph, uint32_t fd,
     return 0;
 }
 
+int64_t lpr_wait_graph_add_netlink(lpr_wait_graph_t *graph, uint32_t fd,
+    uint32_t events,uint32_t ignore,const struct unix_poll_sequence *sequence)
+{
+    for(unsigned i=0;i<graph->netlink_count;i++) {
+        if(graph->netlink_interests[i].fd!=fd)continue;
+        graph->netlink_interests[i].events|=events;
+        graph->netlink_interests[i].ignore_ready&=ignore;
+        if(sequence)graph->netlink_interests[i].ignore_ready &=
+            ~unix_poll_sequence_changed(&graph->netlink_interests[i].sequence,sequence);
+        return 0;
+    }
+    if (graph->netlink_count == LPR_WAIT_GRAPH_MAX_LEAVES) return -LPR_LINUX_ENOSPC;
+    unsigned i=graph->netlink_count++;
+    graph->netlink_interests[i].fd=fd;
+    graph->netlink_interests[i].events=events;
+    graph->netlink_interests[i].ignore_ready=ignore;
+    graph->netlink_interests[i].sequence=sequence?*sequence:(struct unix_poll_sequence){0};
+    return 0;
+}
+
+int64_t lpr_wait_graph_add_input(lpr_wait_graph_t *graph, uint64_t fd,
+    uint32_t events, uint32_t ignore, const struct unix_poll_sequence *sequence)
+{
+    int ready = lpr_input_prepare_wait_sequence(fd, events, ignore, sequence);
+    if (ready < 0) return ready;
+    if (ready) graph->immediate_ready = 1;
+    return lpr_wait_graph_add_leaf(graph, lpr_input_native_wait_fd(fd),
+        PACHA_FD_EVENT_READABLE | PACHA_FD_EVENT_HANGUP,
+        0, LPR_WAIT_DRAIN_NONE, (uint32_t)fd);
+}
+
 int64_t lpr_wait_graph_add_fd(
     lpr_wait_graph_t *graph,
     uint64_t fd,
@@ -168,14 +199,7 @@ int64_t lpr_wait_graph_add_fd(
         return lpr_wait_graph_add_native(graph, lpr_audio_backend(fd)->native.raw,
             PACHA_FD_EVENT_READABLE | PACHA_FD_EVENT_HANGUP);
     if (lpr_linux_input_fd_active(fd))
-        return lpr_wait_graph_add_leaf(
-            graph, lpr_input_native_wait_fd(fd), PACHA_FD_EVENT_READABLE,
-            /*
-             * The channel token represents durable unread input state.
-             * Keep it readable across the post-wake poll rescan; the input
-             * read path drains it immediately before asking inputd for data.
-             */
-            0, LPR_WAIT_DRAIN_NONE, (uint32_t)fd);
+        return lpr_wait_graph_add_input(graph, fd, events, 0, 0);
     if (lpr_linux_sync_file_fd_active(fd))
         /* Error is reported even when POLLIN was not requested. Keep the
          * producer's loss wakeable so the rescan can return POLLERR. */
@@ -186,6 +210,8 @@ int64_t lpr_wait_graph_add_fd(
     if (lpr_linux_epoll_fd_active(fd))
         return lpr_epoll_add_wait_graph(fd, graph);
     if (lpr_linux_socket_fd_active(fd)) {
+        if (lpr_socket_backend(fd)->domain == 16)
+            return lpr_wait_graph_add_netlink(graph,fd,events,0,NULL);
         const pacha_fd_t native_fd = lpr_linux_socket_native_wait_fd(fd);
 #if defined(LPR_GLYCIN_DIAG) && LPR_GLYCIN_DIAG
         const lpr_socket_backend_t *socket = lpr_socket_backend(fd);
@@ -567,6 +593,10 @@ static int64_t lpr_wait_graph_block_native(
             if ((graph->leaves[i].revents &
                  (PACHA_FD_EVENT_READABLE | PACHA_FD_EVENT_HANGUP)) == 0)
                 continue;
+            if ((graph->leaves[i].revents & PACHA_FD_EVENT_HANGUP) &&
+                graph->logical_fds[i] != UINT32_MAX &&
+                lpr_linux_input_fd_active(graph->logical_fds[i]))
+                lpr_input_mark_hangup(graph->logical_fds[i]);
             if (graph->drain_modes[i] == LPR_WAIT_DRAIN_EVENT)
                 lpr_eventfd_drain_wait(graph->logical_fds[i]);
             else if (graph->drain_modes[i] == LPR_WAIT_DRAIN_NATIVE) {
@@ -637,12 +667,20 @@ static int64_t lpr_wait_graph_block_native(
     return linux_status == -LPR_LINUX_EAGAIN ? 0 : linux_status;
 }
 
+static int64_t lpr_wait_graph_block_services(lpr_wait_graph_t *graph,const lpr_wait_deadline_t *deadline)
+{
+    return graph->unix_count ? lpr_unix_poll_block(graph,deadline,lpr_wait_graph_block_native) :
+        lpr_wait_graph_block_native(graph,deadline);
+}
+
 int64_t lpr_wait_graph_block(lpr_wait_graph_t *graph, const lpr_wait_deadline_t *deadline, unsigned *wait_not_ready __attribute__((unused)))
 {
     if (!graph) return -LPR_LINUX_EFAULT;
     graph->native_not_ready = 0;
-    const int64_t result = graph->unix_count ? lpr_unix_poll_block(graph, deadline, lpr_wait_graph_block_native) :
-        lpr_wait_graph_block_native(graph, deadline);
+    if (graph->immediate_ready) return 0;
+    const int64_t result = graph->netlink_count ?
+        lpr_netlink_poll_block(graph,deadline,lpr_wait_graph_block_services) :
+        lpr_wait_graph_block_services(graph,deadline);
     if (wait_not_ready) *wait_not_ready |= graph->native_not_ready;
     return result;
 }

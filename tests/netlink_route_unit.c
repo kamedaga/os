@@ -1,4 +1,5 @@
 #include <assert.h>
+#include <stdlib.h>
 #include <stdio.h>
 #include <sys/socket.h>
 #include <string.h>
@@ -14,13 +15,25 @@ static struct netd_interface_snapshot actual = {.mtu=1500,
 static int attached = 1;
 int netd_libuinet_interface_snapshot(struct netd_interface_snapshot *out)
 { *out = actual; return attached; }
+static void *vmo_page;
+static unsigned sends[256];
+static int hungup_fd=-1;
+static int bad_watch_rights;
+pacha_fd_t pacha_vmo_create(uint64_t bytes, uint64_t rights, uint32_t flags)
+{ (void)rights; (void)flags; assert(bytes == PACHA_READINESS_BYTES); return 90; }
+void *pacha_mmap(pacha_fd_t fd,uint64_t bytes,uint64_t prot,uint64_t flags,uint64_t offset)
+{ (void)fd;(void)prot;(void)flags;(void)offset;return vmo_page=calloc(1,bytes); }
+int pacha_munmap(void *page,uint64_t bytes)
+{ assert(bytes==PACHA_READINESS_BYTES);free(page);vmo_page=NULL;return 0; }
+int pacha_fd_get_info(pacha_fd_t fd,struct pacha_fd_info *info)
+{ (void)fd;*info=(struct pacha_fd_info){.kind=PACHA_FD_KIND_CHANNEL,.rights=PACHA_FD_RIGHT_SEND | (bad_watch_rights?0:PACHA_FD_RIGHT_WAIT|PACHA_FD_RIGHT_POLL|PACHA_FD_RIGHT_CLOSE)};return 0; }
 int pacha_fd_close(pacha_fd_t fd) { (void)fd; return 0; }
 int pacha_ipc_send(pacha_fd_t fd, const struct pacha_ipc_msg *msg)
-{ (void)fd; (void)msg; return 0; }
+{ (void)msg;assert(fd>=16 && fd<256);sends[fd]++;return 0; }
 int pacha_service_wait_add(struct pacha_service_wait_set *s,pacha_fd_t fd,uint32_t e)
 { (void)s; (void)fd; (void)e; return 0; }
 uint64_t pacha_service_wait_revents(const struct pacha_service_wait_set *s,pacha_fd_t fd)
-{ (void)s; (void)fd; return 0; }
+{ (void)s;return fd==hungup_fd?PACHA_FD_EVENT_HANGUP:0; }
 static netd_io_t io;
 static size_t received;
 static void request(uint64_t handle, unsigned type, unsigned family)
@@ -139,11 +152,36 @@ int main(void)
     for(unsigned i=0;i<15;i++) {request(a,RTM_GETLINK,0);assert(netd_netlink_socket_send(&io,&sent)==0);}
     request(a,RTM_GETLINK,0);assert(netd_netlink_socket_send(&io,&sent)==0);
     for(unsigned i=0;i<16;i++) assert(receive(a).nlmsg_type==RTM_NEWLINK);
+    pacha_fd_t view_fd;
+    assert(netd_netlink_socket_readiness(u,&view_fd)==0);
+    struct pacha_readiness *view=find_socket(u)->readiness;
+    assert(view->identity==u && !(pacha_readiness_load(view)&NETD_POLLIN));
+    uint64_t view_before=pacha_readiness_load(view);
+    uint64_t read_epoch=pacha_readiness_observe(view).read;
+    assert(netd_netlink_socket_arm(u,91)==0 && netd_netlink_socket_arm(u,92)==0);
+    assert(netd_netlink_socket_arm(u,3)==-9);
+    bad_watch_rights=1;assert(netd_netlink_socket_arm(u,93)==-9);bad_watch_rights=0;
     assert(netd_netlink_publish_device(NETD_UEVENT_DRM_CARD0)==0);
     assert(find_socket(u)->queue_len==1 && find_socket(b)->queue_len==0);
+    assert((pacha_readiness_load(view)&NETD_POLLIN) && pacha_readiness_load(view)>view_before);
+    assert(sends[91] && sends[92]);
+    assert(pacha_readiness_observe(view).read>read_epoch);
+    read_epoch=pacha_readiness_observe(view).read;
+    hungup_fd=91;struct pacha_service_wait_set wait_set={0};
+    netd_netlink_socket_reap_hangups(&wait_set);hungup_fd=-1;
+    assert(find_socket(u)->watches && find_socket(u)->watches->fd==92 && !find_socket(u)->watches->next);
+    assert(netd_netlink_publish_device(NETD_UEVENT_DRM_CARD0)==0);
+    assert(find_socket(u)->queue_len==2);
+    read_epoch=pacha_readiness_observe(view).read;
     memset(&io,0,sizeof(io));io.handle=u;
     assert(netd_netlink_socket_recv(&io,sizeof(io.data),&received)==0);
     assert(!strcmp((char *)io.data,"change@/devices/pci0000:00/0000:00:03.0/virtio1/drm/card0"));
+    assert((pacha_readiness_load(view)&NETD_POLLIN) && pacha_readiness_observe(view).read==read_epoch);
+    assert(netd_netlink_socket_recv(&io,sizeof(io.data),&received)==0);
+    assert(!(pacha_readiness_load(view)&NETD_POLLIN));
+    assert(pacha_readiness_observe(view).read==read_epoch);
+    assert(netd_netlink_socket_dup(u)==0);
+    assert(netd_netlink_socket_close(u)==0 && find_socket(u)->readiness==view);
     assert(netd_netlink_socket_close(a)==0);assert(netd_netlink_socket_close(b)==0);
     uint64_t auto_handle;assert(netd_netlink_socket_open(NETD_SOCK_RAW,0,19,&auto_handle)==0);
     request(auto_handle,RTM_GETLINK,0);assert(netd_netlink_socket_send(&io,&sent)==0);

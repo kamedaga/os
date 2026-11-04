@@ -10,6 +10,7 @@
 #endif
 #include GPUD_DRM_SERVICE_SOURCE
 
+static int reply_refusal;
 static char diagnostic[256];
 static unsigned int observed_phases;
 int pacha_log_emit(pacha_fd_t endpoint_fd, unsigned source, const char *message, size_t length)
@@ -41,6 +42,7 @@ int gpud_gpu_rpc_prime_cpu_sync(struct gpud_gpu_rpc *rpc, uint64_t correlation,
 static struct pacha_ipc_msg queued;
 static struct pacha_ipc_fd queued_fds[PACHA_IPC_MAX_TRANSFER_FDS];
 static int maps, unmaps, closes, replies, ready_fd, hungup_fd, map_failure, unmap_failure, close_failure;
+static unsigned immediate_polls;
 static struct pacha_ipc_msg last_reply;
 
 static void bounded_startup_journal(void)
@@ -247,7 +249,7 @@ long pacha_syscall6(uint64_t nr, uint64_t fd, uint64_t address, uint64_t bytes,
 }
 int pacha_fd_close(pacha_fd_t fd) { assert(fd >= 16); ++closes; return close_failure; }
 int pacha_ipc_reply(pacha_fd_t fd, const struct pacha_ipc_msg *reply)
-{ assert(fd == PACHA_IPC_REPLY_IMPLICIT); ++replies; last_reply = *reply; return 0; }
+{ assert(fd == PACHA_IPC_REPLY_IMPLICIT); ++replies; last_reply = *reply; return reply_refusal; }
 int ph_ipc_packet_release(struct ph_ipc_packet *packet)
 {
     for (size_t i = 0; i < packet->fd_count; ++i)
@@ -371,6 +373,7 @@ long pacha_fd_wait_many_batched(struct pacha_pollfd *fds, uint64_t count, uint64
 }
 long pacha_fd_poll(struct pacha_pollfd *fds, uint64_t count)
 {
+    ++immediate_polls;
     long ready = 0;
     for (uint64_t i = 0; i < count; ++i) {
         fds[i].revents = (fds[i].fd == (uint64_t)ready_fd ? PACHA_FD_EVENT_READABLE : 0) |
@@ -591,6 +594,56 @@ static void *resources_stack(void *argument)
 }
 #endif
 
+static int prime_after_poll(struct gpud_drm_service *s) {
+    int status = gpud_drm_service_reap_hangups(s);
+    if (status) return status;
+    unsigned before = immediate_polls;
+    int result = receive_prime_cpu_sync(s);
+    assert(immediate_polls == before); /* reuse, no second native poll */
+    if (!result) assert(receive_prime_cpu_sync(s) == -EAGAIN); /* consume once */
+    return result;
+}
+
+static void direct_prime_fairness(void) {
+    static struct gpud_drm_service s;
+    s.ready = (struct gpud_ready *)(uintptr_t)1; /* receive does not touch collectors */
+    struct gpud_drm_object_lease a = {.object_id=1,.fd=21,.prime_owner=1,.readable=1};
+    struct gpud_drm_object_lease b = {.object_id=2,.fd=22,.prime_owner=1,.readable=1};
+    s.primes[0].owner_lease=&a; s.primes[1].owner_lease=&b;
+    queued=(struct pacha_ipc_msg){.word0=0}; /* rejected request still consumes one turn */
+    ready_fd=21; assert(!receive_prime_cpu_sync(&s) && s.prime_cursor==1);
+    a.readable=1; ready_fd=22;
+    assert(!receive_prime_cpu_sync(&s) && s.prime_cursor==2 && a.readable && !b.readable);
+    ready_fd=21; assert(!receive_prime_cpu_sync(&s) && s.prime_cursor==1);
+    ready_fd=0;
+    puts("direct PRIME owner round robin without readable collector/rearm PASS");
+}
+
+static void readiness_snapshot(void)
+{
+    static struct gpud_drm_service service;
+    for (unsigned i = 0; i < 600; ++i)
+        service.object_leases[i] = (struct gpud_drm_object_lease){
+            .object_id = i + 1, .fd = i + 1000, .prime_owner = i != 0};
+    ready_fd = hungup_fd = 0;
+    unsigned before = immediate_polls;
+    assert(!gpud_drm_service_reap_hangups(&service));
+    assert(immediate_polls - before == (600 + PACHA_FD_WAIT_RETAINED_MAX_FDS - 1) /
+        PACHA_FD_WAIT_RETAINED_MAX_FDS);
+    before = immediate_polls;
+    ready_fd = 1599; /* Arrival after snapshot is picked up by the next level probe. */
+    assert(receive_prime_cpu_sync(&service) == -EAGAIN && immediate_polls == before);
+    assert(!gpud_drm_service_reap_hangups(&service));
+    assert(service.object_leases[599].readable && !service.object_leases[0].readable);
+    service.object_leases[599] = (struct gpud_drm_object_lease){
+        .object_id = 700, .fd = 1600, .prime_owner = 1};
+    assert(receive_prime_cpu_sync(&service) == -EAGAIN); /* no inherited readiness */
+    free(service.pollfds);
+    memset(&service, 0, sizeof(service));
+    ready_fd = 0;
+    puts("GPUD readiness snapshot: 600 fds, no duplicate poll, late arrival, non-prime index, reuse PASS");
+}
+
 static void prime_cpu_authority(void) {
     static struct gpud_drm_service s;
     struct ph_ipc ipc={.generation=9};
@@ -608,7 +661,7 @@ static void prime_cpu_authority(void) {
     for(unsigned i=0;i<6;++i) {
         queued=(struct pacha_ipc_msg){.word0=GPUD_DRM_PRIME_CPU_SYNC_REQUEST_MAGIC,
             .word1=4097,.word2=valid[i]}; ready_fd=21;
-        assert(!receive_prime_cpu_sync(&s));
+        assert(!prime_after_poll(&s));
         assert(last_reply.word0==GPUD_DRM_PRIME_CPU_SYNC_REPLY_MAGIC &&
             !last_reply.word1 && last_reply.word2==4097 && last_reply.word3==valid[i]);
     }
@@ -618,31 +671,32 @@ static void prime_cpu_authority(void) {
     for(unsigned i=0;i<4;++i) {
         queued=(struct pacha_ipc_msg){.word0=GPUD_DRM_PRIME_CPU_SYNC_REQUEST_MAGIC,.word1=4097,.word2=denied[i]};
         ready_fd=21;
-        assert(!receive_prime_cpu_sync(&s) && (int64_t)last_reply.word1==-EACCES);
+        assert(!prime_after_poll(&s) && (int64_t)last_reply.word1==-EACCES);
     }
     assert(cpu_rpc_calls==6);
     s.primes[0].cpu_rights=3;
     queued=(struct pacha_ipc_msg){.word0=GPUD_DRM_PRIME_CPU_SYNC_REQUEST_MAGIC,.word1=8193,.word2=3};ready_fd=21;
-    assert(!receive_prime_cpu_sync(&s) && (int64_t)last_reply.word1==-EINVAL && cpu_rpc_calls==6);
+    assert(!prime_after_poll(&s) && (int64_t)last_reply.word1==-EINVAL && cpu_rpc_calls==6);
     queued.word1=4097; queued.word2=UINT64_C(1)<<32|1; ready_fd=21;
-    assert(!receive_prime_cpu_sync(&s) && (int64_t)last_reply.word1==-EINVAL && cpu_rpc_calls==6);
+    assert(!prime_after_poll(&s) && (int64_t)last_reply.word1==-EINVAL && cpu_rpc_calls==6);
     queued.word2=3; ipc.generation=8; ready_fd=21;
-    assert(!receive_prime_cpu_sync(&s) && (int64_t)last_reply.word1==-ESTALE && cpu_rpc_calls==6);
+    assert(!prime_after_poll(&s) && (int64_t)last_reply.word1==-ESTALE && cpu_rpc_calls==6);
     ipc.generation=9; cpu_deny_rights=1; ready_fd=21;
-    assert(!receive_prime_cpu_sync(&s) && (int64_t)last_reply.word1==-EACCES && cpu_rpc_calls==6);
+    assert(!prime_after_poll(&s) && (int64_t)last_reply.word1==-EACCES && cpu_rpc_calls==6);
     cpu_deny_rights=0;
     const int errors[]={-EINTR,-EAGAIN,-EIO};
     s.primes[0].owner_closed=1; /* The object endpoint/lease still owns it. */
     for(unsigned i=0;i<3;++i) {
         cpu_rpc_error=errors[i]; ready_fd=21;
-        assert(!receive_prime_cpu_sync(&s) && (int64_t)last_reply.word1==errors[i]);
+        assert(!prime_after_poll(&s) && (int64_t)last_reply.word1==errors[i]);
     }
     assert(cpu_rpc_calls==9);
     s.correlation=UINT64_MAX; ready_fd=21;
-    assert(!receive_prime_cpu_sync(&s) && (int64_t)last_reply.word1==-EOVERFLOW && cpu_rpc_calls==9);
+    assert(!prime_after_poll(&s) && (int64_t)last_reply.word1==-EOVERFLOW && cpu_rpc_calls==9);
     s.object_leases[0].prime_owner=0; ready_fd=21;
-    assert(receive_prime_cpu_sync(&s)==-EAGAIN && cpu_rpc_calls==9);
+    assert(prime_after_poll(&s)==-EAGAIN && cpu_rpc_calls==9);
     cpu_rpc_error=cpu_deny_rights=ready_fd=0;
+    free(s.pollfds);
     memset(&s,0,sizeof(s));
     assert(!gpud_drm_files_init(&s.files,9,2));
     uint64_t handle;
@@ -654,8 +708,32 @@ static void prime_cpu_authority(void) {
     puts("GPUD CPU SYNC: dedicated lease proof, public/token forgery refusal, rights/generation/errno; I915 malformed MAP_DUMB rejects before native dispatch PASS");
 }
 
+#if defined(GPUD_DRM_RPC_PROFILE) && GPUD_DRM_RPC_PROFILE
+long pacha_syscall0(uint64_t nr){assert(nr==PACHA_RUNTIME_SYSCALL_GETPID);return 17;}
+#endif
+static void hello_once(struct gpud_drm_service *service,unsigned id){
+ pacha_service_envelope_t *h=(void*)page;*h=(pacha_service_envelope_t){.magic=PACHA_SERVICE_REQUEST_MAGIC,.header_size=sizeof(*h),.service_id=GPUD_DRM_SERVICE_ID,.op=GPUD_DRM_OP_HELLO,.request_id=id};
+ queued=(struct pacha_ipc_msg){.word0=PACHA_SERVICE_REQUEST_MAGIC,.word3=id,.fd_count=1};queued_fds[0]=(struct pacha_ipc_fd){.fd=20};ready_fd=service->endpoint_fd;
+ assert(!receive_request(service,service->endpoint_fd,NULL));
+}
+static void reply_and_trace_control(struct gpud_drm_service *s){
+ int before=replies;reply_refusal=-PACHA_SYSCALL_ERR_CLOSED;hello_once(s,1001);assert(!s->error&&replies==before+1);reply_refusal=0;hello_once(s,1002);assert(!s->error);
+#if defined(GPUD_DRM_RPC_PROFILE) && GPUD_DRM_RPC_PROFILE
+ assert(!gpud_drm_profile_enabled()&&rpc_profile_now()==0);s->log_endpoint_fd=29;gpud_drm_service_profile_arm(29);assert(gpud_drm_profile_enabled()&&rpc_profile_now());
+ for(unsigned i=0;i<64;i++)hello_once(s,1500+i);
+ gpud_drm_service_profile_disarm();assert(!gpud_drm_profile_enabled()&&rpc_profile_now()==0);gpud_drm_service_profile_arm(29);
+ for(unsigned i=0;i<64*512;i++)hello_once(s,2000+i);
+ assert(!gpud_drm_profile_enabled()&&rpc_profile_now()==0&&profile_samples_remaining==0);
+ s->log_endpoint_fd=0;
+ puts("runtime RAM trace default-off/arm/stride64/512 samples/auto-off/record bounds PASS");
+#endif
+ puts("canceled CALL one reply attempt/nonterminal and subsequent HELLO PASS");
+}
+
 int main(void)
 {
+    direct_prime_fairness();
+    readiness_snapshot();
     prime_cpu_authority();
 #if defined(GPUD_DRM_STACK_BUDGET)
     struct gpud_drm_service *service = resources_service();
@@ -816,6 +894,7 @@ int main(void)
     i915_exec_call(&service,handle,-ENOMEM);
     i915_exec_call(&service,handle,-EINTR);
     i915_wait_and_forgery_call(&service,handle);
+    reply_and_trace_control(&service);
     unmap_failure = 1;
     assert(retire_connection(&service.connections) == -EIO && service.connections->aux == auxiliary);
     unmap_failure = 0;

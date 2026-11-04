@@ -4,6 +4,7 @@
 #include "lpr_fd/allocate.h"
 #include "lpr_gui_detail.h"
 #include "lpr_unix/poll.h"
+#include <pacha/readiness.h>
 
 #include "support/string.h"
 #include "support/syscall.h"
@@ -845,13 +846,22 @@ int64_t lpr_netd_dup_handle(uint64_t handle)
 }
 
 
-/* Network OFD handoff across exec; AF_UNIX SCM uses unixd instead. */
+/* Network OFD handoff across exec. */
 int64_t lpr_netd_transfer_dup_handle(uint64_t handle, pacha_fd_t lease_fd)
 {
     if (handle == 0 || lease_fd < 16) return -LPR_LINUX_EINVAL;
     const lpr_netd_fd_options_t options = {
         .transfer_fds = &lease_fd, .transfer_count = 1, .move_transfer = 1 };
     return lpr_netd_call_with_fd(NETD_OP_DUP, -1, handle, 0, &options);
+}
+
+/* SCM construction keeps the sender cap until cleanup, including ambiguous
+ * IPC errors. A MOVE would make that number reusable by a sibling thread. */
+int64_t lpr_netd_transfer_hold(uint64_t handle,pacha_fd_t lease_fd)
+{
+    if(!handle || lease_fd<16)return -LPR_LINUX_EINVAL;
+    const lpr_netd_fd_options_t options={.transfer_fds=&lease_fd,.transfer_count=1};
+    return lpr_netd_call_with_fd(NETD_OP_DUP,-1,handle,0,&options);
 }
 
 int64_t lpr_netd_close_handle(uint64_t handle)
@@ -1073,6 +1083,8 @@ int64_t lpr_linux_socket_close(uint64_t fd)
 int64_t lpr_socket_close_backend(void *state)
 {
     const lpr_socket_backend_t *socket = state;
+    if (socket->readiness_address) (void)lpr_pacha_syscall2(PACHAOS_SYSCALL_MUNMAP,
+        socket->readiness_address, PACHA_READINESS_BYTES);
     const int transfer_lease =
         (socket->reserved1 & LPR_BACKEND_TRANSFER_LEASE) != 0;
     const int64_t status = !transfer_lease && socket->handle != 0 ?
@@ -1717,6 +1729,8 @@ int64_t lpr_linux_recvmmsg(uint64_t fd, uint64_t msgvec_raw, uint64_t vlen, uint
     return (int64_t)received;
 }
 
+static int64_t lpr_netlink_readiness(lpr_socket_backend_t *,uint32_t,struct unix_poll_sequence *);
+
 int64_t lpr_linux_getsockname(uint64_t fd, uint64_t addr, uint64_t addrlen)
 {
     if (lpr_unix_socket_active(fd)) return lpr_unix_socket_name(fd, addr, addrlen, 0);
@@ -1725,8 +1739,11 @@ int64_t lpr_linux_getsockname(uint64_t fd, uint64_t addr, uint64_t addrlen)
     }
     if (lpr_socket_backend(fd)->domain == LPR_LINUX_AF_NETLINK) {
         if (addr == 0 || addrlen == 0) return -LPR_LINUX_EFAULT;
-        lpr_netlink_name(addr, addrlen, lpr_socket_backend(fd)->local_addr_be,
-            lpr_socket_backend(fd)->peer_addr_be);
+        int64_t status=lpr_netlink_readiness(lpr_socket_backend(fd),0,NULL);
+        if(status<0)return status;
+        const struct pacha_readiness *view=(void *)(uintptr_t)lpr_socket_backend(fd)->readiness_address;
+        uint64_t names=__atomic_load_n(&view->names,__ATOMIC_ACQUIRE);
+        lpr_netlink_name(addr,addrlen,(uint32_t)names,(uint32_t)(names>>32));
         return 0;
     }
     return lpr_socket_copy_sockaddr(
@@ -2020,6 +2037,148 @@ int64_t lpr_linux_socket_fstat(uint64_t fd, uint64_t statbuf)
     return 0;
 }
 
+static int64_t lpr_netlink_readiness(lpr_socket_backend_t *socket, uint32_t events,
+    struct unix_poll_sequence *sequence)
+{
+    uint64_t address = __atomic_load_n(&socket->readiness_address, __ATOMIC_ACQUIRE);
+    if (!address) {
+        lpr_state_lock(&socket->readiness_lock);
+        address = socket->readiness_address;
+        int64_t status = 0;
+        if (!address) {
+            void *page;
+            pacha_fd_t request_fd = lpr_netd_create_page(&page);
+            if (request_fd < 16) { status = request_fd; goto mapping_done; }
+            lpr_memset(page, 0, sizeof(netd_poll_t));
+            netd_poll_t *request = page;
+            request->handle = socket->handle;
+            request->reserved[0] = PACHA_READINESS_EXPORT;
+            pacha_fd_t cap = -1;
+            uint32_t count = 0;
+            lpr_netd_fd_options_t options = {.out_received_fds = &cap,
+                .received_capacity = 1, .out_received_count = &count};
+            status = lpr_netd_call_with_fd(NETD_OP_POLL, request_fd, 0, NULL, &options);
+            lpr_netd_destroy_page(request_fd, page);
+            struct pacha_fd_info info;
+            uint64_t rights = PACHA_FD_RIGHT_INSPECT | PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_MAP_READ;
+            if (!status && (count != 1 || cap < 16 || !lpr_native_fd_info(cap, &info) ||
+                info.kind != PACHA_FD_KIND_VMO || info.rights != rights ||
+                info.size != PACHA_READINESS_BYTES ||
+                info.flags != (PACHA_FD_FLAG_PRIVATE | PACHA_FD_FLAG_CLOEXEC))) status = -LPR_LINUX_EIO;
+            if (!status) {
+                int64_t mapped = lpr_pacha_syscall6(PACHAOS_SYSCALL_MMAP, cap, 0,
+                    PACHA_READINESS_BYTES, PACHA_PROT_READ, PACHA_MMAP_SHARED, 0);
+                if (mapped < 4096) status = -LPR_LINUX_ENOMEM;
+                else {
+                    const struct pacha_readiness *view = (void *)(uintptr_t)mapped;
+                    if (view->identity != socket->handle || !pacha_readiness_load(view)) {
+                        (void)lpr_pacha_syscall2(PACHAOS_SYSCALL_MUNMAP, mapped, PACHA_READINESS_BYTES);
+                        status = -LPR_LINUX_EIO;
+                    } else {
+                        address = (uint64_t)mapped;
+                        __atomic_store_n(&socket->readiness_address, address, __ATOMIC_RELEASE);
+                    }
+                }
+            }
+            if (cap >= 16) (void)lpr_close_native_fd_if_open(cap);
+        }
+    mapping_done:
+        lpr_state_unlock(&socket->readiness_lock);
+        if (status) return status;
+    }
+    struct pacha_ready_observation observation=pacha_readiness_observe((void *)(uintptr_t)address);
+    if (sequence) *sequence = (struct unix_poll_sequence){.source = socket->handle,
+        .read = observation.read, .write = observation.write, .error = observation.error};
+    return observation.ready & (events | NETD_POLLERR | NETD_POLLHUP);
+}
+
+int64_t lpr_socket_poll_sequence(uint64_t fd, uint32_t events, struct unix_poll_sequence *sequence)
+{
+    /* Only NETLINK uses the pushed control readiness page. Other network
+     * sockets retain their existing poll contract. */
+    lpr_fd_pin_t pin;
+    if (fd > LPR_LINUX_FD_MAX || lpr_fd_table_pin(&lpr_control_fd_table, fd, &pin))
+        return -LPR_LINUX_EBADF;
+    int64_t result = -88;
+    if (pin.ops_id == LPR_FD_OPS_SOCKET &&
+        ((lpr_socket_backend_t *)pin.state)->domain == LPR_LINUX_AF_NETLINK)
+        result = lpr_netlink_readiness(pin.state, events, sequence);
+    lpr_fd_unpin(&pin);
+    return result;
+}
+
+int64_t lpr_netd_readiness_import(lpr_socket_backend_t *socket)
+{
+    int64_t status=lpr_netlink_readiness(socket,0,NULL);
+    if(status<0)return status;
+    const struct pacha_readiness *view=(void *)(uintptr_t)socket->readiness_address;
+    uint64_t names=__atomic_load_n(&view->names,__ATOMIC_ACQUIRE);
+    socket->local_addr_be=(uint32_t)names;socket->peer_addr_be=(uint32_t)(names>>32);
+    return 0;
+}
+
+struct netlink_poll_watch {
+    struct netlink_poll_watch *next;
+    lpr_fd_pin_t pin;
+    pacha_fd_t receive;
+};
+int64_t lpr_netlink_poll_block(lpr_wait_graph_t *graph, const lpr_wait_deadline_t *deadline,
+    int64_t (*block)(lpr_wait_graph_t *, const lpr_wait_deadline_t *))
+{
+    struct netlink_poll_watch *watches=NULL;
+    uint32_t leaves=graph->leaf_count;
+    int64_t status=0;
+    for(unsigned i=0;i<graph->netlink_count;i++) {
+        struct netlink_poll_watch *watch=lpr_backend_state_alloc(sizeof(*watch));
+        if(!watch){status=-LPR_LINUX_ENOMEM;goto done;}
+        lpr_memset(watch,0,sizeof(*watch));watch->receive=-1;
+        uint32_t fd=graph->netlink_interests[i].fd;
+        if(lpr_fd_table_pin(&lpr_control_fd_table,fd,&watch->pin)) {
+            (void)lpr_backend_state_free(watch,sizeof(*watch));goto done;
+        }
+        watch->next=watches;watches=watch;
+        if(watch->pin.ops_id!=LPR_FD_OPS_SOCKET ||
+            ((lpr_socket_backend_t *)watch->pin.state)->domain!=LPR_LINUX_AF_NETLINK) goto done;
+        lpr_socket_backend_t *socket=watch->pin.state;
+        pacha_fd_t remote=-1;
+        status=lpr_native_wait_pair(&watch->receive,&remote);
+        if(status) goto done;
+        void *page;
+        pacha_fd_t request_fd=lpr_netd_create_page(&page);
+        if(request_fd<16) {status=request_fd;(void)lpr_close_native_fd_if_open(remote);goto done;}
+        lpr_memset(page,0,sizeof(netd_poll_t));
+        netd_poll_t *request=page;request->handle=socket->handle;
+        request->reserved[0]=PACHA_READINESS_ARM;
+        lpr_netd_fd_options_t options={.transfer_fds=&remote,.transfer_count=1};
+        status=lpr_netd_call_with_fd(NETD_OP_POLL,request_fd,0,NULL,&options);
+        (void)lpr_close_native_fd_if_open(remote);
+        lpr_netd_destroy_page(request_fd,page);
+        if(status) goto done;
+        /* Register first, then sample the authoritative atomic level/epoch.
+         * No other thread/process can drain this invocation's doorbell. */
+        struct unix_poll_sequence sequence={0};
+        int64_t ready=lpr_netlink_readiness(socket,
+            graph->netlink_interests[i].events,&sequence);
+        if(ready<0){status=ready;goto done;}
+        uint32_t ignored=graph->netlink_interests[i].ignore_ready &
+            ~unix_poll_sequence_changed(&graph->netlink_interests[i].sequence,&sequence);
+        if(ready & ~ignored) goto done;
+        status=lpr_wait_graph_add_native(graph,watch->receive,
+            PACHA_FD_EVENT_READABLE|PACHA_FD_EVENT_HANGUP);
+        if(status) goto done;
+    }
+    status=block(graph,deadline);
+ done:
+    while(watches) {
+        struct netlink_poll_watch *watch=watches;watches=watch->next;
+        if(watch->receive>=16) (void)lpr_close_native_fd_if_open(watch->receive);
+        lpr_fd_unpin(&watch->pin);
+        (void)lpr_backend_state_free(watch,sizeof(*watch));
+    }
+    graph->leaf_count=leaves;
+    return status;
+}
+
 static int64_t lpr_linux_socket_poll_one(uint64_t fd, uint32_t events, uint32_t *out_revents)
 {
     if (out_revents == 0) {
@@ -2028,6 +2187,12 @@ static int64_t lpr_linux_socket_poll_one(uint64_t fd, uint32_t events, uint32_t 
     *out_revents = 0;
     if (!lpr_linux_socket_fd_active(fd)) {
         return -LPR_LINUX_EBADF;
+    }
+    if (lpr_socket_backend(fd)->domain == LPR_LINUX_AF_NETLINK) {
+        int64_t ready = lpr_netlink_readiness(lpr_socket_backend(fd), events, NULL);
+        if (ready < 0) return ready;
+        *out_revents = (uint32_t)ready;
+        return 0;
     }
     void *page = 0;
     const pacha_fd_t page_fd = lpr_netd_create_page(&page);
@@ -2144,7 +2309,11 @@ static int64_t lpr_linux_poll_scan(
 {
     (void)cached_sockets;
     int64_t ready = 0;
-    struct lpr_pipe_poll_batch pipes = {.count = 0};
+    struct lpr_pipe_poll_batch pipes;
+    // Only [0,count) owns pins or reaches FD_POLL. Each successful pin and
+    // complete leaf initializer precedes count++, and flush resets count.
+    // Clearing all 256 unused rows costs ~24 KiB even for a one-FD timeout0.
+    pipes.count = 0;
     for (uint64_t i = 0; i < nfds; i += 1) {
         fds[i].revents = 0;
         if (fds[i].fd < 0) {

@@ -2,6 +2,7 @@
 #include "lifecycle.h"
 #include "lifecycle_message.h"
 #include <errno.h>
+#include <pacha/pressure.h>
 
 enum { WORK_IDLE, WORK_READY, WORK_BUSY, WORK_DONE };
 
@@ -56,6 +57,11 @@ static int abort_monitor(void *context, int error) {
 
     if (!lifecycle->monitored || error >= 0)
         return -EINVAL;
+    /* Called by the Linux monitor before it exits the opening task. */
+    if (lifecycle->pressure_started) {
+        lifecycle->pressure_stop();
+        lifecycle->pressure_started = 0;
+    }
     return atomic_compare_exchange_strong_explicit(&lifecycle->monitor_abort,
         &expected, error, memory_order_release, memory_order_relaxed) ?
         0 : -EALREADY;
@@ -77,6 +83,8 @@ static int quiesce(struct ph_lifecycle *lifecycle, const struct ph_ipc_packet *p
  * Check control before each ring request; a hot queue cannot hide QUIESCE.
  * An empty probe keeps ownership until the Linux loop ends its bounded poll.
  */
+static int bind_pressure(struct ph_lifecycle *, struct ph_ipc_packet *);
+
 static int poll_work(void *context) {
     struct ph_lifecycle *lifecycle = context;
     if (atomic_load_explicit(&lifecycle->work, memory_order_acquire) != WORK_BUSY)
@@ -96,6 +104,12 @@ static int poll_work(void *context) {
     if (!result) {
         if (packet.operation == PH_LIFECYCLE_QUIESCE) {
             result = quiesce(lifecycle, &packet);
+            PH_OK(ph_ipc_packet_release(&packet));
+            return_to_receiver(lifecycle, result);
+            return 0;
+        }
+        if (packet.operation == PACHA_PRESSURE_BIND) {
+            result = bind_pressure(lifecycle, &packet);
             PH_OK(ph_ipc_packet_release(&packet));
             return_to_receiver(lifecycle, result);
             return 0;
@@ -131,17 +145,49 @@ static void idle(void *context) {
         return_to_receiver(lifecycle, 0);
 }
 
+static int pressure_wake(void *context);
+static int pressure_advance(struct ph_lifecycle *lifecycle);
+
 static int dispatch(void *context, void *linux_service) {
     struct ph_lifecycle *lifecycle = context;
     unsigned int expected = WORK_READY;
     if (!atomic_compare_exchange_strong_explicit(&lifecycle->work, &expected, WORK_BUSY,
         memory_order_acquire, memory_order_relaxed)) return -EPROTO;
+    if (lifecycle->pressure_job) {
+        int result = 0;
+        if (lifecycle->pressure_job == 2) {
+            if (lifecycle->pressure_started) lifecycle->pressure_stop();
+            lifecycle->pressure_started = 0;
+        } else {
+            if (!lifecycle->pressure_started) {
+                result = lifecycle->pressure_start(pressure_wake, lifecycle);
+                if (!result) lifecycle->pressure_started = 1;
+            }
+            if (!result) result = pressure_advance(lifecycle);
+            if (result) {
+                /* Manager loss or malformed pressure must not kill the driver.
+                 * Join its Linux worker before retiring the private endpoint. */
+                if (lifecycle->pressure_started) lifecycle->pressure_stop();
+                lifecycle->pressure_started = 0;
+                PH_OK(ph_ipc_destroy(&lifecycle->pressure, lifecycle->generation));
+                result = 0;
+            }
+        }
+        lifecycle->pressure_job = 0;
+        return_to_receiver(lifecycle, result);
+        return result;
+    }
     int result = lifecycle->service.dispatch(lifecycle->service.context, linux_service);
     if (result > 0) result = -EPROTO;
     int completed = result ? result :
         lifecycle->service.complete(lifecycle->service.context, lifecycle->ipc);
     int closed = lifecycle->service.release(lifecycle->service.context);
     completed = completed ? completed : closed;
+    if (completed && lifecycle->pressure_started) {
+        /* dispatch errors can make Linux return before receiver cleanup. */
+        lifecycle->pressure_stop();
+        lifecycle->pressure_started = 0;
+    }
     /* A ring service retains ownership across the Linux loop's short poll.
      * No staging is reused until completion publication and release finish. */
     if (completed || !lifecycle->service.next)
@@ -168,7 +214,62 @@ static int run_prepared(struct ph_lifecycle *lifecycle, int result) {
     return result ? result : closed;
 }
 
+/* The receiver hands pressure work to the same Linux opening task as DRM
+ * and network work. Reclaim itself runs on the bounded Linux worker. */
+static int pressure_wake(void *context) { (void)context; return 0; }
+static int pressure_advance(struct ph_lifecycle *l) {
+    if (l->pressure_pending && !l->pressure_result_ready) {
+        int error = l->pressure_collect(&l->pressure_result);
+        if (error && error != -EAGAIN) return error;
+        if (!error) l->pressure_result_ready = 1;
+    }
+    if (l->pressure_result_ready) {
+        struct pacha_ipc_msg ack = {
+            .word0=pacha_pressure_tag(l->pressure_sequence, PACHA_PRESSURE_ACK),
+            .word1=l->pressure_result.requested_pages,
+            .word2=l->pressure_result.linux_freed_pages,
+            .word3=l->pressure_result.reported_ok_pages};
+        long error = pacha_ipc_message_syscall(PACHA_IPC_SYSCALL_SEND,
+            l->pressure.fd, &ack, NULL, 0, 0, NULL);
+        if (error == PACHA_SYSCALL_ERR_NOT_READY || error == PACHA_SYSCALL_ERR_EMPTY) return 0;
+        if (error) return -EPIPE;
+        l->pressure_pending = l->pressure_result_ready = 0;
+    }
+    if (l->pressure_pending) return 0;
+    struct pacha_ipc_msg request = {0};
+    long error = pacha_ipc_message_syscall(PACHA_IPC_SYSCALL_RECV,
+        l->pressure.fd, NULL, &request, 0, 0, NULL);
+    if (error == PACHA_SYSCALL_ERR_NOT_READY || error == PACHA_SYSCALL_ERR_EMPTY) return 0;
+    if (error || request.fd_count || (request.word0 & 0xffff) != PACHA_PRESSURE_REQUEST ||
+        (request.word0 >> 16) <= l->pressure_sequence || !request.word1 ||
+        request.word1 > PACHA_PRESSURE_MAX_PAGES || request.word3) return -EPROTO;
+    uint64_t time[2] = {0};
+    if (pacha_syscall2(PACHA_RUNTIME_SYSCALL_CLOCK_GETTIME, 1, (uintptr_t)time)) return -EIO;
+    uint64_t now = time[0]*UINT64_C(1000000000)+time[1];
+    if (now >= request.word2) return -ETIMEDOUT;
+    uint64_t budget = request.word2-now;
+    if (budget > UINT64_C(100000000)) budget = UINT64_C(100000000);
+    error = l->pressure_submit(request.word1, budget);
+    if (error) return (int)error;
+    l->pressure_sequence = request.word0 >> 16;
+    l->pressure_pending = 1;
+    return 0;
+}
+
+static int bind_pressure(struct ph_lifecycle *lifecycle, struct ph_ipc_packet *packet) {
+    if (!lifecycle->pressure_start) return -EPROTO;
+    {
+        if (lifecycle->pressure.generation || packet->fd_count != 1 ||
+            packet->correlation || packet->value) return -EPROTO;
+        int result = ph_ipc_init(&lifecycle->pressure, packet->fds[0].fd, lifecycle->generation);
+        if (result) return result;
+        packet->fds[0].fd = PH_IPC_NO_FD;
+        return ph_ipc_packet_release(packet);
+    }
+}
+
 static int run_service(struct ph_lifecycle *lifecycle, struct ph_ipc_packet *packet) {
+    if (packet->operation == PACHA_PRESSURE_BIND) return bind_pressure(lifecycle, packet);
     int result = lifecycle->service.prepare(lifecycle->service.context, packet);
     int closed = ph_ipc_packet_release(packet);
     if (closed && result >= 0) result = closed;
@@ -368,6 +469,11 @@ static void *receive(void *context) {
             (result = atomic_load_explicit(&lifecycle->monitor_abort,
                 memory_order_acquire)))
             break;
+        if (lifecycle->pressure.admitted) {
+            lifecycle->pressure_job = 1;
+            result = run_prepared(lifecycle, 0);
+            if (result) break;
+        }
         result = ph_ipc_receive(lifecycle->ipc, lifecycle->generation, &packet);
         if (!result) {
             if (packet.operation == PH_LIFECYCLE_QUIESCE) break;
@@ -389,7 +495,7 @@ static void *receive(void *context) {
         }
         if (lifecycle->service.wait) {
             result = lifecycle->service.wait(lifecycle->service.context,
-                lifecycle->ipc->fd, lifecycle->monitored ? 1000 : PACHA_FD_WAIT_FOREVER);
+                lifecycle->ipc->fd, (lifecycle->pressure.admitted ? 100 : (lifecycle->monitored ? 1000 : PACHA_FD_WAIT_FOREVER)));
             if (result) break;
             continue;
         }
@@ -400,12 +506,12 @@ static void *receive(void *context) {
             events[count++] = (struct pacha_pollfd){
                 .fd = lifecycle->service.wake_fd,
                 .events = PACHA_FD_EVENT_READABLE | PACHA_FD_EVENT_HANGUP};
-        if (lifecycle->monitored) {
+        if (lifecycle->monitored || lifecycle->pressure.admitted) {
             /* The Linux opening task can abort for temperature or elapsed
              * time while this native receiver has no incoming IPC. Polling
              * only this inspection profile bounds its join to one second.
              */
-            long waited = wait_receiver(&wait_set, events, count, 1000);
+            long waited = wait_receiver(&wait_set, events, count, lifecycle->pressure.admitted ? 100 : 1000);
             size_t ready = 0;
             for (size_t i = 0; i < count; ++i)
                 ready += events[i].revents != 0;
@@ -419,6 +525,11 @@ static void *receive(void *context) {
         } else {
             PH_CHECK(wait_receiver(&wait_set, events, count, PACHA_FD_WAIT_FOREVER) > 0);
         }
+    }
+    if (lifecycle->pressure_started) {
+        lifecycle->pressure_job = 2;
+        int stopped = run_prepared(lifecycle, 0);
+        if (stopped) result = stopped;
     }
     if (!result) {
         if (packet.operation != PH_LIFECYCLE_QUIESCE)
@@ -456,6 +567,17 @@ static int start_service(struct ph_lifecycle *lifecycle, struct ph_ipc *ipc,
             .abort = monitored ? abort_monitor : NULL},
         .monitored = monitored};
     if (service) lifecycle->service = *service;
+#if !PH_SANDBOX_FS
+    if (service && !service->advance && ph_image_lookup(&ph_core, "kobox_linux_pressure_start")) {
+#define PRESSURE_LOAD(field, name) do { void *symbol = ph_image_lookup(&ph_core, name); \
+        if (!symbol) return -ENOENT; memcpy(&lifecycle->field, &symbol, sizeof(symbol)); } while (0)
+        PRESSURE_LOAD(pressure_start, "kobox_linux_pressure_start");
+        PRESSURE_LOAD(pressure_submit, "kobox_linux_pressure_submit");
+        PRESSURE_LOAD(pressure_collect, "kobox_linux_pressure_collect");
+        PRESSURE_LOAD(pressure_stop, "kobox_linux_pressure_stop");
+#undef PRESSURE_LOAD
+    }
+#endif
     if (service && service->advance) {
         lifecycle->port.dispatch = NULL;
         lifecycle->port.start = async_start;
@@ -519,6 +641,7 @@ void ph_lifecycle_finish(struct ph_lifecycle *lifecycle) {
         memory_order_release, memory_order_relaxed)) ph_wake(&lifecycle->start);
     PH_OK(ph_thread_join(lifecycle->receiver));
     lifecycle->receiver = NULL;
+    if (lifecycle->pressure.generation) PH_OK(ph_ipc_destroy(&lifecycle->pressure, lifecycle->generation));
     /* Async start failed before READY: no admission/worker survives start's
      * rollback, but native mappings still belong to the original caller. */
     if (lifecycle->service.advance && lifecycle->service.stop)

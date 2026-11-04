@@ -8,6 +8,7 @@
 #include "boot/fs_service.h"
 #include "boot/fs_worker.h"
 #include "boot/fs_shared.h"
+#include "memory/reporting.h"
 
 #define PH_FS_QUEUE_RIGHTS (PACHA_FD_RIGHT_INSPECT | PACHA_FD_RIGHT_MAP_READ | \
     PACHA_FD_RIGHT_MAP_WRITE)
@@ -79,6 +80,14 @@ struct ph_fs_queue {
     uint64_t client_watermark, reply_id, reply_operation;
     unsigned prefer_client;
     int closing;
+    struct ph_ipc pressure;
+    int pressure_dead, pressure_pending, pressure_have_result;
+    uint64_t pressure_sequence;
+    struct kobox_linux_pressure_result pressure_result;
+    int (*pressure_start)(int (*)(void *), void *);
+    int (*pressure_submit)(uint64_t, uint64_t);
+    int (*pressure_collect)(struct kobox_linux_pressure_result *);
+    void (*pressure_stop)(void);
     atomic_flag watch_lock;
     uint64_t watch_epoch, wait_after;
     /* receive_async owns this on its dedicated native receiver thread. */

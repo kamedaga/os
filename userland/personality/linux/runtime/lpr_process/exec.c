@@ -306,6 +306,7 @@ static uint32_t lpr_exec_backend_native_fds(
     case LPR_FD_OPS_INPUT:
         LPR_EXEC_ADD_NATIVE(((const lpr_input_backend_t *)state)->wait_fd.raw);
         LPR_EXEC_ADD_NATIVE(((const lpr_input_backend_t *)state)->lease_fd.raw);
+        LPR_EXEC_ADD_NATIVE(((const lpr_input_backend_t *)state)->ring_fd.raw);
         break;
     case LPR_FD_OPS_AUDIO:
         LPR_EXEC_ADD_NATIVE(((const lpr_audio_backend_t *)state)->native.raw);
@@ -597,12 +598,20 @@ static int lpr_prepare_backend_record(
         status = lpr_unix_socket_handoff(socket, prepared_state);
         if (status) return status;
         struct lpr_unix_socket *record = prepared_state;
+        if (fork_snapshot) record->readiness = socket->readiness;
         status = lpr_transaction_track_lease(transaction, pin_index, record->handoff_fd);
         if (status) {
             (void)lpr_close_native_fd_if_open((uint32_t)record->handoff_fd);
             record->handoff_fd = -1;
         }
         return status;
+    }
+    if (ops_id == LPR_FD_OPS_SOCKET) {
+        lpr_socket_backend_t *record = prepared_state;
+        /* exec/SCM transfers never serialize an address into a fresh image.
+         * A fork inherits the RO VMO mapping but not another thread's lock. */
+        if (!fork_snapshot) record->readiness_address = 0;
+        record->readiness_lock = 0;
     }
     if (lpr_backend_needs_transfer_lease(ops_id, original_state)) {
         pacha_fd_t lease_fd = -1;
@@ -791,6 +800,8 @@ static int lpr_prepare_backend_record(
     case LPR_FD_OPS_INPUT: {
         const lpr_input_backend_t *original = original_state;
         lpr_input_backend_t *prepared = prepared_state;
+        prepared->ring_address = fork_snapshot ? original->ring_address : 0;
+        LPR_DUP_MANIFEST_FIELD(original->ring_fd.raw, prepared->ring_fd.raw);
         LPR_DUP_MANIFEST_FIELD(original->wait_fd.raw, prepared->wait_fd.raw);
         if ((original->reserved1 & LPR_BACKEND_TRANSFER_LEASE) != 0)
             LPR_DUP_MANIFEST_FIELD(

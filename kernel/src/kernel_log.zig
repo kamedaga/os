@@ -180,6 +180,16 @@ pub fn writeFmt(comptime fmt: []const u8, args: anytype) void {
     write(s);
 }
 
+// Boot-only clock diagnostics must remain available to the existing snapshot
+// and kernel-log reader without making each byte a serial-port transaction.
+// The caller is the pre-dispatch IRQ-disabled BSP, as for appendText itself.
+pub fn writeBootFmt(comptime fmt: []const u8, args: anytype) void {
+    var buf: [256]u8 = undefined;
+    const s = std.fmt.bufPrint(&buf, fmt, args) catch return;
+    appendText(s);
+    if (comptime ring_enabled) debug_ring.append(s);
+}
+
 pub fn writeHexRaw(value: u64) void {
     serial.writeHexRaw(value);
     appendHexText(value, true);
@@ -314,4 +324,30 @@ test "lock admission log writer try and bounded snapshot blocking use actual rin
     try std.testing.expectEqual(@as(u64, 1), ring.dropped);
     ring.unlock();
     lock_diagnostics.assertRootEmpty();
+}
+
+// Profile snapshots and bounded BSP timer diagnostics share this formatter.
+// Neither may perform serial I/O or touch the unsynchronized boot buffer.
+// IRQ callers advance their rate limit before this nonblocking/drop append.
+pub fn writeProfileFmt(comptime fmt: []const u8, args: anytype) void {
+    if (comptime !ring_enabled) return;
+    var buffer: [256]u8 = undefined;
+    const text = std.fmt.bufPrint(&buffer, fmt, args) catch return;
+    debug_ring.append(text);
+}
+
+test "ring-only diagnostics never write serial or the boot snapshot" {
+    const before=boot_log_len;
+    const cursor=if (ring_enabled) debug_ring.next else 0;
+    writeProfileFmt("diagnostic test {}\n", .{@as(u64,1)});
+    try std.testing.expectEqual(before,boot_log_len);
+    if (comptime ring_enabled) {
+        try std.testing.expect(debug_ring.next>cursor);
+        const drops=debug_ring.dropped;
+        debug_ring.lock_word=1;
+        defer debug_ring.lock_word=0;
+        writeProfileFmt("busy IRQ diagnostic\n",.{});
+        try std.testing.expectEqual(drops+1,debug_ring.dropped);
+        try std.testing.expectEqual(before,boot_log_len);
+    }
 }

@@ -1,6 +1,6 @@
 #include "live_console.h"
 
-#include "inputd/ipc_protocol.h"
+#include "inputd/event_buffer.h"
 #include "netd/boot_config.h"
 #include "pacha/capsule.h"
 #include "pacha/ipc.h"
@@ -26,10 +26,12 @@ struct live_client {
     void *page;
     uint32_t service;
     uint64_t request_id;
+    pacha_fd_t input_ring_fd;
 };
 
 struct live_input_slot {
     uint64_t handle;
+    struct inputd_event_buffer buffer;
     pacha_fd_t notify_fd;
     uint16_t bus, vendor, product;
     char name[64];
@@ -66,6 +68,7 @@ struct live_console {
 static int client_init(struct live_client *client, pacha_fd_t endpoint, uint32_t service)
 {
     memset(client, 0, sizeof(*client));
+    client->input_ring_fd = -1;
     client->endpoint = endpoint;
     client->service = service;
     client->page_fd = pacha_vmo_create(PACHA_SERVICE_PAGE_BYTES,
@@ -94,7 +97,7 @@ static int client_call(struct live_client *client, uint32_t op,
         .trace_id = id,
         .payload_size = payload_size,
     };
-    struct pacha_ipc_fd fds[2] = {{
+    struct pacha_ipc_fd fds[3] = {{
         .fd = (uint64_t)client->page_fd,
         .rights = PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_TRANSFER |
             PACHA_FD_RIGHT_MAP_READ | PACHA_FD_RIGHT_MAP_WRITE,
@@ -109,6 +112,10 @@ static int client_call(struct live_client *client, uint32_t op,
                 PACHA_FD_RIGHT_WAIT | PACHA_FD_RIGHT_POLL,
         };
         count = 2;
+    }
+    if (client->service == INPUTD_SERVICE_ID && op == INPUTD_OP_OPEN && client->input_ring_fd >= 16) {
+        fds[count++] = (struct pacha_ipc_fd){.fd = (uint64_t)client->input_ring_fd,
+            .rights = PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_MAP_READ | PACHA_FD_RIGHT_MAP_WRITE};
     }
     const struct pacha_ipc_msg request = {
         .word0 = PACHA_SERVICE_REQUEST_MAGIC, .word3 = id,
@@ -474,14 +481,21 @@ static int input_slot_open(struct live_console *console, size_t index)
     inputd_open_request_t *body = (void *)((uint8_t *)console->inputd.page +
         PACHA_SERVICE_HEADER_BYTES);
     *body = (inputd_open_request_t){.event_index = (uint32_t)index};
+    struct inputd_event_buffer buffer;
+    status = inputd_event_buffer_create(&buffer);
+    if (status) { (void)pacha_fd_close(pair.a); (void)pacha_fd_close(pair.b); return status; }
+    console->inputd.input_ring_fd = buffer.fd;
     uint64_t handle = 0;
     status = client_call(&console->inputd, INPUTD_OP_OPEN, sizeof(*body),
         pair.b, &handle);
+    console->inputd.input_ring_fd = -1;
     (void)pacha_fd_close(pair.b);
     if (status != 0) {
+        inputd_event_buffer_close(&buffer);
         (void)pacha_fd_close(pair.a);
         return status;
     }
+    console->slots[index].buffer = buffer;
     console->slots[index].handle = handle;
     console->slots[index].notify_fd = pair.a;
     input_slot_describe(console, index);
@@ -502,6 +516,7 @@ static void input_slot_close(struct live_console *console, size_t index)
         body->handle = slot->handle;
         (void)client_call(&console->inputd, INPUTD_OP_CLOSE, sizeof(*body), -1, NULL);
     }
+    inputd_event_buffer_close(&slot->buffer);
     if (slot->notify_fd >= 16) (void)pacha_fd_close(slot->notify_fd);
     *slot = (struct live_input_slot){.notify_fd = -1};
 }
@@ -587,14 +602,9 @@ static int drain_input_slot(struct live_console *console, size_t index)
     struct live_input_slot *slot = &console->slots[index];
     if (!slot->handle) return 0;
     for (unsigned pass = 0; pass < 8; pass++) {
-        inputd_read_request_t *body = (void *)((uint8_t *)console->inputd.page +
-            PACHA_SERVICE_HEADER_BYTES);
-        memset(body, 0, sizeof(*body));
-        body->handle = slot->handle;
-        body->event_capacity = INPUTD_EVENT_CAPACITY;
-        uint64_t count = 0;
-        const int status = client_call(&console->inputd, INPUTD_OP_READ,
-            sizeof(*body), -1, &count);
+        inputd_input_event_t events[INPUTD_EVENT_CAPACITY];
+        int count = inputd_ring_read(slot->buffer.ring, events, INPUTD_EVENT_CAPACITY);
+        int status = count < 0 ? count : 0;
         if (status == -11) return 0;
         if (status == -19 || status == -9) {
             printf("[live_console] input event%zu detached\n", index);
@@ -602,13 +612,13 @@ static int drain_input_slot(struct live_console *console, size_t index)
             return 0;
         }
         if (status != 0) return status;
-        if (count != body->event_count || count > INPUTD_EVENT_CAPACITY) return -5;
+        if (count > INPUTD_EVENT_CAPACITY) return -5;
         for (size_t i = 0; i < count; i++) {
-            if (body->events[i].type == 1)
-                key_event(console, body->events[i].code, body->events[i].value);
-            else if (body->events[i].type == 2 && body->events[i].code == 8 &&
-                body->events[i].value != 0)
-                scroll_view(console, body->events[i].value * 3);
+            if (events[i].type == 1)
+                key_event(console, events[i].code, events[i].value);
+            else if (events[i].type == 2 && events[i].code == 8 &&
+                events[i].value != 0)
+                scroll_view(console, events[i].value * 3);
         }
         if (count < INPUTD_EVENT_CAPACITY) return 0;
     }

@@ -2,6 +2,8 @@
 .artifacts/
 .temp-docs/
 tools/*
+!tools/perf/
+!tools/perf/**
 !tools/java25/
 tools/java25/*
 !tools/java25/java

@@ -129,7 +129,13 @@ fn expectVmoSlotEqual(expected: kernel.NativeVmoSlot, observed: kernel.NativeVmo
     actual.page_store.lock.takes = expected.page_store.lock.takes;
     actual.page_store.visits = expected.page_store.visits;
     inline for (std.meta.fields(kernel.NativeVmoSlot)) |field| {
-        if (comptime !std.mem.eql(u8, field.name, "backing") and !std.mem.eql(u8, field.name, "references") and !std.mem.eql(u8, field.name, "parent_edge"))
+        // The alias head is identity, not an owned recursive value: nodes
+        // point back to their VMO and to each other. Deep equality recurses
+        // forever after stage2 added that graph. Still check the exact head;
+        // ReferenceCheck below the failure operation validates its topology.
+        if (comptime std.mem.eql(u8, field.name, "vma_alias_head"))
+            try std.testing.expectEqual(expected.vma_alias_head, actual.vma_alias_head)
+        else if (comptime !std.mem.eql(u8, field.name, "backing") and !std.mem.eql(u8, field.name, "references") and !std.mem.eql(u8, field.name, "parent_edge"))
             try expectResourceEqualDeep(@field(expected, field.name), @field(actual, field.name));
     }
     if (expected.kind == .device_memory)
@@ -3502,7 +3508,7 @@ test "VMO grow preserves shared aliases page views and final ownership" {
     try s.cloneFdTableForFork(p0, p1);
     try s.cloneVmaTableForFork(p0, p1);
     const view = try s.createNativePageView(ref, 1);
-    try s.installNativeVmoPages(view, 0, &.{base + 4096}, null);
+    try installPageViewFixture(&s, view, 0, &.{base + 4096}, null);
     const refs_before = s.nativeVmoRefCount(ref);
     const original_entry = s.vmaEntryForVaConst(p0, 0x4900_0000).?.*;
     try s.growVmoFdWithPages(p0, fd, 16384, &free_list);
@@ -3589,6 +3595,7 @@ test "zero-on-demand faults preserve backing through physical exhaustion" {
         try std.testing.expectError(KernelError.OutOfFreePages, s.allocPhysicalPage(&free_list));
         try std.testing.expect(s.ensureNativeVmaCowMappingLockedSlow(p0, 0x4a00_1000, true, false, &free_list) == null);
         try expectVmoSlotEqual(before, s.nativeVmoSlot(ref).?.*);
+        try kernel.ReferenceCheck.check(&s);
         try std.testing.expectEqual(@as(?u64, first), s.nativeVmoResolvedPagePaddr(ref, 0));
         try std.testing.expectEqual(@as(?u64, 0), s.nativeVmoResolvedPagePaddrOrZero(ref, 1));
         try std.testing.expect(s.nativeVmaFaultMapping(p0, 0x4a00_1000, false, false) == null);
@@ -4347,7 +4354,7 @@ test "RAM cache preflight resolves only populated canonical RAM owners" {
     stale.generation += 1;
     try std.testing.expectError(KernelError.InvalidState, s.nativeRamCachePages(stale, 0, &pages));
     const view = try s.createNativePageView(parent, 1);
-    try s.installNativeVmoPages(view, 0, &.{0x8400_0000}, null);
+    try installPageViewFixture(&s, view, 0, &.{0x8400_0000}, null);
     try std.testing.expectError(KernelError.InvalidState, s.nativeRamCachePages(view, 0, pages[0..1]));
 }
 
@@ -4363,7 +4370,10 @@ test "native VMO slot explicitly budgets its failed-return destination" {
         @sizeOf(@TypeOf(@as(kernel.NativeVmoSlot, .{}).pager_request_store)) +
         @sizeOf(@TypeOf(@as(kernel.NativeVmoSlot, .{}).pager_request_start)) +
         2 * @sizeOf(kernel.types.PagerRequestRef);
-    try std.testing.expect(@sizeOf(kernel.NativeVmoSlot) <= 64 + @sizeOf(*FreePageList) + 8 + @sizeOf(u64) + @sizeOf(kernel.BackingStore) + @sizeOf(*kernel.BackingStore) + @sizeOf(@TypeOf(@as(kernel.NativeVmoSlot, .{}).references)) + @sizeOf(@TypeOf(@as(kernel.NativeVmoSlot, .{}).parent_edge)) + pager_metadata + 8);
+    // Measured alias head plus the two independently maintained admission
+    // counters are part of the shared-discard storage budget.
+    const shared_discard_metadata = @sizeOf(@TypeOf(@as(kernel.NativeVmoSlot, .{}).vma_alias_head)) + 2 * @sizeOf(u32);
+    try std.testing.expect(@sizeOf(kernel.NativeVmoSlot) <= shared_discard_metadata + 64 + @sizeOf(*FreePageList) + 8 + @sizeOf(u64) + @sizeOf(kernel.BackingStore) + @sizeOf(*kernel.BackingStore) + @sizeOf(@TypeOf(@as(kernel.NativeVmoSlot, .{}).references)) + @sizeOf(@TypeOf(@as(kernel.NativeVmoSlot, .{}).parent_edge)) + pager_metadata + 8);
 }
 
 test "RAM lifetime ticket prevalidates canonical owner before infallible publication update" {
@@ -4391,7 +4401,7 @@ test "RAM lifetime ticket prevalidates canonical owner before infallible publica
     ticket.finish(&wb);
     try std.testing.expect(s.nativeVmoSlotConst(root).?.ram_cache_state == .wb);
     const view = try s.createNativePageView(root, 1);
-    try s.installNativeVmoPages(view, 0, &.{0x8400_0000}, null);
+    try installPageViewFixture(&s, view, 0, &.{0x8400_0000}, null);
     try std.testing.expectError(KernelError.InvalidState, s.prepareNativeRamCacheLifetime(view));
     var stale = root;
     stale.generation += 1;
@@ -4446,7 +4456,7 @@ test "RAM cache mapping validation distinguishes target pages from unrelated cod
     try s.validateRamCacheMappings(root, 0, &.{0x8400_0000});
     try std.testing.expectError(error.ExecutableAlias, s.validateRamCacheMappings(root, 3, &.{0x8400_3000}));
     const view = try s.createNativePageView(root, 1);
-    try s.installNativeVmoPages(view, 0, &.{0x8400_2000}, null);
+    try installPageViewFixture(&s, view, 0, &.{0x8400_2000}, null);
     try s.createVmaWithRetainedVmo(p2, 0x4300_0000, 4096, rw, rw, shared, view, 0);
     try s.validateRamCacheMappings(root, 2, &.{0x8400_2000});
     const view_dma_fd = try s.createDmaMappingFd(p2, .{
@@ -4516,7 +4526,7 @@ test "2 MiB page view can borrow pages after parent RAM becomes WC" {
     for (&reversed, 0..) |*page, index| page.* = pages[page_count - 1 - index];
     for (0..page_count / 64) |chunk| {
         const first = chunk * 64;
-        try s.installNativeVmoPages(view, first, reversed[first .. first + 64], null);
+        try installPageViewFixture(&s, view, first, reversed[first .. first + 64], null);
     }
     try std.testing.expectEqual(@as(?u64, pages[page_count - 1]), s.nativeVmoResolvedPagePaddr(view, 0));
     try std.testing.expectEqual(@as(?u64, pages[0]), s.nativeVmoResolvedPagePaddr(view, page_count - 1));
@@ -4544,7 +4554,7 @@ test "cached RAM final release waits for WB restoration including view and pendi
     const wb: kernel.RamCacheSnapshot = .{};
     const pending: kernel.RamCacheSnapshot = .{ .pending = cached.policy };
     const view = try s.createNativePageView(parent, 1);
-    try s.installNativeVmoPages(view, 0, &.{0x8400_0000}, null);
+    try installPageViewFixture(&s, view, 0, &.{0x8400_0000}, null);
     try s.syncNativeRamCacheState(parent, &cached);
     try std.testing.expectError(KernelError.InvalidState, s.syncNativeRamCacheState(view, &cached));
     try std.testing.expectError(KernelError.InvalidState, s.syncNativeRamCacheState(parent, &pending));
@@ -4687,7 +4697,7 @@ test "page view lifetime survives failure multiple closes and generation reuse" 
 
     const first = try s.createNativePageView(parent, 1);
     const second = try s.createNativePageView(parent, 1);
-    try s.installNativeVmoPages(first, 0, &.{0x8400_0000}, null);
+    try installPageViewFixture(&s, first, 0, &.{0x8400_0000}, null);
     // A later setup failure does not remove the published parent retain or
     // release borrowed pages; normal rollback releases the child.
     try std.testing.expectError(KernelError.InvalidState, s.installNativeVmoPages(second, 0, &.{0x8400_1001}, null));
@@ -4877,7 +4887,7 @@ test "page view borrows scatter pages until its last reference closes" {
     try s.installNativeVmoPages(parent, 0, &.{ 0x8100_0000, 0x8200_0000, 0x8300_0000 }, null);
 
     const view = try s.createNativePageView(parent, 2);
-    try s.installNativeVmoPages(view, 0, &.{ 0x8300_0000, 0x8100_0000 }, null);
+    try installPageViewFixture(&s, view, 0, &.{ 0x8300_0000, 0x8100_0000 }, null);
     try std.testing.expectEqual(@as(?u32, 2), s.nativeVmoRefCount(parent));
     try std.testing.expectEqual(@as(?u64, 0x8300_0000), s.nativeVmoResolvedPagePaddr(view, 0));
     try std.testing.expectEqual(@as(?u64, 0x8100_0000), s.nativeVmoResolvedPagePaddr(view, 1));
@@ -4945,7 +4955,7 @@ test "sparse page view refresh preserves aliases and unavailable holes" {
     try s.installNativeVmoPages(parent, 0, &.{ 0x8100_0000, 0x8200_0000, 0x8300_0000 }, null);
     const view = try s.createNativePageView(parent, 2);
     s.nativeVmoSlot(view).?.page_view_sparse = true;
-    try s.installNativeVmoPages(view, 0, &.{ 0x8100_0000, 0 }, null);
+    try installPageViewFixture(&s, view, 0, &.{ 0x8100_0000, 0 }, null);
     try std.testing.expect(s.nativeVmoIsSparsePageView(view));
     try std.testing.expect(!s.nativeVmoIsSparsePageView(.{ .index = view.index, .generation = view.generation + 1 }));
     s.nativeVmoSlot(parent).?.page_view_sparse = true;
@@ -4983,7 +4993,7 @@ test "sparse page view refresh preserves aliases and unavailable holes" {
 
     const staged = try s.createNativePageView(parent, 2);
     s.nativeVmoSlot(staged).?.page_view_sparse = true;
-    try s.installNativeVmoPages(staged, 0, &.{ 0, 0x8300_0000 }, null);
+    try installPageViewFixture(&s, staged, 0, &.{ 0, 0x8300_0000 }, null);
     const Invalidator = struct {
         calls: usize = 0,
         fail_at: usize = 0,
@@ -5030,7 +5040,7 @@ test "page view mremap preserves borrowed identity offsets and refresh after rel
     try s.installNativeVmoPages(parent, 0, &.{ 0x8100_0000, 0x8200_0000, 0x8300_0000, 0x8400_0000 }, null);
     const view = try s.createNativePageView(parent, 4);
     s.nativeVmoSlot(view).?.page_view_sparse = true;
-    try s.installNativeVmoPages(view, 0, &.{ 0x8100_0000, 0, 0x8300_0000, 0x8400_0000 }, null);
+    try installPageViewFixture(&s, view, 0, &.{ 0x8100_0000, 0, 0x8300_0000, 0x8400_0000 }, null);
     const object = try s.createKernelObject(.vmo, .{ .vmo = view });
     const fd = try s.installFd(p0, object, fdRights(.{ .close = true, .map_read = true, .map_write = true }), .{}, 16);
     const old: u64 = 0x5000_0000;
@@ -5078,7 +5088,7 @@ test "page view mremap preserves borrowed identity offsets and refresh after rel
     try std.testing.expect(s.nativeVmaFaultBackingUnavailable(p0, moved, 4));
     const staged = try s.createNativePageView(parent, 4);
     s.nativeVmoSlot(staged).?.page_view_sparse = true;
-    try s.installNativeVmoPages(staged, 0, &.{ 0x8100_0000, 0x8200_0000, 0, 0x8400_0000 }, null);
+    try installPageViewFixture(&s, staged, 0, &.{ 0x8100_0000, 0x8200_0000, 0, 0x8400_0000 }, null);
     const Invalidator = struct {
         calls: usize = 0,
         pub fn invalidate(self: *@This(), _: PrincipalId, _: u64, _: u64) bool {
@@ -5124,7 +5134,7 @@ test "page view mappings retain their non-executable creation ceiling in every m
     try s.retainNativeVmo(parent);
     try s.installNativeVmoPages(parent, 0, &.{0x8400_0000}, null);
     const view = try s.createNativePageView(parent, 1);
-    try s.installNativeVmoPages(view, 0, &.{0x8400_0000}, null);
+    try installPageViewFixture(&s, view, 0, &.{0x8400_0000}, null);
     const object = try s.createKernelObject(.vmo, .{ .vmo = view });
     const fd = try s.installFd(
         p0,
@@ -5199,7 +5209,7 @@ test "parent revoke removes page view fds and mappings before freeing pages" {
     const parent = s.nativeVmoRefForFd(p0, parent_fd) orelse unreachable;
     const second_page = s.nativeVmoResolvedPagePaddr(parent, 1) orelse unreachable;
     const view = try s.createNativePageView(parent, 1);
-    try s.installNativeVmoPages(view, 0, &.{second_page}, null);
+    try installPageViewFixture(&s, view, 0, &.{second_page}, null);
     const object = try s.createKernelObject(.vmo, .{ .vmo = view });
     const view_fd = try s.installFd(
         p1,
@@ -5302,34 +5312,99 @@ test "VMO lifetime snapshot includes queued IPC and requires INSPECT" {
     try s.closeFdWithFreeList(p0, endpoint, &free_list);
 }
 
-test "preferred mmap arena distinguishes oversized placement from invalid requests" {
+test "native placement continues past former one GiB arena and fork cursors are independent" {
     var physical_fixture = try physicalFixture();
     defer physical_fixture.deinit();
     defer kernel.resetDmaRetentionForTest();
     var s: KernelState = undefined;
     try initFdState(&s);
     defer s.deinitPools();
-    const process_abi = @import("kernel_abi_root").process_abi;
-    const base = process_abi.user_aslr_base_va;
-    const span = process_abi.user_aslr_end_va - base;
-    const table = s.getVmaTable(p0) orelse unreachable;
-    table.next_user_map_va = base + process_abi.user_aslr_granule;
-    const cursor = table.next_user_map_va;
-    for ([_]u64{ span + 4096, @as(u64, 128) << 30 }) |bytes| {
-        try std.testing.expectError(KernelError.TableFull, s.findFreeUserMapVa(p0, bytes, 0));
-        try std.testing.expectEqual(cursor, table.next_user_map_va);
+    var free_list = FreePageList{};
+    const start: u64 = 0x100_0000_0000;
+    const bytes: u64 = 128 << 20;
+    for (0..12) |i| {
+        const address = try s.findFreeUserMapVa(p0, bytes);
+        try std.testing.expectEqual(start + i * bytes, address);
+        _ = try s.createAnonymousVmaWithPages(p0, address, bytes, .{}, .{}, .{ .private = true, .anonymous = true, .noreserve = true }, &free_list);
     }
-    try std.testing.expectError(KernelError.InvalidState, s.findFreeUserMapVa(p0, 0, 0));
-    try std.testing.expectError(KernelError.InvalidState, s.findFreeUserMapVa(p0, 4097, 0));
-    try std.testing.expectError(KernelError.InvalidState, s.findFreeUserMapVa(.Device0, span + 4096, 0));
-    try std.testing.expectEqual(cursor, table.next_user_map_va);
-    try std.testing.expectEqual(@as(usize, 0), table.active_count);
-    try std.testing.expectEqual(cursor, try s.findFreeUserMapVa(p0, 4096, 0));
-    // Finding a placement advances the cursor but does not publish a VMA.
-    // An exact-fit request can still wrap to the empty arena's base.
-    try std.testing.expectEqual(base, try s.findFreeUserMapVa(p0, span, 0));
-    try std.testing.expectEqual(process_abi.user_aslr_end_va, table.next_user_map_va);
-    try std.testing.expectEqual(@as(usize, 0), table.active_count);
+    const cursor = s.getVmaTable(p0).?.next_user_map_va;
+    try s.cloneVmaTableForFork(p0, p1);
+    try std.testing.expectEqual(cursor, s.getVmaTable(p1).?.next_user_map_va);
+    try std.testing.expectEqual(cursor, try s.findFreeUserMapVa(p1, 4096));
+    try std.testing.expectEqual(cursor, s.getVmaTable(p0).?.next_user_map_va);
+    try std.testing.expectEqual(cursor, try s.findFreeUserMapVa(p0, 8192));
+    try std.testing.expectEqual(cursor + 4096, s.getVmaTable(p1).?.next_user_map_va);
+    s.releasePrincipalNativeMemory(p1, &free_list);
+    s.releasePrincipalNativeMemory(p0, &free_list);
+}
+
+test "native placement rejects full union without changing cursor and skips whole huge blockers" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
+    defer s.deinitPools();
+    var free_list = FreePageList{};
+    const map_base: u64 = 0x2300_0000;
+    const map_end: u64 = 0x7000_0000_0000;
+    const start: u64 = 0x100_0000_0000;
+    const table = s.getVmaTable(p0).?;
+    table.next_user_map_va = start;
+    try std.testing.expectError(KernelError.TableFull, s.findFreeUserMapVa(p0, map_end - map_base + 4096));
+    try std.testing.expectEqual(start, table.next_user_map_va);
+    // Oversized relative to the removed arena is now an ordinary request.
+    try std.testing.expectEqual(start, try s.findFreeUserMapVa(p0, 128 << 30));
+    table.next_user_map_va = start;
+    const flags = mmapFlags(.{ .private = true, .anonymous = true, .noreserve = true });
+    _ = try s.createAnonymousVmaWithPages(p0, start, 8 << 40, .{}, .{}, flags, &free_list);
+    try std.testing.expectEqual(start + (8 << 40), try s.findFreeUserMapVa(p0, 4096));
+    s.releasePrincipalNativeMemory(p0, &free_list);
+    var occupied = map_base;
+    while (occupied < map_end) {
+        const size = @min(@as(u64, 8) << 40, map_end - occupied);
+        _ = try s.createAnonymousVmaWithPages(p0, occupied, size, .{}, .{}, flags, &free_list);
+        occupied += size;
+    }
+    table.next_user_map_va = start;
+    try std.testing.expectError(KernelError.TableFull, s.findFreeUserMapVa(p0, 4096));
+    try std.testing.expectEqual(start, table.next_user_map_va);
+    try std.testing.expectError(KernelError.InvalidState, s.findFreeUserMapVa(p0, 0));
+    try std.testing.expectError(KernelError.InvalidState, s.findFreeUserMapVa(p0, 4097));
+    try std.testing.expectError(KernelError.InvalidState, s.findFreeUserMapVa(.Device0, 4096));
+    s.releasePrincipalNativeMemory(p0, &free_list);
+}
+
+test "native placement fails closed on malformed pin range without advancing cursor" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
+    defer s.deinitPools();
+    var free_list = FreePageList{};
+    const start: u64 = 0x100_0000_0000;
+    const table = s.getVmaTable(p0).?;
+    table.next_user_map_va = start;
+    const fd = try s.createMmioRegionFd(p0, .{ .device = 1, .paddr = 4096, .user_va = start + 4096, .size = std.math.maxInt(u64) }, .{ .close = true }, .{}, 16);
+    try std.testing.expect(!try s.userMapRangeIsFree(p0, start, 4096));
+    try std.testing.expectError(KernelError.TableFull, s.findFreeUserMapVa(p0, 4096));
+    try std.testing.expectEqual(start, table.next_user_map_va);
+    try s.closeFdWithFreeList(p0, fd, &free_list);
+    const empty_fd = try s.createMmioRegionFd(p0, .{ .device = 1, .paddr = 4096, .user_va = start + 4096, .size = 4096 }, .{ .close = true }, .{}, 16);
+    const object = s.kernelObjectSlot(s.fdEntryConst(p0, empty_fd).?.object).?;
+    const node = &object.reference_state.?.payload_edge;
+    // Model the zero-sized pin state used during final DMA close, maintaining
+    // both the ownership oracle and its index under this serial fixture.
+    const class = node.pin.class;
+    table.pinned_index.remove(node);
+    object.payload.mmio_region.size = 0;
+    node.range.size = 0;
+    table.pinned_index.insert(node, class);
+    try std.testing.expect(!s.rangeOverlapsPinnedUserObject(p0, start, 8192));
+    try std.testing.expect(try s.userMapRangeIsFree(p0, start, 8192));
+    try std.testing.expectEqual(start, try s.findFreeUserMapVa(p0, 8192));
+    try s.closeFdWithFreeList(p0, empty_fd, &free_list);
 }
 
 test "anonymous vmo fd maps through vma ledger without page capability install" {
@@ -6670,7 +6745,7 @@ test "sole VMA optimization preserves FD foreign VMA and page view aliases" {
         var view: ?kernel.NativeVmoRef = null;
         if (mode == .page_view or mode == .page_view_only) {
             view = try s.createNativePageView(ref, 1);
-            try s.installNativeVmoPages(view.?, 0, pages[0..1], null);
+            try installPageViewFixture(&s, view.?, 0, pages[0..1], null);
         }
         const keep_fd = mode == .fd_only or mode == .fd_and_vma;
         if (!keep_fd) try s.closeFdWithFreeList(p0, fd, &free_list);
@@ -6757,7 +6832,7 @@ test "multiple owned VMAs do not hide FD view or foreign mapping retains" {
         var view: ?kernel.NativeVmoRef = null;
         if (mode == .view) {
             view = try s.createNativePageView(ref, 1);
-            try s.installNativeVmoPages(view.?, 0, pages[1..2], null);
+            try installPageViewFixture(&s, view.?, 0, pages[1..2], null);
         }
         if (mode == .foreign) {
             const other_fd = try s.transferFd(p0, p1, fd, 16, rights, .{}, .copy);
@@ -6806,7 +6881,7 @@ test "whole VMA cuts account only for the removed mapping retain" {
         var view: ?kernel.NativeVmoRef = null;
         if (mode == .view) {
             view = try s.createNativePageView(ref, 1);
-            try s.installNativeVmoPages(view.?, 0, pages[1..2], null);
+            try installPageViewFixture(&s, view.?, 0, pages[1..2], null);
         }
         if (mode == .foreign) {
             const other_fd = try s.transferFd(p0, p1, fd, 16, rights, .{}, .copy);
@@ -7304,7 +7379,7 @@ test "private file VMO partial unmap preserves FD view shadow and fork aliases" 
         var view: ?kernel.NativeVmoRef = null;
         if (alias == .view) {
             view = try s.createNativePageView(ref, 1);
-            try s.installNativeVmoPages(view.?, 0, pages[1..2], null);
+            try installPageViewFixture(&s, view.?, 0, pages[1..2], null);
         }
         if (alias == .shadow or alias == .shadow_tree) {
             view = try s.createNativeVmo(.anonymous, 4096);
@@ -7577,6 +7652,92 @@ test "fixed mmap middle cut fails atomically with only one spare vma slot" {
     try std.testing.expect(table.entries.get(@intCast(spare_index)) == null);
     try std.testing.expectEqual(source_refs, s.nativeVmoRefCount(source_vmo));
     try std.testing.expectEqual(dest_refs, s.nativeVmoRefCount(dest_vmo));
+}
+
+test "mremap prepare reserves three distinct slots and failure publishes nothing" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    var s: KernelState = undefined;
+    try initFdState(&s);
+    defer s.deinitPools();
+    var free_list: FreePageList = .{};
+    const rw = vmaProt(.{ .read = true, .write = true });
+    const flags = mmapFlags(.{ .private = true, .anonymous = true });
+    const source: u64 = 0x5300_0000;
+    const target: u64 = 0x5400_0000;
+    _ = try s.createAnonymousVmaWithPages(p0, source, 3 * 4096, rw, rw, flags, &free_list);
+    _ = try s.createAnonymousVmaWithPages(p0, target, 3 * 4096, rw, rw, flags, &free_list);
+    const table = s.getVmaTable(p0).?;
+    const before_count = table.active_count;
+    const source_before = s.vmaEntryForVaConst(p0, source).?.*;
+    const target_before = s.vmaEntryForVaConst(p0, target).?.*;
+
+    var prepared = try s.prepareMremapWithFreeList(
+        p0, source + 4096, 4096, 4096, target + 4096, true, true, &free_list,
+    );
+    try std.testing.expect(prepared.target_middle.active and prepared.source_middle.active);
+    const target_suffix = prepared.target_middle.suffix_index;
+    const destination = prepared.destination_index;
+    const source_suffix = prepared.source_middle.suffix_index;
+    try std.testing.expect(target_suffix != destination);
+    try std.testing.expect(target_suffix != source_suffix);
+    try std.testing.expect(destination != source_suffix);
+    // Preparation owns drafts and retains, but no VMA is observable yet.
+    try std.testing.expectEqual(before_count, table.active_count);
+    try expectResourceEqualDeep(source_before, s.vmaEntryForVaConst(p0, source).?.*);
+    try expectResourceEqualDeep(target_before, s.vmaEntryForVaConst(p0, target).?.*);
+    s.discardMremapPrepared(&prepared, &free_list);
+
+    // Leave only one reusable slot.  The three-slot transaction must fail
+    // without publishing either cut or the destination.
+    fillVmaTableExcept(&s, table, &.{});
+    while (table.entries.free_head != std.math.maxInt(u64)) {
+        const index = KernelState.findFreeVma(table).?;
+        s.installVmaEntry(table, index, .{
+            .active = true,
+            .start_va = 0x9000_0000 + @as(u64, @intCast(index)) * 0x2000,
+            .size_bytes = 4096,
+        });
+    }
+    KernelState.clearVmaEntry(table, 100);
+    var failure = kernel.InvocationStorageTestAllocator{ .fail_at = 1 };
+    defer failure.deinit();
+    const saved_allocator = table.allocator;
+    table.allocator = failure.interface();
+    defer table.allocator = saved_allocator;
+    const full_before = table.active_count;
+    try std.testing.expectError(KernelError.TableFull, s.prepareMremapWithFreeList(
+        p0, source + 4096, 4096, 4096, target + 4096, true, true, &free_list,
+    ));
+    try std.testing.expectEqual(full_before, table.active_count);
+    try expectResourceEqualDeep(source_before, s.vmaEntryForVaConst(p0, source).?.*);
+    try expectResourceEqualDeep(target_before, s.vmaEntryForVaConst(p0, target).?.*);
+}
+
+test "VMA SlotTable reclaim body set matches a full scan" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    var s: KernelState = undefined;
+    try initFdState(&s);
+    defer s.deinitPools();
+    var free_list: FreePageList = .{};
+    const base: u64 = 0x5600_0000;
+    for (0..130) |i| _ = try s.createAnonymousVmaWithPages(
+        p0, base + i * 8192, 4096, .{}, .{}, .{ .private = true, .anonymous = true }, &free_list,
+    );
+    for (0..64) |i| try s.munmapRangeWithFreeList(p0, base + i * 8192, 4096, &free_list);
+    const entries = &s.getVmaTable(p0).?.entries;
+    // Full-scan oracle from public state: slots 0..63 are all unused, while
+    // the next body still contains live VMA entries.
+    for (0..64) |index| try std.testing.expect(entries.get(@intCast(index)) == null);
+    try std.testing.expect(entries.get(64) != null);
+    entries.reclaimEmptyBodies();
+    var failure = kernel.InvocationStorageTestAllocator{ .fail_at = 1 };
+    defer failure.deinit();
+    // Reattaching the full-scan-empty first body now allocates and fails;
+    // preparing a free index in the live second body needs no allocation.
+    try std.testing.expectError(error.OutOfMemory, entries.prepareIndex(0, failure.interface()));
+    try entries.prepareIndex(65, failure.interface());
 }
 
 test "shared fixed mmap retains aliases offsets and neighbors through fd close" {
@@ -8294,6 +8455,86 @@ test "VMA entries and active indices grow past 8192 without moving a live entry"
     try std.testing.expectEqual(former_max_vmas_per_process + 1, table.active_count);
     try std.testing.expectEqual(before, table.entries.get(0).?);
     try std.testing.expectEqual(@as(u32, @intCast(index)), table.active_indices.get(@intCast(table.active_count - 1)).?.*);
+}
+
+test "VMA slot selection uses the unused list, full-cover reuse and append in bounded work" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    defer kernel.resetDmaRetentionForTest();
+    var s: KernelState = undefined;
+    try initFdState(&s);
+    defer s.deinitPools();
+    const table = s.getVmaTable(p0).?;
+    defer table.reference_slots.deinit();
+    defer table.entries.deinit();
+    defer table.active_indices.deinit();
+    const st = kernel.slot_table_for_test;
+    fillVmaTableExcept(&s, table, &.{});
+    // Consume every unused index so the next selection must append.
+    while (table.entries.free_head != std.math.maxInt(u64)) {
+        const index = KernelState.findFreeVma(table).?;
+        s.installVmaEntry(table, index, .{ .active = true, .start_va = 0x2_0000_0000 + @as(u64, @intCast(index)) * 0x2000, .size_bytes = 4096 });
+    }
+    const capacity: usize = @intCast(table.entries.capacity);
+    // 1. Append: no unused index, no cover request -> exactly capacity.
+    st.test_get_calls = 0;
+    try std.testing.expectEqual(capacity, KernelState.selectPreparedVmaIndexForTest(table, 0, 0, false, &.{}).?);
+    // Bounded work: the old scan visited every slot from 0 (>8192 gets).
+    try std.testing.expect(st.test_get_calls < 16);
+    // The appended block made new unused indices; claim them all again.
+    while (table.entries.free_head != std.math.maxInt(u64)) {
+        const index = KernelState.findFreeVma(table).?;
+        s.installVmaEntry(table, index, .{ .active = true, .start_va = 0x3_0000_0000 + @as(u64, @intCast(index)) * 0x2000, .size_bytes = 4096 });
+    }
+    const full_capacity: usize = @intCast(table.entries.capacity);
+    // 2. Full-cover reuse: [0x7000_0000 + 10*0x2000, +3 VMAs) covers slots 10..12.
+    const cover_start: u64 = 0x7000_0000 + 10 * 0x2000;
+    const cover_size: u64 = 2 * 0x2000 + 4096;
+    const covered = KernelState.selectPreparedVmaIndexForTest(table, cover_start, cover_size, true, &.{}).?;
+    try std.testing.expectEqual(@as(usize, 10), covered);
+    // Excluded covered slots are skipped; distinct across the 3-slot mremap pattern.
+    const second = KernelState.selectPreparedVmaIndexForTest(table, cover_start, cover_size, true, &.{covered}).?;
+    const third = KernelState.selectPreparedVmaIndexForTest(table, cover_start, cover_size, true, &.{ covered, second }).?;
+    try std.testing.expect(second == 11 and third == 12);
+    // Overflowing range end is rejected rather than wrapped.
+    try std.testing.expectEqual(@as(?usize, null), KernelState.selectPreparedVmaIndexForTest(table, std.math.maxInt(u64) - 4095, 8192, true, &.{}));
+    // All covered slots excluded -> append, never a partially covered VMA.
+    try std.testing.expectEqual(full_capacity, KernelState.selectPreparedVmaIndexForTest(table, cover_start, cover_size, true, &.{ covered, second, third }).?);
+    // Appending prepared a new block whose unused indices are now listed.
+    const wide = KernelState.findFreeVma(table).?;
+    s.installVmaEntry(table, wide, .{ .active = true, .start_va = 0x6_0000_0000, .size_bytes = 3 * 4096 });
+    while (table.entries.free_head != std.math.maxInt(u64)) {
+        const index = KernelState.findFreeVma(table).?;
+        s.installVmaEntry(table, index, .{ .active = true, .start_va = 0x5_0000_0000 + @as(u64, @intCast(index)) * 0x2000, .size_bytes = 4096 });
+    }
+    // Partial overlap (range ends inside the 3-page VMA) is never reused.
+    try std.testing.expectEqual(@as(usize, @intCast(table.entries.capacity)), KernelState.selectPreparedVmaIndexForTest(table, 0x6_0000_0000, 2 * 4096, true, &.{}).?);
+    while (table.entries.free_head != std.math.maxInt(u64)) {
+        const index = KernelState.findFreeVma(table).?;
+        s.installVmaEntry(table, index, .{ .active = true, .start_va = 0x7_0000_0000 + @as(u64, @intCast(index)) * 0x2000, .size_bytes = 4096 });
+    }
+    try std.testing.expectEqual(wide, KernelState.selectPreparedVmaIndexForTest(table, 0x6_0000_0000 - 4096, 5 * 4096, true, &.{}).?);
+    // 3. Unused list head first, excluded skipped, bounded walk.
+    KernelState.clearVmaEntry(table, 100);
+    KernelState.clearVmaEntry(table, 200);
+    st.test_get_calls = 0;
+    st.test_free_walk_nodes = 0;
+    try std.testing.expectEqual(@as(usize, 200), KernelState.findFreeVma(table).?);
+    try std.testing.expectEqual(@as(usize, 100), KernelState.selectPreparedVmaIndexForTest(table, 0, 0, false, &.{200}).?);
+    try std.testing.expect(st.test_get_calls < 16 and st.test_free_walk_nodes <= 3);
+    // Free list wins over full-cover reuse (no allocation, no removal order).
+    try std.testing.expectEqual(@as(usize, 200), KernelState.selectPreparedVmaIndexForTest(table, cover_start, cover_size, true, &.{}).?);
+    // 4. A whole block released and its body reclaimed: selection re-attaches it.
+    const slots = @TypeOf(table.entries).block_slots;
+    const block_base: usize = 64 * slots;
+    for (block_base..block_base + slots) |index| KernelState.clearVmaEntry(table, index);
+    table.reference_slots.reclaimEmptyBodies();
+    table.entries.reclaimEmptyBodies();
+    const reattached = KernelState.selectPreparedVmaIndexForTest(table, 0, 0, false, &.{ 100, 200 }).?;
+    try std.testing.expect(reattached >= block_base and reattached < block_base + slots);
+    s.installVmaEntry(table, reattached, .{ .active = true, .start_va = 0x4_0000_0000, .size_bytes = 4096 });
+    try std.testing.expectEqual(@as(u64, 0x4_0000_0000), table.entries.get(@intCast(reattached)).?.start_va);
+    try std.testing.expectEqual(table.entries.get(@intCast(reattached)).?, table.entryForVa(0x4_0000_0000).?);
 }
 
 test "IPC waiter and group links cross old bounds and complete every item in batches" {
@@ -9612,6 +9853,9 @@ fn expectVmaAddressIndex(s: *KernelState, owner: PrincipalId) !void {
         }
         try std.testing.expect(depth <= 2 * (std.math.log2_int(usize, table.active_count + 1) + 1));
     }
+    // Check aliases from the independent source-table oracle at every stable
+    // split/trim/fork/exec-transfer boundary exercised by this fixture.
+    try kernel.ReferenceCheck.check(s);
 }
 
 test "VMA address index survives split trim fork exec transfer and many mappings" {
@@ -9677,7 +9921,12 @@ test "VMA address index storage footprint" {
     const Ref = @typeInfo(@typeInfo(@FieldType(kernel.VmaEntry, "references")).optional.child).pointer.child;
     try std.testing.expectEqual(@sizeOf(Before), @sizeOf(kernel.VmaEntry));
     try std.testing.expectEqual(@as(usize, 32), @FieldType(kernel.VmaTable, "entries").block_slots);
-    try std.testing.expectEqual(@as(usize, 8), @FieldType(kernel.VmaTable, "reference_slots").block_slots);
+    // Embedded pin links add 48 bytes per reference node (two per pair).
+    // At the measured 432 bytes (including the separate alias link), the
+    // existing power-of-two slot allocator still fits four, not
+    // eight, pairs per block; keep that real allocation cost visible.
+    try std.testing.expectEqual(@as(usize, 432), @sizeOf(Ref));
+    try std.testing.expectEqual(@as(usize, 4), @FieldType(kernel.VmaTable, "reference_slots").block_slots);
     std.debug.print("VMA footprint before_entry={} entry={} reference_pair={} before_block={} block={} refs_block={} object={}\n", .{
         @sizeOf(Before),                                                  @sizeOf(kernel.VmaEntry),                           @sizeOf(Ref),
         std.math.floorPowerOfTwo(usize, @max(1, 3072 / @sizeOf(Before))), @FieldType(kernel.VmaTable, "entries").block_slots, @FieldType(kernel.VmaTable, "reference_slots").block_slots,
@@ -9760,11 +10009,125 @@ test "channel FD4200 fits finite backing without four page bodies" {
     std.debug.print("CHANNEL_PRESSURE opened={d} peak_pages={d} largest={d}\n", .{ opened, backend.peak, backend.largest });
 }
 
+const VmaCutSemantic = struct {
+    words: std.ArrayList(u64) = .empty,
+    fn put(self: *@This(), word: u64) !void {
+        try self.words.append(std.testing.allocator, word);
+    }
+    fn value(self: *@This(), v: anytype) !void {
+        const T = @TypeOf(v);
+        switch (@typeInfo(T)) {
+            .bool => try self.put(@intFromBool(v)),
+            .int, .comptime_int => try self.put(@intCast(v)),
+            .@"enum" => try self.put(@intFromEnum(v)),
+            .optional => {
+                try self.put(@intFromBool(v != null));
+                if (v) |n| try self.value(n);
+            },
+            .@"struct" => inline for (std.meta.fields(T)) |field| {
+                if (comptime !std.mem.eql(u8, field.name, "references") and !std.mem.eql(u8, field.name, "active_position")) try self.value(@field(v, field.name));
+            },
+            else => @compileError("nonsemantic oracle value: " ++ @typeName(T)),
+        }
+    }
+    // VMO/COW slot numbers follow release order, which follows VMA slot
+    // order: rename them by first appearance in VMA address order, and
+    // compare unreferenced objects as a sorted multiset of their contents.
+    fn vmoSummary(s: *KernelState, ref: kernel.NativeVmoRef, out: *std.ArrayList(u64)) !void {
+        const slot = s.nativeVmoSlotConst(ref).?;
+        for ([_]u64{ @intFromEnum(slot.kind), slot.ref_count, slot.size_bytes, slot.page_count }) |w| try out.append(std.testing.allocator, w);
+        for (0..slot.page_count) |i| try out.append(std.testing.allocator, @intFromBool((s.nativeVmoPagePaddrOrHole(ref, i) orelse 0) != 0));
+    }
+    fn cowSummary(s: *KernelState, ref: kernel.NativeCowTableRef, out: *std.ArrayList(u64)) !void {
+        const slot = s.nativeCowTableSlotConst(ref).?;
+        for ([_]u64{ @intFromBool(slot.active), slot.ref_count, slot.page_count }) |w| try out.append(std.testing.allocator, w);
+        for (0..slot.page_count) |i| try out.append(std.testing.allocator, @intFromBool((s.nativeCowPagePaddr(ref, @intCast(i)) orelse 0) != 0));
+    }
+    fn hashWords(words: []const u64) u64 {
+        return std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(words));
+    }
+    fn snapshot(self: *@This(), s: *KernelState, free: *FreePageList, state: usize) !void {
+        const A = std.testing.allocator;
+        try self.put(state);
+        var vmo_ids: std.AutoHashMap(u64, u64) = .init(A);
+        defer vmo_ids.deinit();
+        var cow_ids: std.AutoHashMap(u64, u64) = .init(A);
+        defer cow_ids.deinit();
+        var scratch: std.ArrayList(u64) = .empty;
+        defer scratch.deinit(A);
+        for ([_]PrincipalId{ p0, p1, p2 }) |owner| {
+            const table = s.getVmaTable(owner).?;
+            try self.put(table.active_count);
+            try self.put(table.next_user_map_va);
+            var ordered = table.overlapping(0, std.math.maxInt(u64));
+            while (ordered.next()) |e| {
+                for ([_]u64{ @intFromBool(e.device_backing), @intFromBool(e.active), e.start_va, e.size_bytes, e.vmo_offset, e.cow_page_offset }) |w| try self.put(w);
+                try self.value(e.prot);
+                try self.value(e.max_prot);
+                try self.value(e.flags);
+                if (e.vmo.isNull()) try self.put(0) else {
+                    const key = (@as(u64, e.vmo.index) << 32) | e.vmo.generation;
+                    const got = try vmo_ids.getOrPut(key);
+                    if (!got.found_existing) {
+                        got.value_ptr.* = vmo_ids.count();
+                        scratch.clearRetainingCapacity();
+                        try vmoSummary(s, e.vmo, &scratch);
+                        for (scratch.items) |w| try self.put(w);
+                    }
+                    try self.put(got.value_ptr.*);
+                }
+                if (e.cow_table.isNull()) try self.put(0) else {
+                    const key = (@as(u64, e.cow_table.index) << 32) | e.cow_table.generation;
+                    const got = try cow_ids.getOrPut(key);
+                    if (!got.found_existing) {
+                        got.value_ptr.* = cow_ids.count();
+                        scratch.clearRetainingCapacity();
+                        try cowSummary(s, e.cow_table, &scratch);
+                        for (scratch.items) |w| try self.put(w);
+                    }
+                    try self.put(got.value_ptr.*);
+                }
+            }
+            try self.put(std.math.maxInt(u64));
+        }
+        var unreferenced: std.ArrayList(u64) = .empty;
+        defer unreferenced.deinit(A);
+        var vmos = s.native_vmos.iterator();
+        while (vmos.next()) |item| {
+            const key = (@as(u64, item.ref.index) << 32) | item.ref.generation;
+            if (vmo_ids.contains(key)) continue;
+            scratch.clearRetainingCapacity();
+            try vmoSummary(s, .{ .index = item.ref.index, .generation = item.ref.generation }, &scratch);
+            try unreferenced.append(A, hashWords(scratch.items));
+        }
+        std.mem.sort(u64, unreferenced.items, {}, std.sort.asc(u64));
+        try self.put(unreferenced.items.len);
+        for (unreferenced.items) |w| try self.put(w);
+        unreferenced.clearRetainingCapacity();
+        var cows = s.native_cow_tables.iterator();
+        while (cows.next()) |item| {
+            const key = (@as(u64, item.ref.index) << 32) | item.ref.generation;
+            if (cow_ids.contains(key)) continue;
+            scratch.clearRetainingCapacity();
+            try cowSummary(s, .{ .index = item.ref.index, .generation = item.ref.generation }, &scratch);
+            try unreferenced.append(A, hashWords(scratch.items));
+        }
+        std.mem.sort(u64, unreferenced.items, {}, std.sort.asc(u64));
+        try self.put(unreferenced.items.len);
+        for (unreferenced.items) |w| try self.put(w);
+        try self.value(free.pageCount());
+    }
+};
+
 // The golden stream is generated by the pre-index munmap/preflight/removal
 // implementation. Serialize semantic values, not pointer-bearing reverse links
 // or padding; keep every original VMA field, slot/list order and backing slot.
 const VmaCutOracle = struct {
     words: std.ArrayList(u64) = .empty,
+    // Slot-number-independent stream: VMAs in address order without slot
+    // identity, pages as present/hole without physical addresses. Slot order
+    // and PMM return order are implementation choices; this stream is not.
+    semantic: VmaCutSemantic = .{},
     states: usize = 0,
     fn put(self: *@This(), word: u64) !void {
         try self.words.append(std.testing.allocator, word);
@@ -9786,6 +10149,7 @@ const VmaCutOracle = struct {
         }
     }
     fn snapshot(self: *@This(), s: *KernelState, free: *FreePageList) !void {
+        try self.semantic.snapshot(s, free, self.states);
         try kernel.ReferenceCheck.check(s);
         try self.put(self.states);
         self.states += 1;
@@ -9797,7 +10161,11 @@ const VmaCutOracle = struct {
             if (comptime @hasField(kernel.VmaEntry, "active_position")) try kernel.ReferenceCheck.vmaTable(table);
             try self.put(table.active_count);
             try self.put(table.next_user_map_va);
-            for (0..table.active_count) |pos| try self.value(table.active_indices.get(@intCast(pos)).?.*);
+            // Fork may reorder the private active list while preserving stable
+            // slot identities. Check its inverse positions above, then hash
+            // membership in slot order so equivalent enumerations compare.
+            var membership = table.entries.iterator();
+            while (membership.next()) |item| try self.value(item.ref.index);
             var entries = table.entries.iterator();
             while (entries.next()) |item| {
                 try self.value(item.ref);
@@ -9995,11 +10363,22 @@ test "VMA cut legacy oracle randomized operations and shared COW fixed remap for
     std.crypto.hash.sha2.Sha256.hash(data, &digest, .{});
     const hex = std.fmt.bytesToHex(digest, .lower);
     std.debug.print("VMA_ORACLE states={} bytes={} sha256={s}\n", .{ oracle.states, data.len, hex });
+    var semantic_digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(std.mem.sliceAsBytes(oracle.semantic.words.items), &semantic_digest, .{});
+    const semantic_hex = std.fmt.bytesToHex(semantic_digest, .lower);
+    std.debug.print("VMA_SEMANTIC_ORACLE words={} sha256={s}\n", .{ oracle.semantic.words.items.len, semantic_hex });
+    oracle.semantic.words.deinit(std.testing.allocator);
     try std.Io.Dir.cwd().createDirPath(std.testing.io, "../.artifacts/kernel-vma-cut-oracle");
     try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = "../.artifacts/kernel-vma-cut-oracle/snapshots.bin", .data = data });
-    // Filled from the unchanged legacy implementation; full byte streams are
-    // also compared by the implementation validation harness.
-    try std.testing.expectEqualStrings("a5b9852097f7ab2b294524a257bd1352b9d83d4a55d23ac40a43c6192abadca9", &hex);
+    // Canonical membership stream is also compared byte-for-byte against
+    // the original clone algorithm by mc-k1/oracle-reference.py.
+    // Slot-order stream. Regenerated when VMA slot selection moved from the
+    // lowest-index scan to the unused list (c652b87f... -> 5a039d50...): slot
+    // numbers, and the VMO numbers/PFN order derived from slot-ordered
+    // removal, changed. The slot-independent semantic stream below was
+    // identical before and after that change, and must stay so.
+    try std.testing.expectEqualStrings("5a039d50fcbd789664da913dccf7dad4a8596c8711cdab744db07bb742a1e7c6", &hex);
+    try std.testing.expectEqualStrings("23ce9447fcc5820b0cbd95d0496d0dd5c2ca3b1599034a1fdd831faa891ab0cb", &semantic_hex);
 }
 
 test "VMA cut checks reject leftover marks missing tree nodes and incorrect overlap sets" {
@@ -10439,7 +10818,7 @@ test "page view dirty inventory unions pages without accepting private PFNs and 
     for (&pages, 0..) |*page, i| page.* = 0x8400_0000 + i * 4096;
     try s.installNativeVmoPages(parent, 0, &pages, null);
     const view = try s.createNativePageView(parent, pages.len);
-    try s.installNativeVmoPages(view, 0, &pages, null);
+    try installPageViewFixture(&s, view, 0, &pages, null);
     const slot = s.nativeVmoSlot(view).?;
     kernel.page_view_dirty.record(slot, 1, pages[1]);
     kernel.page_view_dirty.record(slot, 69, pages[69]);
@@ -10467,7 +10846,7 @@ test "page view retirement preserves formerly writable aliases and refresh dirty
     try s.retainNativeVmo(parent);
     try s.installNativeVmoPages(parent, 0, &.{ 0x8400_0000, 0x8400_1000 }, null);
     const view = try s.createNativePageView(parent, 1);
-    try s.installNativeVmoPages(view, 0, &.{0x8400_0000}, null);
+    try installPageViewFixture(&s, view, 0, &.{0x8400_0000}, null);
     const ro = vmaProt(.{ .read = true });
     const rw = vmaProt(.{ .read = true, .write = true });
     try s.createVmaWithRetainedVmo(p0, 0x4100_0000, 4096, ro, rw, mmapFlags(.{ .shared = true }), view, 0);
@@ -10480,7 +10859,7 @@ test "page view retirement preserves formerly writable aliases and refresh dirty
     kernel.page_view_dirty.acknowledge(slot);
     kernel.page_view_dirty.markRetiredAliases(&s, p1, 0x4200_0000, 4096);
     const staged = try s.createNativePageView(parent, 1);
-    try s.installNativeVmoPages(staged, 0, &.{0x8400_1000}, null);
+    try installPageViewFixture(&s, staged, 0, &.{0x8400_1000}, null);
     const Invalidator = struct {
         pub fn invalidate(_: @This(), _: PrincipalId, _: u64, _: u64) bool {
             return true;
@@ -10506,8 +10885,8 @@ test "page view dirty partial copyout failure retains full inventory until succe
     try s.installNativeVmoPages(parent, 0, &.{0x8400_0000}, null);
     const view = try s.createNativePageView(parent, 4097);
     s.nativeVmoSlot(view).?.page_view_sparse = true;
-    try s.installNativeVmoPages(view, 0, &.{0x8400_0000}, null);
-    try s.installNativeVmoPages(view, 4096, &.{0x8400_0000}, null);
+    try installPageViewFixture(&s, view, 0, &.{0x8400_0000}, null);
+    try installPageViewFixture(&s, view, 4096, &.{0x8400_0000}, null);
     const slot = s.nativeVmoSlot(view).?;
     kernel.page_view_dirty.record(slot, 0, 0x8400_0000);
     kernel.page_view_dirty.record(slot, 4096, 0x8400_0000);
@@ -10534,4 +10913,407 @@ test "page view dirty partial copyout failure retains full inventory until succe
     try std.testing.expectEqual(@as(u64, 1), retry.bitmap[64]);
     try std.testing.expectEqual(@as(u64, 0), kernel.page_view_dirty.word(slot, 0));
     try std.testing.expectEqual(@as(u64, 0), kernel.page_view_dirty.word(slot, 64));
+}
+
+test "discard production disjoint split preserves identity and refault zero" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    var s: KernelState = undefined;
+    try initFdState(&s);
+    defer _ = s.discard_storage_cache.reclaim();
+    var fl: FreePageList = .{};
+    const pa: u64 = 20 << 30;
+    try fl.installRegions(&.{.{ .id = 0, .start = pa, .end = pa + 16 * 4096 }});
+    try fl.seedContiguousRange(pa, 16);
+    const va: u64 = 0x4900_0000;
+    const ref = try s.createAnonymousVmaWithPages(p0, va, 16384, .{ .read = true, .write = true }, .{ .read = true, .write = true }, .{ .anonymous = true, .private = true }, &fl);
+    const first = (try s.allocPhysicalPage(&fl)).paddr;
+    const last = (try s.allocPhysicalPage(&fl)).paddr;
+    try s.installNativeVmoPages(ref, 0, &.{first}, null);
+    try s.installNativeVmoPages(ref, 3, &.{last}, null);
+    try s.setVmaProtRange(p0, va + 8192, 8192, .{});
+    try std.testing.expectEqual(@as(?u32, 2), s.nativeVmoRefCount(ref));
+    const original = s.vmaEntryForVaConst(p0, va).?.*;
+    const other = s.vmaEntryForVaConst(p0, va + 8192).?.*;
+    try std.testing.expect(kernel.anonymous_discard.eligible(&s, p0, s.vmaEntryForVaConst(p0, va).?, va, 8192));
+    var queue: kernel.discard_pages.Queue = .{};
+    var plan = try kernel.anonymous_discard.prepare(&s, p0, va, va + 16384, &fl, &queue);
+    try std.testing.expectEqual(@as(u64, va + 16384), plan.prefix_end);
+    try std.testing.expectEqual(@as(?u64, first), s.nativeVmoPagePaddr(ref, 0));
+    // In production this call follows synchronous shootdown; this state test
+    // tests the SAME plan/detach helper, not the platform invalidation itself.
+    plan.detach();
+    plan.retireBatches(&queue);
+    try std.testing.expectEqual(@as(?u64, null), s.nativeVmoPagePaddr(ref, 0));
+    try std.testing.expectEqual(.allocate_zero, s.prepareNativeVmaFaultMapping(p0, va, true, false).kind);
+    try std.testing.expectEqual(.denied, s.prepareNativeVmaFaultMapping(p0, va + 12288, true, false).kind);
+    try expectResourceEqualDeep(original, s.vmaEntryForVaConst(p0, va).?.*);
+    try expectResourceEqualDeep(other, s.vmaEntryForVaConst(p0, va + 8192).?.*);
+    _ = queue.reclaim();
+    try std.testing.expect(queue.head == null);
+    try s.setVmaProtRange(p0, va + 8192, 8192, .{ .read = true, .write = true });
+    try std.testing.expectEqual(.allocate_zero, s.prepareNativeVmaFaultMapping(p0, va + 12288, true, false).kind);
+    s.releasePrincipalNativeMemory(p0, &fl);
+    try std.testing.expectEqual(@as(usize, 16), fl.pageCount());
+}
+
+test "discard production eligibility rejects COW parent retain foreign overlap and stale edges" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    var s: KernelState = undefined;
+    try initFdState(&s);
+    defer _ = s.discard_storage_cache.reclaim();
+    var fl: FreePageList = .{};
+    const va: u64 = 0x4900_0000;
+    const ref = try s.createAnonymousVmaWithPages(p0, va, 16384, .{ .read = true, .write = true }, .{ .read = true, .write = true }, .{ .anonymous = true, .private = true }, &fl);
+    const entry = @constCast(s.vmaEntryForVaConst(p0, va).?);
+    const slot = s.nativeVmoSlot(ref).?;
+    const d = kernel.anonymous_discard;
+    try std.testing.expect(d.eligible(&s, p0, entry, va, 4096));
+    entry.flags.fork_cow = true;
+    try std.testing.expect(!d.eligible(&s, p0, entry, va, 4096));
+    entry.flags.fork_cow = false;
+    entry.cow_table = .{ .index = 1, .generation = 1 };
+    try std.testing.expect(!d.eligible(&s, p0, entry, va, 4096));
+    entry.cow_table = .{};
+    slot.backing.parent.ref = .{ .index = 1, .generation = 1 };
+    try std.testing.expect(!d.eligible(&s, p0, entry, va, 4096));
+    slot.backing.parent.ref = .{};
+    try s.retainNativeVmo(ref);
+    try std.testing.expect(!d.eligible(&s, p0, entry, va, 4096));
+    s.releaseNativeVmo(ref);
+    const view = try s.createNativePageView(ref, 1);
+    try std.testing.expect(!d.eligible(&s, p0, entry, va, 4096));
+    s.releaseNativeVmoWithFreeList(view, &fl);
+    var external: kernel.ReferenceIndex.Node = .{};
+    try s.retainNativeVmo(ref);
+    slot.references.connect(&external, .{ .kind = .fd_object }, .{}, true);
+    try std.testing.expect(!d.eligible(&s, p0, entry, va, 4096));
+    kernel.ReferenceIndex.Root.disconnect(&external, true);
+    s.releaseNativeVmo(ref);
+    try s.createVmaWithRetainedVmo(p0, va + 0x10000, 4096, .{ .read = true }, .{ .read = true }, .{ .private = true, .anonymous = true }, ref, 0);
+    try std.testing.expect(!d.eligible(&s, p0, entry, va, 4096));
+    try s.munmapRangeWithFreeList(p0, va + 0x10000, 4096, &fl);
+    try s.createVmaWithRetainedVmo(p1, va, 4096, .{ .read = true }, .{ .read = true }, .{ .private = true, .anonymous = true }, ref, 0);
+    try std.testing.expect(!d.eligible(&s, p0, entry, va, 4096));
+    s.releasePrincipalNativeMemory(p1, &fl);
+    slot.ram_cache_state = .cached;
+    try std.testing.expect(!d.eligible(&s, p0, entry, va, 4096));
+    slot.ram_cache_state = .wb;
+    const pair = entry.references.?;
+    pair.vmo.identity.generation +%= 1;
+    try std.testing.expect(!d.eligible(&s, p0, entry, va, 4096));
+    pair.vmo.identity.generation -%= 1;
+    pair.vmo.range.offset = 4096;
+    try std.testing.expect(!d.eligible(&s, p0, entry, va, 4096));
+    pair.vmo.range.offset = 0;
+    // A fake foreign edge is rejected independently of retain accounting.
+    const identity = pair.vmo.identity;
+    pair.vmo.identity.owner +%= 1;
+    try std.testing.expect(!d.eligible(&s, p0, entry, va, 4096));
+    pair.vmo.identity = identity;
+    try std.testing.expect(d.eligible(&s, p0, entry, va, 4096));
+    var queue: kernel.discard_pages.Queue = .{};
+    var hole = try d.prepare(&s, p0, va, va + 32768, &fl, &queue);
+    try std.testing.expectEqual(va + 16384, hole.prefix_end);
+    hole.retireBatches(&queue);
+    try std.testing.expectEqual(@as(usize, 0), queue.reclaim());
+    s.releasePrincipalNativeMemory(p0, &fl);
+}
+
+test "discard production all prepare allocation failures and pre-detach failure leave backing unchanged" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    var s: KernelState = undefined;
+    try initFdState(&s);
+    defer _ = s.discard_storage_cache.reclaim();
+    var fl: FreePageList = .{};
+    const pa: u64 = 20 << 30;
+    try fl.installRegions(&.{.{ .id = 0, .start = pa, .end = pa + 256 * 4096 }});
+    try fl.seedContiguousRange(pa, 256);
+    const va: u64 = 0x4900_0000;
+    const ref = try s.createAnonymousVmaWithPages(p0, va, 129 * 4096, .{ .read = true, .write = true }, .{ .read = true, .write = true }, .{ .anonymous = true, .private = true }, &fl);
+    var pages: [129]u64 = undefined;
+    for (&pages) |*page| page.* = (try s.allocPhysicalPage(&fl)).paddr;
+    try s.installNativeVmoPages(ref, 0, &pages, null);
+    const before = fl.pageCount();
+    defer s.releasePrincipalNativeMemory(p0, &fl);
+    const d = kernel.anonymous_discard;
+    defer d.test_metadata_allocator = null;
+    for (1..5) |failure| {
+        var issuer: kernel.InvocationStorageTestAllocator = .{};
+        defer issuer.deinit();
+        issuer.fail_at = failure;
+        d.test_metadata_allocator = issuer.interface();
+        var queue: kernel.discard_pages.Queue = .{};
+        if (failure < 4) {
+            try std.testing.expectError(KernelError.OutOfFreePages, d.prepare(&s, p0, va, va + 129 * 4096, &fl, &queue));
+        } else {
+            var plan = try d.prepare(&s, p0, va, va + 129 * 4096, &fl, &queue);
+            plan.fail_after_shootdown = true;
+            var acknowledgements: usize = 0;
+            try std.testing.expectError(KernelError.InvalidState, plan.commit(&acknowledgements, struct {
+                fn invalidate(count: *usize, _: u64, _: u64) bool { count.* += 1; return true; }
+            }.invalidate));
+            try std.testing.expectEqual(@as(usize, 1), acknowledgements);
+            plan.retireBatches(&queue);
+        }
+        _ = queue.reclaim();
+        try std.testing.expectEqual(@as(usize, 0), issuer.active());
+        try std.testing.expectEqual(before, fl.pageCount());
+        for (pages, 0..) |page, i| try std.testing.expectEqual(@as(?u64, page), s.nativeVmoPagePaddr(ref, i));
+    }
+}
+
+test "discard production quarantine and general PMM failure retain ownership past VMO death" {
+    for (0..2) |failure| {
+        var physical_fixture = try physicalFixture();
+        defer physical_fixture.deinit();
+        var s: KernelState = undefined;
+        try initFdState(&s);
+        defer _ = s.discard_storage_cache.reclaim();
+        var fl: FreePageList = .{};
+        const pa: u64 = 20 << 30;
+        try fl.installRegions(&.{.{ .id = 0, .start = pa, .end = pa + 16 * 4096 }});
+        try fl.seedContiguousRange(pa, 16);
+        const va: u64 = 0x4900_0000;
+        const ref = try s.createAnonymousVmaWithPages(p0, va, 12288, .{ .read = true, .write = true }, .{ .read = true, .write = true }, .{ .anonymous = true, .private = true }, &fl);
+        const a = (try s.allocPhysicalPage(&fl)).paddr;
+        const b = (try s.allocPhysicalPage(&fl)).paddr;
+        const c = (try s.allocPhysicalPage(&fl)).paddr;
+        try s.installNativeVmoPages(ref, 0, &.{ a, b, c }, null);
+        var queue: kernel.discard_pages.Queue = .{};
+        var plan = try kernel.anonymous_discard.prepare(&s, p0, va + 4096, va + 8192, &fl, &queue);
+        var hold: ?DmaHold = if (failure == 0) try DmaHold.init(b, 1) else null;
+        const regions = fl.regions;
+        plan.detach();
+        plan.retireBatches(&queue);
+        if (failure == 1) fl.regions = &.{}; // Real appendPage RegionNotFound.
+        try std.testing.expectEqual(@as(usize, 0), queue.reclaim());
+        fl.regions = regions;
+        try std.testing.expect(queue.head != null and queue.head.?.owned == 1);
+        try std.testing.expectEqual(@as(?u64, a), s.nativeVmoPagePaddr(ref, 0));
+        try std.testing.expectEqual(@as(?u64, null), s.nativeVmoPagePaddr(ref, 1));
+        try std.testing.expectEqual(@as(?u64, c), s.nativeVmoPagePaddr(ref, 2));
+        try std.testing.expectEqual(.allocate_zero, s.prepareNativeVmaFaultMapping(p0, va + 4096, true, false).kind);
+        s.releasePrincipalNativeMemory(p0, &fl);
+        try std.testing.expect(s.nativeVmoSlot(ref) == null);
+        try std.testing.expectEqual(@as(usize, 15), fl.pageCount());
+        if (hold) |*h| h.end();
+        _ = queue.reclaim();
+        try std.testing.expect(queue.head == null);
+        try std.testing.expectEqual(@as(usize, 16), fl.pageCount());
+    }
+}
+
+test "discard production three fragment split and overlap negative preserve identities" {
+    var physical_fixture = try physicalFixture();
+    defer physical_fixture.deinit();
+    var s: KernelState = undefined;
+    try initFdState(&s);
+    defer _ = s.discard_storage_cache.reclaim();
+    var fl: FreePageList = .{};
+    const pa: u64 = 20 << 30;
+    try fl.installRegions(&.{.{ .id = 0, .start = pa, .end = pa + 16 * 4096 }});
+    try fl.seedContiguousRange(pa, 16);
+    const va: u64 = 0x4900_0000;
+    const ref = try s.createAnonymousVmaWithPages(p0, va, 16384, .{ .read = true, .write = true }, .{ .read = true, .write = true }, .{ .anonymous = true, .private = true }, &fl);
+    const page = (try s.allocPhysicalPage(&fl)).paddr;
+    try s.installNativeVmoPages(ref, 1, &.{page}, null);
+    try s.setVmaProtRange(p0, va + 4096, 4096, .{});
+    try std.testing.expectEqual(@as(?u32, 3), s.nativeVmoRefCount(ref));
+    const entries = [_]*const kernel.VmaEntry{ s.vmaEntryForVaConst(p0, va).?, s.vmaEntryForVaConst(p0, va + 4096).?, s.vmaEntryForVaConst(p0, va + 8192).? };
+    const original = [_]kernel.VmaEntry{ entries[0].*, entries[1].*, entries[2].* };
+    const middle = @constCast(entries[1]);
+    // Publish a genuine same-owner alias by changing both source and edge.
+    // Range equality alone must not hide overlap with the first fragment.
+    middle.vmo_offset = 0;
+    s.refreshVmaReferences(middle);
+    try std.testing.expect(!kernel.anonymous_discard.eligible(&s, p0, entries[0], va, 4096));
+    middle.vmo_offset = 4096;
+    s.refreshVmaReferences(middle);
+    var queue: kernel.discard_pages.Queue = .{};
+    var plan = try kernel.anonymous_discard.prepare(&s, p0, va, va + 16384, &fl, &queue);
+    plan.detach();plan.retireBatches(&queue);_ = queue.reclaim();
+    for (entries, original) |entry, old| try expectResourceEqualDeep(old, entry.*);
+    try std.testing.expectEqual(@as(?u64, null), s.nativeVmoPagePaddr(ref, 1));
+    s.releasePrincipalNativeMemory(p0, &fl);
+}
+
+fn forkSparseCloneCase(fail_at: usize, preprepared: bool) !usize {
+    std.debug.print("fork scratch case={} prepared={} start\n", .{fail_at, preprepared});
+    var fixture = try physicalFixture();
+    defer fixture.deinit();
+    var s: KernelState = undefined;
+    try initFdState(&s);
+    var fl: FreePageList = .{};
+    defer s.deinitPools();
+    defer s.releasePrincipalNativeMemory(p0, &fl);
+    defer s.releasePrincipalNativeMemory(p1, &fl);
+    const fd = try s.createZeroOnDemandVmoFd(p0, 4096, .{ .close = true, .map_read = true, .map_write = true }, .{}, 16);
+    const ref = s.nativeVmoRefForFd(p0, fd).?;
+    const source = s.getVmaTable(p0).?;
+    for (0..130) |i| _ = try s.mmapFd(p0, fd, 0x6000_0000 + i * 8192, 4096, .{ .read = true, .write = true }, .{ .private = true }, 0);
+    // Leave holes, then reuse a subset: neither capacity nor insertion order
+    // describes the live stable identities after munmap/reuse.
+    for (0..19) |i| try s.munmapRangeWithFreeList(p0, 0x6000_0000 + i * 7 * 8192, 4096, &fl);
+    for (0..5) |i| _ = try s.mmapFd(p0, fd, 0x7000_0000 + i * 8192, 4096, .{ .read = true, .write = true }, .{ .private = true }, 0);
+    // Stable slot IDs survive an arbitrary private enumeration order.
+    for (0..source.active_count / 2) |i| std.mem.swap(u32, source.active_indices.get(@intCast(i)).?, source.active_indices.get(@intCast(source.active_count - 1 - i)).?);
+    for (0..source.active_count) |i| source.entries.get(source.active_indices.get(@intCast(i)).?.*).?.active_position = @intCast(i);
+    const before = s.nativeVmoRefCount(ref);
+    const child = s.getVmaTable(p1).?;
+    if (preprepared) {
+        try child.entries.prepareIndex(1024, child.allocator.?);
+        try child.reference_slots.prepareIndex(1024, child.allocator.?);
+        try child.active_indices.prepareIndex(1024, child.allocator.?);
+    }
+    var failure: ReferenceFailureAllocator = .{ .upstream = child.allocator.?, .fail_at = fail_at };
+    child.allocator = failure.interface();
+    defer child.allocator = failure.upstream;
+    const result = s.cloneVmaTableForFork(p0, p1);
+    const preparation_calls = failure.calls;
+    if (fail_at != 0) {
+        try std.testing.expectError(KernelError.OutOfFreePages, result);
+        try std.testing.expectEqual(@as(usize, 0), child.active_count);
+        try std.testing.expectEqual(@as(usize, 0), child.active_indices.live);
+        try std.testing.expectEqual(@as(usize, 0), child.entries.live);
+        try std.testing.expectEqual(@as(usize, 0), child.reference_slots.live);
+        try std.testing.expectEqual(before, s.nativeVmoRefCount(ref));
+        try kernel.ReferenceCheck.check(&s);
+    } else {
+        try result;
+        try std.testing.expectEqual(source.active_count, child.active_count);
+        for (0..source.active_count) |i| {
+            const slot = source.active_indices.get(@intCast(i)).?.*;
+            const a = source.entries.get(slot).?;
+            const b = child.entries.get(slot).?;
+            try std.testing.expectEqual(a.start_va, b.start_va);
+            try std.testing.expectEqual(a.vmo, b.vmo);
+            try std.testing.expect(b.flags.fork_cow);
+            try std.testing.expect(!a.flags.fork_cow);
+        }
+        s.releaseVmaTableForProcessIndex(1);
+        try std.testing.expectEqual(before, s.nativeVmoRefCount(ref));
+        try s.cloneVmaTableForFork(p0, p1);
+        s.releaseVmaTableForProcessIndex(1);
+        try std.testing.expectEqual(before, s.nativeVmoRefCount(ref));
+    }
+    return preparation_calls;
+}
+
+test "fork reordered slots scratch rollback every allocation and child reuse" {
+    const count = try forkSparseCloneCase(0, false);
+    for (1..count + 1) |i| _ = try forkSparseCloneCase(i, false);
+    _ = try forkSparseCloneCase(0, true);
+}
+
+test "fork zero vmas thread page exclusion and retain rejection return scratch ownership" {
+    var fixture = try physicalFixture();
+    defer fixture.deinit();
+    var s: KernelState = undefined;
+    try initFdState(&s);
+    var fl: FreePageList = .{};
+    defer s.deinitPools();
+    defer s.releasePrincipalNativeMemory(p0, &fl);
+    defer s.releasePrincipalNativeMemory(p1, &fl);
+    const child = s.getVmaTable(p1).?;
+    try s.cloneVmaTableForFork(p0, p1);
+    try std.testing.expectEqual(@as(usize, 0), child.active_indices.live);
+    const rights = fdRights(.{ .close = true, .map_read = true, .map_write = true });
+    const a = try s.createZeroOnDemandVmoFd(p0, 4096, rights, .{}, 16);
+    const b = try s.createZeroOnDemandVmoFd(p0, 4096, rights, .{}, 16);
+    _ = try s.mmapFd(p0, a, 0x6100_0000, 4096, .{ .read = true }, .{ .private = true }, 0);
+    _ = try s.mmapFd(p0, b, 0x6100_2000, 4096, .{ .read = true }, .{ .private = true }, 0);
+    // Only the fork filter is under test; use an existing valid mapped VMO
+    // as a synthetic thread-page identity without requiring user_vm hooks.
+    const excluded = s.nativeVmoSlot(s.nativeVmoRefForFd(p0, a).?).?;
+    const old_kind = excluded.kind;
+    excluded.kind = .thread_page;
+    defer excluded.kind = old_kind;
+    const kept = s.nativeVmoSlot(s.nativeVmoRefForFd(p0, b).?).?;
+    const old_refs = kept.ref_count;
+    kept.ref_count = std.math.maxInt(u32);
+    try std.testing.expectError(KernelError.TableFull, s.cloneVmaTableForFork(p0, p1));
+    kept.ref_count = old_refs;
+    try std.testing.expectEqual(@as(usize, 0), child.active_count);
+    try std.testing.expectEqual(@as(usize, 0), child.active_indices.live);
+    try std.testing.expectEqual(@as(usize, 0), child.entries.live);
+    try std.testing.expectEqual(@as(usize, 0), child.reference_slots.live);
+    try kernel.ReferenceCheck.check(&s);
+    const entry = @constCast(s.vmaEntryForVaConst(p0, 0x6100_2000).?);
+    try s.ensureEntryCowTable(entry, &fl);
+    const cow = s.nativeCowTableSlot(entry.cow_table).?;
+    const cow_refs = cow.ref_count;
+    cow.ref_count = std.math.maxInt(u32);
+    try std.testing.expectError(KernelError.TableFull, s.cloneVmaTableForFork(p0, p1));
+    cow.ref_count = cow_refs;
+    try std.testing.expectEqual(old_refs, kept.ref_count);
+    try std.testing.expectEqual(@as(usize, 0), child.active_count);
+    try std.testing.expectEqual(@as(usize, 0), child.active_indices.live);
+    try std.testing.expectEqual(@as(usize, 0), child.entries.live);
+    try std.testing.expectEqual(@as(usize, 0), child.reference_slots.live);
+    try kernel.ReferenceCheck.check(&s);
+    try s.cloneVmaTableForFork(p0, p1);
+    try std.testing.expectEqual(@as(usize, 1), child.active_count);
+    try std.testing.expect(s.vmaEntryForVaConst(p1, 0x6100_0000) == null);
+    try std.testing.expect(s.vmaEntryForVaConst(p1, 0x6100_2000) != null);
+    try std.testing.expectEqual(@as(usize, 1), child.active_indices.live);
+    try kernel.ReferenceCheck.check(&s);
+}
+
+test "discard metadata cache reuses grants and pressure returns original issuer" {
+    var fixture = try physicalFixture();
+    defer fixture.deinit();
+    var s: KernelState = undefined;
+    try initFdState(&s);
+    defer _ = s.discard_storage_cache.reclaim();
+    var fl: FreePageList = .{};
+    const pa: u64 = 20 << 30;
+    try fl.installRegions(&.{.{ .id = 0, .start = pa, .end = pa + 8 * 4096 }});
+    try fl.seedContiguousRange(pa, 8);
+    const va: u64 = 0x4900_0000;
+    const ref = try s.createAnonymousVmaWithPages(p0, va, 4096, .{ .read = true, .write = true }, .{ .read = true, .write = true }, .{ .anonymous = true, .private = true }, &fl);
+    defer s.releasePrincipalNativeMemory(p0, &fl);
+    fl.reclaimable.register(&s.discard_storage_cache);
+    var queue: kernel.discard_pages.Queue = .{};
+    var previous: ?*kernel.discard_pages.Batch = null;
+    for (0..2) |_| {
+        const page = (try s.allocPhysicalPage(&fl)).paddr;
+        try s.installNativeVmoPages(ref, 0, &.{page}, null);
+        var plan = try kernel.anonymous_discard.prepare(&s, p0, va, va + 4096, &fl, &queue);
+        if (previous) |batch| try std.testing.expectEqual(batch, plan.head.?);
+        previous = plan.head;
+        plan.detach();
+        plan.retireBatches(&queue);
+        try std.testing.expectEqual(@as(usize, 2), queue.reclaim());
+        try std.testing.expectEqual(@as(usize, 1), fl.reclaimable.retainedPages());
+    }
+    try std.testing.expectEqual(@as(usize, 1), fl.reclaimable.reclaim());
+    try std.testing.expectEqual(@as(usize, 0), fl.reclaimable.retainedPages());
+}
+
+// Fixtures formerly supplied borrowed PA arrays directly. Resolve those PAs
+// back to the explicit parent indices so every test uses the production-only
+// view installer and maintains counters, including sparse and duplicate pages.
+fn installPageViewFixture(state: *KernelState, view: kernel.NativeVmoRef, offset: usize, paddrs: []const u64, free_list: ?*FreePageList) !void {
+    const slot = state.nativeVmoSlot(view).?;
+    const parent_ref = slot.backing.parent.ref;
+    const parent = state.nativeVmoSlot(parent_ref).?;
+    var indices: [64]u64 = undefined;
+    var first: usize = 0;
+    while (first < paddrs.len) {
+        const n = @min(indices.len, paddrs.len - first);
+        for (paddrs[first..][0..n], 0..) |pa, i| {
+            if (pa == 0) { indices[i] = std.math.maxInt(u64); continue; }
+            var index: usize = 0;
+            while (index < parent.page_count) : (index += 1) {
+                if (state.nativeVmoPagePaddr(parent_ref, index) == pa) break;
+            }
+            if (index == parent.page_count) return error.InvalidViewFixture;
+            indices[i] = @intCast(index);
+        }
+        try state.installNativeVmoPageViewPages(view, offset + first, indices[0..n], free_list);
+        first += n;
+    }
 }

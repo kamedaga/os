@@ -60,6 +60,22 @@ int64_t lpr_mlock_vm_begin(void)
     return status;
 }
 
+int64_t lpr_mlock_madvise_begin(uint64_t address,uint64_t length)
+{
+    locked_range_t target;
+    if ((address&4095) || !range(address,length,&target)) return -LPR_LINUX_EINVAL;
+    /* Linux locks are personality metadata. Hold the same lock as fork and
+     * mapping replacement until native discard returns; querying then dropping
+     * it would let a concurrent mlock race content withdrawal. No reserve is
+     * needed because madvise does not edit the interval set. */
+    lpr_state_lock(&locked.lock);
+    if (length && lpr_mlock_overlaps(address,length)) {
+        lpr_state_unlock(&locked.lock);
+        return -LPR_LINUX_EINVAL;
+    }
+    return 0;
+}
+
 void lpr_mlock_vm_end(void) { lpr_state_unlock(&locked.lock); }
 volatile uint32_t *lpr_mlock_lock_address(void) { return &locked.lock; }
 void lpr_mlock_fork_lock(void) { lpr_state_lock(&locked.lock); }

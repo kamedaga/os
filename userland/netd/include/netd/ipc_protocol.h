@@ -183,7 +183,7 @@ typedef struct netd_poll {
     uint32_t revents;
     int32_t error;
     uint32_t reserved0;
-    uint64_t reserved[5];
+    uint64_t reserved[5]; /* reserved[0]=1: return RO readiness VMO (NETLINK) */
 } netd_poll_t;
 
 _Static_assert(sizeof(netd_io_t) <= NETD_PAGE_BYTES,

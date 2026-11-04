@@ -2,6 +2,7 @@
 #include "../musl/pachaos/syscall/native.c"
 #include <assert.h>
 #include <stdio.h>
+#include <sys/file.h>
 #include "filed/exec.h"
 #include "filed/runtime.h"
 
@@ -23,6 +24,7 @@ static size_t exec_argc,exec_envc,exec_handles;
 static uint64_t namespace_first,namespace_second,namespace_flags;
 static unsigned namespace_opcode,namespace_calls;
 static unsigned sync_calls;
+static unsigned flock_mode[4096];
 static char namespace_path[128],namespace_other[128];
 static int mock_process_create(const struct pacha_process_fd_grant *grants,uint64_t count)
 {
@@ -147,7 +149,11 @@ int fs_call(kb2_fs_request_t *r,const char *path,const char *second,
         assert(next_handle<4096); h=next_handle++; objects[h]=h; positions[h]=0;
         status_flags[h]=r->flags&~(uint64_t)O_CLOEXEC;
         reply->handle=h; return 0;
-    case KB2_FILESYSTEM_OP_CLOSE: assert(o); objects[h]=0; return 0;
+    case KB2_FILESYSTEM_OP_CLOSE: {
+        assert(o);objects[h]=0;int refs=0;for(unsigned j=0;j<4096;j++)refs|=objects[j]==o;
+        if(!refs) { flock_mode[o]=0; }
+        return 0;
+    }
     case KB2_FILESYSTEM_OP_DUP:
         assert(o && next_handle<4096); reply->handle=next_handle++;
         objects[reply->handle]=o; return 0;
@@ -159,6 +165,19 @@ int fs_call(kb2_fs_request_t *r,const char *path,const char *second,
     case KB2_FILESYSTEM_OP_LSEEK:
         assert(o && r->flags==SEEK_SET && r->offset>=0);
         positions[o]=(uint64_t)r->offset; reply->result=r->offset; return 0;
+    case KB2_FILESYSTEM_OP_FLOCK: {
+        unsigned op=r->flags&~LOCK_NB;assert(o);
+        if(op!=LOCK_EX&&op!=LOCK_SH&&op!=LOCK_UN)return -EINVAL;
+        if(op==LOCK_UN){flock_mode[o]=0;return 0;}
+        for(unsigned j=1;j<4096;j++)if(j!=o&&flock_mode[j]&&(op==LOCK_EX||flock_mode[j]==LOCK_EX))return -EWOULDBLOCK;
+        flock_mode[o]=op;return 0;
+    }
+    case KB2_FILESYSTEM_OP_FALLOCATE:
+        assert(o);
+        if (r->mode>1) return -EOPNOTSUPP;
+        if (r->offset<0 || !r->length || r->length>sizeof(contents)-(uint64_t)r->offset) return -EINVAL;
+        if (!(r->mode&1) && r->offset+r->length>content_size) content_size=r->offset+r->length;
+        return 0;
     case KB2_FILESYSTEM_OP_FTRUNCATE:
         assert(o && r->offset>=0 && (uint64_t)r->offset<sizeof(contents));
         content_size=(size_t)r->offset; return 0;
@@ -220,6 +239,13 @@ int main(void)
     assert(call(SYS_pread64,fd,(long)readback,1,0)==1 && readback[0]==99 && read_calls==4);
     struct __pachaos_kstat st;
     assert(call(SYS_fstat,fd,(long)&st,0,0)==0 && st.st_size==16384);
+    assert(call(SYS_flock,fd,LOCK_EX|LOCK_NB,0,0)==0);
+    assert(call(SYS_flock,duplicate,LOCK_UN,0,0)==0);
+    assert(call(SYS_flock,fd,LOCK_SH|LOCK_EX,0,0)==-EINVAL);
+    assert(call(SYS_fallocate,fd,0,0,24576)==0 && content_size==24576);
+    assert(call(SYS_fallocate,fd,1,24576,4096)==0 && content_size==24576);
+    assert(call(SYS_fallocate,fd,-1,0,4096)==-EOPNOTSUPP);
+    assert(call(SYS_fallocate,-1,0,0,4096)==-EBADF);
     assert(call(SYS_ftruncate,fd,7,0,0)==0);
     assert(call(SYS_fstat,fd,(long)&st,0,0)==0 && st.st_size==7 && stat_calls==2);
     assert(call(SYS_fcntl,duplicate,F_SETFL,O_RDWR|O_APPEND,0)==0);

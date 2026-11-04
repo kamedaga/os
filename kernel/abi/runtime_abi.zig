@@ -51,7 +51,7 @@ pub const clock_monotonic_resolution_nsec: u64 = 1_000_000;
 
 // Read-only clock page, one 4096-byte page (all fields little-endian).
 // fast is 1 while fast reads are allowed and becomes 0 at most once, never 1
-// again. A reader computes ns = ns_origin + (kvmclock(pv0) - pv_origin) from a
+// again. A reader computes ns = ns_origin + (pvclock(pv0) - pv_origin) from a
 // stable, even-version pv0 snapshot, rejects ns > ceiling_ns, returns
 // max(ns, floor_ns), and accepts the result only if fast is still 1 afterwards.
 // floor_ns is the kernel's published monotonic floor; ceiling_ns bounds every
@@ -62,7 +62,11 @@ pub const clock_page_pv_origin_offset: u64 = 8;
 pub const clock_page_ns_origin_offset: u64 = 16;
 pub const clock_page_floor_ns_offset: u64 = 24;
 pub const clock_page_ceiling_ns_offset: u64 = 32;
-// KVM pvclock record (struct pvclock_vcpu_time_info) of vCPU 0, 32 bytes.
+// Kernel-published pvclock-format conversion record, 32 bytes: supplied by
+// KVM (vCPU 0) or synthesized by the kernel. Stable bit 0 promises that this
+// record and any online CPU's TSC yield the kernel's monotonic domain after
+// epoch conversion. Synthetic records have bits 1..7 zero and are immutable.
+// Layout, flag bits and syscall numbers are unchanged; no ABI version added.
 pub const clock_page_pv0_offset: u64 = 64;
 pub const clock_page_pv_version_offset: u64 = 0;
 pub const clock_page_pv_tsc_timestamp_offset: u64 = 8;

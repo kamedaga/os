@@ -320,7 +320,10 @@ pub fn showPanic(message: []const u8) void {
 }
 
 test "diagnostic slot cannot collide with per-CPU copy slots" {
-    try std.testing.expect(slot_va < @import("../arch/x86_64/cpu_runtime.zig").base or slot_va >= @import("../boot/image_range.zig").virtual_base);
+    // CPU runtime is owned through PML4[511] and grows dynamically, so there
+    // is no fixed base to compare in a host test.  The legacy diagnostic PTE
+    // must remain in a different root entry regardless of topology size.
+    try std.testing.expect((slot_va >> 39) & 511 != 511);
     try std.testing.expectEqual(x86.phys_copy_window_va + slot * 4096, slot_va);
 }
 

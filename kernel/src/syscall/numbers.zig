@@ -72,6 +72,7 @@ pub const syscall_timerfd_create: u64 = fd_abi.syscall_timerfd_create;
 pub const syscall_timerfd_settime: u64 = fd_abi.syscall_timerfd_settime;
 pub const syscall_timerfd_gettime: u64 = fd_abi.syscall_timerfd_gettime;
 pub const syscall_vmo_create: u64 = fd_abi.syscall_vmo_create;
+pub const syscall_vmo_discard: u64 = fd_abi.syscall_vmo_discard;
 pub const syscall_vmo_grow: u64 = fd_abi.syscall_vmo_grow;
 pub const syscall_vmo_cache_policy: u64 = fd_abi.syscall_vmo_cache_policy;
 pub const syscall_vmo_create_page_view: u64 = fd_abi.syscall_vmo_create_page_view;
@@ -185,6 +186,7 @@ test "native syscall numbers are contiguous" {
         syscall_futex_wake_wait,
         syscall_futex_requeue,
         syscall_futex_wake_op,
+        syscall_futex_pi,
         syscall_getrandom,
         syscall_power_control,
         syscall_fd_table,
@@ -208,6 +210,7 @@ test "native syscall numbers are contiguous" {
         syscall_timerfd_gettime,
         syscall_vmo_create,
         syscall_vmo_grow,
+        syscall_vmo_discard,
         syscall_vmo_cache_policy,
         syscall_vmo_create_page_view,
         syscall_vmo_refresh_page_view,
@@ -218,6 +221,7 @@ test "native syscall numbers are contiguous" {
         syscall_pager_wait,
         syscall_pager_supply,
         syscall_pager_fail,
+        syscall_vm_query,
         syscall_mmap,
         syscall_munmap,
         syscall_mprotect,

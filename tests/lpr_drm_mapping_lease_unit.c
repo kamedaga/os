@@ -23,6 +23,9 @@ pacha_fd_t lpr_sync_file_duplicate_wait(uint64_t fd) { (void)fd; assert(0); retu
 static atomic_uint unmap_race_stage;
 static int unmap_failure;
 static int64_t map_failure, remap_failure;
+static unsigned hint_testing, hint_calls;
+static int hint_occupied;
+static uint64_t hint_seen_address[10], hint_seen_flags[10];
 #if defined(LPR_UNMAP_PROFILE) && LPR_UNMAP_PROFILE
 static unsigned profile_logs;
 #endif
@@ -126,6 +129,14 @@ int64_t lpr_pacha_syscall6(uint64_t nr, uint64_t fd, uint64_t address,
 {
     assert(nr == PACHAOS_SYSCALL_MMAP && fd == 90);
     assert(lpr_drm_mapping_lock == 1);
+    if (hint_testing) {
+        assert(hint_calls < 10 && length == 8192 && prot == 3 && offset == 4096);
+        hint_seen_address[hint_calls] = address;
+        hint_seen_flags[hint_calls++] = flags;
+        if (flags & PACHAOS_MMAP_FIXED_NOREPLACE)
+            return hint_occupied == 1 || (hint_occupied == 2 && hint_calls < 3) ? -17 : (int64_t)address;
+        return 0x90000;
+    }
     (void)length; (void)prot; (void)flags; (void)offset;
     return map_failure ? map_failure : (int64_t)address;
 }
@@ -147,6 +158,41 @@ static void *reuse_address(void *unused)
     atomic_store(&unmap_race_stage, 3);
     assert(lpr_drm_map_received(90, 81, 0x50000, 4096, 3, 1, 0) == 0x50000);
     return NULL;
+}
+
+static void check_mmap_hint(void)
+{
+    hint_testing = 1;
+    const uint64_t ordinary = PACHAOS_MMAP_PRIVATE;
+    assert(lpr_drm_native_mmap(90, 0x5007b, 8192, 3, ordinary, 4096) == 0x50000);
+    assert(hint_calls == 1 && hint_seen_address[0] == 0x50000);
+    assert(hint_seen_flags[0] == (ordinary | PACHAOS_MMAP_FIXED_NOREPLACE));
+    hint_calls = 0; hint_occupied = 1;
+    assert(lpr_drm_native_mmap(90, 0x5007b, 8192, 3, ordinary, 4096) == 0x90000);
+    assert(hint_calls == 9 && hint_seen_address[8] == 0x5007b);
+    for (unsigned i = 0; i < 8; ++i)
+        assert(hint_seen_address[i] == 0x50000 + i * 8192);
+    assert(hint_seen_flags[8] == ordinary); /* Never replace an occupied hint. */
+    hint_calls = 0; hint_occupied = 2;
+    assert(lpr_drm_native_mmap(90, 0x5007b, 8192, 3, ordinary, 4096) == 0x54000);
+    assert(hint_calls == 3); /* Skip occupied spans without touching them. */
+    hint_occupied = 1;
+    hint_calls = 0;
+    assert(lpr_drm_native_mmap(90, 0, 8192, 3, ordinary, 4096) == 0x90000);
+    assert(hint_calls == 1 && hint_seen_flags[0] == ordinary);
+    hint_calls = 0;
+    assert(lpr_drm_native_mmap(90, UINT64_C(0x7ffffffff000), 8192, 3,
+        ordinary, 4096) == 0x90000);
+    assert(hint_calls == 1 && hint_seen_flags[0] == ordinary);
+    hint_calls = 0;
+    assert(lpr_drm_native_mmap(90, 0x50000, 8192, 3,
+        ordinary | PACHAOS_MMAP_FIXED_NOREPLACE, 4096) == -17);
+    assert(hint_calls == 1); /* Explicit NOREPLACE must not fall back. */
+    hint_calls = 0;
+    assert(lpr_drm_native_mmap(90, 0x50000, 8192, 3,
+        ordinary | PACHAOS_MMAP_FIXED, 4096) == 0x90000);
+    assert(hint_calls == 1 && hint_seen_flags[0] == (ordinary | PACHAOS_MMAP_FIXED));
+    hint_testing = hint_calls = hint_occupied = 0;
 }
 
 static void check_unmap_reuse(void)
@@ -234,6 +280,7 @@ static void cpu_sync_case(void) {
 
 int main(void)
 {
+    check_mmap_hint();
     struct pacha_fd_info mapping_lease = {.kind = PACHA_FD_KIND_CHANNEL,
         .rights = PACHA_FD_RIGHT_CLOSE,
         .flags = PACHA_FD_FLAG_CLOEXEC | PACHA_FD_FLAG_INHERIT};

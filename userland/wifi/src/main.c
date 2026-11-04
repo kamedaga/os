@@ -368,6 +368,49 @@ static int request(int dir, const char *session, const char *id, const char *com
     }
 }
 
+/* Failure diagnostics use only a fresh, same-session status snapshot.
+ * Never dump configuration, credentials, or arbitrary backend output. */
+static void connection_diagnostic(int dir, const char *session, int result)
+{
+    char *text = NULL;
+    if (dir < 0 || verify_session(dir, session) ||
+        read_file(dir, "status", &text, 1)) {
+        fputs("wifi: diagnosis unavailable: no fresh service status\n", stderr);
+        return;
+    }
+    if (verify_session(dir, session)) { free(text); return; }
+    const char *state = NULL;
+    size_t length = 0;
+    for (const char *p = text; *p;) {
+        const char *end = strchr(p, '\n');
+        if (!end) end = p + strlen(p);
+        if (end - p > 10 && !memcmp(p, "wpa_state=", 10)) {
+            if (state) { state = NULL; break; }
+            state = p + 10; length = (size_t)(end - state);
+        }
+        p = *end ? end + 1 : end;
+    }
+    const char *hint = "service status does not identify the failure stage";
+#define STATE(value) (state && length == sizeof(value) - 1 && !memcmp(state, value, sizeof(value) - 1))
+    if (result == -EACCES)
+        hint = "authentication rejected; check credentials and AP security settings (not proof of a wrong password)";
+    else if (STATE("SCANNING"))
+        hint = "scanning for an eligible AP; association has not completed";
+    else if (STATE("AUTHENTICATING") || STATE("ASSOCIATING") || STATE("ASSOCIATED"))
+        hint = "AP authentication/association is in progress; IPv4 configuration has not started";
+    else if (STATE("4WAY_HANDSHAKE") || STATE("GROUP_HANDSHAKE"))
+        hint = "WPA key exchange has not completed; credentials, security compatibility or packet loss may be involved";
+    else if (STATE("COMPLETED"))
+        hint = strstr(text, "\nip_address=unconfigured\n") ?
+            "WPA authentication completed; IPv4/DHCP configuration is still pending" :
+            "WPA authentication completed; inspect wifi status for the current IP (the failed request is not confirmed successful)";
+    else if (STATE("DISCONNECTED") || STATE("INACTIVE") || STATE("INTERFACE_DISABLED"))
+        hint = "not associated with an AP; inspect saved network settings and radio availability";
+#undef STATE
+    fprintf(stderr, "wifi: diagnosis: %s\n", hint);
+    free(text);
+}
+
 static void usage(void)
 {
     fputs("Usage: wifi status | scan | disconnect | reconnect\n"
@@ -382,7 +425,7 @@ int main(int argc, char **argv)
     enum security security = TRANSITION;
     const char *ssid = NULL, *command = argc > 1 ? argv[1] : "";
     char country[3] = {0};
-    char session[17];
+    char session[17] = {0};
     if (argc == 2 && (!strcmp(command, "--help") || !strcmp(command, "help"))) { usage(); return 0; }
     if (!strcmp(command, "connect")) {
         if (argc < 3 || !argv[2][0] || strlen(argv[2]) > 32) { usage(); return 2; }
@@ -443,7 +486,11 @@ int main(int argc, char **argv)
         wipe(config, sizeof(config));
         if (result) goto done;
     }
-    if (strcmp(command, "status")) result = request(dir, session, id, !strcmp(command, "reconnect") ? "connect" : command);
+    if (strcmp(command, "status")) {
+        result = request(dir, session, id, !strcmp(command, "reconnect") ? "connect" : command);
+        if (result && (!strcmp(command, "connect") || !strcmp(command, "reconnect")))
+            connection_diagnostic(dir, session, result);
+    }
     if (!result && (!strcmp(command, "status") || !strcmp(command, "scan"))) {
         char *text = NULL;
         result = read_file(dir, !strcmp(command, "status") ? "status" : "scan-results", &text,

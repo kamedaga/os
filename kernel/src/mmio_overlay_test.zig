@@ -9,6 +9,10 @@ test "MMIO overlay pager admission survives unrelated RAM cache policy" {
     const policy = @import("memory/ram_cache_policy.zig");
     var fixture = try MmioRetirementFixture.start();
     defer fixture.end();
+    // Match dispatcher K -> AS/shared/backing/PMM ordering for setup and cleanup.
+    const k = @import("syscalls.zig").KernelLockTestSupport;
+    k.lock();
+    defer k.unlock();
     defer copy.publishRamCacheSnapshot(null);
     const state = fixture.state;
     const client = kernel.processPrincipalFromIndex(1).?;
@@ -168,13 +172,13 @@ test "MMIO overlay RAM cache captures cross-process aliases and preserves late h
     defer cleanup();
     const nx: u64 = @as(u64, 1) << 63;
     var leaves: [2]*u64 = undefined;
-    for (&spaces, 0..) |*space, i| {
+    for (spaces[0..2], 0..) |*space, i| {
         space.cr3 = 0x1000 + i * 4096;
         const slot = vm.ensureUserPtSlotForPd(space, 1, 0, 0).?;
         leaves[i] = &space.ptPage(slot)[i];
         leaves[i].* = physical | nx | 5 | (if (i == 0) @as(u64, 2) else 0) | (1 << 10);
         // An unrelated physical page must not get swept into the transition.
-        space.ptPage(slot)[7] = (physical + 4096) | nx | 7;
+        writeFixturePte(space, slot, 7, (physical + 4096) | nx | 7);
     }
     var scratch: [2]vm.RamCacheUserAlias = undefined;
     const allocations = pt_alloc_calls;
@@ -266,12 +270,12 @@ test "MMIO overlay RAM aliases contain only user leaves and reject copied superv
     spaces[0].cr3 = @intFromPtr(&spaces[0].pml4);
     const slot = vm.ensureUserPtSlotForPd(&spaces[0], 0, 2, 0).?;
     const leaf = &spaces[0].ptPage(slot)[0];
-    leaf.* = physical | nx | 7;
+    writeFixturePte(&spaces[0], slot, 0, physical | nx | 7);
     var sources: RamAliasSources = .{};
     try vm.visitRamCacheProcessAliases(&.{physical}, &sources, RamAliasSources.visit);
     try std.testing.expectEqual(@as(usize, 1), sources.count);
     try std.testing.expect(sources.items[0] == .leaf);
-    leaf.* &= ~@as(u64, 4);
+    writeFixturePte(&spaces[0], slot, 0, leaf.* & ~@as(u64, 4));
     sources.count = 0;
     try std.testing.expectError(error.UnknownTopology, vm.visitRamCacheProcessAliases(&.{physical}, &sources, RamAliasSources.visit));
     try std.testing.expectEqual(@as(usize, 0), sources.count);
@@ -297,11 +301,11 @@ test "MMIO overlay RAM alias scan rejects unknown supervisor and global mappings
     spaces[0].cr3 = @intFromPtr(&spaces[0].pml4);
     const slot = vm.ensureUserPtSlotForPd(&spaces[0], 1, 0, 0).?;
     var sources: RamAliasSources = .{};
-    spaces[0].ptPage(slot)[0] = physical | 3;
+    writeFixturePte(&spaces[0], slot, 0, physical | 3);
     try std.testing.expectError(error.UnknownTopology, vm.visitRamCacheProcessAliases(&.{physical}, &sources, RamAliasSources.visit));
-    spaces[0].ptPage(slot)[0] = physical | 0x107 | (@as(u64, 1) << 63);
+    writeFixturePte(&spaces[0], slot, 0, physical | 0x107 | (@as(u64, 1) << 63));
     try std.testing.expectError(error.GlobalAlias, vm.visitRamCacheProcessAliases(&.{physical}, &sources, RamAliasSources.visit));
-    spaces[0].ptPage(slot)[0] = physical | 7;
+    writeFixturePte(&spaces[0], slot, 0, physical | 7);
     try std.testing.expectError(error.ExecutableAlias, vm.visitRamCacheProcessAliases(&.{physical}, &sources, RamAliasSources.visit));
     try std.testing.expectEqual(@as(usize, 0), sources.count);
 }
@@ -313,7 +317,7 @@ test "MMIO overlay RAM topology rejects detached PT before publishing aliases" {
     const slot = vm.ensureUserPtSlotForPd(&spaces[0], 1, 0, 0).?;
     const leaf = &spaces[0].ptPage(slot)[0];
     const original = physical | 7 | (@as(u64, 1) << 63);
-    leaf.* = original;
+    writeFixturePte(&spaces[0], slot, 0, original);
     const parent = &spaces[0].pdPage(0).*[0];
     const linked = parent.*;
     var sources: RamAliasSources = .{};
@@ -338,7 +342,7 @@ test "MMIO overlay RAM topology rejects supervisor parents in every permission c
     const table_pa = parent.* & 0x000f_ffff_ffff_f000;
     for ([_]u64{ 1, 3, 1 | nx, 3 | nx }) |flags| {
         parent.* = table_pa | flags;
-        spaces[0].ptPage(slot)[0] = physical | flags;
+        writeFixturePte(&spaces[0], slot, 0, physical | flags);
         for (0..2) |_| {
             var sources: RamAliasSources = .{};
             try std.testing.expectError(error.UnknownTopology, vm.visitRamCacheProcessAliases(&.{physical}, &sources, RamAliasSources.visit));
@@ -653,13 +657,13 @@ fn cleanup() void {
         space.pd_store.freeDetached();
         space.pdp_store.freeDetached();
         space.scratch_store.freeDetached();
-        space.reservations.deinit();
+        vm.resetUserReservations(space);
         space.reservation_draft.deinit();
     }
     vm.releaseRamCacheKernelSplitsForTest();
     std.debug.assert(pt_live_pages == 0);
 }
-var spaces: [2]vm.UserAddressSpace align(4096) = .{ .{}, .{} };
+var spaces: [5]vm.UserAddressSpace align(4096) = @splat(.{});
 var table: vm.UserAddressSpaceTable = undefined;
 // One serial, fixture-local history for both PT storage and actual PMM returns.
 // Every captured alias is a separate obligation; another CR3's flush cannot
@@ -778,6 +782,7 @@ fn observeDataReturn(pa: u64, pages: usize) void {
 }
 
 var flushes: usize = 0;
+var table_retire_hooks: usize = 0;
 var expect_full_context: bool = false;
 var translations: usize = 0;
 var fail_translation: usize = 0;
@@ -805,7 +810,9 @@ fn flushPage(principal: kernel.PrincipalId, va: u64) void {
     flushes += 1;
     retirement.flushed(principal, va & ~@as(u64, 4095), 4096);
 }
+var shared_ack_check: ?struct { state: *kernel.KernelState, ref: kernel.NativeVmoRef, pa: u64 } = null;
 fn flushRange(principal: kernel.PrincipalId, va: u64, bytes: usize) void {
+    if (shared_ack_check) |check| std.debug.assert(check.state.nativeVmoPagePaddr(check.ref, 0) == check.pa);
     if (expect_full_context) std.debug.assert(va == 4096 and bytes == (1 << 47) - 4096);
     if (g3_retirement) |probe| probe.acknowledge(principal);
     flushes += 1;
@@ -832,8 +839,40 @@ fn flushRange(principal: kernel.PrincipalId, va: u64, bytes: usize) void {
     }
     retirement.flushed(principal, va, bytes);
 }
+fn retirePageTables(principal: kernel.PrincipalId) void {
+    table_retire_hooks += 1;
+    // The synchronous hook observes detached descriptors still assigned and
+    // pending; only after it returns may releasePageDetached recycle them.
+    var pending: usize = 0;
+    const target = &spaces[kernel.processIndexFromPrincipal(principal).?];
+    var pt_it = target.pt_store.iterator();
+    while (pt_it.next()) |_| {
+        if (pt_it.current.?.retire_pending) pending += 1;
+    }
+    var pd_it = target.pd_store.iterator();
+    while (pd_it.next()) |_| {
+        if (pd_it.current.?.retire_pending) pending += 1;
+    }
+    var pdp_it = target.pdp_store.iterator();
+    while (pdp_it.next()) |_| {
+        if (pdp_it.current.?.retire_pending) pending += 1;
+    }
+    std.debug.assert(pending != 0);
+    flushRange(principal, 4096, (1 << 47) - 4096);
+}
+var discard_notify_count: usize = 0;
+var discard_expected_leaf: ?*u64 = null;
+fn discardBeforeRetirement(_: kernel.PrincipalId, _: u64, _: u64) void {
+    if (discard_expected_leaf) |leaf| {
+        std.debug.assert(leaf.* & 1 != 0);
+        std.debug.assert(flushes == 0);
+        discard_notify_count += 1;
+    }
+}
 fn init() void {
     cleanup();
+    discard_expected_leaf = null;
+    discard_notify_count = 0;
     for (&spaces) |*space| {
         @import("memory/address_space.zig").initializeUserAddressSpaceStorage(space);
         space.lock_state = .{};
@@ -843,6 +882,7 @@ fn init() void {
     teardown_check = null;
     table.initializeFreshStorage(&spaces);
     flushes = 0;
+    table_retire_hooks = 0;
     translations = 0;
     fail_translation = 0;
     reclaim_flush_first = null;
@@ -868,6 +908,8 @@ fn init() void {
         .page_nx = @as(u64, 1) << 63,
         .flush_user_tlb_for_principal_va = flushPage,
         .flush_user_tlb_for_principal_range = flushRange,
+        .retire_user_page_tables_for_principal = retirePageTables,
+        .before_pte_retirement = discardBeforeRetirement,
         .kernel_pointer_paddr = translate,
         .seed_user_pml4_with_kernel = seed,
     });
@@ -881,9 +923,9 @@ test "MMIO overlay PT storage accessors grow without moving existing pages" {
     try std.testing.expectEqual(@as(usize, 0), read_only.ptCapacity());
     const first_slot = vm.ensureUserPtSlotForPd(space, 1, 0, 0).?;
     const first_page = space.ptPage(first_slot);
-    first_page[7] = 23;
+    writeFixturePte(space, first_slot, 7, 23);
     for (1..65) |pd| _ = vm.ensureUserPtSlotForPd(space, 1, 0, pd).?;
-    try std.testing.expectEqual(@as(usize, 128), read_only.ptCapacity());
+    try std.testing.expectEqual(std.mem.alignForward(usize, 65, pt_storage.slots_per_bank), read_only.ptCapacity());
     try std.testing.expectEqual(first_page, space.ptPage(first_slot));
     try std.testing.expectEqual(@as(u64, 23), read_only.ptPage(first_slot)[7]);
     comptime {
@@ -902,10 +944,10 @@ test "MMIO overlay dynamic PTs cross 64 and 512 with one acknowledged retirement
         defer cleanup();
         for (0..count) |i| {
             const slot = vm.ensureUserPtSlotForPd(&spaces[0], 1, i / 512, i % 512).?;
-            spaces[0].ptPage(slot)[0] = physical | 7;
+            writeFixturePte(&spaces[0], slot, 0, physical | 7);
         }
         try std.testing.expectEqual(count, usedPtSlots());
-        const metadata_pages = (count + 63) / 64;
+        const metadata_pages = (count + pt_storage.slots_per_bank - 1) / pt_storage.slots_per_bank;
         try std.testing.expectEqual(count + metadata_pages + 6 + (count + 511) / 512, pt_live_pages);
         retirement.capture();
         try std.testing.expect(vm.unmapPresentRemoteUserRegion(owner, base, count * (1 << 21)));
@@ -915,7 +957,7 @@ test "MMIO overlay dynamic PTs cross 64 and 512 with one acknowledged retirement
         // Freed slots are reused and lazily acquire new bodies, not new banks.
         try std.testing.expectEqual(@as(usize, 0), spaces[0].ptCapacity());
         try std.testing.expectEqual(@as(?usize, 0), vm.ensureUserPtSlotForPd(&spaces[0], 1, 0, 0));
-        try std.testing.expectEqual(@as(usize, 64), spaces[0].ptCapacity());
+        try std.testing.expectEqual(pt_storage.slots_per_bank, spaces[0].ptCapacity());
         try std.testing.expectEqual(@as(usize, 9), pt_live_pages);
     }
 }
@@ -926,11 +968,11 @@ test "MMIO overlay PT lookup distinguishes tuples holes and reused bank boundari
     const space = &spaces[0];
     for (0..513) |i| {
         const slot = vm.ensureUserPtSlotForPd(space, 1, i / 512, i % 512).?;
-        space.ptPage(slot)[0] = (physical + i * 4096) | 7;
+        writeFixturePte(space, slot, 0, (physical + i * 4096) | 7);
     }
     // The same PD number in another PML4 must not alias either PDP's slot.
     const other = vm.ensureUserPtSlotForPd(space, 2, 0, 0).?;
-    space.ptPage(other)[0] = (physical + 0x800000) | 7;
+    writeFixturePte(space, other, 0, (physical + 0x800000) | 7);
     const before_alloc = pt_alloc_calls;
     for ([_]usize{ 0, 63, 64, 511, 512 }) |i| {
         const va = base + (i << 21);
@@ -954,7 +996,7 @@ test "MMIO overlay PT lookup distinguishes tuples holes and reused bank boundari
     const reused = vm.ensureUserPtSlotForPd(space, 2, 1, 63).?;
     try std.testing.expectEqual(@as(usize, 63), reused);
     try std.testing.expectEqual(capacity, space.ptCapacity());
-    space.ptPage(reused)[0] = (physical + 0x900000) | 7;
+    writeFixturePte(space, reused, 0, (physical + 0x900000) | 7);
     try std.testing.expectEqual(@as(?u64, physical + 0x900000), vm.lookupUserMappedPaddrForVa(owner, (2 << 39) + (1 << 30) + (63 << 21)));
     try std.testing.expectEqual(@as(?u64, null), vm.lookupUserMappedPaddrForVa(owner, retired_va));
     for ([_][3]usize{ .{ 256, 0, 0 }, .{ 1, 512, 0 }, .{ 1, 0, 512 }, .{ 0xffff, 0xffff, 0xffff } }) |indices|
@@ -969,11 +1011,11 @@ test "MMIO overlay dynamic PT clear and exec detach before storage return" {
     // page beyond the former 512-table limit.
     for (0..513) |i| {
         const slot = vm.ensureUserPtSlotForPd(&spaces[0], 1, i / 512, i % 512).?;
-        spaces[0].ptPage(slot)[0] = physical | 7;
+        writeFixturePte(&spaces[0], slot, 0, physical | 7);
     }
     const last = spaces[0].ptPage(512);
     _ = vm.ensureUserPtSlotForPd(&spaces[1], 2, 0, 0).?;
-    spaces[1].ptPage(0)[0] = (physical + 4096) | 7;
+    writeFixturePte(&spaces[1], 0, 0, (physical + 4096) | 7);
     spaces[1].cr3 = @intFromPtr(&spaces[1].pml4);
     const old_target_page = spaces[1].ptPage(0);
     const old_target_pml4 = spaces[1].pml4;
@@ -1029,6 +1071,9 @@ test "MMIO overlay COW invalidates before releasing shared dirty backing" {
     const state = try std.testing.allocator.create(kernel.KernelState);
     defer std.testing.allocator.destroy(state);
     try state.initFromDetectedRegionsInPlace(1);
+    const k = @import("syscalls.zig").KernelLockTestSupport;
+    k.lock();
+    defer k.unlock();
     state.invocation_test_allocator = invocation_allocator.interface();
     var free_list = kernel.FreePageList{};
     try free_list.installRegions(&.{.{ .id = 0, .start = physical, .end = (physical) + (16) * 4096 }});
@@ -1097,11 +1142,11 @@ test "MMIO overlay failure PT accounting distinguishes live empty and supervisor
     for (0..5) |pd| _ = vm.ensureUserPtSlotForPd(&spaces[0], 1, 0, pd).?;
     // Nonpresent, supervisor-only, user-only, mixed, and zero respectively. Nonpresent
     // entries and stale bytes in an unassigned slot must not count as live.
-    spaces[0].ptPage(0).*[0] = physical | 4;
-    spaces[0].ptPage(1).*[0] = physical | 3;
-    spaces[0].ptPage(2).*[0] = physical | 5;
-    spaces[0].ptPage(3).*[0] = physical | 7;
-    spaces[0].ptPage(3).*[1] = (physical + 4096) | 3;
+    writeFixturePte(&spaces[0], 0, 0, physical | 4);
+    writeFixturePte(&spaces[0], 1, 0, physical | 3);
+    writeFixturePte(&spaces[0], 2, 0, physical | 5);
+    writeFixturePte(&spaces[0], 3, 0, physical | 7);
+    writeFixturePte(&spaces[0], 3, 1, (physical + 4096) | 3);
     _ = spaces[0].pt_store.ensurePage(5, ptAllocator()).?;
     spaces[0].ptPage(5).*[0] = physical | 7;
     const before = try snapshot();
@@ -1217,7 +1262,7 @@ fn fillFaultPtSlots(count: usize) !void {
     for (0..count) |pd| {
         const slot = vm.ensureUserPtSlotForPd(&spaces[0], 1, 0, pd) orelse
             return error.TestUnexpectedResult;
-        spaces[0].ptPage(slot).*[0] = physical | 7;
+        writeFixturePte(&spaces[0], slot, 0, physical | 7);
     }
 }
 
@@ -1225,10 +1270,10 @@ test "user fault pressure retires only zero PTs after shootdown and preserves re
     init();
     defer cleanup();
     try fillFaultPtSlots(512);
-    for (501..512) |slot| spaces[0].ptPage(slot).*[0] = 0;
-    spaces[0].ptPage(0).*[0] = physical | 3; // Supervisor only.
-    spaces[0].ptPage(1).*[0] = physical | 4; // Nonpresent, nonzero.
-    spaces[0].ptPage(2).*[1] = (physical + 4096) | 3; // Mixed.
+    for (501..512) |slot| writeFixturePte(&spaces[0], slot, 0, 0);
+    writeFixturePte(&spaces[0], 0, 0, physical | 3); // Supervisor only.
+    writeFixturePte(&spaces[0], 1, 0, physical | 4); // Nonpresent, nonzero.
+    writeFixturePte(&spaces[0], 2, 1, (physical + 4096) | 3); // Mixed.
     try std.testing.expect(vm.reserveUserMapping(owner, base, 2, .linear_region, true));
     const reservations = try snapshotReservations();
     defer std.testing.allocator.free(reservations);
@@ -1261,7 +1306,7 @@ test "user fault PT pressure fast paths and reentry do not alter prepared tables
         init();
         defer cleanup();
         try fillFaultPtSlots(if (mode == 0) 511 else 512);
-        spaces[0].ptPage(0).*[0] = 0;
+        writeFixturePte(&spaces[0], 0, 0, 0);
         // A formerly full table with a free slot also needs no reclamation.
         if (mode == 1) spaces[0].ptPdIndex(511).* = vm.UserAddressSpace.no_pd_index;
         try std.testing.expect(vm.lockAddressSpace(owner));
@@ -1284,7 +1329,7 @@ test "user fault PT pressure preserves full live tables and unproven parent link
         defer cleanup();
         try fillFaultPtSlots(512);
         if (mode != 0) {
-            spaces[0].ptPage(511).*[0] = 0;
+            writeFixturePte(&spaces[0], 511, 0, 0);
             switch (mode) {
                 1 => spaces[0].pdPage(0).*[511] = 0,
                 2 => spaces[0].pdPage(0).*[511] |= 128,
@@ -1311,7 +1356,7 @@ test "MMIO overlay sparse 128 GiB unmap retains admission policy and retires PTs
     for ([_]u64{ base, middle, base + size - 4096 }) |va|
         try std.testing.expect(vm.mapUserMmioOverlay(owner, va, physical, 4096, .{ .read = true }));
     const supervisor_slot = vm.ensureUserPtSlotForPd(&spaces[0], 1, 1, 0).?;
-    spaces[0].ptPage(supervisor_slot).*[0] = physical | 3;
+    writeFixturePte(&spaces[0], supervisor_slot, 0, physical | 3);
     try std.testing.expect(vm.unmapPresentUserLinearRegionSplitSlotsRequired(owner, base, size) == null);
     const before = try snapshot();
     defer destroySnapshot(before);
@@ -1324,7 +1369,7 @@ test "MMIO overlay sparse 128 GiB unmap retains admission policy and retires PTs
     try std.testing.expect(!vm.unmapPresentVmaSource(owner, base, size));
     try std.testing.expect(!vm.unmapPresentRemoteUserRegion(owner, base, size));
     try unchanged(before);
-    spaces[0].ptPage(supervisor_slot).*[0] = 0;
+    writeFixturePte(&spaces[0], supervisor_slot, 0, 0);
     try std.testing.expectEqual(@as(?usize, 0), vm.unmapPresentVmaSourceSplitSlotsRequired(owner, base, size));
     try std.testing.expect(vm.unmapPresentVmaSource(owner, base, size));
     try std.testing.expectEqual(@as(usize, 0), usedPtSlots());
@@ -1382,16 +1427,34 @@ test "MMIO overlay partial removal retains shootdown without PT retirement" {
     }
 }
 
-test "MMIO overlay free range search rejects a present last page" {
+test "MMIO overlay page-table retire hook is tables-only and releases after flush" {
     init();
     defer cleanup();
-    // Overlay PTEs deliberately have no reservation record: the search must
-    // detect them from the page tables, including a one-page candidate.
+    try std.testing.expect(vm.mapUserMmioOverlay(owner, base, physical, 8192, .{ .read = true }));
+    // Removing one leaf keeps its PT: range flush only, no table-retire hook.
+    try std.testing.expect(vm.unmapPresentUserLinearRegion(owner, base, 4096));
+    try std.testing.expectEqual(@as(usize, 0), table_retire_hooks);
+    try std.testing.expectEqual(@as(usize, 1), usedPtSlots());
+    // Removing the last leaf detaches the parent.  retirePageTables asserts
+    // retire_pending is still assigned while its mock flush is in progress.
+    try std.testing.expect(vm.unmapPresentUserLinearRegion(owner, base + 4096, 4096));
+    try std.testing.expectEqual(@as(usize, 1), table_retire_hooks);
+    try std.testing.expectEqual(@as(usize, 0), usedPtSlots());
+}
+
+test "MMIO overlay present PTE blocker iterator rejects unrecorded overlay pages" {
+    init();
+    defer cleanup();
     try std.testing.expect(vm.mapUserMmioOverlay(owner, base, physical, 4096, .{ .read = true }));
-    try std.testing.expectEqual(@as(?u64, base + 4096), vm.findFreeUserMappingRange(owner, 1, 1));
-    try std.testing.expect(vm.advanceFreeUserMappingSearch(owner, base + 8192));
     try std.testing.expect(vm.mapUserMmioOverlay(owner, base + 3 * 4096, physical, 4096, .{ .read = true }));
-    try std.testing.expectEqual(@as(?u64, base + 4 * 4096), vm.findFreeUserMappingRange(owner, 2, 1));
+    var blockers = vm.PresentUserMappingBlockerIterator.init(owner, base, base + 5 * 4096);
+    const first = blockers.next().?;
+    try std.testing.expectEqual(base, first.start);
+    try std.testing.expectEqual(base + 4096, first.end);
+    const last = blockers.next().?;
+    try std.testing.expectEqual(base + 3 * 4096, last.start);
+    try std.testing.expectEqual(base + 4 * 4096, last.end);
+    try std.testing.expect(blockers.next() == null);
 }
 
 test "MMIO overlay no-op protection preserves range validation and PTEs" {
@@ -1407,7 +1470,7 @@ test "MMIO overlay no-op protection preserves range validation and PTEs" {
     }) |range| {
         try std.testing.expect(!vm.validateUserLinearRegion(owner, range[0], @intCast(range[1])));
     }
-    try std.testing.expect(!vm.validateUserLinearRegion(kernel.processPrincipalFromIndex(2).?, base, 4096));
+    try std.testing.expect(!vm.validateUserLinearRegion(kernel.processPrincipalFromIndex(spaces.len).?, base, 4096));
     try unchanged(before);
     try std.testing.expectEqual(@as(usize, 0), flushes);
 }
@@ -1443,7 +1506,7 @@ test "MMIO overlay trusted remap keeps full-range shootdown for every non-AD dif
         const slot = vm.ensureUserPtSlotForPd(&spaces[0], 1, 0, 0).?;
         const expected = spaces[0].ptPage(slot).*[0..2].*;
         spaces[0].ptPage(slot).*[0] |= (1 << 5) | (1 << 6);
-        spaces[0].ptPage(slot).*[1] ^= @as(u64, 1) << bit;
+        writeFixturePte(&spaces[0], slot, 1, spaces[0].ptPage(slot).*[1] ^ (@as(u64, 1) << bit));
         try std.testing.expect(vm.remapTrustedUserPaddrsWithProt(owner, base, &paddrs, prot));
         try std.testing.expectEqualSlices(u64, &expected, spaces[0].ptPage(slot).*[0..2]);
         try std.testing.expectEqual(@as(usize, 1), flushes);
@@ -1769,7 +1832,7 @@ test "MMIO overlay last-close preserves neighboring supervisor PTEs and their pa
     defer cleanup();
     const slot = vm.ensureUserPtSlotForPd(&spaces[0], 1, 0, 0).?;
     const neighbor: u64 = physical + 4096 | 3; // Present writable supervisor page.
-    spaces[0].ptPage(slot).*[1] = neighbor;
+    writeFixturePte(&spaces[0], slot, 1, neighbor);
     try std.testing.expect(vm.mapUserMmioOverlay(owner, base, physical, 4096, .{ .read = true }));
     try std.testing.expect(vm.unmapUserMmioOverlay(owner, base, physical, 4096));
     try std.testing.expectEqual(neighbor, spaces[0].ptPage(slot).*[1]);
@@ -1781,7 +1844,7 @@ test "MMIO overlay last-close preserves neighboring supervisor PTEs and their pa
     defer destroySnapshot(before);
     try std.testing.expect(!vm.mapUserMmioOverlay(owner, base + 4096, physical, 4096, .{ .read = true }));
     try unchanged(before);
-    spaces[0].ptPage(slot).*[1] = 0;
+    writeFixturePte(&spaces[0], slot, 1, 0);
     try std.testing.expect(vm.unmapUserMmioOverlay(owner, base, physical, 4096));
     try noTables();
 }
@@ -1792,9 +1855,10 @@ const MmioRetirementFixture = struct {
     state: *kernel.KernelState,
     free_list: *kernel.FreePageList,
 
-    fn start() !@This() {
+    fn start() !@This() { return startPages(513); }
+    fn startPages(pages: usize) !@This() {
         init();
-        var backing = try @import("memory/physical_access_test.zig").BackingSet.initMixed(&.{ .{ .first = physical, .pages = 513 }, .{ .first = 0x201000, .pages = 3 } });
+        var backing = try @import("memory/physical_access_test.zig").BackingSet.initMixed(&.{ .{ .first = physical, .pages = pages }, .{ .first = 0x201000, .pages = 3 } });
         errdefer backing.deinit();
         const storage = try std.testing.allocator.alignedAlloc(u8, .fromByteUnits(4096), kernel.runtimeStorageBytes());
         errdefer std.testing.allocator.free(storage);
@@ -1802,13 +1866,18 @@ const MmioRetirementFixture = struct {
         const state = try std.testing.allocator.create(kernel.KernelState);
         errdefer std.testing.allocator.destroy(state);
         try state.initFromDetectedRegionsInPlace(1);
-        state.invocation_test_allocator = invocation_allocator.interface();
+        const k = @import("syscalls.zig").KernelLockTestSupport;
+    k.lock();
+    defer k.unlock();
+    state.invocation_test_allocator = invocation_allocator.interface();
         const free_list = try std.testing.allocator.create(kernel.FreePageList);
         errdefer std.testing.allocator.destroy(free_list);
         free_list.* = .{};
+        @import("memory/shared_discard_slots.zig").global.init(2, free_list);
         return .{ .backing = backing, .storage = storage, .state = state, .free_list = free_list };
     }
     fn end(self: *@This()) void {
+        _ = @import("memory/shared_discard_slots.zig").global.reclaim();
         cleanup();
         self.backing.deinit();
         std.testing.allocator.destroy(self.free_list);
@@ -1844,6 +1913,10 @@ test "MMIO overlay production munmap returns only acknowledged whole trim and mi
     for ([_][2]usize{ .{ 0, 3 }, .{ 0, 1 }, .{ 2, 1 }, .{ 1, 1 } }) |cut| {
         var f = try MmioRetirementFixture.start();
         defer f.end();
+        // Match dispatcher K -> AS/shared/backing/PMM ordering for setup and cleanup.
+        const k = @import("syscalls.zig").KernelLockTestSupport;
+        k.lock();
+        defer k.unlock();
         try f.free_list.installRegions(&.{.{ .id = 0, .start = physical, .end = physical + 128 * 4096 }});
         try f.free_list.seedContiguousRange(physical, 128);
         try f.map(owner, base, 3);
@@ -1865,6 +1938,10 @@ test "MMIO overlay production MAP_FIXED and mremap retire source and target befo
     for (0..3) |mode| {
         var f = try MmioRetirementFixture.start();
         defer f.end();
+        // Match dispatcher K -> AS/shared/backing/PMM ordering for setup and cleanup.
+        const k = @import("syscalls.zig").KernelLockTestSupport;
+        k.lock();
+        defer k.unlock();
         try f.free_list.installRegions(&.{.{ .id = 0, .start = physical, .end = physical + 128 * 4096 }});
         try f.free_list.seedContiguousRange(physical, 128);
         try f.map(owner, base, 3);
@@ -1886,6 +1963,10 @@ test "MMIO overlay production revoke waits for both address spaces before final 
     const sc = @import("syscall/numbers.zig");
     var f = try MmioRetirementFixture.start();
     defer f.end();
+    // Match dispatcher K -> AS/shared/backing/PMM ordering for setup and cleanup.
+    const k = @import("syscalls.zig").KernelLockTestSupport;
+    k.lock();
+    defer k.unlock();
     try f.free_list.installRegions(&.{.{ .id = 0, .start = physical, .end = physical + 128 * 4096 }});
     try f.free_list.seedContiguousRange(physical, 128);
     const child = kernel.processPrincipalFromIndex(1).?;
@@ -1907,6 +1988,10 @@ test "MMIO overlay exec handoff retires staged CR3 once with unchanged shootdown
     for (0..2) |variant| {
         var f = try MmioRetirementFixture.start();
         defer f.end();
+        // Match dispatcher K -> AS/shared/backing/PMM ordering for setup and cleanup.
+        const k = @import("syscalls.zig").KernelLockTestSupport;
+        k.lock();
+        defer k.unlock();
         try f.free_list.installRegions(&.{.{ .id = 0, .start = physical, .end = physical + 128 * 4096 }});
         try f.free_list.seedContiguousRange(physical, 128);
         const staged = kernel.processPrincipalFromIndex(1).?;
@@ -1978,6 +2063,10 @@ test "MMIO overlay last FD return inherits both alias acknowledgements" {
     const sc = @import("syscall/numbers.zig");
     var f = try MmioRetirementFixture.start();
     defer f.end();
+    // Match dispatcher K -> AS/shared/backing/PMM ordering for setup and cleanup.
+    const k = @import("syscalls.zig").KernelLockTestSupport;
+    k.lock();
+    defer k.unlock();
     try f.free_list.installRegions(&.{.{ .id = 0, .start = physical, .end = physical + 128 * 4096 }});
     try f.free_list.seedContiguousRange(physical, 128);
     const fd = try f.state.createAnonymousVmoFdWithPages(owner, 4096, .{ .map_read = true, .map_write = true, .close = true }, .{}, 0, f.free_list);
@@ -2001,6 +2090,10 @@ test "MMIO overlay remote process unmap uses target CR3 retirement" {
     const sc = @import("syscall/numbers.zig");
     var f = try MmioRetirementFixture.start();
     defer f.end();
+    // Match dispatcher K -> AS/shared/backing/PMM ordering for setup and cleanup.
+    const k = @import("syscalls.zig").KernelLockTestSupport;
+    k.lock();
+    defer k.unlock();
     try f.free_list.installRegions(&.{.{ .id = 0, .start = physical, .end = physical + 128 * 4096 }});
     try f.free_list.seedContiguousRange(physical, 128);
     const child = kernel.processPrincipalFromIndex(1).?;
@@ -2114,6 +2207,10 @@ test "MMIO overlay FD iterator maps shared and preserves private ZOD branches" {
     for (0..3) |mode| {
         var f = try MmioRetirementFixture.start();
         defer f.end();
+        // Match dispatcher K -> AS/shared/backing/PMM ordering for setup and cleanup.
+        const k = @import("syscalls.zig").KernelLockTestSupport;
+        k.lock();
+        defer k.unlock();
         try f.free_list.installRegions(&.{.{ .id = 0, .start = physical, .end = physical + 513 * 4096 }});
         try f.free_list.seedContiguousRange(physical, 513);
         const rights = kernel.FdRights{ .map_read = true, .map_write = true, .share = true, .close = true };
@@ -2137,6 +2234,10 @@ test "MMIO overlay process map iterator batch rolls back earlier published entry
     for ([_]bool{ true, false }) |missing_last| {
         var f = try MmioRetirementFixture.start();
         defer f.end();
+        // Match dispatcher K -> AS/shared/backing/PMM ordering for setup and cleanup.
+        const k = @import("syscalls.zig").KernelLockTestSupport;
+        k.lock();
+        defer k.unlock();
         const child = kernel.processPrincipalFromIndex(1).?;
         const process_fd = try f.state.createProcessFd(owner, .{ .principal_raw = @intFromEnum(child), .state = .active, .exit_code = 0 }, .{ .map_into = true, .close = true }, .{}, 16);
         const fd = try f.state.createAnonymousVmoFd(owner, 3 * 4096, .{ .map_read = true, .map_write = true, .share = true, .close = true }, .{}, 16);
@@ -2176,6 +2277,10 @@ test "MMIO overlay capsule DMA resolution owns invocation workspace through fail
     const abi = @import("kernel_abi_root").capsule_abi;
     var f = try MmioRetirementFixture.start();
     defer f.end();
+    // Match dispatcher K -> AS/shared/backing/PMM ordering for setup and cleanup.
+    const k = @import("syscalls.zig").KernelLockTestSupport;
+    k.lock();
+    defer k.unlock();
     var backend = kernel.InvocationStorageTestAllocator{};
     defer backend.deinit();
     f.state.invocation_test_allocator = backend.interface();
@@ -2222,6 +2327,10 @@ test "MMIO overlay scratch returned PMM page backs VMO and supports UC WC restor
     const paging = @import("memory/ram_cache_paging.zig");
     var f = try MmioRetirementFixture.start();
     defer f.end();
+    // Match dispatcher K -> AS/shared/backing/PMM ordering for setup and cleanup.
+    const k = @import("syscalls.zig").KernelLockTestSupport;
+    k.lock();
+    defer k.unlock();
     try T.begin();
     defer T.end();
     try std.testing.expectError(error.KernelImageAlias, plan.measure(&.{T.tail}));
@@ -2289,7 +2398,9 @@ test "MMIO overlay G3 PDP PD and PT banks exceed old limits through fault lookup
     }
     try std.testing.expectEqual(@as(usize, 0), pt_live_pages);
 
-    const count = 512 * pt_storage.slots_per_bank + 1;
+    // Preserve both independent stresses as descriptor packing changes:
+    // exceed 512 PT metadata banks AND 64 hardware PD pages.
+    const count = @max(512 * pt_storage.slots_per_bank, 64 * 512) + 1;
     for (0..count) |i| {
         // The normal mapper and the fault mapper share ensureUserPtSlotForPd.
         // Materialize one leaf per 2 MiB to exercise 513 real descriptor banks.
@@ -2323,6 +2434,9 @@ test "MMIO overlay G3 every path and journal acquisition rolls back with origina
             defer pt_release_fail = false;
             try std.testing.expect(!vm.mapUserMmioOverlay(owner, base, physical, 4096, .{ .read = true }));
             try std.testing.expectEqual(@as(usize, 0), usedPtSlots());
+            try std.testing.expectEqual(@as(usize, 0), spaces[0].pt_store.assignments.count);
+            var empty_descriptors = spaces[0].pt_store.iterator();
+            while (empty_descriptors.next()) |slot| try std.testing.expectEqual(@as(u16, 0), spaces[0].pt_store.descriptor(slot).?.user_present_count);
             try std.testing.expect(std.mem.allEqual(u64, &spaces[0].pml4, 0));
             try std.testing.expectEqual(@as(usize, 0), flushes); // No path published yet.
             pt_release_fail = false;
@@ -2341,7 +2455,14 @@ test "MMIO overlay G3 every path and journal acquisition rolls back with origina
         const acquired = pt_alloc_calls;
         pt_fail_at = acquired + failure;
         const ok = vm.mapUserMmioOverlay(owner, @as(u64, 66) << 39, physical, 4096, .{ .read = true });
-        if (!ok) try unchanged(saved);
+        if (!ok) {
+            try unchanged(saved);
+            try std.testing.expectEqual(@as(usize, 1), spaces[0].pt_store.assignments.count);
+            var total_present: usize = 0;
+            var descriptors = spaces[0].pt_store.iterator();
+            while (descriptors.next()) |slot| total_present += spaces[0].pt_store.descriptor(slot).?.user_present_count;
+            try std.testing.expectEqual(@as(usize, 1), total_present);
+        }
         try std.testing.expectEqual(@as(?u64, physical), vm.lookupUserMappedPaddrForVa(owner, base));
     }
 }
@@ -2594,7 +2715,10 @@ test "MMIO overlay AS waiter loan survives withdrawal until A admission finishes
     // Model another CPU holding A while the actual admission path waits.
     // Host tests cannot execute STI/CLI, but use the production atomics and
     // publication/borrow protocol; the test-only wait emits a CPU pause.
-    space.lock_state.owner_cpu = 1;
+    // The waiter is CPU 1 with diagnostics and CPU 0 (stack fallback) without.
+    // The simulated owner must differ from both, or the waiter takes the
+    // recursive path and is admitted before retirement.
+    space.lock_state.owner_cpu = 2;
     space.lock_state.depth = 1;
     @atomicStore(u8, &space.lock_state.value, 1, .release);
     const Waiter = struct {
@@ -2704,6 +2828,10 @@ test "MMIO overlay intrusive PMM must retain untranslated DMA backing until drai
     // alone cannot revoke the raw bus address already handed to a device.
     var f = try MmioRetirementFixture.start();
     defer f.end();
+    // Match dispatcher K -> AS/shared/backing/PMM ordering for setup and cleanup.
+    const k = @import("syscalls.zig").KernelLockTestSupport;
+    k.lock();
+    defer k.unlock();
     defer @import("memory/dma_retention.zig").complete(0x1001);
     const bytes = try std.testing.allocator.alignedAlloc(u8, .fromByteUnits(4096), 4096);
     defer std.testing.allocator.free(bytes);
@@ -2754,6 +2882,10 @@ test "MMIO overlay forced bypass DMA drains after last enabling authority and re
     for ([_]u8{ 0, 1, 2, 3, 4 }) |scenario| {
         var f = try MmioRetirementFixture.start();
         defer f.end();
+        // Match dispatcher K -> AS/shared/backing/PMM ordering for setup and cleanup.
+        const k = @import("syscalls.zig").KernelLockTestSupport;
+        k.lock();
+        defer k.unlock();
         const device = pci.resourceIdFromLocation(.{ .bus = 0, .device = 3, .function = 0 });
         defer retention.complete(device);
         const bytes = try std.testing.allocator.alignedAlloc(u8, .fromByteUnits(4096), 4096);
@@ -2899,6 +3031,10 @@ test "MMIO overlay clone preparation OOM status rollback and ready publication" 
             const abi = @import("kernel_abi_root").process_abi;
             var f = try MmioRetirementFixture.start();
             defer f.end();
+            // Match dispatcher K -> AS/shared/backing/PMM ordering for setup and cleanup.
+            const k = @import("syscalls.zig").KernelLockTestSupport;
+            k.lock();
+            defer k.unlock();
             const host_grants = [_]kernel.PhysicalAccessTest.Mapping{.{ .physical = @intFromPtr(&fork_memory), .bytes = &fork_memory }};
             kernel.PhysicalAccessTest.host_mappings = &host_grants;
             defer kernel.PhysicalAccessTest.host_mappings = &.{};
@@ -3025,6 +3161,7 @@ test "MMIO overlay RAM alias group flushes once per owner even unsorted" {
     };
     flushes = 0;
     vm.flushRamCacheUserAliases(&aliases);
+    shared_ack_check = null;
     try std.testing.expectEqual(@as(usize, 2), flushes);
 }
 
@@ -3044,5 +3181,1734 @@ test {
     _ = @import("cpu_set.zig");
     _ = @import("cpu_topology.zig");
     _ = @import("tlb_residency.zig");
+    _ = @import("memory/user_vm.zig");
+    _ = @import("user_copy.zig");
     _ = @import("arch/x86_64/syscall_entry_code.zig");
+}
+
+
+test "MMIO overlay pin index actual AS K close rollback and owner retirement" {
+    var f = try MmioRetirementFixture.start();
+    defer f.end();
+    const k = @import("syscalls.zig").KernelLockTestSupport;
+    k.lock();
+    defer k.unlock();
+    const pin_table = f.state.getVmaTable(owner).?;
+    const mapping = try f.state.createDmaMappingFd(owner, .{ .device = 0x1001, .user_va = base, .iova = physical, .size = 4096 }, .{ .close = true }, .{}, 16);
+    try std.testing.expect(f.state.ownerHasPinnedUserObject(owner));
+    try std.testing.expect(!f.state.rangeConflictsWithDmaDerivation(owner, base, 4096, null, true, true));
+    try std.testing.expect(f.state.rangeOverlapsPinnedUserObject(owner, base, 4096));
+    try f.state.closeFd(owner, mapping);
+    try pin_table.pinned_index.requireEmpty(pin_table.pinned_objects.count);
+    // Exhaust only the logical FD inventory; install failure must never
+    // leave the provisionally allocated DMA object in either pin index.
+    var current: usize = 16;
+    const descriptors = try f.state.fdTableForActiveProcess(owner);
+    while (current < descriptors.capacity) : (current += 1) {
+        if (!descriptors.at(current).object.isNull()) continue;
+        _ = try f.state.createEventFd(owner, 0, .{}, .{ .close = true }, @intCast(current));
+    }
+    try std.testing.expectError(kernel.KernelError.TableFull, f.state.createDmaMappingFd(owner, .{ .device = 0x1001, .user_va = base, .iova = physical, .size = 4096 }, .{ .close = true }, .{}, 16));
+    try pin_table.pinned_index.requireEmpty(pin_table.pinned_objects.count);
+    f.state.releaseFdTableForProcessIndex(0);
+    _ = try f.state.createDmaMappingFd(owner, .{ .device = 0x1001, .user_va = base, .iova = physical, .size = 4096 }, .{ .close = true }, .{}, 16);
+    f.state.releasePrincipalNativeMemory(owner, f.free_list);
+}
+
+var identity_ram: [256 * 4096]u8 align(4096) = undefined;
+test "thread identity resident ownership permissions fork close and quarantine" {
+    const identity = @import("thread_identity.zig");
+    var f = try MmioRetirementFixture.start();
+    defer f.end();
+    const access = @import("memory/physical_access_test.zig");
+    const mappings = [_]access.Mapping{.{ .physical = @intFromPtr(&identity_ram), .bytes = &identity_ram }};
+    access.host_mappings = &mappings;
+    defer access.host_mappings = &.{};
+    const state = f.state;
+    try f.free_list.installRegions(&.{.{ .id = 0, .start = @intFromPtr(&identity_ram), .end = @intFromPtr(&identity_ram) + identity_ram.len }});
+    try f.free_list.seedContiguousRange(@intFromPtr(&identity_ram), 256);
+    const space = vm.getUserSpace(owner).?;
+    const fd = try identity.Test.openQualified(state, owner, f.free_list, 64);
+    const ref = state.nativeVmoRefForFd(owner, fd).?;
+    const vmo = state.nativeVmoSlot(ref).?;
+    const header: *identity.Header = @ptrFromInt(space.thread_identity_header);
+    try std.testing.expectEqual(@as(u64, 8192), header.total_bytes);
+    try std.testing.expect(header.enabled == 1 and header.owner_cookie != 0);
+    identity.publish(space, 63, 123);
+    const line: *identity.Slot = @ptrFromInt(space.thread_identity_slots.get(63).?.*);
+    try std.testing.expectEqual(@as(u64, 2), line.seq);
+    try std.testing.expectEqual(@as(u64, 123), line.current);
+    const rights = state.fdEntryConst(owner, fd).?.rights;
+    const fdabi = @import("kernel_abi_root").fd_abi;
+    try std.testing.expectEqual(fdabi.right_inspect | fdabi.right_close | fdabi.right_map_read,kernel.fdRightsToBits(rights));
+    try std.testing.expectError(kernel.KernelError.InvalidState,state.dupFd(owner,fd,16,.{.map_read=true},.{}));
+    try std.testing.expectError(kernel.KernelError.InvalidState,state.setFdFlags(owner,fd,.{},.{.private=true,.cloexec=true}));
+    try std.testing.expect(rights.inspect and rights.close and rights.map_read and !rights.dup and !rights.transfer and !rights.share and !rights.map_write and !rights.map_exec);
+    const child = kernel.processPrincipalFromIndex(1).?;
+    try std.testing.expectError(kernel.KernelError.InvalidState, state.mmapFdIntoProcess(owner, fd, child, base, 4096, .{ .read = true }, .{ .shared = true }, 0));
+    try std.testing.expectError(kernel.KernelError.InvalidState, state.prepareFixedFdMmapIntoProcess(owner, fd, child, base, 4096, .{ .read = true }, .{ .fixed = true, .shared = true }, 0, f.free_list));
+    for ([_]kernel.VmaProt{ .{ .read = true, .write = true }, .{ .read = true, .exec = true } }) |prot|
+        try std.testing.expectError(kernel.KernelError.InvalidState, state.mmapFd(owner, fd, base, 4096, prot, .{ .shared = true }, 0));
+    try std.testing.expectError(kernel.KernelError.InvalidState, state.mmapFd(owner, fd, base, 4096, .{ .read = true }, .{ .private = true }, 0));
+    try std.testing.expectError(kernel.KernelError.InvalidState, state.installNativeVmoPages(ref, 0, &.{4096}, f.free_list));
+    try std.testing.expectError(kernel.KernelError.InvalidState, state.createNativePageView(ref, 1));
+    _ = try state.mmapFd(owner, fd, base, 8192, .{ .read = true }, .{ .shared = true }, 0);
+    const mapping = state.nativeVmaFaultMapping(owner, base, false, false).?;
+    try std.testing.expect(vm.mapNativeVmaFaultPage(owner, base, mapping));
+    try std.testing.expectEqual(@as(u64, 0), space.reservations.live);
+    try std.testing.expect(state.nativeVmaDmaPinMode(owner, base, false) == null);
+    try std.testing.expectError(kernel.KernelError.InvalidState, state.setVmaProtRange(owner, base, 8192, .{ .read = true, .write = true }));
+    try state.cloneVmaTableForFork(owner, child);
+    try std.testing.expect(state.nativeVmaFaultMapping(child, base, false, false) == null);
+    try std.testing.expect(vm.getUserSpace(child).?.thread_identity_vmo.isNull());
+    try kernel.ReferenceCheck.check(state);
+    // Read-only FD closure cannot remove the kernel writer's independent root.
+    try state.closeFdWithFreeList(owner, fd, f.free_list);
+    try std.testing.expectEqual(@as(?u32, 2), state.nativeVmoRefCount(ref));
+    identity.close(space);
+    try std.testing.expect(header.enabled == 0 and space.thread_identity_header == 0);
+    const before_seq = line.seq; identity.publish(space, 63, 777);
+    try std.testing.expectEqual(before_seq, line.seq);
+    // Inject a PMM rejection into the actual final-owned-page return path.
+    const page = state.nativeVmoPagePaddr(ref, 0).?;
+    const second_page = state.nativeVmoPagePaddr(ref, 1).?;
+    var hold = try kernel.DmaRetentionTestHold.init(page, 1);
+    defer hold.end();
+    vm.clearUserAddressSpace(owner);
+    identity.retire(state, space, f.free_list);
+    state.releasePrincipalNativeMemory(owner, f.free_list);
+    try std.testing.expect(state.hasPendingDataReturns());
+    hold.end(); state.drainPendingDataReturns();
+    // Other tests intentionally retain unrelated device DMA globally. Check
+    // this state's return owners, rather than clearing that quarantine.
+    try std.testing.expectEqual(@as(usize, 0), @atomicLoad(usize, &state.pending_data_returns, .acquire));
+    try std.testing.expect(!@import("memory/dma_retention.zig").contains(page, 1));
+    try std.testing.expect(!@import("memory/dma_retention.zig").contains(second_page, 1));
+    try std.testing.expect(space.thread_identity_vmo.isNull() and space.thread_identity_slots.live == 0);
+    try std.testing.expect(state.nativeVmoSlot(ref) == null);
+    _ = vmo;
+    try kernel.ReferenceCheck.check(state);
+}
+
+test "thread identity creation OOM never publishes a partial page" {
+    const identity = @import("thread_identity.zig");
+    for (0..8) |available| {
+        var f = try MmioRetirementFixture.start();
+        defer f.end();
+        const access = @import("memory/physical_access_test.zig");
+        const mappings = [_]access.Mapping{.{ .physical = @intFromPtr(&identity_ram), .bytes = &identity_ram }};
+        access.host_mappings = &mappings;
+        defer access.host_mappings = &.{};
+        try f.free_list.installRegions(&.{.{ .id = 0, .start = @intFromPtr(&identity_ram), .end = @intFromPtr(&identity_ram) + identity_ram.len }});
+        if (available != 0) try f.free_list.seedContiguousRange(@intFromPtr(&identity_ram), available);
+        const space = vm.getUserSpace(owner).?;
+        if (identity.Test.openQualified(f.state, owner, f.free_list, 64)) |fd| {
+            try f.state.closeFdWithFreeList(owner, fd, f.free_list);
+            identity.retire(f.state, space, f.free_list);
+        } else |_| {
+            try std.testing.expect(space.thread_identity_header == 0 and space.thread_identity_vmo.isNull());
+            space.thread_identity_slots.deinit();
+        }
+        try kernel.ReferenceCheck.check(f.state);
+        f.state.drainPendingDataReturns();
+        try std.testing.expectEqual(@as(usize, 0), @atomicLoad(usize, &f.state.pending_data_returns, .acquire));
+        var remaining = f.state.native_vmos.iterator();
+        try std.testing.expect(remaining.next() == null);
+    }
+}
+
+test "thread identity VMO create rejects noncanonical arguments before allocation" {
+    const abi = @import("kernel_abi_root").fd_abi;
+    const sc = @import("syscall/numbers.zig");
+    var f = try MmioRetirementFixture.start();
+    defer f.end();
+    const flags = abi.vmo_create_current_thread_page | abi.flag_private | abi.flag_cloexec;
+    for ([_][3]u64{
+        .{4096,0,flags}, .{0,1,flags}, .{0,0,flags | abi.flag_inherit},
+        .{0,0,flags | abi.vmo_create_pager}, .{0,0,flags | abi.vmo_create_zero_on_demand},
+        .{0,0,flags & ~abi.flag_private}, .{0,0,flags & ~abi.flag_cloexec},
+    }) |args| {
+        try std.testing.expectEqual(sc.syscall_err_invalid, try f.syscall(sc.syscall_vmo_create, .{args[0],args[1],args[2],0,0,0}));
+        try std.testing.expect(vm.getUserSpace(owner).?.thread_identity_header == 0);
+        try std.testing.expect(vm.getUserSpace(owner).?.thread_identity_vmo.isNull());
+    }
+}
+
+test "thread identity handlers keep reservations empty across fork exec and stale FD" {
+    const identity = @import("thread_identity.zig");
+    const abi = @import("kernel_abi_root");
+    const sc = @import("syscall/numbers.zig");
+    var f = try MmioRetirementFixture.start();
+    defer f.end();
+    const access = @import("memory/physical_access_test.zig");
+    const mappings = [_]access.Mapping{.{ .physical = @intFromPtr(&identity_ram), .bytes = &identity_ram }};
+    access.host_mappings = &mappings;
+    defer access.host_mappings = &.{};
+    try f.free_list.installRegions(&.{.{ .id = 0, .start = @intFromPtr(&identity_ram), .end = @intFromPtr(&identity_ram) + identity_ram.len }});
+    try f.free_list.seedContiguousRange(@intFromPtr(&identity_ram), 256);
+    const state = f.state;
+    const space = vm.getUserSpace(owner).?;
+    const fd = try identity.Test.openQualified(state, owner, f.free_list, 64);
+    const old_cookie = space.thread_identity_cookie;
+    const old_header: *identity.Header = @ptrFromInt(space.thread_identity_header);
+    // Exercise real MMAP, including fixed replacement. Deleting either lazy
+    // identity branch would create a linear reservation and fail this test.
+    try std.testing.expectEqual(base, try f.syscall(sc.syscall_mmap, .{fd,base,8192,abi.vm_abi.prot_read,abi.vm_abi.mmap_shared,0}));
+    try std.testing.expectEqual(base, try f.syscall(sc.syscall_mmap, .{fd,base,8192,abi.vm_abi.prot_read,abi.vm_abi.mmap_shared | abi.vm_abi.mmap_fixed,0}));
+    const process_fd = try state.createProcessFd(owner, .{ .principal_raw = @intFromEnum(owner), .state = .active, .exit_code = 0 }, .{ .map_into = true, .close = true }, .{}, 16);
+    var h: @import("syscalls.zig").Hooks = undefined;
+    h.free_list = f.free_list;
+    h.copy_user_bytes_from_va = copyIteratorBatch;
+    var frame = std.mem.zeroes(@import("interrupts.zig").TrapFrame);
+    frame.rax = sc.syscall_process_map;
+    frame.rdi = process_fd; frame.rsi = fd; frame.rdx = base + (1 << 21);
+    frame.r10 = 4096; frame.r8 = abi.vm_abi.prot_read; frame.r9 = abi.process_abi.process_map_flag_shared;
+    try std.testing.expectEqual(frame.rdx, @import("syscall/process.zig").dispatch(h,state,owner,&frame).?);
+    iterator_batch_entries = .{
+        .{fd,base + (2 << 21),4096,abi.vm_abi.prot_read,0,abi.process_abi.process_map_flag_shared},
+        .{fd,base + (3 << 21),4096,abi.vm_abi.prot_read,4096,abi.process_abi.process_map_flag_shared},
+    };
+    frame.rax = sc.syscall_process_map_batch;frame.rsi = 0x1000;frame.rdx = 2;
+    try std.testing.expectEqual(sc.syscall_ok,@import("syscall/process.zig").dispatch(h,state,owner,&frame).?);
+    for ([_]u64{base,base+(1<<21),base+(2<<21),base+(3<<21)}) |va| {
+        const mapping = state.nativeVmaFaultMapping(owner,va,false,false).?;
+        try std.testing.expect(vm.mapNativeVmaFaultPage(owner,va,mapping));
+    }
+    try std.testing.expectEqual(@as(u64,0),space.reservations.live);
+    const child = kernel.processPrincipalFromIndex(1).?;
+    try vm.cloneAddressSpaceMetadataForFork(owner,child);
+    try state.cloneVmaTableForFork(owner,child);
+    try std.testing.expectEqual(@as(u64,0),vm.getUserSpace(child).?.reservations.live);
+    for ([_]u64{base,base+(1<<21),base+(2<<21),base+(3<<21)}) |va|
+        try std.testing.expect(state.vmaEntryForVaConst(child,va)==null);
+    // Model the no-fail exec commit helpers in their production order. Keep
+    // an old FD deliberately to prove AS-cookie reuse cannot revive it.
+    vm.clearUserAddressSpace(owner);
+    identity.retire(state,space,f.free_list);
+    state.dropThreadIdentityVmasForExec(owner,f.free_list);
+    try std.testing.expectEqual(@as(u64,0),old_header.enabled);
+    const next = try identity.Test.openQualified(state,owner,f.free_list,4);
+    try std.testing.expect(space.thread_identity_cookie != old_cookie);
+    try std.testing.expectError(kernel.KernelError.InvalidState,state.mmapFd(owner,fd,base,4096,.{.read=true},.{.shared=true},0));
+    try kernel.ReferenceCheck.check(state);
+    identity.retire(state,space,f.free_list);
+    try state.closeFdWithFreeList(owner,fd,f.free_list);
+    try state.closeFdWithFreeList(owner,next,f.free_list);
+    try state.closeFdWithFreeList(owner,process_fd,f.free_list);
+    try kernel.ReferenceCheck.check(state);
+}
+
+test "MMIO overlay discard production shootdown precedes detach and K exit reclaim" {
+    kernel.resetDmaRetentionForTest();
+    defer kernel.resetDmaRetentionForTest();
+    const sc = @import("syscall/numbers.zig");
+    const k = @import("syscalls.zig").KernelLockTestSupport;
+    var f = try MmioRetirementFixture.start();
+    defer f.end();
+    try f.free_list.installRegions(&.{.{ .id = 0, .start = physical, .end = physical + 128 * 4096 }});
+    try f.free_list.seedContiguousRange(physical, 128);
+    k.lock();
+    try f.map(owner, base, 4);
+    const ref = f.state.vmaEntryForVaConst(owner, base).?.vmo;
+    const first = f.state.nativeVmoPagePaddr(ref, 0).?;
+    try f.state.setVmaProtRange(owner, base + 8192, 8192, .{});
+    const before = flushes;
+    try std.testing.expectEqual(sc.syscall_ok, try f.syscall(sc.syscall_madvise, .{ base, 16384, 4, 0, 0, 0 }));
+    try std.testing.expect(flushes > before);
+    try std.testing.expect(vm.lookupUserMappedPaddrForVa(owner, base) == null);
+    try std.testing.expect(f.state.nativeVmoPagePaddr(ref, 0) == null);
+    try std.testing.expect(kernel.discard_pages.global.head != null);
+    try std.testing.expectEqual(@as(usize, 124), f.free_list.pageCount());
+    // Queue callbacks require no K/AS/shared lock and never enter the VMO.
+    // This invokes the same post-exit helper used by the actual outer defer.
+    k.unlock();
+    k.reclaimDiscard();
+    try std.testing.expect(kernel.discard_pages.global.head == null);
+    try std.testing.expectEqual(@as(usize, 128), f.free_list.pageCount());
+    try std.testing.expect(first != 0);
+    k.lock();
+    f.state.releasePrincipalNativeMemory(owner, f.free_list);
+    k.unlock();
+}
+
+test "MMIO overlay discard OOM registry reclaim needs no K AS shared reentry" {
+    kernel.resetDmaRetentionForTest();
+    defer kernel.resetDmaRetentionForTest();
+    const sc = @import("syscall/numbers.zig");
+    const k = @import("syscalls.zig").KernelLockTestSupport;
+    var f = try MmioRetirementFixture.start();
+    defer f.end();
+    try f.free_list.installRegions(&.{.{ .id = 0, .start = physical, .end = physical + 128 * 4096 }});
+    try f.free_list.seedContiguousRange(physical, 128);
+    f.free_list.reclaimable.discard_retired = &kernel.discard_pages.global;
+    k.lock();
+    try f.map(owner, base, 1);
+    const mapping = try f.state.createDmaMappingFd(owner, .{ .device = 0x1001, .user_va = base, .iova = physical, .size = 4096 }, .{ .close = true }, .{}, 16);
+    try std.testing.expectEqual(sc.syscall_err_invalid, try f.syscall(sc.syscall_madvise, .{ base, 4096, 4, 0, 0, 0 }));
+    try std.testing.expect(vm.lookupUserMappedPaddrForVa(owner, base) != null);
+    try f.state.closeFd(owner, mapping);
+    try std.testing.expectEqual(sc.syscall_ok, try f.syscall(sc.syscall_madvise, .{ base, 4096, 4, 0, 0, 0 }));
+    try std.testing.expect(vm.lockVmTransaction(owner));
+    // PMM's actual pressure registry can enter under caller K/AS/shared locks.
+    // The detached domain must not reacquire any of them to make progress.
+    _ = f.free_list.reclaimable.reclaim();
+    vm.unlockVmTransaction(owner);
+    try std.testing.expect(kernel.discard_pages.global.head == null);
+    f.state.releasePrincipalNativeMemory(owner, f.free_list);
+    k.unlock();
+    k.reclaimDiscard();
+    try std.testing.expectEqual(@as(usize, 128), f.free_list.pageCount());
+}
+
+test "MMIO overlay discard actual outer defer normal inactive and remote lifecycle exits" {
+    const sc = @import("syscall/numbers.zig");
+    const sys = @import("syscalls.zig");
+    const scheduler = @import("scheduler.zig").connection;
+    const storage = @import("memory/owned_storage.zig");
+    const Probe = struct {
+        var exits: usize = 0;
+        var ready = true;
+        fn notify() void {}
+        fn write(_: []const u8) void {}
+        fn number(_: u64) void {}
+        fn label(_: kernel.PrincipalId) []const u8 { return "test"; }
+        fn exit(_: kernel.PrincipalId, frame: *@import("interrupts.zig").TrapFrame, _: ?scheduler.BeforeCurrentThreadLeaveCallback, _: ?scheduler.BeforeCurrentThreadLeaveCallback) void {
+            @import("sync/lock_diagnostics.zig").assertRootEmpty();
+            exits += 1;frame.rax = 0xdead;
+        }
+        fn data(_: *anyopaque, _: u64) bool { unreachable; }
+        fn release(context: *anyopaque, mapped: storage.MappedExtent) bool {
+            @import("sync/lock_diagnostics.zig").assertRootEmpty();
+            const issuer: *storage.TestAllocator = @ptrCast(@alignCast(context));
+            const original = issuer.interface();
+            return original.release(original.context, mapped.allocation);
+        }
+    };
+    for (0..3) |mode| {
+        kernel.resetDmaRetentionForTest();
+        var f = try MmioRetirementFixture.start();defer f.end();
+        try scheduler.PiTestSupport.start();defer scheduler.PiTestSupport.end();
+        const clock_state = @import("clockevent.zig").testInstallNotifier(Probe.notify);
+        defer @import("clockevent.zig").testRestoreState(clock_state);
+        var issuer: storage.TestAllocator = .{};defer issuer.deinit();
+        var allocator = issuer.interface();allocator.release_mapped = Probe.release;
+        var context: u8 = 0;
+        const batch = try kernel.discard_pages.prepare(allocator, &context, Probe.data, .{}, 1, &.{.{ .index = 0, .paddr = 4096 }});
+        try kernel.discard_pages.global.push(batch);
+        var h: sys.Hooks = undefined;
+        h.state=f.state;h.free_list=f.free_list;h.kernel_state_ready=&Probe.ready;
+        h.write=Probe.write;h.print_hex=Probe.number;h.print_number=Probe.number;h.principal_label=Probe.label;h.exit_current_process=Probe.exit;
+        if (mode==1) f.state.clearPrincipalState();
+        const root = @import("root");
+        if (mode==2) {
+            if (@hasDecl(root,"setTestLockDiagnosticsCpu")) root.setTestLockDiagnosticsCpu(1);
+            try std.testing.expect(scheduler.tryBeginPrincipalLifecycle(owner));
+            if (@hasDecl(root,"setTestLockDiagnosticsCpu")) root.setTestLockDiagnosticsCpu(0);
+        }
+        defer if (mode==2) {
+            if (@hasDecl(root,"setTestLockDiagnosticsCpu")) root.setTestLockDiagnosticsCpu(1);
+            scheduler.endPrincipalLifecycle();
+            if (@hasDecl(root,"setTestLockDiagnosticsCpu")) root.setTestLockDiagnosticsCpu(0);
+        };
+        var frame=std.mem.zeroes(@import("interrupts.zig").TrapFrame);
+        frame.rax=sc.syscall_madvise;frame.rdi=base;frame.rsi=0;frame.rdx=4;
+        const result=sys.KernelLockTestSupport.dispatchBody(h,&frame);
+        if (mode==0) try std.testing.expectEqual(sc.syscall_ok,result);
+        if (mode==1) try std.testing.expectEqual(@as(u64,0xdead),result);
+        if (mode==2) try std.testing.expectEqual(sc.syscall_err_not_ready,result);
+        try std.testing.expect(kernel.discard_pages.global.head==null);
+        try std.testing.expectEqual(@as(usize,0),issuer.active());
+    }
+}
+
+test "MMIO overlay fork partial parent write protect failure keeps parent recoverable" {
+    const process = @import("syscall/process.zig");
+    const sc = @import("syscall/numbers.zig");
+    const abi = @import("kernel_abi_root").process_abi;
+    var f = try MmioRetirementFixture.start();
+    defer f.end();
+    // Match dispatcher K -> AS/shared/backing/PMM ordering for setup and cleanup.
+    const k = @import("syscalls.zig").KernelLockTestSupport;
+    k.lock();
+    defer k.unlock();
+    const host_grants = [_]kernel.PhysicalAccessTest.Mapping{.{ .physical = @intFromPtr(&fork_memory), .bytes = &fork_memory }};
+    kernel.PhysicalAccessTest.host_mappings = &host_grants;
+    defer kernel.PhysicalAccessTest.host_mappings = &.{};
+    try f.free_list.installRegions(&.{.{ .id = 0, .start = @intFromPtr(&fork_memory), .end = @intFromPtr(&fork_memory) + fork_memory.len }});
+    try f.free_list.seedContiguousRange(@intFromPtr(&fork_memory), fork_memory.len / 4096);
+    const child = kernel.processPrincipalFromIndex(1).?;
+    _ = f.state.removeProcessDescriptor(child);
+    _ = try f.state.poolAllocator();
+    const fd = try f.state.createAnonymousVmoFdWithPages(owner, 8192, .{ .map_read = true, .map_write = true, .close = true }, .{}, 16, f.free_list);
+    for (0..2) |i| {
+        const va = base + i * 8192;
+        _ = try f.state.mmapFd(owner, fd, va, 4096, .{ .read = true, .write = true }, .{ .private = true }, i * 4096);
+        const pa = f.state.nativeVmaInitialMapping(owner, va).?.paddr;
+        try std.testing.expect(vm.mapLazyUserPaddrsWithProt(owner, va, &.{pa}, .{ .read = true, .write = true }));
+    }
+    const ref = f.state.nativeVmoRefForFd(owner, fd).?;
+    const refs = f.state.nativeVmoSlot(ref).?.ref_count;
+    ForkBoundary.reset();
+    process.ForkPreparationTest.fail_parent_wp_after = 1;
+    defer process.ForkPreparationTest.fail_parent_wp_after = null;
+    var h: @import("syscalls.zig").Hooks = undefined;
+    h.free_list = f.free_list;
+    h.user_spaces = &table;
+    var frame = std.mem.zeroes(@import("interrupts.zig").TrapFrame);
+    frame.rdi = kernel.fdRightsToBits(.{ .close = true, .inspect = true });
+    frame.rsi = abi.process_clone_flag_current_thread;
+    const flush_before = flushes;
+    try std.testing.expectEqual(sc.syscall_err_map, process.ForkPreparationTest.run(ForkBoundary, h, f.state, owner, &frame));
+    try std.testing.expect(!ForkBoundary.ready and !ForkBoundary.allocated);
+    try std.testing.expect(!f.state.hasActivePrincipal(child));
+    try std.testing.expectEqual(refs, f.state.nativeVmoSlot(ref).?.ref_count);
+    try std.testing.expectEqual(@as(usize, 0), f.state.getVmaTable(child).?.active_count);
+    try std.testing.expectEqual(@as(u64, 0), spaces[1].cr3);
+    try std.testing.expect(flushes > flush_before);
+    // First PTE is RO, the second still writable: this is a genuinely partial
+    // commit, not a failure before mutation. Remaining COW is valid parent state.
+    try std.testing.expect(spaces[0].ptPage(0)[0] & 2 == 0);
+    try std.testing.expect(spaces[0].ptPage(0)[2] & 2 != 0);
+    try std.testing.expect(f.state.vmaEntryForVaConst(owner, base).?.flags.fork_cow);
+    const plan = f.state.prepareNativeVmaCowMapping(owner, base, true, false);
+    try std.testing.expectEqual(.allocate_copy, plan.kind);
+    const page = (try f.state.allocPhysicalPage(f.free_list)).paddr;
+    const copied = f.state.commitNativeVmaCowMapping(owner, plan, page, f.free_list).?;
+    try std.testing.expect(copied.paddr == page and copied.paddr != plan.source_paddr);
+    try std.testing.expect(vm.remapTrustedUserPaddrsWithProt(owner, base, &.{page}, .{ .read = true, .write = true }));
+    try std.testing.expect(spaces[0].ptPage(0)[0] & 2 != 0);
+    vm.clearUserAddressSpace(owner);
+    f.state.releasePrincipalNativeMemory(owner, f.free_list);
+}
+
+test "MMIO overlay discard PTE empty skips flush and present notifies before withdrawal" {
+    init();
+    defer cleanup();
+    try std.testing.expect(vm.invalidatePresentUserLinearRegionPtes(owner, base, 4096));
+    try std.testing.expectEqual(@as(usize, 0), flushes);
+    try std.testing.expect(vm.mapUserMmioOverlay(owner, base + 4096, physical, 4096, .{ .read = true }));
+    flushes = 0;
+    try std.testing.expect(vm.invalidatePresentUserLinearRegionPtes(owner, base, 4096));
+    try std.testing.expectEqual(@as(usize, 0), flushes);
+    const slot = vm.ensureUserPtSlotForPd(&spaces[0], 1, 0, 0).?;
+    const leaf = &spaces[0].ptPage(slot).*[1];
+    const original = leaf.*;
+    // A supervisor leaf later in the range must reject before any mutation.
+    leaf.* &= ~@as(u64, 4); // Deliberate corruption bypasses the mandatory writer invariant.
+    try std.testing.expect(!vm.invalidatePresentUserLinearRegionPtes(owner, base, 8192));
+    try std.testing.expectEqual(original & ~@as(u64, 4), leaf.*);
+    try std.testing.expectEqual(@as(usize, 0), flushes);
+    leaf.* = original; // Restore fixture accounting unchanged.
+    discard_expected_leaf = leaf;
+    try std.testing.expect(vm.invalidatePresentUserLinearRegionPtes(owner, base, 8192));
+    try std.testing.expectEqual(@as(usize, 1), discard_notify_count);
+    try std.testing.expectEqual(@as(usize, 1), flushes);
+    try std.testing.expectEqual(@as(u64, 0), leaf.*);
+    try std.testing.expectEqual(@as(usize, 1), usedPtSlots());
+    discard_expected_leaf = null;
+    try std.testing.expect(vm.invalidatePresentUserLinearRegionPtes(owner, base, 8192));
+    try std.testing.expectEqual(@as(usize, 1), flushes);
+}
+
+test "MMIO overlay native placement four paths share cursor and reject reservation pin and overlay blockers" {
+    const sc = @import("syscall/numbers.zig");
+    const abi = @import("kernel_abi_root");
+    const v = abi.vm_abi;
+    var f = try MmioRetirementFixture.start();
+    defer f.end();
+    // Match dispatcher K -> AS/shared/backing/PMM ordering for setup and cleanup.
+    const k = @import("syscalls.zig").KernelLockTestSupport;
+    k.lock();
+    defer k.unlock();
+    try f.free_list.installRegions(&.{.{ .id = 0, .start = physical, .end = physical + 128 * 4096 }});
+    try f.free_list.seedContiguousRange(physical, 128);
+    const flags = v.mmap_private | v.mmap_anonymous | v.mmap_noreserve;
+    const first = try f.syscall(sc.syscall_mmap, .{ 0, 0, 4096, 0, flags, 0 });
+    try std.testing.expectEqual(base, first);
+    // No native VMA: this reservation is visible only through user_vm.
+    try std.testing.expect(vm.reserveUserMapping(owner, base + 4096, 1, .linear_region, false));
+    _ = try f.state.createMmioRegionFd(owner, .{ .device = 1, .paddr = physical + 4096, .user_va = base + 8192, .size = 4095 }, .{ .close = true }, .{}, 16);
+    // No reservation or VMA: the present-PTE union must independently catch it.
+    try std.testing.expect(vm.mapUserMmioOverlay(owner, base + 12288, physical + 8192, 4096, .{ .read = true }));
+    const next = try f.syscall(sc.syscall_mmap, .{ 0, base + 4096, 4096, 0, flags, 0 });
+    try std.testing.expectEqual(base + 16384, next);
+    const table_ptr = f.state.getVmaTable(owner).?;
+    const cursor = table_ptr.next_user_map_va;
+    try std.testing.expectEqual(sc.syscall_err_invalid, try f.syscall(sc.syscall_mmap, .{ 0, base + 4096, 4096, 0, flags | v.mmap_fixed_noreplace, 0 }));
+    try std.testing.expectEqual(cursor, table_ptr.next_user_map_va);
+    try std.testing.expectEqual(first, try f.syscall(sc.syscall_mmap, .{ 0, first, 4096, 0, flags | v.mmap_fixed, 0 }));
+    try std.testing.expectEqual(cursor, table_ptr.next_user_map_va);
+    const moved = try f.syscall(sc.syscall_mremap, .{ first, 4096, 8192, v.mremap_maymove, 0, 0 });
+    try std.testing.expectEqual(cursor, moved);
+    const process_fd = try f.state.createProcessFd(owner, .{ .principal_raw = @intFromEnum(owner), .state = .active, .exit_code = 0 }, .{ .map_into = true, .close = true }, .{}, 16);
+    var h: @import("syscalls.zig").Hooks = undefined;
+    h.free_list = f.free_list;
+    var frame = std.mem.zeroes(@import("interrupts.zig").TrapFrame);
+    frame.rax = sc.syscall_process_map;
+    frame.rdi = process_fd;
+    frame.rsi = 0;
+    frame.rdx = abi.process_abi.process_map_anywhere_va;
+    frame.r10 = 4096;
+    frame.r8 = 0;
+    frame.r9 = abi.process_abi.process_map_flag_anonymous | abi.process_abi.process_map_flag_private;
+    const anywhere = @import("syscall/process.zig").dispatch(h, f.state, owner, &frame).?;
+    try std.testing.expectEqual(moved + 8192, anywhere);
+    const state_move_cursor = table_ptr.next_user_map_va;
+    try std.testing.expectEqual(state_move_cursor, try f.state.mremapRangeWithFreeList(owner, next, 4096, 8192, 0, true, false, f.free_list));
+    try std.testing.expectEqual(state_move_cursor + 8192, table_ptr.next_user_map_va);
+    // An accepted empty hint preserves the unspecified-placement cursor.
+    const hint = base + 0x10_0000;
+    try std.testing.expectEqual(hint, try f.syscall(sc.syscall_mmap, .{ 0, hint, 4096, 0, flags, 0 }));
+    try std.testing.expectEqual(state_move_cursor + 8192, table_ptr.next_user_map_va);
+    vm.clearUserAddressSpace(owner);
+    f.state.releasePrincipalNativeMemory(owner, f.free_list);
+}
+
+
+fn sharedZeroPage(pa: u64) bool {
+    const bytes = kernel.PhysicalAccessTest.slice(u8, pa, 4096) orelse return false;
+    @memset(bytes, 0);
+    return true;
+}
+test "shared discard two AS aliases ACK and zero refault preserve identity" {
+    const shared = @import("state/shared_discard.zig");
+    const k = @import("syscalls.zig").KernelLockTestSupport;
+    var f = try MmioRetirementFixture.start();
+    defer { _ = kernel.discard_pages.global.reclaim(); @import("memory/vmo_backing.zig").reclaimDeferred(); f.end(); }
+    try f.free_list.installRegions(&.{.{ .id = 0, .start = physical, .end = physical + 128 * 4096 }});
+    try f.free_list.seedContiguousRange(physical, 128);
+    k.lock();
+    defer k.unlock();
+    const fd = try f.state.createZeroOnDemandVmoFd(owner, 8192, .{ .map_read = true, .map_write = true, .revoke = true, .share = true, .close = true }, .{}, 16);
+    const ref = f.state.nativeVmoRefForFd(owner, fd).?;
+    for (0..2) |p| {
+        const principal = kernel.processPrincipalFromIndex(p).?;
+        _ = try f.state.mmapFdIntoProcess(owner, fd, principal, base, 8192, .{ .read = true, .write = true }, .{ .shared = true }, 0);
+        const mapping = @import("user_copy.zig").resolveNativeVmaFaultMappingWithAddressSpaceLocked(f.state, f.free_list, principal, base, true, false).?;
+        try std.testing.expect(vm.mapNativeVmaFaultPage(principal, base, mapping));
+    }
+    f.state.zero_physical_page_hook = sharedZeroPage;
+    const old = f.state.nativeVmoPagePaddr(ref, 0).?;
+    @memset(kernel.PhysicalAccessTest.slice(u8, old, 4096).?, 0x7b);
+    shared_ack_check = .{ .state = f.state, .ref = ref, .pa = old };
+    defer shared_ack_check = null;
+    try kernel.ReferenceCheck.check(f.state);
+    flushes = 0;
+    try std.testing.expect(try shared.discard(f.state, ref, &.{.{ .first_page = 0, .page_count = 1 }}, f.free_list));
+    try std.testing.expectEqual(@as(usize, 2), flushes);
+    try std.testing.expect(f.state.nativeVmoPagePaddr(ref, 0) == null);
+    for (0..2) |p| try std.testing.expect(vm.lookupUserMappedPaddrForVa(kernel.processPrincipalFromIndex(p).?, base) == null);
+    for (0..2) |p| {
+        const principal = kernel.processPrincipalFromIndex(p).?;
+        const mapping = @import("user_copy.zig").resolveNativeVmaFaultMappingWithAddressSpaceLocked(f.state, f.free_list, principal, base, true, false).?;
+        try std.testing.expect(vm.mapNativeVmaFaultPage(principal, base, mapping));
+    }
+    const fresh = f.state.nativeVmoPagePaddr(ref, 0).?;
+    try std.testing.expect(fresh != old);
+    try std.testing.expect(std.mem.allEqual(u8, kernel.PhysicalAccessTest.slice(u8, fresh, 4096).?, 0));
+    try std.testing.expectEqual(vm.lookupUserMappedPaddrForVa(owner, base), vm.lookupUserMappedPaddrForVa(kernel.processPrincipalFromIndex(1).?, base));
+    try kernel.ReferenceCheck.check(f.state);
+}
+
+test "shared discard range validation overflow ordering and limits" {
+    const shared = @import("state/shared_discard.zig");
+    try std.testing.expectEqual(@as(usize, 1024), try shared.validateRanges(&.{.{ .first_page = 0, .page_count = 1024 }}, 1024));
+    for ([_]shared.Range{ .{ .first_page = 0, .page_count = 0 }, .{ .first_page = 0, .page_count = 1025 }, .{ .first_page = std.math.maxInt(u64), .page_count = 1 } }) |range|
+        try std.testing.expectError(error.Invalid, shared.validateRanges(&.{range}, 1024));
+    try std.testing.expectError(error.Invalid, shared.validateRanges(&.{ .{ .first_page = 1, .page_count = 2 }, .{ .first_page = 2, .page_count = 1 } }, 1024));
+    try std.testing.expectError(error.Invalid, shared.validateRanges(&.{}, 1024));
+    var many: [33]shared.Range = undefined;
+    for (&many, 0..) |*range, i| range.* = .{ .first_page = i, .page_count = 1 };
+    try std.testing.expectError(error.Invalid, shared.validateRanges(&many, 1024));
+    try std.testing.expectEqual(@as(usize, 32), try shared.validateRanges(many[0..32], 1024));
+    try std.testing.expectError(error.Invalid, shared.validateRanges(&.{.{ .first_page = 1024, .page_count = 1 }}, 1024));
+    try std.testing.expectError(error.Invalid, shared.validateRanges(&.{ .{ .first_page = 2, .page_count = 1 }, .{ .first_page = 0, .page_count = 1 } }, 1024));
+}
+
+test "shared discard sparse index floor and consecutive final PTE withdrawal" {
+    init();
+    defer cleanup();
+    try std.testing.expect(vm.lockAddressSpace(owner));
+    try std.testing.expect(vm.withdrawSharedDiscardRange(owner, base, 4096));
+    vm.unlockAddressSpace(owner);
+    for (0..2048) |i| {
+        const va = base + @as(u64, @intCast(i)) * (1 << 21);
+        try std.testing.expect(vm.mapUserMmioOverlay(owner, va, physical, 4096, .{ .read = true }));
+    }
+    vm.shared_discard_visits = .{};
+    // Remove every last PTE in consecutive PTs, forcing remove/reset of the
+    // index nodes collected before the first write. The independent full scan
+    // in the production test build checks occupancy and tree membership.
+    const first = base + 512 * (1 << 21);
+    try std.testing.expect(vm.lockAddressSpace(owner));
+    try std.testing.expect(vm.withdrawSharedDiscardRange(owner, first, 4 * 1024 * 1024));
+    vm.unlockAddressSpace(owner);
+    try std.testing.expectEqual(@as(usize, 2), vm.shared_discard_visits.descriptors);
+    try std.testing.expect(vm.shared_discard_visits.ptes <= 2048);
+    try std.testing.expect(vm.lookupUserMappedPaddrForVa(owner, first) == null);
+    try std.testing.expect(vm.lookupUserMappedPaddrForVa(owner, first + (1 << 21)) == null);
+    try std.testing.expect(vm.lookupUserMappedPaddrForVa(owner, first - (1 << 21)) != null);
+    vm.shared_discard_visits = .{};
+    try std.testing.expect(vm.lockAddressSpace(owner));
+    // Start key is missing; floor precedes it, successor lies past end.
+    try std.testing.expect(vm.withdrawSharedDiscardRange(owner, first, 4096));
+    vm.unlockAddressSpace(owner);
+    try std.testing.expectEqual(@as(usize, 0), vm.shared_discard_visits.descriptors);
+    vm.shared_discard_visits = .{};
+    const unaligned_pt = base + 100 * (1 << 21);
+    try std.testing.expect(vm.lockAddressSpace(owner));
+    try std.testing.expect(vm.withdrawSharedDiscardRange(owner, unaligned_pt + 4096, 4 * 1024 * 1024));
+    vm.unlockAddressSpace(owner);
+    try std.testing.expectEqual(@as(usize, 3), vm.shared_discard_visits.descriptors);
+    try std.testing.expect(vm.shared_discard_visits.ptes <= 2048);
+    try std.testing.expect(vm.lookupUserMappedPaddrForVa(owner, unaligned_pt) != null);
+    try std.testing.expect(vm.lookupUserMappedPaddrForVa(owner, unaligned_pt + (1 << 21)) == null);
+}
+
+test "shared discard slot and descriptor writes match independent occupancy" {
+    init();
+    defer cleanup();
+    const slot = vm.ensureUserPtSlotForPd(&spaces[0], 1, 0, 0).?;
+    const descriptor = spaces[0].pt_store.descriptor(slot).?;
+    writeFixturePte(&spaces[0], slot, 1, physical | 7);
+    vm.PlacementTestSupport.writeAt(&spaces[0], descriptor, 2, physical | 5);
+    try std.testing.expectEqual(@as(u16, 2), descriptor.user_present_count);
+    vm.PlacementTestSupport.writeAt(&spaces[0], descriptor, 1, physical | 5);
+    try std.testing.expectEqual(@as(u16, 2), descriptor.user_present_count);
+    writeFixturePte(&spaces[0], slot, 1, 0);
+    try std.testing.expectEqual(@as(u16, 1), descriptor.user_present_count);
+    vm.PlacementTestSupport.writeAt(&spaces[0], descriptor, 2, 0);
+    try std.testing.expectEqual(@as(u16, 0), descriptor.user_present_count);
+    try std.testing.expect(!descriptor.assignment.linked);
+    try spaces[0].pt_store.assignments.validate();
+}
+
+test "shared discard A admission retiring unwind and private range busy" {
+    const shared = @import("state/shared_discard.zig");
+    const k = @import("syscalls.zig").KernelLockTestSupport;
+    var f = try MmioRetirementFixture.start();
+    defer { _ = kernel.discard_pages.global.reclaim(); @import("memory/vmo_backing.zig").reclaimDeferred(); f.end(); }
+    try f.free_list.installRegions(&.{.{ .id = 0, .start = physical, .end = physical + 128 * 4096 }});
+    try f.free_list.seedContiguousRange(physical, 128);
+    k.lock();
+    defer k.unlock();
+    const fd = try f.state.createZeroOnDemandVmoFd(owner, 4096, .{ .map_read = true, .map_write = true, .revoke = true, .share = true, .close = true }, .{}, 16);
+    const ref = f.state.nativeVmoRefForFd(owner, fd).?;
+    const ranges = &.{shared.Range{ .first_page = 0, .page_count = 1 }};
+    try std.testing.expect(try shared.discard(f.state, ref, ranges, f.free_list)); // A=0
+    for (0..5) |p| {
+        const principal = kernel.processPrincipalFromIndex(p).?;
+        _ = try f.state.mmapFdIntoProcess(owner, fd, principal, base, 4096, .{ .read = true, .write = true }, .{ .shared = true }, 0);
+        if (p < 4) {
+            try std.testing.expect(try shared.discard(f.state, ref, ranges, f.free_list));
+            try std.testing.expectEqual(p + 1, shared.test_work.locked);
+            try std.testing.expectEqual(p + 1, shared.test_work.released);
+        }
+    }
+    try std.testing.expectError(error.Invalid, shared.discard(f.state, ref, ranges, f.free_list));
+    try kernel.ReferenceCheck.check(f.state);
+}
+
+test "shared PTE rejection slot" {
+    init();
+    defer cleanup();
+    const slot = vm.ensureUserPtSlotForPd(&spaces[0], 1, 0, 0).?;
+    vm.PlacementTestSupport.writePte(&spaces[0], slot, 0, physical | 1);
+}
+test "shared PTE rejection descriptor" {
+    init();
+    defer cleanup();
+    const slot = vm.ensureUserPtSlotForPd(&spaces[0], 1, 0, 0).?;
+    vm.PlacementTestSupport.writeAt(&spaces[0], spaces[0].pt_store.descriptor(slot).?, 0, physical | 1);
+}
+
+test "shared discard view blocks only intersected range and generic install rejects" {
+    const shared = @import("state/shared_discard.zig");
+    const k = @import("syscalls.zig").KernelLockTestSupport;
+    var f = try MmioRetirementFixture.start();
+    defer { _ = kernel.discard_pages.global.reclaim(); @import("memory/vmo_backing.zig").reclaimDeferred(); f.end(); }
+    try f.free_list.installRegions(&.{.{ .id = 0, .start = physical, .end = physical + 128 * 4096 }});
+    try f.free_list.seedContiguousRange(physical, 128);
+    k.lock();
+    defer k.unlock();
+    const fd = try f.state.createZeroOnDemandVmoFd(owner, 8192, .{ .map_read = true, .map_write = true, .revoke = true, .share = true, .close = true }, .{}, 16);
+    const ref = f.state.nativeVmoRefForFd(owner, fd).?;
+    const a = (try f.state.allocPhysicalPage(f.free_list)).paddr;
+    const b = (try f.state.allocPhysicalPage(f.free_list)).paddr;
+    try f.state.installNativeVmoPages(ref, 0, &.{ a, b }, f.free_list);
+    const view = try f.state.createNativePageView(ref, 2);
+    try std.testing.expectError(kernel.KernelError.InvalidState, f.state.installNativeVmoPages(view, 0, &.{a}, f.free_list));
+    try f.state.installNativeVmoPageViewPages(view, 0, &.{ 0, 0 }, f.free_list);
+    const ranges = &.{ shared.Range{ .first_page = 0, .page_count = 1 }, shared.Range{ .first_page = 1, .page_count = 1 } };
+    try std.testing.expect(!try shared.discard(f.state, ref, ranges, f.free_list));
+    try std.testing.expectEqual(@as(?u64, a), f.state.nativeVmoPagePaddr(ref, 0));
+    try std.testing.expect(f.state.nativeVmoPagePaddr(ref, 1) == null);
+    f.state.releaseNativeVmoWithFreeList(view, f.free_list);
+    try std.testing.expect(try shared.discard(f.state, ref, ranges, f.free_list));
+    try std.testing.expect(f.state.nativeVmoPagePaddr(ref, 0) == null);
+}
+
+test "shared discard eligibility admission leaves backing and PTE unchanged" {
+    const shared = @import("state/shared_discard.zig");
+    const k = @import("syscalls.zig").KernelLockTestSupport;
+    var f = try MmioRetirementFixture.start();
+    defer { _ = kernel.discard_pages.global.reclaim(); @import("memory/vmo_backing.zig").reclaimDeferred(); f.end(); }
+    try f.free_list.installRegions(&.{.{ .id = 0, .start = physical, .end = physical + 128 * 4096 }});
+    try f.free_list.seedContiguousRange(physical, 128);
+    k.lock();
+    defer k.unlock();
+    const fd = try f.state.createZeroOnDemandVmoFd(owner, 4096, .{ .map_read = true, .map_write = true, .revoke = true, .share = true, .close = true }, .{}, 16);
+    const ref = f.state.nativeVmoRefForFd(owner, fd).?;
+    _ = try f.state.mmapFd(owner, fd, base, 4096, .{ .read = true, .write = true }, .{ .shared = true }, 0);
+    const mapping = @import("user_copy.zig").resolveNativeVmaFaultMappingWithAddressSpaceLocked(f.state, f.free_list, owner, base, true, false).?;
+    try std.testing.expect(vm.mapNativeVmaFaultPage(owner, base, mapping));
+    const pa = f.state.nativeVmoPagePaddr(ref, 0).?;
+    const slot = f.state.nativeVmoSlot(ref).?;
+    const ranges = &.{shared.Range{ .first_page = 0, .page_count = 1 }};
+    for (0..11) |mode| {
+        if (mode == 3) continue; // Cached WB ranges are covered by stage5.
+        switch (mode) {
+            0 => slot.zero_on_demand = false,
+            1 => slot.kernel_edges = 1,
+            2 => slot.non_view_children = 1,
+            3 => slot.ram_cache_state = .cached,
+            4 => slot.ram_cache_state = .retiring,
+            5 => slot.pending_data_return = f.free_list,
+            6 => slot.kind = .pager,
+            7 => slot.kind = .page_view,
+            8 => slot.kind = .device_memory,
+            9 => slot.kind = .kernel_page,
+            10 => slot.kind = .thread_page,
+            else => unreachable,
+        }
+        try std.testing.expectError(error.Invalid, shared.discard(f.state, ref, ranges, f.free_list));
+        slot.zero_on_demand = true;slot.kernel_edges = 0;slot.non_view_children = 0;slot.ram_cache_state = .wb;slot.pending_data_return = null;slot.kind = .anonymous;
+        try std.testing.expectEqual(@as(?u64, pa), f.state.nativeVmoPagePaddr(ref, 0));
+        try std.testing.expectEqual(@as(?u64, pa), vm.lookupUserMappedPaddrForVa(owner, base));
+    }
+    // Failure after acquiring the first AS must release its recursive loan.
+    const other = kernel.processPrincipalFromIndex(1).?;
+    _ = try f.state.mmapFdIntoProcess(owner, fd, other, base, 4096, .{ .read = true }, .{ .shared = true }, 0);
+    spaces[1].retiring = true;
+    try std.testing.expectError(error.NotReady, shared.discard(f.state, ref, ranges, f.free_list));
+    spaces[1].retiring = false;
+    try std.testing.expectEqual(@as(usize, 2), shared.test_work.lock_attempts);
+    try std.testing.expectEqual(@as(usize, 1), shared.test_work.locked);
+    try std.testing.expectEqual(@as(usize, 1), shared.test_work.released);
+    try std.testing.expectEqual(@as(usize, 0), spaces[0].borrowers);
+    try std.testing.expectEqual(@as(usize, 0), spaces[1].borrowers);
+    try std.testing.expectEqual(@as(usize, 0), spaces[0].lock_state.depth);
+    try std.testing.expectEqual(@as(?u64, pa), f.state.nativeVmoPagePaddr(ref, 0));
+    const entry = @constCast(f.state.vmaEntryForVaConst(owner, base).?);
+    entry.flags.private = true;
+    try std.testing.expect(!try shared.discard(f.state, ref, ranges, f.free_list));
+    entry.flags.private = false;
+    entry.flags.fork_cow = true;
+    try std.testing.expect(!try shared.discard(f.state, ref, ranges, f.free_list));
+    entry.flags.fork_cow = false;
+    const pin = try f.state.createDmaMappingFd(owner, .{ .device = 0x1001, .user_va = base, .iova = pa, .size = 4096 }, .{ .close = true }, .{}, 16);
+    _ = pin;
+    try std.testing.expect(!try shared.discard(f.state, ref, ranges, f.free_list));
+    try std.testing.expectEqual(@as(?u64, pa), f.state.nativeVmoPagePaddr(ref, 0));
+}
+
+test "shared discard deferred retries at actual ordinary dispatcher exit after VMO lifetime" {
+    const backing = @import("memory/vmo_backing.zig");
+    const storage = @import("memory/owned_storage.zig");
+    const sys = @import("syscalls.zig");
+    const scheduler = @import("scheduler.zig").connection;
+    const Probe = struct {
+        var ready = true;
+        fn notify() void {}
+        fn write(_: []const u8) void {}
+        fn number(_: u64) void {}
+        fn label(_: kernel.PrincipalId) []const u8 { return "test"; }
+        fn release(context: *anyopaque, grant: storage.PhysicalExtent) bool {
+            @import("sync/lock_diagnostics.zig").assertRootEmpty();
+            const issuer: *storage.TestAllocator = @ptrCast(@alignCast(context));
+            return issuer.interface().release(context, grant);
+        }
+    };
+    var f = try MmioRetirementFixture.start();defer { _ = kernel.discard_pages.global.reclaim(); @import("memory/vmo_backing.zig").reclaimDeferred(); f.end(); }
+    try scheduler.PiTestSupport.start();defer scheduler.PiTestSupport.end();
+    const clock_state = @import("clockevent.zig").testInstallNotifier(Probe.notify);
+    defer @import("clockevent.zig").testRestoreState(clock_state);
+    var issuer: storage.TestAllocator = .{};defer issuer.deinit();
+    var allocator = issuer.interface();allocator.release = Probe.release;
+    var store: backing.Store = .{};
+    const ref = store.init(77);
+    try store.prepare(ref, 0, allocator);
+    sys.KernelLockTestSupport.lock();
+    store.putLocked(0, 4096);store.putLocked(0, 0);
+    store.pruneEmptyDeferred(ref, 0);
+    _ = store.clear(ref);
+    backing.reclaim();
+    try std.testing.expectEqual(@as(usize, 0), issuer.returns);
+    sys.KernelLockTestSupport.unlock();
+    var h: sys.Hooks = undefined;
+    h.state=f.state;h.free_list=f.free_list;h.kernel_state_ready=&Probe.ready;
+    h.write=Probe.write;h.print_hex=Probe.number;h.print_number=Probe.number;h.principal_label=Probe.label;
+    var frame=std.mem.zeroes(@import("interrupts.zig").TrapFrame);
+    issuer.fail_return = true;
+    frame.rax=@import("syscall/numbers.zig").syscall_fd_close;frame.rdi=60000;
+    _ = sys.KernelLockTestSupport.dispatchBody(h,&frame);
+    try std.testing.expect(backing.hasDeferred());
+    const attempted = issuer.returns;
+    frame.rax=@import("syscall/numbers.zig").syscall_vmo_discard;frame.rdx=0;frame.r10=0;
+    try std.testing.expectEqual(@import("syscall/numbers.zig").syscall_err_invalid, sys.KernelLockTestSupport.dispatchBody(h,&frame));
+    try std.testing.expectEqual(attempted, issuer.returns); // Preflight exits do not retry.
+    issuer.fail_return = false;
+    frame.rax=@import("syscall/numbers.zig").syscall_fd_close;
+    _ = sys.KernelLockTestSupport.dispatchBody(h,&frame);
+    try std.testing.expect(!backing.hasDeferred());
+    try std.testing.expectEqual(@as(usize, 0), issuer.active());
+}
+
+var shared_input_ranges: [1]@import("kernel_abi_root").fd_abi.VmoDiscardRange = .{.{ .first_page = 0, .page_count = 1 }};
+var shared_input_copies: usize = 0;
+fn sharedCopyRanges(_: kernel.PrincipalId, va: u64, out: []u8) bool {
+    if (va != 0x1000 or out.len != @sizeOf(@TypeOf(shared_input_ranges))) return false;
+    shared_input_copies += 1;
+    @memcpy(out, std.mem.asBytes(&shared_input_ranges));
+    return true;
+}
+test "shared discard dispatch WRITE REVOKE authority and single input copy" {
+    const sc = @import("syscall/numbers.zig");
+    const k = @import("syscalls.zig").KernelLockTestSupport;
+    var f = try MmioRetirementFixture.start();defer { _ = kernel.discard_pages.global.reclaim(); @import("memory/vmo_backing.zig").reclaimDeferred(); f.end(); }
+    k.lock();defer k.unlock();
+    for ([_]kernel.FdRights{ .{ .read = true }, .{ .map_write = true }, .{ .revoke = true }, .{ .map_write = true, .revoke = true }, .{ .write = true, .revoke = true } }, 0..) |rights, i| {
+        const fd = try f.state.createZeroOnDemandVmoFd(owner, 4096, rights, .{}, 16);
+        var h: @import("syscalls.zig").Hooks = undefined;
+        h.free_list = f.free_list;h.copy_user_bytes_from_va = sharedCopyRanges;
+        var frame = std.mem.zeroes(@import("interrupts.zig").TrapFrame);
+        frame.rax=sc.syscall_vmo_discard;frame.rdi=fd;frame.rsi=0x1000;frame.rdx=1;
+        shared_input_copies = 0;
+        const status = @import("syscall/fd.zig").dispatch(h, f.state, owner, &frame).?;
+        try std.testing.expectEqual(if (i == 4) sc.syscall_ok else sc.syscall_err_invalid, status);
+        try std.testing.expectEqual(@as(usize, if (i == 4) 1 else 0), shared_input_copies);
+    }
+}
+
+test "shared discard second AS withdrawal failure preserves original backing" {
+    const shared = @import("state/shared_discard.zig");
+    const k = @import("syscalls.zig").KernelLockTestSupport;
+    var f = try MmioRetirementFixture.start();defer { _ = kernel.discard_pages.global.reclaim(); @import("memory/vmo_backing.zig").reclaimDeferred(); f.end(); }
+    try f.free_list.installRegions(&.{.{ .id = 0, .start = physical, .end = physical + 128 * 4096 }});
+    try f.free_list.seedContiguousRange(physical, 128);
+    k.lock();defer k.unlock();
+    const fd = try f.state.createZeroOnDemandVmoFd(owner, 4096, .{ .write = true, .revoke = true, .map_read = true, .map_write = true, .share = true }, .{}, 16);
+    const ref = f.state.nativeVmoRefForFd(owner, fd).?;
+    for (0..2) |p| {
+        const principal = kernel.processPrincipalFromIndex(p).?;
+        _ = try f.state.mmapFdIntoProcess(owner, fd, principal, base, 4096, .{ .read = true, .write = true }, .{ .shared = true }, 0);
+        const mapping = @import("user_copy.zig").resolveNativeVmaFaultMappingWithAddressSpaceLocked(f.state, f.free_list, principal, base, true, false).?;
+        try std.testing.expect(vm.mapNativeVmaFaultPage(principal, base, mapping));
+    }
+    const old = f.state.nativeVmoPagePaddr(ref, 0).?;
+    vm.test_shared_fail_principal = kernel.processPrincipalFromIndex(1).?;defer vm.test_shared_fail_principal = null;
+    try std.testing.expect(!try shared.discard(f.state, ref, &.{.{ .first_page = 0, .page_count = 1 }}, f.free_list));
+    try std.testing.expectEqual(@as(?u64, old), f.state.nativeVmoPagePaddr(ref, 0));
+    try std.testing.expect(vm.lookupUserMappedPaddrForVa(owner, base) == null);
+    try std.testing.expectEqual(@as(?u64, old), vm.lookupUserMappedPaddrForVa(kernel.processPrincipalFromIndex(1).?, base));
+    const mapping = @import("user_copy.zig").resolveNativeVmaFaultMappingWithAddressSpaceLocked(f.state, f.free_list, owner, base, true, false).?;
+    try std.testing.expectEqual(old, mapping.paddr);
+}
+
+test "shared discard alias removal oracle preserves surviving overlapping carrier" {
+    const k = @import("syscalls.zig").KernelLockTestSupport;
+    var f = try MmioRetirementFixture.start();defer f.end();
+    try f.free_list.installRegions(&.{.{ .id = 0, .start = physical, .end = physical + 128 * 4096 }});
+    try f.free_list.seedContiguousRange(physical, 128);
+    k.lock();defer k.unlock();
+    const fd = try f.state.createZeroOnDemandVmoFd(owner, 4096, .{ .map_read = true, .map_write = true, .revoke = true, .write = true, .close = true }, .{}, 16);
+    const ref = f.state.nativeVmoRefForFd(owner, fd).?;
+    const pa = (try f.state.allocPhysicalPage(f.free_list)).paddr;
+    try f.state.installNativeVmoPages(ref, 0, &.{pa}, f.free_list);
+    for (0..3) |i| _ = try f.state.mmapFd(owner, fd, base + i * 8192, 4096, .{ .read = true, .write = true }, .{ .shared = true }, 0);
+    try f.state.closeFdWithFreeList(owner, fd, f.free_list);
+    try kernel.ReferenceCheck.check(f.state);
+    try std.testing.expectEqual(@import("syscall/numbers.zig").syscall_ok, try f.syscall(@import("syscall/numbers.zig").syscall_munmap, .{ base + 8192, 4096, 0, 0, 0, 0 }));
+    try kernel.ReferenceCheck.check(f.state);
+    try std.testing.expectEqual(@as(?u64, pa), f.state.nativeVmoPagePaddr(ref, 0));
+}
+
+test "shared discard W exact admission and VR cap precede mutation" {
+    const shared = @import("state/shared_discard.zig");
+    const k = @import("syscalls.zig").KernelLockTestSupport;
+    var f = try MmioRetirementFixture.start();defer f.end();
+    k.lock();defer k.unlock();
+    const fd = try f.state.createZeroOnDemandVmoFd(owner, 1024 * 4096, .{ .write = true, .revoke = true, .map_read = true }, .{}, 16);
+    const ref = f.state.nativeVmoRefForFd(owner, fd).?;
+    for (0..3) |i| _ = try f.state.mmapFd(owner, fd, base + i * 8 * 1024 * 1024, 1024 * 4096, .{ .read = true }, .{ .shared = true }, 0);
+    try std.testing.expect(try shared.discard(f.state, ref, &.{.{ .first_page = 0, .page_count = 1024 }}, f.free_list));
+    // 1024 backing pages + three complete aliases + one extra alias page.
+    _ = try f.state.mmapFd(owner, fd, base + 32 * 1024 * 1024, 4096, .{ .read = true }, .{ .shared = true }, 0);
+    try std.testing.expectError(error.Invalid, shared.discard(f.state, ref, &.{.{ .first_page = 0, .page_count = 1024 }}, f.free_list));
+    const other_fd = try f.state.createZeroOnDemandVmoFd(owner, 32 * 4096, .{ .write = true, .revoke = true, .map_read = true }, .{}, 16);
+    const other_ref = f.state.nativeVmoRefForFd(owner, other_fd).?;
+    var ranges: [32]shared.Range = undefined;
+    for (&ranges, 0..) |*range, i| range.* = .{ .first_page = i, .page_count = 1 };
+    for (0..33) |i| {
+        _ = try f.state.mmapFd(owner, other_fd, base + 64 * 1024 * 1024 + i * 8192, 4096, .{ .read = true }, .{ .shared = true }, 0);
+        if (i == 31) try std.testing.expect(try shared.discard(f.state, other_ref, &ranges, f.free_list));
+    }
+    try std.testing.expectError(error.Invalid, shared.discard(f.state, other_ref, &ranges, f.free_list));
+}
+
+test "shared alias rejection without K" {
+    var f = try MmioRetirementFixture.start();defer f.end();
+    const fd = try f.state.createZeroOnDemandVmoFd(owner, 4096, .{ .map_read = true }, .{}, 16);
+    _ = try f.state.mmapFd(owner, fd, base, 4096, .{ .read = true }, .{ .shared = true }, 0);
+}
+test "shared descriptor rejection without AS loan" {
+    init();defer cleanup();
+    _ = vm.withdrawSharedDiscardRange(owner, base, 4096);
+}
+
+test "shared discard actual resolver waits for target AS and refaults after commit" {
+    const shared = @import("state/shared_discard.zig");
+    const k = @import("syscalls.zig").KernelLockTestSupport;
+    const Worker = struct {
+        state: *kernel.KernelState,
+        fl: *kernel.FreePageList,
+        entered: bool = false,
+        done: bool = false,
+        pa: ?u64 = null,
+        fn run(self: *@This()) void {
+            @import("root").setTestLockDiagnosticsCpu(1);
+            @atomicStore(bool, &self.entered, true, .release);
+            if (vm.lockAddressSpace(owner)) {
+                defer vm.unlockAddressSpace(owner);
+                if (@import("user_copy.zig").resolveNativeVmaFaultMappingWithAddressSpaceLocked(self.state, self.fl, owner, base, true, false)) |mapping| {
+                    if (vm.mapNativeVmaFaultPage(owner, base, mapping)) self.pa = mapping.paddr;
+                }
+            }
+            @atomicStore(bool, &self.done, true, .release);
+        }
+    };
+    var f = try MmioRetirementFixture.start();
+    defer { _ = kernel.discard_pages.global.reclaim(); @import("memory/vmo_backing.zig").reclaimDeferred(); f.end(); }
+    try f.free_list.installRegions(&.{.{ .id = 0, .start = physical, .end = physical + 128 * 4096 }});
+    try f.free_list.seedContiguousRange(physical, 128);
+    f.state.zero_physical_page_hook = sharedZeroPage;
+    k.lock();defer k.unlock();
+    const fd = try f.state.createZeroOnDemandVmoFd(owner, 4096, .{ .write = true, .revoke = true, .map_read = true, .map_write = true }, .{}, 16);
+    const ref = f.state.nativeVmoRefForFd(owner, fd).?;
+    _ = try f.state.mmapFd(owner, fd, base, 4096, .{ .read = true, .write = true }, .{ .shared = true }, 0);
+    const initial = @import("user_copy.zig").resolveNativeVmaFaultMappingWithAddressSpaceLocked(f.state, f.free_list, owner, base, true, false).?;
+    try std.testing.expect(vm.mapNativeVmaFaultPage(owner, base, initial));
+    try std.testing.expect(vm.lockAddressSpace(owner));
+    var worker = Worker{ .state = f.state, .fl = f.free_list };
+    const thread = std.Thread.spawn(.{}, Worker.run, .{&worker}) catch |err| { vm.unlockAddressSpace(owner); return err; };
+    while (!@atomicLoad(bool, &worker.entered, .acquire)) std.atomic.spinLoopHint();
+    const result = shared.discard(f.state, ref, &.{.{ .first_page = 0, .page_count = 1 }}, f.free_list);
+    const blocked = !@atomicLoad(bool, &worker.done, .acquire);
+    vm.unlockAddressSpace(owner);
+    thread.join();
+    try std.testing.expect(try result);
+    try std.testing.expect(blocked);
+    try std.testing.expect(worker.pa != null and worker.pa != initial.paddr);
+    try std.testing.expectEqual(worker.pa, f.state.nativeVmoPagePaddr(ref, 0));
+    try std.testing.expect(std.mem.allEqual(u8, kernel.PhysicalAccessTest.slice(u8, worker.pa.?, 4096).?, 0));
+}
+
+test "shared discard AS directory growth adds no unrelated visits" {
+    const shared = @import("state/shared_discard.zig");
+    const address = @import("memory/address_space.zig");
+    const k = @import("syscalls.zig").KernelLockTestSupport;
+    var f = try MmioRetirementFixture.start();defer f.end();
+    try f.free_list.installRegions(&.{.{ .id = 0, .start = physical, .end = physical + 128 * 4096 }});
+    try f.free_list.seedContiguousRange(physical, 128);
+    k.lock();defer k.unlock();
+    const fd = try f.state.createZeroOnDemandVmoFd(owner, 4096, .{ .map_read = true, .write = true, .revoke = true }, .{}, 16);
+    const ref = f.state.nativeVmoRefForFd(owner, fd).?;
+    for (0..3) |i| _ = try f.state.mmapFd(owner, fd, base + i * 8192, 4096, .{ .read = true }, .{ .shared = true }, 0);
+    const ranges = &.{shared.Range{ .first_page = 0, .page_count = 1 }};
+    @atomicStore(usize, &address.test_directory_visits, 0, .monotonic);
+    try std.testing.expect(try shared.discard(f.state, ref, ranges, f.free_list));
+    const before = @atomicLoad(usize, &address.test_directory_visits, .monotonic);
+    try std.testing.expectEqual(@as(usize, 1), shared.test_work.locked);
+    const DirectoryRam = struct { var bytes: [128 * 1024]u8 align(4096) = undefined; };
+    var directory_fl: kernel.FreePageList = .{};
+    const directory_pa = @intFromPtr(&DirectoryRam.bytes);
+    try directory_fl.installRegions(&.{.{ .id = 101, .start = directory_pa, .end = directory_pa + DirectoryRam.bytes.len }});
+    try directory_fl.seedContiguousRange(directory_pa, DirectoryRam.bytes.len / 4096);
+    try std.testing.expect(table.ensureCapacity(4096, &directory_fl));
+    defer {
+        // No extra AS body was published and every directory loan ended.
+        // Unpublish the host fixture directory before returning its grant.
+        table.extra_slots = undefined;
+        @atomicStore(usize, &table.capacity_value, spaces.len, .release);
+        table.directory_storage.retireAll() catch unreachable;
+        table.directory_storage.reclaimRetiredAfterBorrowExclusion() catch unreachable;
+    }
+    @atomicStore(usize, &address.test_directory_visits, 0, .monotonic);
+    try std.testing.expect(try shared.discard(f.state, ref, ranges, f.free_list));
+    try std.testing.expectEqual(before, @atomicLoad(usize, &address.test_directory_visits, .monotonic));
+    try std.testing.expectEqual(@as(usize, 1), shared.test_work.locked);
+}
+
+test "shared discard actual dispatcher keeps pending and deferred return origins separate" {
+    const backing = @import("memory/vmo_backing.zig");
+    const storage = @import("memory/owned_storage.zig");
+    const sys = @import("syscalls.zig");
+    const scheduler = @import("scheduler.zig").connection;
+    const Origin = struct {
+        issuer: *storage.TestAllocator,
+        deferred: bool,
+        reject: bool = true,
+        calls: usize = 0,
+        fn acquire(context: *anyopaque, pages: usize) ?storage.MappedExtent {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            const allocator = self.issuer.interface();
+            return allocator.acquire(allocator.context, pages);
+        }
+        fn release(context: *anyopaque, grant: storage.PhysicalExtent) bool {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            const diagnostics = @import("sync/lock_diagnostics.zig");
+            if (self.deferred) diagnostics.assertRootEmpty() else diagnostics.assertKernelStateHeld();
+            self.calls += 1;
+            if (self.reject) return false;
+            const allocator = self.issuer.interface();
+            return allocator.release(allocator.context, grant);
+        }
+        fn interface(self: *@This()) storage.Allocator { return .{ .context = self, .acquire = acquire, .release = release }; }
+    };
+    const Probe = struct {
+        var ready = true;
+        fn notify() void {}
+        fn write(_: []const u8) void {}
+        fn number(_: u64) void {}
+        fn label(_: kernel.PrincipalId) []const u8 { return "test"; }
+    };
+    var f = try MmioRetirementFixture.start();defer f.end();
+    try scheduler.PiTestSupport.start();defer scheduler.PiTestSupport.end();
+    const clock_state = @import("clockevent.zig").testInstallNotifier(Probe.notify);
+    defer @import("clockevent.zig").testRestoreState(clock_state);
+    var issuer: storage.TestAllocator = .{};defer issuer.deinit();
+    var delayed = Origin{ .issuer = &issuer, .deferred = true };
+    var immediate = Origin{ .issuer = &issuer, .deferred = false };
+    var stores = [_]backing.Store{ .{}, .{} };
+    const refs = [_]backing.Ref{ stores[0].init(1), stores[1].init(2) };
+    try stores[0].prepare(refs[0], 0, delayed.interface());
+    try stores[1].prepare(refs[1], 0, immediate.interface());
+    sys.KernelLockTestSupport.lock();
+    stores[0].pruneEmptyDeferred(refs[0], 0);
+    _ = stores[0].clear(refs[0]);
+    _ = stores[1].clear(refs[1]);
+    try std.testing.expectEqual(@as(usize, 0), delayed.calls);
+    try std.testing.expect(backing.hasPending() and backing.hasDeferred());
+    sys.KernelLockTestSupport.unlock();
+    var h: sys.Hooks = undefined;
+    h.state=f.state;h.free_list=f.free_list;h.kernel_state_ready=&Probe.ready;
+    h.write=Probe.write;h.print_hex=Probe.number;h.print_number=Probe.number;h.principal_label=Probe.label;
+    var frame=std.mem.zeroes(@import("interrupts.zig").TrapFrame);
+    frame.rax=@import("syscall/numbers.zig").syscall_fd_close;frame.rdi=60000;
+    _ = sys.KernelLockTestSupport.dispatchBody(h,&frame);
+    try std.testing.expect(delayed.calls != 0 and immediate.calls != 0);
+    try std.testing.expect(backing.hasPending() and backing.hasDeferred());
+    delayed.reject=false;immediate.reject=false;
+    frame.rax=@import("syscall/numbers.zig").syscall_fd_close;
+    _ = sys.KernelLockTestSupport.dispatchBody(h,&frame);
+    try std.testing.expect(!backing.hasPending() and !backing.hasDeferred());
+    try std.testing.expectEqual(@as(usize, 0), issuer.active());
+}
+
+// Malformed supervisor leaves deliberately bypass the production present=>user
+// invariant. Count only present+user, as before stage2, and remove an old user
+// leaf from the index before forging its supervisor replacement.
+fn writeFixturePte(space: *vm.UserAddressSpace, slot: usize, index: usize, value: u64) void {
+    if (value & 5 != 1) {
+        vm.PlacementTestSupport.writePte(space, slot, index, value);
+        return;
+    }
+    if (space.ptPage(slot)[index] & 5 == 5)
+        vm.PlacementTestSupport.writePte(space, slot, index, 0);
+    space.ptPage(slot)[index] = value;
+}
+
+// Exercise the real boot page-tracking helper, including its FD close, with
+// the public boot K pair before syscall wiring. Host tables replace hardware;
+// full bootfs/ELF loading and native IPI progress are checked by the QEMU script.
+fn bootTrackedPage(f: *MmioRetirementFixture, address: u64) !void {
+    const page = try f.state.allocPhysicalPage(f.free_list);
+    @import("boot/process_factory.zig").trackMappedNativePageOrHalt(
+        f.state, owner, address, page, true, false, "boot-test", "page", f.free_list,
+    );
+}
+
+test "boot K construction and failure return release" {
+    const d = @import("sync/lock_diagnostics.zig");
+    const sys = @import("syscalls.zig");
+    var f = try MmioRetirementFixture.start();
+    defer f.end();
+    try std.testing.expect(d.enabled);
+    try f.free_list.installRegions(&.{.{ .id = 0, .start = physical, .end = physical + 32 * 4096 }});
+    try f.free_list.seedContiguousRange(physical, 32);
+    d.assertRootEmpty();
+    sys.lockKernelStateForBoot();
+    const result = bootTrackedPage(&f, base);
+    sys.unlockKernelStateForBoot();
+    d.assertRootEmpty();
+    try result;
+    // A second acquisition also detects a leaked/nonrecursive K hold.
+    sys.lockKernelStateForBoot();
+    // Reproduce the extra bootstrap stack pages' tracking contract.
+    const second = bootTrackedPage(&f, base + 4096);
+    sys.unlockKernelStateForBoot();
+    d.assertRootEmpty();
+    try second;
+    // Physical exhaustion is a recoverable host prefix failure. It must
+    // still release K before the caller can reclaim or publish dispatch.
+    sys.lockKernelStateForBoot();
+    var empty: kernel.FreePageList = .{};
+    const failure = f.state.allocPhysicalPage(&empty);
+    sys.unlockKernelStateForBoot();
+    d.assertRootEmpty();
+    try std.testing.expectError(error.OutOfFreePages, failure);
+    sys.lockKernelStateForBoot();
+    f.state.releasePrincipalNativeMemory(owner, f.free_list);
+    sys.unlockKernelStateForBoot();
+    d.assertRootEmpty();
+    try std.testing.expectEqual(@as(usize, 32), f.free_list.pageCount());
+}
+
+test "boot K mutation without hold rejects native alias publication" {
+    var f = try MmioRetirementFixture.start();
+    defer f.end();
+    try f.free_list.installRegions(&.{.{ .id = 0, .start = physical, .end = physical + 32 * 4096 }});
+    try f.free_list.seedContiguousRange(physical, 32);
+    // Same real boot call as above, with only the outer K pair removed.
+    try bootTrackedPage(&f, base);
+}
+
+const Stage4b = struct {
+    const copy = @import("user_copy.zig");
+    const backing = @import("memory/vmo_backing.zig");
+    var current: *MmioRetirementFixture = undefined;
+    var zero_calls: usize = 0;
+    var zero_mode: enum { normal, fail, retry_once, retry_always, fail_second } = .normal;
+    fn zero(_: u64) bool {
+        zero_calls += 1;
+        if (zero_mode == .fail or (zero_mode == .fail_second and zero_calls == 2)) return false;
+        if (zero_mode == .retry_always or (zero_mode == .retry_once and zero_calls == 1)) {
+            const entry = current.state.getVmaTable(owner).?.entryForVa(base).?;
+            entry.vmo_offset = if (entry.vmo_offset == 0) 4096 else 0;
+        }
+        return true;
+    }
+    fn setup(f: *MmioRetirementFixture) !void {
+        current = f;
+        zero_calls = 0;
+        zero_mode = .normal;
+        var hooks: copy.Hooks = undefined;
+        hooks.state = f.state;
+        hooks.free_list = f.free_list;
+        copy.init(hooks);
+        f.state.zero_physical_page_hook = zero;
+    }
+    fn map(f: *MmioRetirementFixture, va: u64, pages: usize, private: bool) !kernel.NativeVmoRef {
+        const fd = try f.state.createZeroOnDemandVmoFd(owner, pages * 4096, .{ .close = true, .map_read = true, .map_write = true }, .{}, 0);
+        _ = try f.state.mmapFd(owner, fd, va, pages * 4096, .{ .read = true, .write = true }, .{ .shared = !private, .private = private }, 0);
+        return f.state.nativeVmoRefForFd(owner, fd).?;
+    }
+    fn finish(f: *MmioRetirementFixture) void {
+        vm.clearUserAddressSpace(owner);
+        f.state.releasePrincipalNativeMemory(owner, f.free_list);
+        backing.test_allocator = null;
+    }
+};
+
+test "stage4b populate PMM zeroing TableFull invalid and partial residency" {
+    const c = Stage4b.copy;
+    var f = try MmioRetirementFixture.start();
+    defer f.end();
+    const k = @import("syscalls.zig").KernelLockTestSupport;
+    k.lock();
+    defer k.unlock();
+    try f.free_list.installRegions(&.{.{ .id = 0, .start = physical, .end = physical + 128 * 4096 }});
+    try f.free_list.seedContiguousRange(physical, 128);
+    try Stage4b.setup(&f);
+    defer Stage4b.finish(&f);
+    const ref = try Stage4b.map(&f, base, 2, false);
+    _ = try Stage4b.map(&f, base + 16384, 1, true);
+    const saved = f.free_list.*;
+    f.free_list.* = .{};
+    try std.testing.expect(c.populateUserRange(owner, base, 4096, true) == .out_of_memory);
+    try std.testing.expect(c.probeUserRange(owner, base, 4096, true) == .invalid_address);
+    try std.testing.expect(c.populateUserRange(owner, base + 16384, 4096, false) == .invalid_address);
+    f.free_list.* = saved;
+    Stage4b.zero_mode = .fail;
+    const before = f.free_list.pageCount();
+    try std.testing.expect(c.populateUserRange(owner, base, 4096, true) == .invalid_address);
+    try std.testing.expectEqual(before, f.free_list.pageCount());
+    // Force the actual ensure-store TableFull guard, not allocator exhaustion.
+    const slot = f.state.nativeVmoSlot(ref).?;
+    const store_owner = slot.page_store_owner;
+    slot.page_store_owner = 0;
+    slot.has_page_store = false;
+    Stage4b.zero_mode = .normal;
+    try std.testing.expectError(error.TableFull, kernel.KernelState.ensureNativeVmoPageStore(slot));
+    try std.testing.expect(c.populateUserRange(owner, base, 4096, true) == .invalid_address);
+    slot.page_store_owner = store_owner;
+    try std.testing.expectEqual(before, f.free_list.pageCount());
+    Stage4b.zero_calls = 0;
+    Stage4b.zero_mode = .fail_second;
+    try std.testing.expect(c.populateUserRange(owner, base, 8192, true) == .invalid_address);
+    try std.testing.expect(vm.lookupUserMappedPaddrForVa(owner, base) != null);
+    try std.testing.expectEqual(@as(?u64, null), vm.lookupUserMappedPaddrForVa(owner, base + 4096));
+    try std.testing.expect(c.populateUserRange(owner, base + 8192, 4096, false) == .invalid_address);
+    try std.testing.expect(c.populateUserRange(owner, std.math.maxInt(u64), 2, false) == .invalid_address);
+}
+
+test "stage4b populate backing directory and leaf OOM return candidate" {
+    const storage = @import("memory/owned_storage.zig");
+    // Acquisitions 1..5 are directory nodes; acquisition 6 is the leaf.
+    for (1..7) |failure| {
+        var f = try MmioRetirementFixture.start();
+        defer f.end();
+        var issuer: storage.TestAllocator = .{ .fail_at = failure };
+        defer issuer.deinit();
+        const k = @import("syscalls.zig").KernelLockTestSupport;
+        k.lock();
+        defer k.unlock();
+        try f.free_list.installRegions(&.{.{ .id = 0, .start = physical, .end = physical + 128 * 4096 }});
+        try f.free_list.seedContiguousRange(physical, 128);
+        try Stage4b.setup(&f);
+        defer Stage4b.finish(&f);
+        _ = try Stage4b.map(&f, base, 1, false);
+        Stage4b.backing.test_allocator = issuer.interface();
+        const before = f.free_list.pageCount();
+        const result = Stage4b.copy.populateUserRange(owner, base, 4096, true);
+        try std.testing.expectEqual(failure, issuer.calls);
+        try std.testing.expect(result == .out_of_memory);
+        try std.testing.expectEqual(before, f.free_list.pageCount());
+        try std.testing.expectEqual(@as(usize, 0), issuer.active());
+        issuer.fail_at = 0;
+        try std.testing.expect(Stage4b.copy.populateUserRange(owner, base, 4096, true) == .resident);
+    }
+}
+
+test "stage4b populate PT chunk bank and page OOM persists on ready retry" {
+    for (1..10) |failure| {
+        var f = try MmioRetirementFixture.start();
+        defer f.end();
+        const k = @import("syscalls.zig").KernelLockTestSupport;
+        k.lock();
+        defer k.unlock();
+        try f.free_list.installRegions(&.{.{ .id = 0, .start = physical, .end = physical + 128 * 4096 }});
+        try f.free_list.seedContiguousRange(physical, 128);
+        try Stage4b.setup(&f);
+        defer Stage4b.finish(&f);
+        const ref = try Stage4b.map(&f, base, 1, false);
+        const before = pt_live_pages;
+        pt_fail_at = pt_alloc_calls + failure;
+        try std.testing.expect(Stage4b.copy.populateUserRange(owner, base, 4096, true) == .out_of_memory);
+        try std.testing.expectEqual(before, pt_live_pages);
+        const pa = f.state.nativeVmoPagePaddr(ref, 0).?;
+        try std.testing.expect(pa != 0);
+        const remaining = f.free_list.pageCount();
+        for (0..2) |_| {
+            pt_fail_at = pt_alloc_calls + 1;
+            try std.testing.expect(Stage4b.copy.populateUserRange(owner, base, 4096, true) == .out_of_memory);
+            try std.testing.expectEqual(pa, f.state.nativeVmoPagePaddr(ref, 0).?);
+            try std.testing.expectEqual(remaining, f.free_list.pageCount());
+        }
+        pt_fail_at = 0;
+        try std.testing.expect(Stage4b.copy.populateUserRange(owner, base, 4096, true) == .resident);
+    }
+}
+
+test "stage4b populate commit revalidation retries and returns candidates" {
+    for ([_]bool{ false, true }) |exhaust| {
+        var f = try MmioRetirementFixture.start();
+        defer f.end();
+        const k = @import("syscalls.zig").KernelLockTestSupport;
+        k.lock();
+        defer k.unlock();
+        try f.free_list.installRegions(&.{.{ .id = 0, .start = physical, .end = physical + 128 * 4096 }});
+        try f.free_list.seedContiguousRange(physical, 128);
+        try Stage4b.setup(&f);
+        defer Stage4b.finish(&f);
+        const ref = try Stage4b.map(&f, base, 2, false);
+        Stage4b.zero_mode = if (exhaust) .retry_always else .retry_once;
+        const before = f.free_list.pageCount();
+        const result = Stage4b.copy.populateUserRange(owner, base, 4096, true);
+        try std.testing.expectEqual(@as(usize, 2), Stage4b.zero_calls);
+        if (exhaust) {
+            try std.testing.expect(result == .invalid_address);
+            try std.testing.expectEqual(before, f.free_list.pageCount());
+        } else {
+            try std.testing.expect(result == .resident);
+            try std.testing.expectEqual(before - 1, f.free_list.pageCount());
+            try std.testing.expectEqual(@as(?u64, 0), f.state.nativeVmoResolvedPagePaddrOrZero(ref, 0));
+            try std.testing.expect(f.state.nativeVmoPagePaddr(ref, 1).? != 0);
+        }
+    }
+}
+
+test "stage4b populate 33 excluded pages mixed ranges private fork and cache denial" {
+    var f = try MmioRetirementFixture.start();
+    defer f.end();
+    const k = @import("syscalls.zig").KernelLockTestSupport;
+    k.lock();
+    defer k.unlock();
+    try f.free_list.installRegions(&.{.{ .id = 0, .start = physical, .end = physical + 128 * 4096 }});
+    try f.free_list.seedContiguousRange(physical, 128);
+    try Stage4b.setup(&f);
+    defer Stage4b.finish(&f);
+    _ = try Stage4b.map(&f, base, 33, true);
+    _ = try Stage4b.map(&f, base + 33 * 4096, 1, false);
+    _ = try Stage4b.map(&f, base + 34 * 4096, 1, true);
+    Stage4b.copy.beginSyscallCopyTracking(owner);
+    defer _ = Stage4b.copy.takeSyscallCopyAbsent();
+    try std.testing.expect(Stage4b.copy.populateUserRange(owner, base, 33 * 4096, true) == .resident);
+    try std.testing.expect(Stage4b.copy.populateUserRange(owner, base, 35 * 4096, true) == .resident);
+    try std.testing.expect(Stage4b.copy.populateUserRange(owner, base, 35 * 4096, true) == .resident);
+    // Exactly one coverage slot per whole range, even with mixed eligibility.
+    Stage4b.copy.beginSyscallCopyTracking(owner);
+    for (0..32) |_| try std.testing.expect(Stage4b.copy.populateUserRange(owner, base, 35 * 4096, true) == .resident);
+    try std.testing.expect(Stage4b.copy.populateUserRange(owner, base, 35 * 4096, true) == .invalid_address);
+    Stage4b.copy.beginSyscallCopyTracking(owner);
+    const child = kernel.processPrincipalFromIndex(1).?;
+    const hole = base + (1 << 21);
+    _ = try Stage4b.map(&f, hole, 1, true);
+    try f.state.cloneVmaTableForFork(owner, child);
+    f.state.markForkCowVmasCommitted(owner);
+    defer {
+        vm.clearUserAddressSpace(child);
+        f.state.releasePrincipalNativeMemory(child, f.free_list);
+    }
+    try std.testing.expect(Stage4b.copy.populateUserRange(child, hole, 4096, true) == .resident);
+    try std.testing.expect(vm.lockAddressSpace(child));
+    const writable = vm.lookupUserPhysicalPageWithAddressSpaceLocked(child, .fromInt(hole), true, false) != null;
+    vm.unlockAddressSpace(child);
+    try std.testing.expect(writable);
+    const ref = try Stage4b.map(&f, hole + 4096, 1, false);
+    const pa = (try f.state.allocPhysicalPage(f.free_list)).paddr;
+    _ = try f.state.resolveOrInstallNativeVmoPage(ref, 0, pa, f.free_list);
+    const policy = @import("memory/ram_cache_policy.zig");
+    const spans = [_]policy.Span{.{ .base = pa, .bytes = 4096, .owner = 9, .mode = .wc, .pat_slot = 4 }};
+    const cache_snapshot: policy.Snapshot = .{ .pending = &spans };
+    Stage4b.copy.publishRamCacheSnapshot(&cache_snapshot);
+    defer Stage4b.copy.publishRamCacheSnapshot(null);
+    try std.testing.expect(Stage4b.copy.populateUserRange(owner, hole + 4096, 4096, true) == .invalid_address);
+}
+
+test "stage4b populate real pager absence shares range probe" {
+    var f = try MmioRetirementFixture.start();
+    defer f.end();
+    const k = @import("syscalls.zig").KernelLockTestSupport;
+    k.lock();
+    defer k.unlock();
+    try f.free_list.installRegions(&.{.{ .id = 0, .start = physical, .end = physical + 128 * 4096 }});
+    try f.free_list.seedContiguousRange(physical, 128);
+    try Stage4b.setup(&f);
+    defer Stage4b.finish(&f);
+    const port = try f.state.createPagerPortFd(owner, .{}, 16);
+    const fd = try f.state.createPagerVmoFd(owner, 4096, .{ .close = true, .map_read = true, .map_write = true, .pager_attach = true }, .{}, 16);
+    _ = try f.state.attachPagerVmo(owner, port, fd, 1);
+    const client = kernel.processPrincipalFromIndex(1).?;
+    _ = try f.state.mmapFdIntoProcess(owner, fd, client, base, 4096, .{ .read = true, .write = true }, .{ .private = true }, 0);
+    defer {
+        vm.clearUserAddressSpace(client);
+        f.state.releasePrincipalNativeMemory(client, f.free_list);
+    }
+    Stage4b.copy.beginSyscallCopyTracking(client);
+    defer _ = Stage4b.copy.takeSyscallCopyAbsent();
+    const populated = Stage4b.copy.populateUserRange(client, base, 4096, true);
+    try std.testing.expectEqual(base, populated.backing_absent);
+    const probed = Stage4b.copy.probeUserRange(client, base, 4096, true);
+    try std.testing.expectEqual(base, probed.backing_absent);
+}
+
+test "stage4b populate partial OOM keeps successful prefix resident" {
+    var f = try MmioRetirementFixture.start();
+    defer f.end();
+    const k = @import("syscalls.zig").KernelLockTestSupport;
+    k.lock();
+    defer k.unlock();
+    try f.free_list.installRegions(&.{.{ .id = 0, .start = physical, .end = physical + 128 * 4096 }});
+    try f.free_list.seedContiguousRange(physical, 128);
+    try Stage4b.setup(&f);
+    defer Stage4b.finish(&f);
+    const ref = try Stage4b.map(&f, base, 2, false);
+    var held: [127]u64 = undefined;
+    for (&held) |*page| page.* = try f.free_list.popFront();
+    defer for (held) |page| f.free_list.appendPage(page) catch @panic("test PMM return");
+    try std.testing.expect(Stage4b.copy.populateUserRange(owner, base, 8192, true) == .out_of_memory);
+    const resident = vm.lookupUserMappedPaddrForVa(owner, base).?;
+    try std.testing.expectEqual(resident, f.state.nativeVmoPagePaddr(ref, 0).?);
+    try std.testing.expectEqual(@as(?u64, null), vm.lookupUserMappedPaddrForVa(owner, base + 4096));
+    try std.testing.expectEqual(@as(usize, 0), f.free_list.pageCount());
+}
+
+
+test "stage5 mixed cache fresh holes fault populate discard and retiring" {
+    const shared = @import("state/shared_discard.zig");
+    const policy = @import("memory/ram_cache_policy.zig");
+    var f = try MmioRetirementFixture.start();
+    defer f.end();
+    const k = @import("syscalls.zig").KernelLockTestSupport;
+    k.lock(); defer k.unlock();
+    try f.free_list.installRegions(&.{.{ .id = 0, .start = physical, .end = physical + 128 * 4096 }});
+    try f.free_list.seedContiguousRange(physical, 128);
+    try Stage4b.setup(&f);
+    defer Stage4b.finish(&f);
+    const ref = try Stage4b.map(&f, base, 5, false);
+    try std.testing.expect(Stage4b.copy.populateUserRange(owner, base, 4096, true) == .resident);
+    const leased = f.state.nativeVmoPagePaddr(ref, 0).?;
+    const slot = f.state.nativeVmoSlot(ref).?;
+    slot.ram_cache_state = .cached;
+    const spans = [_]policy.Span{.{ .base = leased, .bytes = 4096, .owner = 9, .mode = .wc, .pat_slot = 4 }};
+    const cache_snapshot: policy.Snapshot = .{ .policy = &spans };
+    Stage4b.copy.publishRamCacheSnapshot(&cache_snapshot);
+    defer { Stage4b.copy.publishRamCacheSnapshot(null); slot.ram_cache_state = .wb; }
+    try std.testing.expectError(error.InvalidState, f.state.resolveOrInstallNativeVmoPage(ref, 0, leased, f.free_list));
+    // Neither an arbitrary address nor a formerly allocated PA is fresh.
+    const recycled = (try f.state.allocPhysicalPage(f.free_list)).paddr;
+    try f.free_list.appendPage(recycled);
+    try std.testing.expectError(error.InvalidState, f.state.resolveOrInstallNativeVmoPage(ref, 1, recycled, f.free_list));
+    try std.testing.expectError(error.InvalidState, f.state.resolveOrInstallNativeVmoPage(ref, 1, leased, f.free_list));
+    try std.testing.expectError(error.InvalidState, f.state.resolveOrInstallNativeVmoPage(ref, 1, physical + 127 * 4096, f.free_list));
+    try std.testing.expectError(error.InvalidState, f.state.installNativeVmoPages(ref, 1, &.{leased}, f.free_list));
+    var pages: [2]u64 = undefined;
+    try std.testing.expectError(error.InvalidState, f.state.nativeRamCachePages(ref, 0, &pages));
+    try std.testing.expect(vm.lockAddressSpace(owner));
+    const fault = Stage4b.copy.resolveNativeVmaFaultMappingWithAddressSpaceLocked(f.state, f.free_list, owner, base + 4096, true, false);
+    vm.unlockAddressSpace(owner);
+    try std.testing.expect(fault != null);
+    try std.testing.expect(Stage4b.copy.populateUserRange(owner, base + 8192, 4096, true) == .resident);
+    try std.testing.expect(Stage4b.copy.populateUserRange(owner, base + 3 * 4096, 4096, true) == .resident);
+    const ranges = [_]shared.Range{ .{ .first_page = 0, .page_count = 1 }, .{ .first_page = 1, .page_count = 3 } };
+    try std.testing.expect(!try shared.discard(f.state, ref, &ranges, f.free_list));
+    try std.testing.expectEqual(leased, f.state.nativeVmoPagePaddr(ref, 0).?);
+    for (1..4) |i| try std.testing.expect(f.state.nativeVmoPagePaddr(ref, i) == null);
+    const pending_snapshot: policy.Snapshot = .{ .pending = &spans };
+    Stage4b.copy.publishRamCacheSnapshot(&pending_snapshot);
+    try std.testing.expect(!try shared.discard(f.state, ref, ranges[0..1], f.free_list));
+    slot.ram_cache_state = .retiring;
+    try std.testing.expect(Stage4b.copy.populateUserRange(owner, base, 4096, true) == .invalid_address);
+    try std.testing.expect(Stage4b.copy.populateUserRange(owner, base + 4 * 4096, 4096, true) == .invalid_address);
+    try std.testing.expectError(error.Invalid, shared.discard(f.state, ref, &ranges, f.free_list));
+    try std.testing.expect(vm.lockAddressSpace(owner));
+    vm.lockSharedVmObjects();
+    const plan = f.state.prepareNativeVmaFaultMapping(owner, base + 4 * 4096, true, false);
+    const before = f.free_list.pageCount();
+    const denied = f.state.commitFreshNativeVmaFaultMapping(owner, plan, f.free_list);
+    vm.unlockSharedVmObjects(); vm.unlockAddressSpace(owner);
+    try std.testing.expectError(error.Denied, denied);
+    try std.testing.expectEqual(before, f.free_list.pageCount());
+}
+
+test "stage5 cached ready PT exhaustion remains ALLOC" {
+    var f = try MmioRetirementFixture.start(); defer f.end();
+    const k = @import("syscalls.zig").KernelLockTestSupport;
+    k.lock(); defer k.unlock();
+    try f.free_list.installRegions(&.{.{ .id = 0, .start = physical, .end = physical + 128 * 4096 }});
+    try f.free_list.seedContiguousRange(physical, 128);
+    try Stage4b.setup(&f); defer Stage4b.finish(&f);
+    const ref = try Stage4b.map(&f, base, 1, false);
+    f.state.nativeVmoSlot(ref).?.ram_cache_state = .cached;
+    defer f.state.nativeVmoSlot(ref).?.ram_cache_state = .wb;
+    for (0..3) |_| {
+        pt_fail_at = pt_alloc_calls + 1;
+        try std.testing.expect(Stage4b.copy.populateUserRange(owner, base, 4096, true) == .out_of_memory);
+        try std.testing.expect(f.state.nativeVmoPagePaddr(ref, 0) != null);
+    }
+    pt_fail_at = 0;
+    try std.testing.expect(Stage4b.copy.populateUserRange(owner, base, 4096, true) == .resident);
+}
+
+test "stage5 another AS wins before fresh commit and WC PTE inherits winner" {
+    const policy = @import("memory/ram_cache_policy.zig");
+    var f = try MmioRetirementFixture.start(); defer f.end();
+    const k = @import("syscalls.zig").KernelLockTestSupport;
+    k.lock(); defer k.unlock();
+    try f.free_list.installRegions(&.{.{ .id = 0, .start = physical, .end = physical + 128 * 4096 }});
+    try f.free_list.seedContiguousRange(physical, 128);
+    try Stage4b.setup(&f);
+    const fd = try f.state.createZeroOnDemandVmoFd(owner, 4096, .{ .map_read = true, .map_write = true, .close = true }, .{}, 16);
+    const ref = f.state.nativeVmoRefForFd(owner, fd).?;
+    const other = kernel.processPrincipalFromIndex(1).?;
+    defer { vm.clearUserAddressSpace(other); f.state.releasePrincipalNativeMemory(other, f.free_list); Stage4b.finish(&f); }
+    for ([_]kernel.PrincipalId{ owner, other }) |p| _ = try f.state.mmapFdIntoProcess(owner, fd, p, base, 4096, .{ .read = true, .write = true }, .{ .shared = true }, 0);
+    try std.testing.expect(vm.lockAddressSpace(owner));
+    vm.lockSharedVmObjects();
+    const stale = f.state.prepareNativeVmaFaultMapping(owner, base, true, false);
+    vm.unlockSharedVmObjects(); vm.unlockAddressSpace(owner);
+    try std.testing.expect(vm.lockAddressSpace(other));
+    const winner = Stage4b.copy.resolveNativeVmaFaultMappingWithAddressSpaceLocked(f.state, f.free_list, other, base, true, false).?;
+    vm.unlockAddressSpace(other);
+    const slot = f.state.nativeVmoSlot(ref).?;
+    slot.ram_cache_state = .cached;
+    const spans = [_]policy.Span{.{ .base = winner.paddr, .bytes = 4096, .owner = 9, .mode = .wc, .pat_slot = 4 }};
+    const cache_snapshot: policy.Snapshot = .{ .policy = &spans };
+    Stage4b.copy.publishRamCacheSnapshot(&cache_snapshot);
+    defer { Stage4b.copy.publishRamCacheSnapshot(null); slot.ram_cache_state = .wb; }
+    try std.testing.expect(vm.lockAddressSpace(owner));
+    defer vm.unlockAddressSpace(owner);
+    vm.lockSharedVmObjects();
+    const before = f.free_list.pageCount();
+    const committed = f.state.commitFreshNativeVmaFaultMapping(owner, stale, f.free_list);
+    vm.unlockSharedVmObjects();
+    const result = try committed;
+    try std.testing.expectEqual(winner.paddr, result.paddr);
+    try std.testing.expectEqual(before, f.free_list.pageCount());
+    try std.testing.expect(vm.mapNativeVmaFaultPage(owner, base, result));
+    const pt_slot = vm.ensureUserPtSlotForPd(&spaces[0], 1, 0, 0).?;
+    const pt = spaces[0].ptPage(pt_slot);
+    // PAT slot four is the 4KiB leaf PAT bit (bit seven), not a WB PTE.
+    try std.testing.expect(pt[0] & (@as(u64, 1) << 7) != 0);
+}
+
+test "stage5 DMA resolver supplies WB hole beside live WC page" {
+    const sc = @import("syscall/numbers.zig");
+    var f = try MmioRetirementFixture.start(); defer f.end();
+    const k = @import("syscalls.zig").KernelLockTestSupport;
+    k.lock(); defer k.unlock();
+    try f.free_list.installRegions(&.{.{ .id = 0, .start = physical, .end = physical + 128 * 4096 }});
+    try f.free_list.seedContiguousRange(physical, 128);
+    try Stage4b.setup(&f); defer Stage4b.finish(&f);
+    const ref = try Stage4b.map(&f, base, 2, false);
+    try std.testing.expect(Stage4b.copy.populateUserRange(owner, base, 4096, true) == .resident);
+    const slot = f.state.nativeVmoSlot(ref).?;
+    slot.ram_cache_state = .cached;
+    const policy = @import("memory/ram_cache_policy.zig");
+    const spans = [_]policy.Span{.{ .base = f.state.nativeVmoPagePaddr(ref, 0).?, .bytes = 4096, .owner = 9, .mode = .wc, .pat_slot = 4 }};
+    const cache_snapshot: policy.Snapshot = .{ .policy = &spans };
+    Stage4b.copy.publishRamCacheSnapshot(&cache_snapshot);
+    defer { Stage4b.copy.publishRamCacheSnapshot(null); slot.ram_cache_state = .wb; }
+    const device = try f.state.createDeviceFd(owner, 0x1001, .{ .query = true, .derive_dma = true, .dma_read = true, .dma_write = true, .close = true }, .{}, 16);
+    var h: @import("syscalls.zig").Hooks = undefined; h.free_list = f.free_list;
+    var frame = std.mem.zeroes(@import("interrupts.zig").TrapFrame);
+    frame.rax = sc.syscall_capsule_derive_dma_buffer;
+    frame.rdi = device; frame.rsi = base + 4096;
+    frame.rdx = @import("kernel_abi_root").capsule_abi.dma_iova_kernel_choose;
+    frame.r10 = 4096;
+    const fd = @import("syscall/capsule.zig").dispatch(h, f.state, owner, &frame).?;
+    try std.testing.expect(fd >= @import("kernel_abi_root").fd_abi.first_dynamic_fd);
+    try std.testing.expect(f.state.nativeVmoPagePaddr(ref, 1) != null);
+    try std.testing.expectEqual(f.state.nativeVmoPagePaddr(ref, 1).?, f.state.dmaBufferObjectForFd(owner, @intCast(fd), .{}).?.iova);
+    try f.state.closeFdWithFreeList(owner, @intCast(fd), f.free_list);
+}
+
+test "stage5 cache writer all AS transaction waits for fault publication" {
+    const k = @import("syscalls.zig").KernelLockTestSupport;
+    const Worker = struct {
+        entered: bool = false,
+        committed: bool = false,
+        fn run(c: *@This()) void {
+            @import("root").setTestLockDiagnosticsCpu(1);
+            k.lock(); defer k.unlock();
+            @atomicStore(bool, &c.entered, true, .release);
+            vm.lockAllVmTransactions(); defer vm.unlockAllVmTransactions();
+            @atomicStore(bool, &c.committed, true, .release);
+        }
+    };
+    var f = try MmioRetirementFixture.start(); defer f.end();
+    try f.free_list.installRegions(&.{.{ .id = 0, .start = physical, .end = physical + 128 * 4096 }});
+    try f.free_list.seedContiguousRange(physical, 128);
+    k.lock();
+    Stage4b.setup(&f) catch |err| { k.unlock(); return err; };
+    const ref = Stage4b.map(&f, base, 1, false) catch |err| { k.unlock(); return err; };
+    f.state.nativeVmoSlot(ref).?.ram_cache_state = .cached;
+    k.unlock();
+    defer {
+        k.lock();
+        f.state.nativeVmoSlot(ref).?.ram_cache_state = .wb;
+        Stage4b.finish(&f);
+        k.unlock();
+    }
+    try std.testing.expect(vm.lockAddressSpace(owner));
+    var worker: Worker = .{};
+    const thread = std.Thread.spawn(.{}, Worker.run, .{&worker}) catch |err| { vm.unlockAddressSpace(owner); return err; };
+    while (!@atomicLoad(bool, &worker.entered, .acquire)) std.atomic.spinLoopHint();
+    const mapping = Stage4b.copy.resolveNativeVmaFaultMappingWithAddressSpaceLocked(f.state, f.free_list, owner, base, true, false);
+    const blocked = !@atomicLoad(bool, &worker.committed, .acquire);
+    const mapped = if (mapping) |m| vm.mapNativeVmaFaultPage(owner, base, m) else false;
+    vm.unlockAddressSpace(owner);
+    thread.join();
+    try std.testing.expect(blocked and mapped);
+    try std.testing.expect(@atomicLoad(bool, &worker.committed, .acquire));
+}
+
+test "stage5 cache writer K transaction waits through shared discard detach" {
+    const k = @import("syscalls.zig").KernelLockTestSupport;
+    const Worker = struct {
+        entered: bool = false,
+        committed: bool = false,
+        fn run(c: *@This()) void {
+            @import("root").setTestLockDiagnosticsCpu(1);
+            @atomicStore(bool, &c.entered, true, .release);
+            k.lock(); defer k.unlock();
+            vm.lockAllVmTransactions(); defer vm.unlockAllVmTransactions();
+            @atomicStore(bool, &c.committed, true, .release);
+        }
+    };
+    var f = try MmioRetirementFixture.start(); defer f.end();
+    try f.free_list.installRegions(&.{.{ .id = 0, .start = physical, .end = physical + 128 * 4096 }});
+    try f.free_list.seedContiguousRange(physical, 128);
+    k.lock();
+    Stage4b.setup(&f) catch |err| { k.unlock(); return err; };
+    const ref = Stage4b.map(&f, base, 1, false) catch |err| { k.unlock(); return err; };
+    const populated = Stage4b.copy.populateUserRange(owner, base, 4096, true);
+    f.state.nativeVmoSlot(ref).?.ram_cache_state = .cached;
+    var worker: Worker = .{};
+    const thread = std.Thread.spawn(.{}, Worker.run, .{&worker}) catch |err| { k.unlock(); return err; };
+    while (!@atomicLoad(bool, &worker.entered, .acquire)) std.atomic.spinLoopHint();
+    const discarded = @import("state/shared_discard.zig").discard(f.state, ref, &.{.{ .first_page = 0, .page_count = 1 }}, f.free_list);
+    const blocked = !@atomicLoad(bool, &worker.committed, .acquire);
+    const detached = f.state.nativeVmoPagePaddr(ref, 0) == null;
+    k.unlock();
+    thread.join();
+    defer { k.lock(); f.state.nativeVmoSlot(ref).?.ram_cache_state = .wb; Stage4b.finish(&f); k.unlock(); }
+    try std.testing.expect(populated == .resident);
+    try std.testing.expect(try discarded);
+    try std.testing.expect(blocked and detached and @atomicLoad(bool, &worker.committed, .acquire));
+}
+
+// These exercise the production shared ownership path, not a metadata allocator
+// substitute. Backing metadata uses the fixture's independent host issuer.
+fn sharedResident(f: *MmioRetirementFixture, pages: usize) !kernel.NativeVmoRef {
+    const fd = try f.state.createZeroOnDemandVmoFd(owner, pages * 4096, .{ .write = true, .revoke = true, .map_read = true, .map_write = true, .share = true }, .{}, 16);
+    const ref = f.state.nativeVmoRefForFd(owner, fd).?;
+    var paddrs: [1024]u64 = undefined;
+    for (paddrs[0..pages]) |*pa| pa.* = (try f.state.allocPhysicalPage(f.free_list)).paddr;
+    try f.state.installNativeVmoPages(ref, 0, paddrs[0..pages], f.free_list);
+    return ref;
+}
+
+test "shared discard zero PMM free succeeds for 1024 pages and exit returns all" {
+    var f = try MmioRetirementFixture.startPages(1024); defer f.end();
+    try f.free_list.installRegions(&.{.{ .id = 0, .start = physical, .end = physical + 1024 * 4096 }});
+    try f.free_list.seedContiguousRange(physical, 1024);
+    const k = @import("syscalls.zig").KernelLockTestSupport;
+    k.lock();
+    const ref = try sharedResident(&f, 1024);
+    try std.testing.expectEqual(@as(usize, 0), f.free_list.pageCount());
+    try std.testing.expect(try @import("state/shared_discard.zig").discard(f.state, ref, &.{.{ .first_page = 0, .page_count = 1024 }}, f.free_list));
+    try std.testing.expectEqual(@as(usize, 0), f.free_list.pageCount());
+    k.unlock();
+    k.reclaimDiscard();
+    try std.testing.expectEqual(@as(usize, 1024), f.free_list.pageCount());
+    try f.free_list.validate();
+}
+
+test "shared discard all filled drains under K and OOM uses same slot ownership" {
+    var f = try MmioRetirementFixture.start(); defer f.end();
+    try f.free_list.installRegions(&.{.{ .id = 0, .start = physical, .end = physical + 3 * 4096 }});
+    try f.free_list.seedContiguousRange(physical, 3);
+    const pool = &@import("memory/shared_discard_slots.zig").global;
+    f.free_list.reclaimable.shared_discard_retired = pool;
+    const k = @import("syscalls.zig").KernelLockTestSupport;
+    k.lock(); defer k.unlock();
+    const ref = try sharedResident(&f, 3);
+    for (0..3) |i| {
+        try std.testing.expect(try @import("state/shared_discard.zig").discard(f.state, ref, &.{.{ .first_page = i, .page_count = 1 }}, f.free_list));
+        try std.testing.expectEqual(@as(usize, if (i == 2) 1 else 0), f.free_list.pageCount());
+    }
+    // A PMM allocation at zero free must find detached slots through Registry.
+    const returned = try f.free_list.popFront();
+    try std.testing.expectEqual(@as(usize, 0), f.free_list.pageCount());
+    _ = try f.free_list.popFront();
+    try std.testing.expectEqual(@as(usize, 1), f.free_list.pageCount());
+    try f.free_list.appendPage(returned);
+    for (pool.slots[0..pool.active]) |*slot| {
+        try std.testing.expectEqual(@as(usize, 0), slot.count);
+        try std.testing.expectEqual(@import("memory/shared_discard_slots.zig").State.free, slot.state);
+    }
+}
+
+test "shared discard all draining or occupied returns NOT_READY before mutation" {
+    var f = try MmioRetirementFixture.start(); defer f.end();
+    try f.free_list.installRegions(&.{.{ .id = 0, .start = physical, .end = physical + 4 * 4096 }});
+    try f.free_list.seedContiguousRange(physical, 4);
+    const k = @import("syscalls.zig").KernelLockTestSupport;
+    k.lock(); defer k.unlock();
+    const ref = try sharedResident(&f, 1);
+    const fd: kernel.Fd = 16;
+    _ = try f.state.mmapFd(owner, fd, base, 4096, .{ .read = true }, .{ .shared = true }, 0);
+    const pa = f.state.nativeVmoPagePaddr(ref, 0).?;
+    try std.testing.expect(vm.mapNativeVmaFaultPage(owner, base, .{ .paddr = pa, .prot = .{ .read = true } }));
+    const pool = &@import("memory/shared_discard_slots.zig").global;
+    const State = @import("memory/shared_discard_slots.zig").State;
+    defer for (pool.slots[0..pool.active]) |*slot| { @atomicStore(State, &slot.state, .free, .release); };
+    for ([_][2]State{ .{ .draining, .draining }, .{ .occupied, .occupied }, .{ .draining, .occupied } }) |states| {
+        for (pool.slots[0..pool.active], states) |*slot, state| @atomicStore(State, &slot.state, state, .release);
+        const before = f.free_list.pageCount();
+        try std.testing.expectEqual(@as(usize, 0), pool.reclaim());
+        try std.testing.expectError(error.NotReady, @import("state/shared_discard.zig").discard(f.state, ref, &.{.{ .first_page = 0, .page_count = 1 }}, f.free_list));
+        try std.testing.expectEqual(@as(?u64, pa), f.state.nativeVmoPagePaddr(ref, 0));
+        try std.testing.expectEqual(@as(?u64, pa), vm.lookupUserMappedPaddrForVa(owner, base));
+        try std.testing.expectEqual(before, f.free_list.pageCount());
+        for (pool.slots[0..pool.active], states) |*slot, state| try std.testing.expectEqual(state, slot.state);
+    }
+}
+
+test "shared discard other AS overlapping DMA pins and forced retention keep range PA" {
+    var f = try MmioRetirementFixture.start(); defer f.end();
+    try f.free_list.installRegions(&.{.{ .id = 0, .start = physical, .end = physical + 8 * 4096 }});
+    try f.free_list.seedContiguousRange(physical, 8);
+    const k = @import("syscalls.zig").KernelLockTestSupport;
+    k.lock(); defer k.unlock();
+    const ref = try sharedResident(&f, 2);
+    const other = kernel.processPrincipalFromIndex(1).?;
+    _ = try f.state.mmapFdIntoProcess(owner, 16, other, base, 8192, .{ .read = true, .write = true }, .{ .shared = true }, 0);
+    const pa = f.state.nativeVmoPagePaddr(ref, 0).?;
+    const pin = try f.state.createDmaMappingFd(other, .{ .device = 0x1001, .user_va = base, .iova = pa, .size = 4096 }, .{ .close = true }, .{}, 16);
+    _ = try f.state.createDmaMappingFd(other, .{ .device = 0x1002, .user_va = base, .iova = pa, .size = 4096 }, .{ .close = true }, .{}, 16);
+    const ranges = [_]@import("state/shared_discard.zig").Range{ .{ .first_page = 0, .page_count = 1 }, .{ .first_page = 1, .page_count = 1 } };
+    try std.testing.expect(!try @import("state/shared_discard.zig").discard(f.state, ref, &ranges, f.free_list));
+    try f.state.closeFdWithFreeList(other, pin, f.free_list);
+    try std.testing.expect(!try @import("state/shared_discard.zig").discard(f.state, ref, ranges[0..1], f.free_list));
+    f.state.revokeOwnedPinnedUserObjectsWithFreeList(other, f.free_list);
+    try std.testing.expect(!f.state.rangeOverlapsPinnedUserObject(other, base, 4096));
+    try std.testing.expect(@import("iommu.zig").physicalRangeQuarantined(pa, 1));
+    try std.testing.expect(!try @import("state/shared_discard.zig").discard(f.state, ref, &ranges, f.free_list));
+    try std.testing.expectEqual(@as(?u64, pa), f.state.nativeVmoPagePaddr(ref, 0));
+    try std.testing.expect(f.state.nativeVmoPagePaddr(ref, 1) == null);
+    @import("memory/dma_retention.zig").complete(0x1002);
+    try std.testing.expect(try @import("state/shared_discard.zig").discard(f.state, ref, ranges[0..1], f.free_list));
+}
+
+test "shared discard leaf prune sparse unaligned multiple ranges matches per-page oracle" {
+    const backing = @import("memory/vmo_backing.zig");
+    var f = try MmioRetirementFixture.start(); defer f.end();
+    try f.free_list.installRegions(&.{.{ .id = 0, .start = physical, .end = physical + 8 * 4096 }});
+    try f.free_list.seedContiguousRange(physical, 8);
+    const k = @import("syscalls.zig").KernelLockTestSupport;
+    k.lock(); defer k.unlock();
+    const fd = try f.state.createZeroOnDemandVmoFd(owner, 1280 * 4096, .{ .write = true, .revoke = true }, .{}, 16);
+    const ref = f.state.nativeVmoRefForFd(owner, fd).?;
+    var issuer: @import("memory/owned_storage.zig").TestAllocator = .{}; defer issuer.deinit();
+    var oracle: backing.Store = .{};
+    const oracle_ref = oracle.init(98); defer std.debug.assert(oracle.clear(oracle_ref));
+    const indices = [_]u32{ 1, 255, 256, 520, 768, 1025 };
+    for (indices) |index| {
+        const pa = (try f.state.allocPhysicalPage(f.free_list)).paddr;
+        try f.state.installNativeVmoPages(ref, index, &.{pa}, f.free_list);
+        try oracle.prepare(oracle_ref, index, issuer.interface());
+        oracle.putLocked(index, pa);
+    }
+    // Busy range leaves one resident PA; successful ranges share leaf zero,
+    // cross a leaf boundary and include completely absent sparse leaves.
+    const slot = f.state.nativeVmoSlot(ref).?;
+    const view = try f.state.createNativePageView(ref, 1);
+    try f.state.installNativeVmoPageViewPages(view, 0, &.{768}, f.free_list);
+    defer f.state.releaseNativeVmoWithFreeList(view, f.free_list);
+    const ranges = [_]@import("state/shared_discard.zig").Range{ .{ .first_page = 1, .page_count = 1 }, .{ .first_page = 250, .page_count = 300 }, .{ .first_page = 768, .page_count = 1 }, .{ .first_page = 1020, .page_count = 10 } };
+    try std.testing.expect(!try @import("state/shared_discard.zig").discard(f.state, ref, &ranges, f.free_list));
+    for (indices) |index| if (index != 768) { oracle.putLocked(index, 0); };
+    for (ranges, 0..) |range, r| {
+        if (r == 2) continue;
+        for (@as(u32, @intCast(range.first_page))..@as(u32, @intCast(range.first_page + range.page_count))) |index| oracle.pruneEmptyDeferred(oracle_ref, @intCast(index));
+    }
+    for (0..1280) |index| {
+        try std.testing.expectEqual(oracle.getLocked(@intCast(index)), slot.page_store.getLocked(@intCast(index)));
+        try std.testing.expectEqual(oracle.hasPathLocked(@intCast(index)), slot.page_store.hasPathLocked(@intCast(index)));
+    }
+    try std.testing.expectEqual(oracle.used, slot.page_store.used);
+    backing.reclaimDeferred();
 }

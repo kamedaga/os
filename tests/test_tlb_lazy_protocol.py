@@ -9,6 +9,31 @@ load is serializing; IF=0 defers IRQ service until the user boundary.
 import dataclasses as d
 import unittest
 
+def parent_retire_trace(pcid, residency, mutant=None):
+    """Order model for detaching a parent paging entry and retiring its page."""
+    trace = ['detach parent entry']
+    if mutant != 'skip_retained_clear':
+        trace.append('clear retained identity')
+    needs_ipi = residency in ('active', 'borrowed')
+    if mutant == 'release_before_flush':
+        trace.append('release table page')
+    # PCID 0 still needs a full CR3 load for current borrowers; a dormant CPU
+    # is made safe by the next flushing load.  Nonzero PCIDs use the same
+    # retained-row invalidation to force that future flushing load.
+    if needs_ipi:
+        trace += ['full context flush', 'ack']
+    else:
+        trace.append('future flushing load required')
+    if mutant != 'release_before_flush':
+        trace.append('release table page')
+    safe = trace.index('detach parent entry') < trace.index('release table page')
+    if needs_ipi:
+        safe &= trace.index('ack') < trace.index('release table page')
+    else:
+        safe &= trace.index('future flushing load required') < trace.index('release table page')
+    safe &= 'clear retained identity' in trace
+    return safe, trace
+
 @d.dataclass(frozen=True)
 class S:
     e: int = 0
@@ -105,6 +130,19 @@ def explore(initial, mutant=None):
 
 
 class Protocol(unittest.TestCase):
+    def test_parent_detach_retirement_matches_leaf_order_for_all_residencies(self):
+        for pcid in (0, 7):
+            for residency in ('active', 'borrowed', 'dormant_retained'):
+                safe, trace = parent_retire_trace(pcid, residency)
+                self.assertTrue(safe, (pcid, residency, trace))
+
+    def test_parent_detach_negative_release_and_retained_mutations(self):
+        for mutant in ('release_before_flush', 'skip_retained_clear'):
+            for pcid in (0, 7):
+                for residency in ('active', 'borrowed', 'dormant_retained'):
+                    safe, _ = parent_retire_trace(pcid, residency, mutant)
+                    self.assertFalse(safe, (mutant, pcid, residency))
+
     def test_all_interleavings(self):
         total=0;witnesses={}
         # Both retained and mismatching loads, including an invalid TLB and

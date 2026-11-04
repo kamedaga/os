@@ -1,12 +1,24 @@
 #define _GNU_SOURCE
 #define __pachaos__
 #define PACHAOS_NATIVE_TEST
+#include "../musl/pachaos/syscall/native_raw.h"
+/* The fixture tests FS bytes, not host x86 compact IPC registers. Route the
+ * production message helper to the existing pointer-envelope mock explicitly. */
+static long fixture_ipc_message(uint64_t nr,uint64_t fd,
+ const struct __pachaos_ipc_msg *send,struct __pachaos_ipc_msg *reply,
+ uint64_t timeout,uint64_t flags,int *committed)
+{
+ if(committed)*committed=0;
+ return native_test_raw(nr,fd,(long)send,(long)reply,timeout,flags,0);
+}
+#define __pachaos_ipc_message fixture_ipc_message
 #define main fixture_entry
 #include "../musl/pachaos/smoke/libc_vfs_exec.c"
 #undef main
 #include <assert.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
+#include <sys/file.h>
 
 struct resource {
     struct resource *next;
@@ -104,6 +116,9 @@ static void dispatch_mock(struct resource *vmo,const struct __pachaos_ipc_msg *m
         if (response.result>=0) response.data_length=(uint64_t)response.result;
         break;
     case KB2_FILESYSTEM_OP_LSEEK: response.result=lseek(fd,r.offset,(int)r.flags); break;
+    case KB2_FILESYSTEM_OP_FLOCK: response.result=flock(fd,(int)r.flags); break;
+    case KB2_FILESYSTEM_OP_FALLOCATE:
+        response.result=fallocate(fd,(int)r.mode,r.offset,(int64_t)r.length); break;
     case KB2_FILESYSTEM_OP_FTRUNCATE: response.result=ftruncate(fd,r.offset); break;
     case KB2_FILESYSTEM_OP_STATX: {
         struct stat stat;
@@ -172,6 +187,36 @@ int main(int argc,char **argv,char **envp)
     assert(run_filed_raw_operation_bench(fixture)==0);
     assert(largest_io==16384 && largest_request>16384 && largest_path>800);
     assert(resources==NULL && handles==NULL);
+    uint64_t allocate_handle=0;
+    assert(raw_open(fixture,O_RDWR,0,&allocate_handle)==0);
+    kb2_fs_request_t alloc={.opcode=KB2_FILESYSTEM_OP_FALLOCATE,
+        .handle=allocate_handle,.length=4096};
+    kb2_fs_response_t allocation_reply;
+    assert(raw_fs_call(&alloc,NULL,NULL,NULL,0,NULL,0,&allocation_reply)==0);
+    struct stat allocated;
+    assert(fstat(handle_fd(allocate_handle),&allocated)==0 && allocated.st_size==4096);
+    alloc.mode=1;alloc.offset=4096;
+    assert(raw_fs_call(&alloc,NULL,NULL,NULL,0,NULL,0,&allocation_reply)==0);
+    assert(fstat(handle_fd(allocate_handle),&allocated)==0 && allocated.st_size==4096);
+    alloc.mode=UINT64_MAX;
+    assert(raw_fs_call(&alloc,NULL,NULL,NULL,0,NULL,0,&allocation_reply)==-EOPNOTSUPP);
+    alloc.mode=0;alloc.offset=-1;
+    assert(raw_fs_call(&alloc,NULL,NULL,NULL,0,NULL,0,&allocation_reply)==-EINVAL);
+    assert(raw_simple(KB2_FILESYSTEM_OP_CLOSE,allocate_handle,0,0)==0);
+    uint64_t lock_a=0,lock_b=0;
+    assert(!raw_open(fixture,O_RDONLY,0,&lock_a));
+    assert(!raw_open(fixture,O_RDONLY,0,&lock_b));
+    assert(!raw_simple(KB2_FILESYSTEM_OP_FLOCK,lock_a,0,LOCK_EX|LOCK_NB));
+    assert(raw_simple(KB2_FILESYSTEM_OP_FLOCK,lock_b,0,LOCK_EX|LOCK_NB)==-EWOULDBLOCK);
+    kb2_fs_request_t duplicate_lock={.opcode=KB2_FILESYSTEM_OP_DUP,.handle=lock_a};
+    kb2_fs_response_t duplicate_reply;
+    assert(!raw_fs_call(&duplicate_lock,NULL,NULL,NULL,0,NULL,0,&duplicate_reply));
+    assert(!raw_simple(KB2_FILESYSTEM_OP_CLOSE,lock_a,0,0));
+    assert(raw_simple(KB2_FILESYSTEM_OP_FLOCK,lock_b,0,LOCK_EX|LOCK_NB)==-EWOULDBLOCK);
+    assert(!raw_simple(KB2_FILESYSTEM_OP_CLOSE,duplicate_reply.handle,0,0));
+    assert(!raw_simple(KB2_FILESYSTEM_OP_FLOCK,lock_b,0,LOCK_EX|LOCK_NB));
+    assert(raw_simple(KB2_FILESYSTEM_OP_FLOCK,lock_b,0,LOCK_SH|LOCK_EX)==-EINVAL);
+    assert(!raw_simple(KB2_FILESYSTEM_OP_CLOSE,lock_b,0,0));
     uint64_t h=0;
     assert(raw_open(fixture,O_RDONLY,0,&h)==0);
     corrupt_sequence=1;

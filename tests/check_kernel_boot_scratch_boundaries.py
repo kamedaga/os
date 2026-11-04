@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Scoped boot-staging migration tripwires, not a Zig borrow/lifetime proof."""
 from collections import Counter
+from functools import lru_cache
 from pathlib import Path
 import re
 from check_kernel_address_boundaries import code_only, function_body, without_tests
@@ -8,16 +9,33 @@ from check_kernel_address_boundaries import code_only, function_body, without_te
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def check(files):
-    errors = []
+# Mutation self-tests change one file at a time. Reuse only exact source
+# contents within this process; path matters because scoped files omit tests.
+# Bound retention so repeated calls cannot accumulate arbitrary source trees.
+@lru_cache(maxsize=512)
+def prepare_source(path, text):
     scoped = {'kernel/src/boot/boot_scratch.zig', 'kernel/src/boot/entry.zig',
               'kernel/src/boot/elf_load.zig', 'kernel/src/pci.zig',
               'kernel/src/boot/resource_pages.zig', 'kernel/src/boot/init_setup.zig',
               'kernel/src/arch/x86_64/physical_layout.zig',
               'bootloader/limine/kernel_entry.zig'}
-    sources = {path: (without_tests(code_only(text)) if path in scoped or
-                     re.search(r'^\s*const\s+\w+\s*=\s*@import\("[^"\n]*boot_scratch\.zig"\)', text, re.M)
-                     else code_only(text)) for path, text in files.items()}
+    source = code_only(text)
+    if path in scoped or re.search(r'^\s*const\s+\w+\s*=\s*@import\("[^"\n]*boot_scratch\.zig"\)', text, re.M):
+        return without_tests(source)
+    return source
+
+
+@lru_cache(maxsize=8192)
+def reference_count(source, name):
+    # The census is recomputed for changed contents, including new aliases in
+    # mutation tests. Cache only the immutable count, never a mutable Counter.
+    return (len(re.findall(r'\b' + name + r'\b', source)) -
+            len(re.findall(r'\bfn\s+' + name + r'\b', source)))
+
+
+def check(files):
+    errors = []
+    sources = {path: prepare_source(path, text) for path, text in files.items()}
     arena = sources['kernel/src/boot/boot_scratch.zig']
     if re.search(r'pub fn (allocate|free)\s*\(', arena):
         errors.append('scratch raw allocate/free bypass restored')
@@ -65,8 +83,7 @@ def check(files):
     for path, source in sources.items():
         references = Counter()
         for wrapper in wrappers:
-            count = len(re.findall(r'\b'+wrapper+r'\b', source))
-            count -= len(re.findall(r'\bfn\s+'+wrapper+r'\b', source))
+            count = reference_count(source, wrapper)
             if count:
                 references[wrapper] = count
         if references:
@@ -119,7 +136,7 @@ def check(files):
     for path, source in sources.items():
         counts = Counter()
         for name in ('hhdmSlice', 'hhdmBytes', 'identityBytes'):
-            count = len(re.findall(r'\b'+name+r'\b', source)) - len(re.findall(r'\bfn\s+'+name+r'\b', source))
+            count = reference_count(source, name)
             if count:
                 counts[name] = count
         if counts:
@@ -224,7 +241,7 @@ def check(files):
         found = {}
         for path, text in sources.items():
             text = without_tests(text)
-            count = len(re.findall(r'\b'+name+r'\b', text)) - len(re.findall(r'\bfn\s+'+name+r'\b', text))
+            count = reference_count(text, name)
             if count: found[path] = count
         if found != expected_paths:
             errors.append('scratch boot-only reference census changed: '+name+' '+str(found))

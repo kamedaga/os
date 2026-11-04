@@ -14,6 +14,22 @@ source_tree="$repo_root/kobox2/linux-sandbox"
 jobs="${JOBS:-${PACGO_BUILD_JOBS:-2}}"
 canonical="$repo_root/.artifacts/kobox2-storage-production-canonical"
 output="$repo_root/.artifacts/kobox2-storage-production"
+reporting=0
+while (($#)); do
+    case "$1" in
+        --lazy-arena) reporting=1; shift ;;
+        --output-directory)
+            [[ $# -ge 2 && -n "$2" ]] || { echo 'missing output directory' >&2; exit 2; }
+            output="$(realpath -m -- "$2")"; shift 2 ;;
+        *) echo "unknown storage package option: $1" >&2; exit 2 ;;
+    esac
+done
+if (( reporting )); then
+    if [[ "$output" == "$repo_root/.artifacts/kobox2-storage-production" ]]; then
+        echo 'reporting requires a separate output directory' >&2; exit 2
+    fi
+    canonical="$output/canonical"
+fi
 
 if [[ -n "${CAPOS_LINUX_LLVM18_BIN:-}" ]]; then
     PATH="$CAPOS_LINUX_LLVM18_BIN:$PATH"
@@ -65,6 +81,27 @@ if [[ "$(sha256sum "$canonical/.config" | cut -d' ' -f1)" != "$expected_config_d
     echo 'storage canonical config differs from its pinned profile' >&2
     exit 1
 fi
+if (( reporting )); then
+    "$source_tree/scripts/kconfig/merge_config.sh" -m -r -O "$canonical" \
+        "$canonical/.config" "$source_tree/kobox/memory/reporting.config"
+    make -C "$source_tree" O="$canonical" ARCH=x86 LLVM=-18 \
+        KBUILD_KCONFIG="$kbuild_kconfig" olddefconfig
+    rg -qx 'CONFIG_PAGE_REPORTING=y' "$canonical/.config"
+    # Derived experimental profile retains all storage constraints. Only the
+    # explicitly requested Kconfig feature changes its config identity.
+    python3 - "$profile" "$canonical/.config" "$output/reporting-profile.json" <<'PROFILE'
+import hashlib, json, pathlib, sys
+profile = json.loads(pathlib.Path(sys.argv[1]).read_text())
+profile["config_sha256"] = hashlib.sha256(pathlib.Path(sys.argv[2]).read_bytes()).hexdigest()
+pathlib.Path(sys.argv[3]).write_text(json.dumps(profile, indent=2) + "\n")
+PROFILE
+    profile="$output/reporting-profile.json"
+    expected_config_digest="$(sha256sum "$canonical/.config" | cut -d' ' -f1)"
+fi
+if [[ "$(sha256sum "$canonical/.config" | cut -d' ' -f1)" != "$expected_config_digest" ]]; then
+    echo 'storage canonical config differs from its pinned profile' >&2
+    exit 1
+fi
 pacgo_make "$jobs" -C "$source_tree" O="$canonical" ARCH=x86 LLVM=-18 \
     KBUILD_KCONFIG="$kbuild_kconfig" vmlinux modules
 
@@ -80,6 +117,7 @@ python3 "$source_tree/kobox/manifest/generate_closure_inventory.py" \
 identity="$(sha256sum "$canonical/.config" "$canonical/vmlinux" \
     "$canonical/vmlinux.a" | sha256sum | cut -d' ' -f1)"
 provider="$repo_root/.artifacts/kobox2-storage-providers/$identity"
+if (( reporting )); then provider="$output/providers/$identity"; fi
 pacgo_reserve_jobs "$jobs" >/dev/null
 python3 "$source_tree/kobox/boot/build_boot_runtime.py" \
     --source-tree "$source_tree" --canonical-build-dir "$canonical" \

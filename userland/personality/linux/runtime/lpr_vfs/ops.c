@@ -157,6 +157,49 @@ int64_t lpr_linux_ftruncate(uint64_t fd, uint64_t length)
 }
 
 
+int64_t lpr_linux_fallocate(uint64_t fd, uint64_t mode, uint64_t offset, uint64_t length)
+{
+    if (fd > LPR_LINUX_FD_MAX) return -LPR_LINUX_EBADF;
+    lpr_fd_arrays_init();
+    lpr_fd_pin_t pin;
+    if (lpr_fd_table_pin(&lpr_control_fd_table, (uint32_t)fd, &pin))
+        return -LPR_LINUX_EBADF;
+    int64_t result;
+    if (pin.ops_id == LPR_FD_OPS_FILED) {
+        /* Retain the original OFD through connection adoption and the reply:
+         * another thread may close/reuse the integer while allocation sleeps.
+         * Linux owns mode/range/type/seal checks; no size-changing emulation. */
+        const lpr_filed_backend_t *file = pin.state;
+        /* A locally attenuated writable descriptor must not regain WRITE by
+         * presenting its still-writable Linux OFD to the service. Read-only
+         * OFDs go to VFS, preserving its argument-before-FMODE error order. */
+        result = !file ? -LPR_LINUX_EBADF :
+            ((file->flags & LPR_LINUX_O_ACCMODE) != LPR_LINUX_O_RDONLY &&
+             !(pin.effective_rights & LPR_FD_RIGHT_WRITE)) ? -LPR_LINUX_EBADF :
+            lpr_filed_endpoint_ready();
+        if (!result) {
+            kb2_fs_request_t request = {.opcode = KB2_FILESYSTEM_OP_FALLOCATE,
+                .handle = file->handle, .mode = mode,
+                .offset = (int64_t)offset, .length = length};
+            kb2_fs_response_t response;
+            result = lpr_fs_call(&request, 0, 0, 0, 0, 0, 0, &response, -1, 0);
+        }
+    } else if (!(pin.effective_rights & LPR_FD_RIGHT_WRITE)) {
+        result = -LPR_LINUX_EBADF;
+    } else if (pin.ops_id == LPR_FD_OPS_PIPE) {
+        result = -LPR_LINUX_ESPIPE;
+    } else if (pin.ops_id == LPR_FD_OPS_INSTALL_DISK) {
+        /* A native block capability has no Linux file/allocator. Never turn
+         * a reservation or hole-punch request into an apparent success. */
+        result = -LPR_LINUX_EOPNOTSUPP;
+    } else {
+        result = -LPR_LINUX_ENODEV;
+    }
+    lpr_fd_unpin(&pin);
+    return result;
+}
+
+
 int64_t lpr_linux_memfd_create(uint64_t name_raw, uint64_t flags)
 {
     if (!name_raw) return -LPR_LINUX_EFAULT;

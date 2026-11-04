@@ -1,19 +1,43 @@
 #include <personality/lpr_signal_stack.h>
 #include <pacha/abi.h>
 #include "lpr_entry_stack.h"
+#include "lpr_clock_entry.h"
 
 .text
+#include "lpr_thread_page.inc"
 
 .globl lpr_syscall_entry
 .hidden lpr_syscall_entry
 .type lpr_syscall_entry, @function
 lpr_syscall_entry:
+#if LPR_CLOCK_LEAF_ENABLED
+    jmp lpr_clock_syscall_leaf
+#endif
+.hidden lpr_syscall_entry_slow
+.globl lpr_syscall_entry_slow
+lpr_syscall_entry_slow:
     # Only two transit words touch the caller stack. Capture on an LPR stack
     # before any C call: a Go goroutine can have just 2 KiB of stack in total.
     push %rax
     push %rcx
+    # The sole live thread may use its retained private stack without GETTID.
+    # The cache is revoked before count can return to 1 after exit/fork/failure;
+    # count>1 uses the sequenced CPU page, or GETTID until it is available.
+    mov lpr_clock_thread_count(%rip), %rcx
+    cmpl $1, (%rcx)
+    jne .Lentry_tid
+    mov lpr_entry_single_stack_top(%rip), %rax
+    test %rax, %rax
+    jnz .Lentry_switch
+.Lentry_tid:
+    LPR_THREAD_READ .Lentry_lock, .Lentry_gettid
+.Lentry_gettid:
     mov $PACHA_RUNTIME_SYSCALL_GETTID, %eax
+#ifdef LPR_ENTRY_IDENTITY_TEST
+    call lpr_entry_test_gettid
+#else
     syscall
+#endif
     mov %rax, %r11
 .Lentry_lock:
     mov $1, %eax
@@ -33,6 +57,11 @@ lpr_syscall_entry:
     jmp .Lentry_next
 .Lentry_found:
     mov 16(%rcx), %rax
+    mov lpr_clock_thread_count(%rip), %r11
+    cmpl $1, (%r11)
+    jne .Lentry_found_publish_done
+    mov %rax, lpr_entry_single_stack_top(%rip)
+.Lentry_found_publish_done:
     movl $0, lpr_entry_context_lock(%rip)
     jmp .Lentry_switch
 .Lentry_bootstrap:
@@ -55,6 +84,8 @@ lpr_syscall_entry:
     jmp lpr_syscall_entry_private
 .size lpr_syscall_entry, .-lpr_syscall_entry
 
+#include "lpr_clock_entry.inc"
+
 #define LPR_SYSCALL_PRESERVE_FP 1
 #define LPR_SYSCALL_ENTRY_NAME lpr_syscall_entry_private
 #define LPR_SYSCALL_ENTRY_PRIVATE_STACK 1
@@ -64,6 +95,11 @@ lpr_syscall_entry:
 .hidden lpr_fork_child_entry
 .type lpr_fork_child_entry, @function
 lpr_fork_child_entry:
+    movq $0, lpr_thread_fast_page(%rip)
+    # Fork must not borrow a parent thread's private entry stack.
+    movq $0, lpr_entry_single_stack_top(%rip)
+    # A child must not borrow a parent syscall-frame identity on bootstrap.
+    xor %ebp, %ebp
     call lpr_fork_child_bootstrap
 .Lrestore_clone_child:
     mov %rax, %r11

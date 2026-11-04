@@ -11,6 +11,7 @@
 #include "pacha/ipc.h"
 #include "../../audiod/include/audiod/protocol.h"
 #include "pacha/syscall.h"
+#include "pacha/trace.h"
 #include "../../kobox2_owner/fs_channel.h"
 #include "filed/unix_path.h"
 #include <kobox2/virtqueue_x86_64.h>
@@ -144,6 +145,14 @@ static int make_file_vmo(filed_runtime_t *rt,const kb2_fs_request_t *r,
         response->service=cached_pager ? FILED_FILE_VMO_PAGER : 0;
         return 0;
     }
+    filed_storage_stat_t cache_stat=stat;
+    if (stat.snapshot_valid) {
+        /* Do this only on a miss: an admitted cache entry already has a
+         * classified immutable backing. Unknown backing is not cacheable;
+         * the original stat still authorizes/coheres the caller's pager. */
+        int memory=filed_storage_memory_backed(rt,r->handle);
+        cache_stat.memory_backed=memory!=0;
+    }
     /* Executable snapshots need the manifest's instruction/data boundaries
      * even for small DSOs. The eager raw-copy path makes LPR scan ELF data
      * as instructions; the size threshold is only a non-executable heuristic. */
@@ -152,7 +161,7 @@ static int make_file_vmo(filed_runtime_t *rt,const kb2_fs_request_t *r,
         status=filed_pager_create(rt,r->handle,(uint64_t)r->offset,mapped,
             length,rx,&stat,rights,fd,&record);
         if (status) return status;
-        filed_snapshot_cache_put_pager(&rt->snapshots,&stat,(uint64_t)r->offset,
+        filed_snapshot_cache_put_pager(&rt->snapshots,&cache_stat,(uint64_t)r->offset,
             mapped,*fd,record,rx);
         response->result=(int64_t)length;
         response->handle=0;
@@ -206,7 +215,7 @@ static int make_file_vmo(filed_runtime_t *rt,const kb2_fs_request_t *r,
 #endif
     if (status) { (void)pacha_fd_close(vmo); return status; }
     if (consistent && done==length)
-        filed_snapshot_cache_put_variant(&rt->snapshots,&stat,
+        filed_snapshot_cache_put_variant(&rt->snapshots,&cache_stat,
             (uint64_t)r->offset,mapped,vmo,rx);
     response->result=(int64_t)done;
     response->handle=0;
@@ -338,8 +347,14 @@ static int exec_request(filed_runtime_t *rt,const kb2_fs_request_t *r,
         if (mapping) (void)pacha_munmap(mapping,info.size);
     }
     uint64_t handle=0;
+#if defined(FILED_EXEC_STAGE_REPORT) && FILED_EXEC_STAGE_REPORT
+    uint64_t permission_start = pacha_trace_read_tsc();
+#endif
     if (!status) status=filed_storage_exec_open(rt,r->handle,
         (const char *)bytes+r->path.offset,&handle);
+#if defined(FILED_EXEC_STAGE_REPORT) && FILED_EXEC_STAGE_REPORT
+    filed_exec_linux_lpr_profile_open(pacha_trace_read_tsc() - permission_start);
+#endif
     pacha_fd_t process=-1,thread=-1;
     if (!status && r->opcode==KB2_FILESYSTEM_OP_EXEC_SELF) {
         if (!(request.flags & FILED_EXEC_LINUX_LPR) || source_count!=1 ||

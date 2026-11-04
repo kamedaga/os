@@ -36,8 +36,45 @@ pub fn testRestoreState(saved: TestState) void {
     test_notifier = saved.notifier;
 }
 
+const IrqCounts = struct {
+    total: u64 = 0,
+    maintenance: u64 = 0,
+    waiter: u64 = 0,
+    retry: u64 = 0,
+    other: u64 = 0,
+    next_log: u64 = 0,
+    fn add(self: *@This(), now: u64, tick: bool, due: bool, retry: bool) bool {
+        self.total +|= 1;
+        if (tick) self.maintenance +|= 1 else if (retry) self.retry +|= 1 else if (due) self.waiter +|= 1 else self.other +|= 1;
+        if (self.next_log == 0) {
+            self.next_log = now +| 10_000_000_000;
+            return false;
+        }
+        if (now < self.next_log or self.next_log == std.math.maxInt(u64)) return false;
+        // No catch-up burst, including a time jump. Advance BEFORE try-append:
+        // a dropped record must not format again at the next IRQ.
+        self.next_log = now +| 10_000_000_000;
+        return true;
+    }
+};
+var irq_counts: if (@import("kernel_log.zig").ring_enabled) IrqCounts else void = if (@import("kernel_log.zig").ring_enabled) .{} else {};
+// BSP only, IF=0; no new lock, allocation, serial output or boot-buffer write.
+// Maintenance subsumes coincident waiter IRQs. Retry and unclassified IRQs
+// are reported separately, never hidden in a claim of a universal 1kHz cap.
+fn retryConstrained(now: u64, waiter: u64, retry: u64, programmed: u64) bool {
+    return waiter != 0 and retry != 0 and retry >= waiter and programmed == retry and now >= retry;
+}
+pub fn recordTimerInterrupt(now: ?u64, tick: bool) void {
+    if (comptime !@import("kernel_log.zig").ring_enabled) return;
+    const ns = now orelse return;
+    const waiter = publishedWaiterDeadline();
+    if (irq_counts.add(ns, tick, waiter != 0 and waiter <= ns, retryConstrained(ns, waiter, contention_retry_ns, programmed_deadline_ns)))
+        @import("kernel_log.zig").writeProfileFmt("lapic-irq: ns={} total={} maintenance={} waiter={} retry={} other={}\n", .{ ns, irq_counts.total, irq_counts.maintenance, irq_counts.waiter, irq_counts.retry, irq_counts.other });
+}
+
 pub fn kernelStaticStorageEndAddr() usize {
-    return @max(lapic.kernelStaticStorageEndAddr(), @max(@intFromPtr(&programmed_deadline_ns) + @sizeOf(u64), @max(@intFromPtr(&waiter_deadline_ns) + @sizeOf(u64), @intFromPtr(&contention_retry_ns) + @sizeOf(u64))));
+    const diagnostic_end = if (@import("kernel_log.zig").ring_enabled) @intFromPtr(&irq_counts) + @sizeOf(IrqCounts) else 0;
+    return @max(diagnostic_end, @max(lapic.kernelStaticStorageEndAddr(), @max(@intFromPtr(&programmed_deadline_ns) + @sizeOf(u64), @max(@intFromPtr(&waiter_deadline_ns) + @sizeOf(u64), @intFromPtr(&contention_retry_ns) + @sizeOf(u64)))));
 }
 
 /// The last published waiter deadline (0: none), for consistency checks.
@@ -268,4 +305,25 @@ test "clockevent deadline selection preserves tick and cancellation" {
     try std.testing.expectEqual(@as(u64, 2_000_000), selectDeadline(1_100_000, 5_000_000, 0));
     try std.testing.expectEqual(@as(u64, 1_150_000), selectDeadline(1_100_000, 1_050_000, 1_150_000));
     try std.testing.expectEqual(@as(u64, 3_000_000), selectDeadline(2_000_000, 0, 0));
+}
+
+test "IRQ accounting rate window classifies retries and never retries dropped records" {
+    var c: IrqCounts = .{};
+    try std.testing.expect(!c.add(1, true, false, false));
+    for (1..10000) |i| try std.testing.expect(!c.add(i * 1_000_000 + 1, true, false, false));
+    try std.testing.expect(c.add(10_000_000_001, true, false, false));
+    try std.testing.expectEqual(@as(u64, 10001), c.total);
+    // Treat the preceding append as dropped: still no new attempt until 10s.
+    try std.testing.expect(!c.add(10_000_000_002, false, true, false));
+    try std.testing.expect(!c.add(10_000_050_002, false, true, true));
+    try std.testing.expect(c.add(100_000_000_000, false, false, false));
+    try std.testing.expect(!c.add(100_000_000_001, true, false, false));
+    try std.testing.expectEqual(c.total, c.maintenance + c.waiter + c.retry + c.other);
+}
+
+test "IRQ retry attribution excludes stale retry and later waiter" {
+    try std.testing.expect(retryConstrained(1_050_000, 1_000_000, 1_050_000, 1_050_000));
+    try std.testing.expect(!retryConstrained(2_500_000, 2_500_000, 1_050_000, 2_500_000));
+    try std.testing.expect(!retryConstrained(1_050_000, 0, 1_050_000, 1_050_000));
+    try std.testing.expect(!retryConstrained(1_000_000, 1_000_000, 1_050_000, 1_050_000));
 }

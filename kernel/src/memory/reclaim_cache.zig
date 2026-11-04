@@ -10,6 +10,8 @@ pub const Registry = struct {
     // Withdrawn grants already have no borrowers. Rejected physical returns
     // remain independently owned and reachable from PMM pressure.
     fd_retired: ?*storage.RetiredQueue = null,
+    discard_retired: ?*@import("discard_pages.zig").Queue = null,
+    shared_discard_retired: ?*@import("shared_discard_slots.zig").Pool = null,
     pub fn register(self: *Registry, cache: *Cache) void {
         // Boot/test setup only, before either allocator is published.
         std.debug.assert(!cache.registered);
@@ -31,6 +33,8 @@ pub const Registry = struct {
     }
     pub fn reclaim(self: *Registry) usize {
         var pages: usize = if (self.fd_retired) |domain| domain.reclaim() else 0;
+        if (self.discard_retired) |domain| pages += domain.reclaim();
+        if (self.shared_discard_retired) |domain| pages += domain.reclaim();
         var cursor = self.head;
         while (cursor) |cache| : (cursor = cache.next) pages += cache.reclaim();
         return pages;

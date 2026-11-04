@@ -46,6 +46,9 @@ typedef struct lpr_native_fd {
     pacha_fd_t raw;
 } lpr_native_fd_t;
 
+/* Private backend identity; low reserved1 bits remain memfd seal state. */
+#define LPR_FILED_PROC_FD_DIRECTORY 0x80u
+
 typedef struct lpr_filed_backend {
     uint8_t active;
     uint16_t mode;
@@ -164,6 +167,8 @@ typedef struct lpr_input_backend {
     uint64_t handle;
     lpr_native_fd_t wait_fd;
     lpr_native_fd_t lease_fd;
+    lpr_native_fd_t ring_fd;
+    uint64_t ring_address;
 } lpr_input_backend_t;
 
 typedef struct lpr_audio_backend {
@@ -223,6 +228,9 @@ typedef struct lpr_socket_backend {
     uint32_t peer_gid;
     lpr_native_fd_t wait_fd;
     lpr_native_fd_t lease_fd;
+    uint64_t readiness_address;
+    uint32_t readiness_lock;
+    uint32_t readiness_reserved;
 } lpr_socket_backend_t;
 
 typedef struct lpr_epoll_backend {

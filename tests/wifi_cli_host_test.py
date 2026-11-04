@@ -126,6 +126,34 @@ class WifiCLI(unittest.TestCase):
             os.close(master)
             os.close(slave)
 
+    def test_connection_failure_diagnoses_stage_without_secrets(self):
+        cases = [('SCANNING', 'unconfigured', b'scanning for an eligible AP'),
+                 ('4WAY_HANDSHAKE', 'unconfigured', b'WPA key exchange'),
+                 ('COMPLETED', 'unconfigured', b'IPv4/DHCP'),
+                 ('COMPLETED', '192.0.2.1', b'not confirmed successful')]
+        for state, ip, expected in cases:
+            with self.subTest(state=state, ip=ip):
+                (self.runtime / 'request').unlink(missing_ok=True)
+                self.write(self.runtime / 'status',
+                           f'service=ready\nwpa_state={state}\nip_address={ip}\npsk=PRIVATE_FIXTURE\n')
+                thread = self.backend('connect', status=-110)
+                result = self.run_cli('reconnect')
+                self.join_backend(thread)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(expected, result.stderr)
+                self.assertNotIn(b'PRIVATE_FIXTURE', result.stderr + result.stdout)
+                self.assertEqual(result.stdout, b'')
+
+    def test_connection_failure_rejects_stale_diagnostic(self):
+        path = self.runtime / 'status'
+        self.write(path, 'wpa_state=COMPLETED\nip_address=unconfigured\n')
+        os.utime(path, (time.time() - 10, time.time() - 10))
+        thread = self.backend('connect', status=-110)
+        result = self.run_cli('reconnect')
+        self.join_backend(thread)
+        self.assertIn(b'no fresh service status', result.stderr)
+        self.assertNotIn(b'IPv4/DHCP', result.stderr)
+
     def test_backend_absent_never_success(self):
         result = self.run_cli('disconnect')
         self.assertNotEqual(result.returncode, 0)

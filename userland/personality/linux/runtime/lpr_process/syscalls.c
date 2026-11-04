@@ -1,3 +1,4 @@
+#include "../lpr_input/wire.h"
 #include "../lpr_filed_internal.h"
 #include "../lpr_gui_detail.h"
 #include "../lpr_unix/cache.h"
@@ -5,6 +6,7 @@
 #include "../lpr_mlock.h"
 #include "../lpr_clock.h"
 #include "../lpr_entry_stack.h"
+#include "../lpr_thread_page.h"
 #if defined(LPR_BOOT_DIAGNOSTICS) && LPR_BOOT_DIAGNOSTICS
 #include "../lpr_common/boot_diagnostic.h"
 #endif
@@ -159,6 +161,8 @@ static int lpr_reserve_fork_bootstrap_fd(void)
 
 const struct lpr_linux_user_frame *lpr_fork_child_bootstrap(void)
 {
+    lpr_thread_page_after_fork_child();
+    lpr_input_wire_after_fork_child();
     if (lpr_fork_child_return_frame.fp_state) {
         lpr_memcpy(lpr_fork_child_fp_state,
             (const void *)(uintptr_t)lpr_fork_child_return_frame.fp_state, 512);
@@ -361,6 +365,11 @@ void lpr_thread_after_fork_child(void)
 
 int64_t lpr_linux_gettid(void)
 {
+    /* Use the same bounded, migration-safe identity reader as syscall entry.
+     * Bootstrap/reentrant entry and an unavailable page still use the native
+     * syscall. No TLS/FS/GS ownership or TID lifetime cache is introduced. */
+    uint64_t tid = lpr_thread_page_read();
+    if (tid && tid <= UINT32_MAX) return (int64_t)tid;
     return lpr_pacha_syscall0(PACHAOS_SYSCALL_GETTID);
 }
 
@@ -872,8 +881,12 @@ static int64_t lpr_linux_clone_frame_impl(const struct lpr_linux_user_frame *use
     native_child_frame.rsp = (uint64_t)(uintptr_t)(
         lpr_fork_child_stack + sizeof(lpr_fork_child_stack));
     lpr_fork_child_transaction = &fork_transaction;
+    /* Acquire input first: a live lease may enter native VM/identity paths.
+     * Snapshot its page/FD pair only after its reply and release complete. */
+    lpr_input_wire_fork_lock();
     lpr_mlock_fork_lock();
     lpr_clock_fork_lock();
+    lpr_thread_page_fork_lock();
     lpr_unix_cache_fork_lock();
     lpr_fs_control_fork_lock();
     lpr_drm_mapping_fork_lock();
@@ -894,8 +907,10 @@ static int64_t lpr_linux_clone_frame_impl(const struct lpr_linux_user_frame *use
     lpr_drm_mapping_fork_unlock();
     lpr_fs_control_fork_unlock();
     lpr_unix_cache_fork_unlock();
+    lpr_thread_page_fork_unlock();
     lpr_clock_fork_unlock();
     lpr_mlock_vm_end();
+    lpr_input_wire_fork_unlock();
     lpr_fork_child_transaction = 0;
     lpr_trace_clone_frame("after_syscall", &child_frame, ret);
     if (ret >= 16) {

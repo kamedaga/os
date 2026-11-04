@@ -17,7 +17,7 @@ struct unix_transfer_item {
     uint64_t rights;
     uint32_t flags;
     /* Provider-defined metadata, preserved by escrow and validated on import.
-     * Zero for unixd socket OFDs. LPR TTY: 0 console, 1 PTY master, 2 slave. */
+     * LPR NETLINK: domain | type<<8 | protocol<<16. Zero for unixd socket OFDs. LPR TTY: 0 console, 1 PTY master, 2 slave. */
     uint32_t provider_data;
 };
 

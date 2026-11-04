@@ -7,6 +7,8 @@ const identity_allocator = @import("identity_allocator.zig");
 const table = @import("../state/table.zig");
 const types = @import("../state/types.zig");
 
+pub var test_directory_visits: if (builtin.is_test) usize else void = if (builtin.is_test) 0 else {};
+
 pub const AddressSpaceLockState = struct {
     value: u8 = 0,
     diagnostic_record: lock_diagnostics.Record = .{},
@@ -33,6 +35,28 @@ pub const UserAddressSpace = struct {
         kind: ReservationKind = .none,
         writable: bool = false,
         active: bool = false,
+        placement: ReservationAdapter.Node = .{},
+    };
+
+    pub const ReservationAdapter = struct {
+        pub const Key = u64;
+        pub const Handle = *Reservation;
+        pub const Node = struct {
+            key: Key = 0,
+            parent: ?Handle = null,
+            child: [2]?Handle = .{ null, null },
+            red: bool = false,
+            linked: bool = false,
+        };
+        pub const augmented = false;
+        pub fn resolve(h: Handle) *Node {
+            return &h.placement;
+        }
+        pub fn less(a: Key, b: Key) bool {
+            return a < b;
+        }
+        pub fn update(_: Handle) void {}
+        pub fn validate(_: Handle) !void {}
     };
 
     pub const ReservationTable = @import("slot_table.zig").SlotTable(Reservation);
@@ -50,8 +74,15 @@ pub const UserAddressSpace = struct {
     reservations: ReservationTable = .{},
     reservation_draft: ReservationTable = .{},
     reservation_generation: u32 = 0,
-    next_dynamic_map_page: u64 = 0,
+    reservation_index: @import("ordered_index.zig").Index(ReservationAdapter) = .{},
     cr3: u64 = 0,
+    // CPU pins retain this stable AS body. The immutable pointer directory is
+    // prepared off the return path; the header is release-published LAST.
+    thread_identity_header: usize = 0,
+    thread_identity_slots: @import("slot_table.zig").SlotTable(usize) = .{},
+    thread_identity_vmo: types.NativeVmoRef = .{},
+    thread_identity_reference: types.references.Node = .{},
+    thread_identity_cookie: u64 = 0,
     // This object is address-stable: its page tables contain physical
     // pointers to its inline PML4.  Keep the lock with that lifetime
     // and never reset or copy it as address-space contents are recycled.
@@ -137,6 +168,11 @@ pub fn initializeUserAddressSpaceStorage(space: *UserAddressSpace) void {
     space.pd_store = .{};
     space.pt_store = .{};
     space.scratch_store = .{};
+    space.thread_identity_header = 0;
+    space.thread_identity_slots = .{};
+    space.thread_identity_vmo = .{};
+    space.thread_identity_reference = .{};
+    space.thread_identity_cookie = 0;
     space.reservations = .{};
     space.reservation_draft = .{};
     resetUserAddressSpaceStorage(space);
@@ -154,7 +190,7 @@ pub fn resetUserAddressSpaceStorage(space: *UserAddressSpace) void {
     space.reservations.deinit();
     space.reservation_draft.deinit();
     space.reservation_generation = 0;
-    space.next_dynamic_map_page = 0;
+    space.reservation_index = .{};
     space.cr3 = 0;
 }
 
@@ -226,6 +262,7 @@ pub const UserAddressSpaceTable = struct {
     }
 
     pub fn get(self: *UserAddressSpaceTable, index: usize) ?*UserAddressSpace {
+        if (comptime builtin.is_test) _ = @atomicRmw(usize, &test_directory_visits, .Add, 1, .monotonic);
         if (index < self.inline_spaces.len) return &self.inline_spaces[index];
         const restore_interrupts = self.lockDirectory();
         defer self.unlockDirectory(restore_interrupts);
@@ -269,6 +306,7 @@ pub const UserAddressSpaceTable = struct {
     }
 
     fn getLocked(self: *UserAddressSpaceTable, index: usize) ?*UserAddressSpace {
+        if (comptime builtin.is_test) _ = @atomicRmw(usize, &test_directory_visits, .Add, 1, .monotonic);
         if (index < self.inline_spaces.len) return &self.inline_spaces[index];
         if (index >= self.capacity_value) return null;
         const raw = self.extra_slots[index - self.inline_spaces.len];

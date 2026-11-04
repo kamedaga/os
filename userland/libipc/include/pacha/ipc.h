@@ -288,6 +288,7 @@ int pacha_timerfd_settime(pacha_fd_t fd, uint64_t initial_ns, uint64_t interval_
 
 pacha_fd_t pacha_vmo_create(uint64_t size, uint64_t rights, uint32_t flags);
 /* Grow page-aligned capacity while preserving live aliases; requires RESIZE. */
+int pacha_vmo_discard(pacha_fd_t fd, const struct pacha_vmo_discard_range *ranges, size_t count);
 int pacha_vmo_grow(pacha_fd_t fd, uint64_t new_capacity);
 pacha_fd_t pacha_vmo_create_contiguous(uint64_t size, uint64_t rights, uint32_t flags);
 pacha_fd_t pacha_vmo_create_page_view(pacha_fd_t parent_fd, const uint64_t *page_indices,

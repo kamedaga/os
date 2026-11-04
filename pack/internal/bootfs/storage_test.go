@@ -45,6 +45,12 @@ func TestStoragePolicyUsesConfiguredPartitionWithoutCopy(t *testing.T) {
 	if err != nil || !bytes.Equal(image, after) {
 		t.Fatal("configured image was modified")
 	}
+    // Auto policy must survive packaging as zero for target-side discovery.
+    opts.RAMBytes = 0
+    auto, err := storageEntries(opts)
+    if err != nil || binary.LittleEndian.Uint64(auto[1].Data[0:8]) != 0 {
+        t.Fatalf("runtime RAM policy lost: %v", err)
+    }
 	opts.RootPartition = 1
 	if _, err := storageEntries(opts); err == nil {
 		t.Fatal("accepted unused other partition")

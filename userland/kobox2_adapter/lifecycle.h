@@ -6,6 +6,7 @@
 #include "host.h"
 #include "ipc.h"
 #include "boot/lifecycle.h"
+#include "memory/reporting.h"
 
 enum { PH_LIFECYCLE_SERVICE_IDLE = 1, PH_LIFECYCLE_SERVICE_PROGRESS = 2 };
 
@@ -86,6 +87,14 @@ struct ph_lifecycle {
     unsigned control_skips; /* Owner only: advances since the last receive. */
     int work_result;
     struct ph_lifecycle_service service;
+    struct ph_ipc pressure;
+    uint64_t pressure_sequence;
+    int pressure_job, pressure_started, pressure_pending, pressure_result_ready;
+    struct kobox_linux_pressure_result pressure_result;
+    int (*pressure_start)(int (*)(void *), void *);
+    int (*pressure_submit)(uint64_t, uint64_t);
+    int (*pressure_collect)(struct kobox_linux_pressure_result *);
+    void (*pressure_stop)(void);
     uint64_t generation, token;
     bool monitored;
 };

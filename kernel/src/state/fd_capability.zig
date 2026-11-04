@@ -25,6 +25,8 @@ pub fn directIpcUnderK(self: anytype, owner: types.PrincipalId, fd: types.Fd, ca
 }
 
 pub fn ipcUnderK(self: anytype, owner: types.PrincipalId, fd: types.Fd, rights: types.FdRights, outbound: bool) ?FullIpc {
+    const wf11 = @import("../ipc_metric.zig").detailBegin();
+    defer @import("../ipc_metric.zig").detailEnd(.handle, wf11);
     return resolveIpcUnderK(true, self, owner, fd, rights, outbound);
 }
 

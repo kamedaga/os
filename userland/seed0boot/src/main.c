@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 
 #include "bootstrap_abi.h"
+#include "pressure_manager.h"
 #include "bootfs_reader.h"
 #include "filed/live_bootstrap.h"
 #include "pacha/capsule.h"
@@ -188,20 +189,30 @@ fail:
     return status;
 }
 
-static int serve_power_requests(pacha_fd_t power_fd)
+static int serve_power_requests(pacha_fd_t power_fd, pacha_fd_t registration_fd)
 {
     if (power_fd < 16) return -22;
+    int power_closed = 0;
     for (;;) {
         struct pacha_ipc_fd reply_fd = {0};
         struct pacha_ipc_msg request;
         memset(&request, 0, sizeof(request));
         request.fds = &reply_fd;
         request.fd_capacity = 1;
-        const int status = pacha_ipc_recv_wait(
-            power_fd, &request, PACHA_FD_WAIT_FOREVER);
+        const unsigned interval = seed0_pressure_poll(registration_fd);
+        if (power_closed) {
+            /* With no power peer, retain manager lifetime and its timer.
+             * A dead registration channel must not turn this into a spin. */
+            uint64_t delay[2] = {0, (uint64_t)interval * 1000000};
+            (void)pacha_syscall1(PACHA_RUNTIME_SYSCALL_NANOSLEEP, (uintptr_t)delay);
+            continue;
+        }
+        const int status = pacha_ipc_recv_wait(power_fd, &request, interval);
+        if (status == PACHA_ERR_NOT_READY) continue;
         if (status != 0) {
             fprintf(stderr, "[seed0boot] power channel closed status=%d\n", status);
-            return status;
+            power_closed = 1;
+            continue;
         }
         if (request.word0 != PACHA_LIVE_POWER_REQUEST_MAGIC ||
             (request.word1 != PACHA_LIVE_POWER_OFF &&
@@ -218,6 +229,7 @@ static int serve_power_requests(pacha_fd_t power_fd)
         fflush(stdout);
         const long result = pacha_syscall1(PACHA_RUNTIME_SYSCALL_POWER_CONTROL,
             request.word1);
+        if (!result) { seed0_pressure_shutdown(); return 0; }
         fprintf(stderr, "[seed0boot] ACPI %s failed status=%ld\n",
             request.word1 == PACHA_LIVE_POWER_OFF ? "poweroff" : "reboot", result);
         const struct pacha_ipc_msg response = {
@@ -241,6 +253,8 @@ static int launch_live_root(void)
          memcmp(installer_marker, expected_marker, sizeof(expected_marker) - 1)))
         return 25;
     const int installer_mode = marker_status == 0;
+    struct pacha_ipc_channel_pair pressure_export = {.a=-1, .b=-1};
+    if (pacha_ipc_channel_create(&pressure_export, channel_rights, 0)) return 20;
     struct pacha_ipc_channel_pair ready = { .a = -1, .b = -1 };
     struct pacha_ipc_channel_pair unix_path = { .a = -1, .b = -1 };
     struct pacha_ipc_channel_pair root_handoff = { .a = -1, .b = -1 };
@@ -251,8 +265,9 @@ static int launch_live_root(void)
         pacha_ipc_channel_create(&power, channel_rights, 0) != 0)
         return 20;
     pacha_fd_t endpoint_fd = -1;
-    int status = seed0_launch_live_filed(ready.b, unix_path.a,
+    int status = seed0_launch_live_filed(ready.b, unix_path.a, pressure_export.b,
         &endpoint_fd);
+    (void)pacha_fd_close(pressure_export.b);
     (void)pacha_fd_close(ready.b);
     (void)pacha_fd_close(unix_path.a);
     if (status != 0) {
@@ -274,7 +289,8 @@ static int launch_live_root(void)
     printf("[seed0boot] RAM root ready; launching live services\n");
     fflush(stdout);
     status = seed0_launch_live_seed0root(endpoint_fd, unix_path.b,
-        root_handoff.a, power.b);
+        root_handoff.a, power.b, pressure_export.a);
+    (void)pacha_fd_close(pressure_export.a);
     (void)pacha_fd_close(endpoint_fd);
     (void)pacha_fd_close(unix_path.b);
     (void)pacha_fd_close(root_handoff.a);
@@ -286,13 +302,12 @@ static int launch_live_root(void)
         return 23;
     }
     status = send_root_handoff(root_handoff.b, 1, installer_mode);
-    (void)pacha_fd_close(root_handoff.b);
     if (status != 0) {
         fprintf(stderr, "[seed0boot] live device handoff failed status=%d\n",
             status);
         return 24;
     }
-    return serve_power_requests(power.a);
+    return serve_power_requests(power.a, root_handoff.b);
 }
 
 int main(void)
@@ -347,7 +362,6 @@ int main(void)
         return 12;
     }
     status = send_root_handoff(root_handoff.a, 0, 0);
-    (void)pacha_fd_close(root_handoff.a);
     if (status != 0) {
         fprintf(stderr, "[seed0boot] root capability handoff failed status=%d\n", status);
         return 13;
@@ -356,5 +370,5 @@ int main(void)
     fflush(stdout);
     fflush(stderr);
 
-    return serve_power_requests(power.a);
+    return serve_power_requests(power.a, root_handoff.a);
 }

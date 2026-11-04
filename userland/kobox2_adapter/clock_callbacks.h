@@ -20,7 +20,8 @@ static const volatile unsigned char *clock_page;
 #define CLOCK_PAGE_PV(field) (PACHA_CLOCK_PAGE_PV0_OFFSET + PACHA_CLOCK_PAGE_PV_##field##_OFFSET)
 
 /* Monotonic time without a syscall, in the kernel's own CLOCK_MONOTONIC domain:
- * the same KVM pvclock record, epoch and conversion as the kernel, bounded by
+ * the kernel-published pvclock-format record (KVM or kernel-synthesized), with
+ * stable bit 0 guaranteeing the conversion on every online CPU, bounded by
  * the kernel's ceiling and lifted to its floor. Any doubt (fast closed, odd or
  * torn version, no stable bit, overflow, value above the ceiling) returns 1 so
  * the caller asks the kernel, which may then switch clock source safely.

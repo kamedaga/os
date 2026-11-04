@@ -196,7 +196,10 @@ def check(sources):
     end = function_body(scheduler, 'endPrincipalLifecycle')
     if end.find('lock_diagnostics.releasing(') < 0 or end.find('lock_diagnostics.releasing(') > end.find('@atomicStore(usize, &principal_lifecycle_gate, 0'):
         errors.append('L: unlink before gate publication required')
-    q = function_body(code_only(sources['state/fd.zig']), 'recordDeviceInterruptEvent')
+    # The device-specific wrapper now delegates to the common source matcher;
+    # the lifetime/leaf proof belongs to the implementation that dereferences
+    # IrqPublishSlot for every IRQ source.
+    q = function_body(code_only(sources['state/fd.zig']), 'recordInterruptEvent')
     positions = [q.find(x) for x in ('while (true)', 'self.object_directory_leaf.lock()', 'self.irq_publish_slots.get(', '@atomicRmw(', 'const owner_raw = slot.owner_principal_raw;')]
     if min(positions) < 0 or positions != sorted(positions):
         errors.append('Q: each candidate must acquire directory leaf before lookup and event addition')

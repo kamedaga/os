@@ -8,6 +8,19 @@
 #include <pacha/syscall.h>
 #include <string.h>
 
+#if defined(GPUD_DRM_RPC_PROFILE) && GPUD_DRM_RPC_PROFILE
+extern int gpud_drm_profile_enabled(void);
+static uint64_t rpc_stamp(void) {
+    if (!gpud_drm_profile_enabled())
+        return 0;
+    uint32_t low, high;
+    __asm__ volatile("lfence; rdtsc" : "=a"(low), "=d"(high) :: "memory");
+    return (uint64_t)high << 32 | low;
+}
+#else
+static inline uint64_t rpc_stamp(void) { return 0; }
+#endif
+
 /* Preserve the first fault before cleanup and subsequent calls can replace
  * the useful admission site with an already-terminal error return. */
 static int rpc_failed(struct gpud_gpu_rpc *rpc, int error, unsigned int line) {
@@ -269,6 +282,7 @@ int gpud_gpu_rpc_call(struct gpud_gpu_rpc *rpc, unsigned int queue,
         (control || display ? 2048u : GPUD_GPU_OUTPUT_OFFSET - GPUD_GPU_REQUEST_OFFSET) ||
         reply_capacity < capacity)
         return -EMSGSIZE;
+    const uint64_t profile_start = rpc_stamp();
     uint64_t deadline;
     int error = now_ms(&deadline);
     if (error)
@@ -287,6 +301,7 @@ int gpud_gpu_rpc_call(struct gpud_gpu_rpc *rpc, unsigned int queue,
     if (kb2_vq_arm(lane, generation, &ready) || ready ||
         kb2_vq_publish(lane, generation, &rpc->chain, &notify))
         goto protocol_error;
+    const uint64_t profile_published = rpc_stamp();
     if (notify) {
         struct ph_ipc_packet packet = {.operation = PH_GPU_QUEUE_NOTIFY,
             .generation = generation, .value = lane->queue.available_notification_id};
@@ -294,11 +309,13 @@ int gpud_gpu_rpc_call(struct gpud_gpu_rpc *rpc, unsigned int queue,
         if (error)
             goto failed;
     }
+    const uint64_t profile_notified = rpc_stamp();
     /* Arming before publication requires a used wake even when the ring is
      * already complete. Consume it before returning IPC to lifecycle handling. */
     error = wait_wake(rpc, lane->queue.used_notification_id, deadline);
     if (error)
         goto failed;
+    const uint64_t profile_used = rpc_stamp();
     kb2_vq_chain_t *done = NULL;
     if (kb2_vq_take_used(lane, generation, &done) || done != &rpc->chain ||
         done->used_length < KB2_PROTOCOL_MESSAGE_ENVELOPE_SIZE || done->used_length > capacity ||
@@ -307,6 +324,17 @@ int gpud_gpu_rpc_call(struct gpud_gpu_rpc *rpc, unsigned int queue,
     *reply_size = done->used_length;
     if (kb2_vq_release(lane, generation, done))
         goto protocol_error;
+#if defined(GPUD_DRM_RPC_PROFILE) && GPUD_DRM_RPC_PROFILE
+    if (gpud_drm_profile_enabled()) {
+        rpc->profile_calls++;
+        rpc->profile_prepare += profile_published - profile_start;
+        rpc->profile_notify += profile_notified - profile_published;
+        rpc->profile_wait += profile_used - profile_notified;
+        rpc->profile_copy += rpc_stamp() - profile_used;
+    }
+#else
+    (void)profile_start; (void)profile_published; (void)profile_notified; (void)profile_used;
+#endif
     return 0;
 protocol_error:
     error = -EPROTO;

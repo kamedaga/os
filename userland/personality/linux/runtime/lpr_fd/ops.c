@@ -1,3 +1,4 @@
+#include <inputd/event_ring.h>
 #include "../lpr_filed_internal.h"
 #include "../support/browser_diag.h"
 #include "device.h"
@@ -58,6 +59,8 @@ static int64_t lpr_ops_input_close(void *state)
     }
     if (input->lease_fd.raw >= 16)
         (void)lpr_close_native_fd_if_open((uint64_t)input->lease_fd.raw);
+    if (input->ring_address) (void)lpr_pacha_syscall2(PACHAOS_SYSCALL_MUNMAP, input->ring_address, INPUTD_RING_BYTES);
+    if (input->ring_fd.raw >= 16) (void)lpr_close_native_fd_if_open(input->ring_fd.raw);
     return status;
 }
 
@@ -246,6 +249,33 @@ int lpr_fd_transfer_prepare(
         *item = (struct unix_transfer_item){ .provider = UNIX_TRANSFER_SOCKET, .object = socket->socket };
         return 0; /* unixd retains the authenticated OFD, not local VMO numbers. */
     }
+    if (pin->ops_id == LPR_FD_OPS_SOCKET) {
+        const lpr_socket_backend_t *socket=pin->state;
+        if(socket->domain!=16 || !socket->handle || socket->wait_fd.raw<16)
+            return -LPR_LINUX_EOPNOTSUPP;
+        if(!capability_fds || capability_capacity<2) return -LPR_LINUX_EMSGSIZE;
+        pacha_fd_t wait=lpr_transfer_duplicate_capability(socket->wait_fd.raw);
+        if(wait<0)return wait;
+        pacha_fd_t lease=-1,remote=-1;
+        int status=lpr_native_wait_pair(&lease,&remote);
+        if(!status)status=(int)lpr_netd_transfer_hold(socket->handle,remote);
+        if(remote>=16)(void)lpr_close_native_fd_if_open(remote);
+        if(status){
+            (void)lpr_close_native_fd_if_open(wait);
+            if(lease>=16)(void)lpr_close_native_fd_if_open(lease);
+            return status;
+        }
+        /* As for fork/exec, the service's existing transfer lease retains
+         * one OFD reference until every escrow/imported lease copy closes.
+         * Virtual mappings/locks are reconstructed, never sent as metadata. */
+        item->object=socket->handle;
+        item->provider_data=socket->domain | ((uint32_t)socket->type<<8) |
+            ((uint32_t)socket->protocol<<16);
+        item->flags=socket->flags & ~(uint32_t)LPR_LINUX_O_CLOEXEC;
+        item->capability_count=2;
+        capability_fds[0]=wait;capability_fds[1]=lease;*out_capability_count=2;
+        return 0;
+    }
     if (pin->ops_id == LPR_FD_OPS_FILED) {
         unix_profile_fd_inventory(0);
         UP_BEGIN(export_total, UP_FD_TRANSFER, LPR_FD_OPS_FILED, UP_TOTAL);
@@ -333,7 +363,7 @@ int lpr_fd_transfer_prepare(
         if (input->handle == 0 || input->handle > 0x00ffffffffffffffull ||
             input->wait_fd.raw < 16)
             return -LPR_LINUX_EOPNOTSUPP;
-        if (capability_fds == 0 || capability_capacity < 2)
+        if (capability_fds == 0 || capability_capacity < 3)
             return -LPR_LINUX_EMSGSIZE;
         const pacha_fd_t wait_fd = lpr_transfer_duplicate_capability(input->wait_fd.raw);
         if (wait_fd < 0) return wait_fd;
@@ -344,26 +374,36 @@ int lpr_fd_transfer_prepare(
             (void)lpr_close_native_fd_if_open((uint64_t)wait_fd);
             return pair_status;
         }
+        const pacha_fd_t ring_fd = lpr_transfer_duplicate_capability(input->ring_fd.raw);
+        if (ring_fd < 0) {
+            (void)lpr_close_native_fd_if_open(wait_fd);
+            (void)lpr_close_native_fd_if_open(lease_fd);
+            (void)lpr_close_native_fd_if_open(remote_lease_fd);
+            return ring_fd;
+        }
         uint64_t ticket = 0;
         const int64_t status = lpr_input_transfer_dup_handle(
             input->handle, remote_lease_fd, &ticket);
         if (status != 0) {
+            (void)lpr_close_native_fd_if_open(ring_fd);
             (void)lpr_close_native_fd_if_open((uint64_t)wait_fd);
             (void)lpr_close_native_fd_if_open((uint64_t)lease_fd);
             (void)lpr_close_native_fd_if_open((uint64_t)remote_lease_fd);
             return (int)status;
         }
         if (ticket != input->handle) {
+            (void)lpr_close_native_fd_if_open(ring_fd);
             (void)lpr_close_native_fd_if_open((uint64_t)wait_fd);
             (void)lpr_close_native_fd_if_open((uint64_t)lease_fd);
             return -LPR_LINUX_EIO;
         }
         item->object = ticket | ((uint64_t)input->event_index << 56u);
         item->flags = input->flags & ~(uint32_t)LPR_LINUX_O_CLOEXEC;
-        item->capability_count = 2;
+        item->capability_count = 3;
         capability_fds[0] = wait_fd;
         capability_fds[1] = lease_fd;
-        *out_capability_count = 2;
+        capability_fds[2] = ring_fd;
+        *out_capability_count = 3;
         return 0;
     }
     if (pin->ops_id == LPR_FD_OPS_DRM) {
@@ -479,7 +519,8 @@ int lpr_fd_transfer_stage_batch(
         const struct unix_transfer_item *item = &items[prepared_count];
         if (item->object == 0 ||
             (item->provider != LPR_FD_OPS_TTY &&
-             item->provider != LPR_FD_OPS_FILED && item->provider_data != 0) ||
+             item->provider != LPR_FD_OPS_FILED && item->provider != LPR_FD_OPS_SOCKET &&
+             item->provider_data != 0) ||
             (item->rights & ~known_rights) != 0 ||
             item->capability_first != next_capability ||
             item->capability_count > capability_count - next_capability)
@@ -509,6 +550,19 @@ int lpr_fd_transfer_stage_batch(
                 break;
             }
             handle = (uint32_t)item->object;
+        } else if (item->provider == LPR_FD_OPS_SOCKET) {
+            uint32_t domain=item->provider_data & 255u;
+            uint32_t type=(item->provider_data>>8)&255u,protocol=item->provider_data>>16;
+            struct pacha_fd_info wait,lease;
+            if(domain!=16 || (type!=2 && type!=3) || (protocol!=0 && protocol!=15) ||
+                !(item->object & (UINT64_C(1)<<62)) || (item->object>>63) ||
+                item->capability_count!=2 || item_capabilities[0]<16 || item_capabilities[1]<16 ||
+                !lpr_native_fd_info(item_capabilities[0],&wait) ||
+                !lpr_native_fd_info(item_capabilities[1],&lease) ||
+                wait.kind!=PACHA_FD_KIND_CHANNEL || lease.kind!=PACHA_FD_KIND_CHANNEL ||
+                !(wait.rights&PACHA_FD_RIGHT_POLL) || !(lease.rights&PACHA_FD_RIGHT_CLOSE)) {
+                status=-LPR_LINUX_EINVAL;break;
+            }
         } else if (item->provider == LPR_FD_OPS_TTY) {
             if (item->capability_count != 2 ||
                 item->provider_data > LPR_TTY_BACKEND_PTY_SLAVE ||
@@ -518,8 +572,8 @@ int lpr_fd_transfer_stage_batch(
                 break;
             }
         } else if (item->provider == LPR_FD_OPS_INPUT) {
-            if (item->capability_count != 2 || item_capabilities[0] < 16 ||
-                item_capabilities[1] < 16)
+            if (item->capability_count != 3 || item_capabilities[0] < 16 ||
+                item_capabilities[1] < 16 || item_capabilities[2] < 16)
             {
                 status = -LPR_LINUX_EINVAL;
                 break;
@@ -608,6 +662,19 @@ int lpr_fd_transfer_stage_batch(
             filed->reserved1 = (uint8_t)(item->object >> 32u);
             filed->reserved2 |= LPR_BACKEND_TRANSFER_LEASE;
             filed->lease_fd.raw = item_capabilities[0];
+        } else if (item->provider == LPR_FD_OPS_SOCKET) {
+            lpr_socket_backend_t *socket=states[prepared_count];
+            socket->active=1;socket->flags=(uint32_t)linux_flags;socket->handle=handle;
+            socket->domain=(uint8_t)item->provider_data;
+            socket->type=(uint8_t)(item->provider_data>>8);
+            socket->protocol=(uint16_t)(item->provider_data>>16);
+            socket->wait_fd.raw=item_capabilities[0];socket->lease_fd.raw=item_capabilities[1];
+            socket->reserved1|=LPR_BACKEND_TRANSFER_LEASE;
+            status=(int)lpr_netd_readiness_import(socket);
+            if(status){
+                (void)lpr_backend_state_free(states[prepared_count],state_bytes);
+                states[prepared_count]=NULL;break;
+            }
         } else if (item->provider == LPR_FD_OPS_TTY) {
             lpr_tty_backend_t *tty = states[prepared_count];
             tty->active = 1;
@@ -626,6 +693,8 @@ int lpr_fd_transfer_stage_batch(
             input->reserved1 |= LPR_BACKEND_TRANSFER_LEASE;
             input->wait_fd.raw = item_capabilities[0];
             input->lease_fd.raw = item_capabilities[1];
+            input->ring_fd.raw = item_capabilities[2];
+            input->ring_address = 0;
         } else if (item->provider == LPR_FD_OPS_SYNC_FILE) {
             lpr_sync_file_backend_t *sync_file = states[prepared_count];
             sync_file->active = 1;

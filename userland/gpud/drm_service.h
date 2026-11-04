@@ -6,11 +6,14 @@
 #include "drm_files.h"
 #include "drm_translate.h"
 #include "gpu_rpc.h"
+#include "ready.h"
+#include "index.h"
 #include "../../kobox2/linux-sandbox/kobox/boot/drm_limits.h"
 
 struct gpud_drm_watch {
     uint64_t handle, device_minor;
     pacha_fd_t fd;
+    struct gpud_ready_source *source;
     unsigned int transferred, submit_reported, modeset_reported;
     unsigned int dirty_probe_reported, dirty_update_reported;
 };
@@ -31,13 +34,16 @@ struct gpud_drm_mapping {
     uint64_t id, exchange, handle, length;
     uint32_t rights, cache_policy, gem_handle, cache_kind;
     pacha_fd_t view_fd;
-    unsigned int owner_closed;
+    unsigned int owner_closed, lease_count, gem_next, closed_next, closed_queued, free_next;
 };
 
+struct gpud_drm_object_lease;
 struct gpud_drm_prime {
     uint64_t token, length;
+    struct gpud_drm_object_lease *owner_lease;
     pacha_fd_t view_fd;
     uint32_t cpu_rights;
+    unsigned lease_count;
     unsigned int owner_closed;
 };
 
@@ -45,6 +51,10 @@ struct gpud_drm_object_lease {
     uint64_t object_id;
     pacha_fd_t fd;
     unsigned int prime_owner;
+    /* Snapshot from the same generation-owner poll that reaps hangups. */
+    unsigned int readable, free_next;
+    struct gpud_ready_source *source;
+    struct gpud_drm_object_lease *ready_next;
 };
 
 struct gpud_drm_event_buffer {
@@ -54,7 +64,8 @@ struct gpud_drm_event_buffer {
 };
 
 struct gpud_drm_connection {
-    struct gpud_drm_connection *next;
+    struct gpud_drm_connection *next, *ready_next;
+    struct gpud_ready_source *source;
     void *page;
     pacha_fd_t fd;
     unsigned ready;
@@ -80,7 +91,7 @@ struct gpud_drm_service {
     uint32_t kms_session_mode;
     uint64_t resource_creates, gem_closes, exec_submits;
     /* Set only after a typed driver reply with defined error-path outputs. */
-    unsigned ioctl_reply_on_error;
+    unsigned ioctl_reply_on_error, reply_attempted;
     /* Bound startup diagnostics per generation, not per client, so a busy
      * renderer cannot turn the shared RAM log into a frame-by-frame trace. */
     unsigned int startup_requests_logged, active_request_sequence;
@@ -94,9 +105,15 @@ struct gpud_drm_service {
     } ioctl_workspace;
     struct gpud_drm_pending_fence *fences;
     struct gpud_drm_connection *connections;
+    struct gpud_ready *ready;
+    struct gpud_drm_connection *connection_ready_head, *connection_ready_tail;
+    struct gpud_drm_object_lease *prime_ready_head, *prime_ready_tail;
+    struct gpud_index_entry mapping_index[2 * GPUD_DRM_MAPPINGS_MAX];
+    struct gpud_index_entry gem_index[2 * GPUD_DRM_MAPPINGS_MAX];
+    uint32_t closed_head, closed_tail, mapping_free_head, lease_free_head;
     struct pacha_pollfd *pollfds;
     size_t poll_capacity;
-    unsigned prefer_connection;
+    unsigned prefer_connection, prefer_prime, prime_cursor;
     size_t mapping_high_water;
     struct gpud_drm_watch watches[GPUD_DRM_REFERENCES_MAX];
     struct gpud_drm_mapping mappings[GPUD_DRM_MAPPINGS_MAX];
@@ -109,16 +126,25 @@ struct gpud_drm_service {
     void *page;
     void *request_aux;
     pacha_fd_t endpoint_fd;
+    /* Sole in-flight reply transfer, retained through failed observer cleanup. */
+    pacha_fd_t pending_transfer_client_fd;
     int error;
 };
 
 /* Binds this generation to filed's process-lifetime DRM endpoint. The
  * endpoint is borrowed so a replacement generation can bind it again. */
 int gpud_drm_service_bind(struct gpud_drm_service *service, pacha_fd_t endpoint_fd);
-/* Receives and replies to one existing LPR native IPC_CALL. -EAGAIN means no
+/* Call reap_hangups before each receive to refresh level readiness, as the
+ * generation loop does. Receives and replies to one existing LPR native IPC_CALL. -EAGAIN means no
  * request; other errors stop the service. A Linux operation error is sent in
  * the reply, not returned here. CLOSE waits for the real backend completion. */
 int gpud_drm_service_receive(struct gpud_drm_service *service);
+/* Owner-only optional instrumentation: disabled until runtime trace control,
+ * bounded sampling, explicit disarm. Builds without it are no-ops. No wire extension. */
+void gpud_drm_service_profile_arm(pacha_fd_t log_fd);
+void gpud_drm_service_profile_disarm(void);
+int gpud_drm_profile_enabled(void);
+int gpud_drm_service_stop_ready(struct gpud_drm_service *);
 /* While an optional physical GPU is armed but not probed, the public node
  * must answer clients instead of leaving an IPC_CALL waiting indefinitely. */
 int gpud_drm_service_reject_unavailable(pacha_fd_t endpoint_fd);

@@ -18,6 +18,7 @@
 #include <stdio.h>
 #include <string.h>
 
+void ph_boot_log_gpu_export_ready(void) {}
 static unsigned int calls;
 static int i915_parameter_status;
 static int32_t i915_parameter_value = 0x9a49;
@@ -117,6 +118,8 @@ static int i915_query_mock(struct kobox_linux_drm_file *file, uint32_t flags,
 static int large_topology;
 static unsigned int device_exports;
 static unsigned int page_view_creates;
+static int page_view_failures,export_table_full,export_table_grow_fail;
+static unsigned export_table_grows;
 static int expect_page_view;
 static long device_export_result = 19;
 long ph_pci_export_pages(struct ph_pci *pci, uint64_t *pages, size_t count,
@@ -1142,6 +1145,10 @@ void *ph_image_lookup(void *image, const char *name) {
 }
 
 long pacha_syscall2(uint64_t number, uint64_t a0, uint64_t a1) {
+    if(number==PACHA_FD_SYSCALL_TABLE){
+        if(a0){++export_table_grows;assert(a0==4380);if(export_table_grow_fail)return PACHA_SYSCALL_ERR_ALLOC;export_table_full=0;}
+        *(struct pacha_fd_table_info *)(uintptr_t)a1=(struct pacha_fd_table_info){.capacity=a0?a0:4124,.maximum=16384,.free_slots=export_table_full?0:32};return 0;
+    }
     if (number == PACHA_RUNTIME_SYSCALL_CLOCK_GETTIME) {
         assert(a0==1); uint64_t *time=(void *)(uintptr_t)a1;
         time[0]=1;time[1]=0;return 0;
@@ -1197,6 +1204,7 @@ long pacha_syscall5(uint64_t number, uint64_t a0, uint64_t a1,
             (a3 & PACHA_FD_RIGHT_MAP_WRITE));
         assert(a4 == PACHA_FD_FLAG_CLOEXEC);
         ++page_view_creates;
+        if(page_view_failures){if(page_view_failures>0)--page_view_failures;return PACHA_SYSCALL_ERR_ALLOC;}
         return 19;
     }
     return -1;
@@ -3947,7 +3955,24 @@ static void create_ext_roundtrip(void) {
  puts("CREATE_EXT typed request/region span/private dispatcher/result and driver errno roundtrip PASS");
 }
 
+static unsigned attachment_rollbacks;
+static int attachment_unmap(struct kobox_linux_drm_service *s,uint64_t id){assert(s==(void*)&calls&&id==4096);++attachment_rollbacks;return 0;}
+static void attachment_failure_roundtrip(void){
+ for(unsigned i=0;i<4;i++){
+  int errors[]={-ENOMEM,-EMFILE,-ENOSPC,-EAGAIN};unsigned status[]={KB2_GPU_STATUS_NO_MEMORY,KB2_GPU_STATUS_LIMIT,KB2_GPU_STATUS_LIMIT,KB2_GPU_STATUS_RETRY};
+  struct ph_gpu_query q={.generation=7,.session_id=103,.correlation=11,.result={.mapping_id=4096}};
+  assert(!ph_gpu_query_attachment_error(&q,errors[i],(void*)&calls,attachment_unmap));
+  assert(!q.result.mapping_id&&!q.terminal_after_completion);
+  kb2_protocol_message_envelope_t envelope;kb2_gpu_inline_completion_t reply;
+  assert(!kb2_protocol_message_envelope_decode(q.reply,q.reply_size,&envelope));assert(envelope.generation==7&&envelope.correlation_id==11);
+  assert(!kb2_gpu_inline_completion_decode(q.reply+KB2_PROTOCOL_MESSAGE_ENVELOPE_SIZE,envelope.payload_length,103,&reply));assert(reply.status==status[i]&&!reply.record_schema_id&&!reply.length);
+ }
+ struct ph_gpu_query bad={.result={.mapping_id=4096}};assert(ph_gpu_query_attachment_error(&bad,-EPROTO,(void*)&calls,attachment_unmap)==-EPROTO);assert(attachment_rollbacks==4);
+ puts("native export headroom/one retry and resource-error pin rollback/typed nonterminal reply PASS");
+}
+
 int main(void) {
+ attachment_failure_roundtrip();
  create_ext_roundtrip();
     syncobj_file_query_roundtrip();
     i915_mmap_roundtrip();
@@ -3991,6 +4016,16 @@ int main(void) {
         query.result.mapping_cache_policy = KOBOX_DRM_CACHE_WC;
         assert(!ph_gpu_query_publish_attachment(&query, &ipc));
         assert(page_view_creates == 2 && sends == 3);
+        page_view_failures=1;export_table_full=1;unsigned before=page_view_creates;
+        assert(!ph_gpu_query_publish_attachment(&query,&ipc));assert(page_view_creates==before+2&&export_table_grows==1);
+        page_view_failures=1;export_table_full=0;before=page_view_creates;
+        assert(ph_gpu_query_publish_attachment(&query,&ipc)==-ENOMEM);assert(page_view_creates==before+1&&export_table_grows==1);
+        page_view_failures=1;export_table_full=1;export_table_grow_fail=1;
+        assert(ph_gpu_query_publish_attachment(&query,&ipc)==-ENOMEM);assert(export_table_grows==2);
+        page_view_failures=-1;export_table_full=1;export_table_grow_fail=0;before=page_view_creates;
+        assert(ph_gpu_query_publish_attachment(&query,&ipc)==-ENOMEM);assert(page_view_creates==before+2&&export_table_grows==3);
+        page_view_failures=export_table_full=0;
+
         query.result.mapping_cache_policy = KOBOX_DRM_CACHE_UC;
         assert(ph_gpu_query_publish_attachment(&query, &ipc) == -EPROTO);
         query.result.mapping_cache_policy = 99;

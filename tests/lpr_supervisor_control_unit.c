@@ -90,8 +90,26 @@ int pacha_ipc_channel_create(struct pacha_ipc_channel_pair *pair, uint64_t right
     return 0;
 }
 
+static void fork_image_identity_test(void)
+{
+    lprs_process_t table[2]={0};
+    uint64_t old_pid=g_next_pid, old_token=g_next_token, old_generation=g_next_generation;
+    table[0].active=1;table[0].token=91;table[0].pid=21;
+    strcpy(table[0].comm,"browser");strcpy(table[0].cmdline,"/usr/lib/browser/browser");
+    g_processes=table;g_process_count=g_process_capacity=2;
+    lprs_fork_t request={0};assert(!lprs_fork_begin(91,&request));
+    lprs_process_t *child=lprs_find_by_token(request.child_token);
+    assert(child && child->ppid==21 && child->pid!=21);
+    assert(!strcmp(child->comm,"browser") && !strcmp(child->cmdline,"/usr/lib/browser/browser"));
+    strcpy(table[0].cmdline,"/bin/other");
+    assert(!strcmp(child->cmdline,"/usr/lib/browser/browser"));
+    g_processes=NULL;g_process_count=g_process_capacity=0;
+    g_next_pid=old_pid;g_next_token=old_token;g_next_generation=old_generation;
+}
+
 int main(void)
 {
+    fork_image_identity_test();
     lprs_process_t processes[3] = {
         { .active = 1, .token = 101, .pid = 10, .process_fd = 90, .control_fd = -1,
             .bootstrap_server_fd = -1, .bootstrap_client_fd = -1, .pending_exec_fd = -1 },

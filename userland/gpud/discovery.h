@@ -12,11 +12,14 @@ struct gpud_discovery_entry {
     uint64_t dev;
 };
 struct gpud_discovery {
-    struct gpud_discovery_entry entries[32];
+    struct gpud_discovery_entry entries[40];
     size_t count, published, ancestor_count;
-    uint32_t owned;
+    uint64_t owned;
 };
 /* Snapshot only the granted PCI function. No driver/model selection. */
 int gpud_discovery_prepare(struct gpud_discovery *, pacha_fd_t device_fd, int primary);
 int gpud_discovery_publish(struct gpud_discovery *, pacha_fd_t filed_fd);
 int gpud_discovery_remove(struct gpud_discovery *, pacha_fd_t filed_fd);
+
+_Static_assert(sizeof(((struct gpud_discovery *)0)->entries) /
+    sizeof(struct gpud_discovery_entry) <= 64, "discovery ownership bitmap capacity");

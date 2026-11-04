@@ -13,6 +13,7 @@ struct lpr_unix_socket {
     pacha_fd_t handoff_fd;
     uint32_t adopt_lock;
     struct lpr_unix_mapping mapping;
+    const struct pacha_readiness *readiness;
 };
 
 int lpr_unix_socket_active(uint64_t fd);

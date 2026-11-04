@@ -8,6 +8,9 @@ sandbox="$repo_root/kobox2/linux-sandbox/kobox"
 protocol="$repo_root/kobox2/protocol"
 out="${1:-$repo_root/.artifacts/gpud/sandbox.elf}"
 [[ $# == 0 ]] || shift
+arena_lazy=0
+lazy_profile=
+resident_stress=0
 gates=0
 device=1
 dma_profile=0
@@ -38,6 +41,10 @@ for argument in "$@"; do
     --usb-storage) usb_hid=1; block=1 ;;
     --nvme) block=1 ;;
     --storage) filesystem=1 ;;
+    --lazy-arena) arena_lazy=1 ;;
+    --lazy-arena=storage|--lazy-arena=gpu|--lazy-arena=wifi)
+      arena_lazy=1; lazy_profile=${argument#*=} ;;
+    --resident-stress) resident_stress=1 ;;
     --ps2) ps2=1; device=0 ;;
     --fs-profile) fs_profile=1 ;;
     --fs-owner-publish) fs_owner_publish=1 ;;
@@ -52,6 +59,17 @@ for argument in "$@"; do
     *) echo "Unknown sandbox build argument: $argument" >&2; exit 2 ;;
   esac
 done
+# Preserve the old storage opt-in. Device profiles require an explicit name.
+if (( arena_lazy )); then
+  case "$lazy_profile" in
+    ""|storage) (( filesystem )) || { echo '--lazy-arena requires --storage; use --lazy-arena=gpu or wifi for devices' >&2; exit 2; } ;;
+    gpu) (( amdgpu || i915 || (device && !usb_hid && !net && !audio && !block && !filesystem && !ps2) )) || { echo 'lazy GPU requires a GPU profile' >&2; exit 2; } ;;
+    wifi) (( wifi )) || { echo 'lazy Wi-Fi requires --wifi' >&2; exit 2; } ;;
+  esac
+fi
+if (( resident_stress && !arena_lazy )); then
+  echo '--resident-stress requires an opted-in lazy arena' >&2; exit 2
+fi
 mkdir -p "$(dirname "$out")"
 sources=("$adapter/sandbox_main.c" "$adapter/runtime.c" "$adapter/entry.S"
   "$adapter/native.c" "$adapter/wait_retained.c" "$adapter/fiber.S" "$adapter/machine.c" "$adapter/image.c" "$adapter/exception.c"
@@ -61,6 +79,9 @@ sources=("$adapter/sandbox_main.c" "$adapter/runtime.c" "$adapter/entry.S"
   "$sandbox/boot/package.c" "$sandbox/boot/fixed_image.c" "$sandbox/arch/x86_64/elf.c"
   "$sandbox/machine/domain.c" "$sandbox/boot/core.c"
   "$protocol/src/closure_manifest.c" "$protocol/src/resource_grant.c" "$protocol/src/sha256.c")
+if (( arena_lazy )); then
+  sources+=("$repo_root/userland/libipc/src/ipc.c")
+fi
 link_inputs=()
 extra_dependencies=()
 if (( usb_hid + net + amdgpu + i915 + audio > 1 )); then
@@ -78,7 +99,7 @@ fi
 if [[ "$cache_preflight" == 1 && "$amdgpu" != 1 ]]; then
   echo 'cache preflight requires the AMDGPU sandbox log profile' >&2; exit 2
 fi
-flags=(-DPH_SANDBOX_DEVICE="$device" -DPH_SANDBOX_USB_HID="$usb_hid"
+flags=(-DPH_RESIDENT_STRESS="$resident_stress" -DPH_ARENA_LAZY="$arena_lazy" -DPH_SANDBOX_DEVICE="$device" -DPH_SANDBOX_USB_HID="$usb_hid"
   -DPH_SANDBOX_AUDIO="$audio" -DPH_SANDBOX_NET="$net" -DPH_SANDBOX_AMDGPU="$amdgpu"
   -DPH_SANDBOX_WIFI="$wifi" -DPH_SANDBOX_I915="$i915"
   -DPH_SANDBOX_BLOCK="$block"

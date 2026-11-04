@@ -1513,33 +1513,15 @@ fn createPageViewVmoFd(
 // Input is read once into an unpublished metadata owner. A malformed late
 // index therefore cannot partially modify any already published alias.
 fn populatePageView(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, parent: kernel.NativeVmoRef, view: kernel.NativeVmoRef, indices_va: u64, page_count: usize) u64 {
-    const sparse = (state.nativeVmoSlotConst(view) orelse return sc.syscall_err_invalid).page_view_sparse;
+    _ = parent; // The view's retained parent is the only authority for resolution.
     var page_offset: usize = 0;
     while (page_offset < page_count) {
-        var pages: [64]u64 = undefined;
-        const chunk_count = @min(pages.len, page_count - page_offset);
-        for (pages[0..chunk_count], 0..) |*paddr, chunk_index| {
-            const list_index = page_offset + chunk_index;
-            const list_va = indices_va +
-                @as(u64, @intCast(list_index)) * fd_abi.vmo_page_view_index_size;
-            const parent_page = h.read_user_u64(proc, list_va) orelse {
-                reportPageViewRefusal("index-read", page_count, list_index, null, "unreadable");
-                return sc.syscall_err_invalid;
-            };
-            if (sparse and parent_page == fd_abi.vmo_page_view_hole) {
-                paddr.* = 0;
-                continue;
-            }
-            if (parent_page > @import("std").math.maxInt(usize)) {
-                reportPageViewRefusal("index-range", page_count, list_index, parent_page, "overflow");
-                return sc.syscall_err_invalid;
-            }
-            paddr.* = state.nativeVmoResolvedPagePaddr(parent, @intCast(parent_page)) orelse {
-                reportPageViewRefusal("page-resolve", page_count, list_index, parent_page, "absent-or-invalid");
-                return sc.syscall_err_invalid;
-            };
+        var indices: [64]u64 = undefined;
+        const chunk_count = @min(indices.len, page_count - page_offset);
+        for (indices[0..chunk_count], 0..) |*index, i| {
+            index.* = h.read_user_u64(proc, indices_va + @as(u64, @intCast(page_offset + i)) * fd_abi.vmo_page_view_index_size) orelse return sc.syscall_err_invalid;
         }
-        state.installNativeVmoPages(view, page_offset, pages[0..chunk_count], h.free_list) catch |err| {
+        state.installNativeVmoPageViewPages(view, page_offset, indices[0..chunk_count], h.free_list) catch |err| {
             reportPageViewRefusal("install", page_count, page_offset, null, @errorName(err));
             return statusFromKernelError(err);
         };
@@ -1646,7 +1628,7 @@ fn mapVmoFd(
             (!flags.shared or flags.private or
                 !kernel.KernelState.pageViewProtAllowed(prot, vmo.page_view_max_prot)))
             return sc.syscall_err_invalid;
-        if (vmo.kind == .kernel_page and
+        if ((vmo.kind == .kernel_page or vmo.kind == .thread_page) and
             (!flags.shared or flags.private or prot.write or prot.exec))
             return sc.syscall_err_invalid;
     }
@@ -1662,13 +1644,7 @@ fn mapVmoFd(
     const base_va = if (flags.fixed or flags.fixed_noreplace or use_requested_hint)
         requested_va
     else
-        state.findRandomizedFreeUserMapVa(proc, aligned_size, 0x4644_4d4d_4150_0000 ^ scheduler.lapic_tick_count ^ @as(u64, fd)) catch |err| blk: {
-            // Exhausting the preferred arena is a placement issue for every
-            // mapping kind, not a NORESERVE/physical backing policy decision.
-            // Fixed mappings and accepted hints never enter this fallback.
-            if (err != kernel.KernelError.TableFull) return sc.syscall_err_map;
-            break :blk findMremapMoveTarget(state, proc, aligned_size) orelse return sc.syscall_err_map;
-        };
+        state.findFreeUserMapVa(proc, aligned_size) catch return sc.syscall_err_map;
     if (!user_vm.validateUserLinearRegion(proc, base_va, @intCast(aligned_size))) return sc.syscall_err_invalid;
     if ((base_va & 0xFFF) != 0) return sc.syscall_err_invalid;
     if (flags.fixed) {
@@ -1787,6 +1763,10 @@ fn mapVmoFd(
         return base_va;
     }
     const mapped_vmo = state.nativeVmoRefForFd(proc, fd) orelse return sc.syscall_err_invalid;
+    // This VMA is deliberately absent from fork/exec snapshots. Keep its
+    // PTEs fault-driven (resident backing, no allocation of data pages), so
+    // the ordinary eager path cannot leave inherited linear reservations.
+    if (state.nativeVmoSlotConst(mapped_vmo).?.kind == .thread_page) return base_va;
     // These VMOs explicitly accept fault-time allocation failure. Leave even
     // populated pages to the normal fault path rather than requiring all holes.
     if (state.nativeVmoIsZeroOnDemand(mapped_vmo)) return base_va;
@@ -1873,28 +1853,6 @@ fn mprotectVmaRange(
     return sc.syscall_ok;
 }
 
-fn findMremapMoveTarget(
-    state: *kernel.KernelState,
-    proc: kernel.PrincipalId,
-    size_bytes: u64,
-) ?u64 {
-    const page_count = size_bytes / 4096;
-    const align_pages = @import("kernel_abi_root").process_abi.user_aslr_granule / 4096;
-    // Each retry jumps to the end of an entire colliding VMA/object.  The
-    // K stabilizes the live blocker counts for this search. A fixed former
-    // pool capacity would prematurely reject a gap after table growth.
-    const vmas: u64 = if (state.getVmaTableConst(proc)) |table| table.active_count else 0;
-    const max_attempts = vmas + @as(u64, state.fd_objects.live) + 1;
-    var attempt: u64 = 0;
-    while (attempt < max_attempts) : (attempt += 1) {
-        const candidate = user_vm.findFreeUserMappingRange(proc, page_count, align_pages) orelse return null;
-        const collision_end = state.userMapCollisionEndVa(proc, candidate, size_bytes) orelse
-            return candidate;
-        if (!user_vm.advanceFreeUserMappingSearch(proc, collision_end)) return null;
-    }
-    return null;
-}
-
 fn fixedMremapTargetIsVmaManaged(
     state: *kernel.KernelState,
     proc: kernel.PrincipalId,
@@ -1979,7 +1937,7 @@ fn mremapVmaRange(
     else if (fixed)
         new_va
     else
-        findMremapMoveTarget(state, proc, new_size) orelse {
+        state.findFreeUserMapVa(proc, new_size) catch {
             @import("../kernel_log.zig").writeFmt("vm: mremap target search failed principal={} old=0x{x}/0x{x} size=0x{x}\n", .{ @intFromEnum(proc), old_va, old_size, new_size });
             return sc.syscall_err_map;
         };
@@ -2061,23 +2019,47 @@ fn madviseVmaRange(
     base_va: u64,
     size_bytes: u64,
     advice: u64,
+    free_list: *kernel.FreePageList,
 ) u64 {
     // NORMAL/RANDOM/SEQUENTIAL/WILLNEED are paging hints. We accept them
-    // without extra prefetch; advice requiring discard or inheritance changes
-    // must not falsely succeed until those operations are implemented.
+    // without extra prefetch. DONTNEED uses ownership-preserving withdrawal;
+    // unsupported inheritance/COW/backing operations must not falsely succeed.
     // POPULATE has already performed checked, pager-aware prefault in syscall
     // preflight before K. Revalidate the VMA coverage here against concurrent
     // mapping changes; do not turn unsupported discard into a successful hint.
-    if (advice > 3 and advice != vm_abi.madvise_populate_read and
+    if (advice > 3 and advice != 4 and advice != 8 and advice != vm_abi.madvise_populate_read and
         advice != vm_abi.madvise_populate_write) return sc.syscall_err_invalid;
     if ((base_va & 0xFFF) != 0) return sc.syscall_err_invalid;
     if (size_bytes == 0) return sc.syscall_ok;
     const size = pageAlignUp(size_bytes) orelse return sc.syscall_err_invalid;
     const end, const overflow = @addWithOverflow(base_va, size);
-    _ = end;
     if (overflow != 0) return sc.syscall_err_invalid;
     if (!user_vm.lockVmTransaction(proc)) return sc.syscall_err_invalid;
     defer user_vm.unlockVmTransaction(proc);
+    const discard = @import("../state/discard.zig");
+    if (advice == 8) {
+        // Lazy reclaim may do no reclaim. Validate type/coverage atomically;
+        // a userland query followed by success would race native VM changes.
+        const covered = discard.validateFree(state, proc, base_va, end) catch return sc.syscall_err_invalid;
+        return if (covered) sc.syscall_ok else sc.syscall_err_map;
+    }
+    if (advice == 4) {
+        const queue = &@import("../memory/discard_pages.zig").global;
+        var plan = discard.prepare(state, proc, base_va, end, free_list, queue) catch |err| return switch (err) {
+            error.OutOfFreePages => sc.syscall_err_alloc,
+            else => sc.syscall_err_invalid,
+        };
+        defer plan.retireBatches(queue);
+        if (plan.prefix_end == base_va) return sc.syscall_err_map;
+        // Synchronous shootdown ends ALL CPU aliases before any PA can leave
+        // backing ownership. Identity/offset/protection and futex keys survive.
+        plan.commit(proc, struct {
+            fn invalidate(owner: kernel.PrincipalId, first: u64, length: u64) bool {
+                return user_vm.invalidatePresentUserLinearRegionPtes(owner, first, @intCast(length));
+            }
+        }.invalidate) catch return sc.syscall_err_map;
+        return if (plan.prefix_end == end) sc.syscall_ok else sc.syscall_err_map;
+    }
     if (!nativeVmaCoversRange(state, proc, base_va, size)) return sc.syscall_err_map;
     return sc.syscall_ok;
 }
@@ -2338,6 +2320,15 @@ pub fn dispatch(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId
         sc.syscall_timerfd_gettime => timerfdGettime(h, state, proc, @intCast(frame.rdi), frame.rsi),
         sc.syscall_vmo_create => blk: {
             if ((frame.rdx & ~fd_abi.vmo_create_known_flags_mask) != 0) break :blk sc.syscall_err_invalid;
+            if (frame.rdx & fd_abi.vmo_create_current_thread_page != 0) {
+                if (frame.rdi != 0 or frame.rsi != 0 or frame.rdx !=
+                    (fd_abi.vmo_create_current_thread_page | fd_abi.flag_private | fd_abi.flag_cloexec)) break :blk sc.syscall_err_invalid;
+                if (!user_vm.lockVmTransaction(proc)) break :blk sc.syscall_err_invalid;
+                defer user_vm.unlockVmTransaction(proc);
+                user_vm.lockSharedVmObjects();
+                defer user_vm.unlockSharedVmObjects();
+                break :blk @import("../thread_identity.zig").open(state, proc, h.free_list) catch |err| statusFromKernelError(err);
+            }
             if ((frame.rdx & (fd_abi.vmo_create_zero_on_demand | fd_abi.vmo_create_pager)) ==
                 (fd_abi.vmo_create_zero_on_demand | fd_abi.vmo_create_pager)) break :blk sc.syscall_err_invalid;
             user_vm.lockSharedVmObjects();
@@ -2401,6 +2392,22 @@ pub fn dispatch(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId
             state.completePagerRequest(port_ref, frame.rsi, frame.rdx, frame.r10, true, @intCast(frame.r8)) catch
                 break :blk sc.syscall_err_invalid;
             break :blk sc.syscall_ok;
+        },
+        sc.syscall_vmo_discard => blk: {
+            const fd = std_rc.math.cast(kernel.Fd, frame.rdi) orelse break :blk sc.syscall_err_invalid;
+            if (frame.rdx == 0 or frame.rdx > 32 or frame.r10 != 0) break :blk sc.syscall_err_invalid;
+            if (state.fdEntryConst(proc, fd) == null) break :blk sc.syscall_err_closed;
+            const payload = state.fdPayloadWithRightsConst(proc, fd, .{ .write = true, .revoke = true }) orelse break :blk sc.syscall_err_invalid;
+            const ref = switch (payload.payload.*) { .vmo => |ref| ref, else => break :blk sc.syscall_err_invalid };
+            var ranges: [32]fd_abi.VmoDiscardRange = undefined;
+            const count: usize = @intCast(frame.rdx);
+            if (!h.copy_user_bytes_from_va(proc, frame.rsi, std_rc.mem.sliceAsBytes(ranges[0..count]))) break :blk sc.syscall_err_map;
+            const done = @import("../state/shared_discard.zig").discard(state, ref, ranges[0..count], h.free_list) catch |err| break :blk switch (err) {
+                error.Invalid => sc.syscall_err_invalid,
+                error.Alloc => sc.syscall_err_alloc,
+                error.NotReady => sc.syscall_err_not_ready,
+            };
+            break :blk if (done) sc.syscall_ok else sc.syscall_err_not_ready;
         },
         sc.syscall_vmo_grow => blk: {
             if (frame.rdi > @import("std").math.maxInt(kernel.Fd)) break :blk sc.syscall_err_invalid;
@@ -2531,7 +2538,7 @@ pub fn dispatch(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId
         },
         sc.syscall_mprotect => mprotectVmaRange(state, proc, frame.rdi, frame.rsi, frame.rdx),
         sc.syscall_mremap => mremapVmaRange(state, proc, h.free_list, frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8),
-        sc.syscall_madvise => madviseVmaRange(state, proc, frame.rdi, frame.rsi, frame.rdx),
+        sc.syscall_madvise => madviseVmaRange(state, proc, frame.rdi, frame.rsi, frame.rdx, h.free_list),
         else => null,
     };
 }

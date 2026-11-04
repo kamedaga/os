@@ -1,4 +1,5 @@
 const references = types.references;
+const user_vm = @import("../memory/user_vm.zig");
 const std = @import("std");
 const smp_perf = @import("../smp_perf.zig");
 const builtin = @import("builtin");
@@ -173,7 +174,7 @@ pub fn rangeOverlapsPinnedUserObject(
 
 pub fn rangeOverlapsPinnedUserObjectExcept(self: anytype, owner: PrincipalId, start_va: u64, size_bytes: u64, except_object: ?KernelObjectRef) bool {
     const result = indexedPinnedOverlap(self, owner, start_va, size_bytes, except_object);
-    if (comptime @import("reference_check.zig").enabled) {
+    if (comptime @import("reference_check.zig").pin_oracle_enabled) {
         if (rangeOverlapsPinnedUserObjectExceptOld(self, owner, start_va, size_bytes, except_object) != result) @import("reference_check.zig").failure(error.PinnedMismatch);
     }
     return result;
@@ -184,13 +185,26 @@ pub fn pinnedObjectCursor(self: anytype, owner: PrincipalId) references.Cursor {
     const table = self.vmaTableForProcessIndex(index) orelse return .{};
     return references.Cursor.init(&table.pinned_objects);
 }
+// Runtime callers hold K. AS recursion is deliberate: DERIVE/VM mutation
+// already hold A, while PROCESS_CLONE/EXEC inspect pins before their AS pair.
+// Serial logical host fixtures can have no architectural AS; runtime cannot.
+pub fn lockPinIndex(owner: PrincipalId) bool {
+    const locked = user_vm.lockAddressSpace(owner);
+    if (!locked and !@import("builtin").is_test) @panic("pin index lost owner AS");
+    return locked;
+}
+pub fn unlockPinIndex(owner: PrincipalId, locked: bool) void {
+    if (locked) user_vm.unlockAddressSpace(owner);
+}
+pub fn pinExcept(object: ?KernelObjectRef) ?references.Identity {
+    const o = object orelse return null;
+    return .{ .container = @intFromEnum(o.kind), .index = o.index, .generation = o.generation };
+}
 fn indexedPinnedOverlap(self: anytype, owner: PrincipalId, start: u64, size: u64, except: ?KernelObjectRef) bool {
-    var cursor = pinnedObjectCursor(self, owner);
-    while (cursor.next()) |edge| {
-        if (except) |object| if (edge.identity.index == object.index and edge.identity.generation == object.generation and edge.identity.container == @intFromEnum(object.kind)) continue;
-        if (references.overlap(start, size, edge.range.start, edge.range.size)) return true;
-    }
-    return false;
+    const locked = lockPinIndex(owner);
+    defer unlockPinIndex(owner, locked);
+    const table = self.getVmaTableConst(owner) orelse return false;
+    return table.pinned_index.anyOverlap(start, size, 15, pinExcept(except));
 }
 
 fn rangeOverlapsPinnedUserObjectExceptOld(
@@ -229,7 +243,21 @@ fn rangeOverlapsPinnedUserObjectExceptOld(
 /// lifetime policy makes closing either mapping harmless to the other. Scatter
 /// mappings additionally require an active IOMMU so every alias owns an independent
 /// IOVA allocation; pass-through retains only its existing linear-mapping alias.
-pub fn rangeConflictsWithDmaDerivation(
+pub fn rangeConflictsWithDmaDerivation(self: anytype, owner: PrincipalId, start_va: u64, size_bytes: u64, except_object: ?KernelObjectRef, allow_dma_mapping_aliases: bool, iommu_active: bool) bool {
+    const locked = lockPinIndex(owner);
+    defer unlockPinIndex(owner, locked);
+    const table = self.getVmaTableConst(owner) orelse return false;
+    const index = &table.pinned_index;
+    const mask: u4 = 2 | (if (!allow_dma_mapping_aliases) @as(u4, 4) else 0) | (if (!allow_dma_mapping_aliases or !iommu_active) @as(u4, 8) else 0);
+    // MMIO is never an alias exception. Allowed mapping classes are excluded
+    // BEFORE traversal, even when thousands of them overlap the query VA.
+    const result = index.anyOverlap(start_va, size_bytes, 1, null) or index.anyOverlap(start_va, size_bytes, mask, pinExcept(except_object));
+    if (comptime @import("reference_check.zig").pin_oracle_enabled) {
+        if (rangeConflictsWithDmaDerivationOracle(self, owner, start_va, size_bytes, except_object, allow_dma_mapping_aliases, iommu_active) != result) @import("reference_check.zig").failure(error.PinnedMismatch);
+    }
+    return result;
+}
+fn rangeConflictsWithDmaDerivationOracle(
     self: anytype,
     owner: PrincipalId,
     start_va: u64,
@@ -325,6 +353,15 @@ fn pachaTraceDmaDerivationConflict(
 }
 
 pub fn ownerHasPinnedUserObject(self: anytype, owner: PrincipalId) bool {
+    const locked = lockPinIndex(owner);
+    defer unlockPinIndex(owner, locked);
+    const table = self.getVmaTableConst(owner) orelse return false;
+    var result = false;
+    for (&table.pinned_index.trees) |*tree| result = result or tree.count != 0;
+    if (comptime @import("reference_check.zig").pin_oracle_enabled) if (result != ownerHasPinnedUserObjectOracle(self, owner)) @import("reference_check.zig").failure(error.PinnedMismatch);
+    return result;
+}
+fn ownerHasPinnedUserObjectOracle(self: anytype, owner: PrincipalId) bool {
     var cursor = pinnedObjectCursor(self, owner);
     while (cursor.next()) |edge| {
         const object: KernelObjectRef = .{ .kind = @enumFromInt(edge.identity.container), .index = edge.identity.index, .generation = edge.identity.generation };
@@ -332,38 +369,6 @@ pub fn ownerHasPinnedUserObject(self: anytype, owner: PrincipalId) bool {
         if (pinnedUserObjectRange(slot, @intFromEnum(owner)) != null) return true;
     }
     return false;
-}
-
-/// Return the furthest end of any VMA or address-bound object intersecting a
-/// candidate range.  The syscall allocator uses this to jump whole occupied
-/// spans rather than retrying one page at a time through a large PROT_NONE
-/// arena.
-pub fn userMapCollisionEndVa(
-    self: anytype,
-    owner: PrincipalId,
-    start_va: u64,
-    size_bytes: u64,
-) ?u64 {
-    var collision_end: u64 = 0;
-    const table = self.getVmaTableConst(owner) orelse return std.math.maxInt(u64);
-    var active_index: usize = 0;
-    while (active_index < table.active_count) : (active_index += 1) {
-        const entry_index: usize = @intCast(table.active_indices.get(@intCast(active_index)).?.*);
-        const entry = (table.entries.get(@intCast(entry_index)).?);
-        if (!entry.active or !rangesOverlap(start_va, size_bytes, entry.start_va, entry.size_bytes)) continue;
-        collision_end = @max(collision_end, entry.endVa());
-    }
-    var cursor = pinnedObjectCursor(self, owner);
-    while (cursor.next()) |edge| {
-        const object: KernelObjectRef = .{ .kind = @enumFromInt(edge.identity.container), .index = edge.identity.index, .generation = edge.identity.generation };
-        const slot = self.kernelObjectSlot(object) orelse unreachable;
-        const object_range = pinnedUserObjectRange(slot, @intFromEnum(owner)) orelse continue;
-        if (!rangesOverlap(start_va, size_bytes, object_range.start_va, object_range.size_bytes)) continue;
-        const object_end, const overflow = @addWithOverflow(object_range.start_va, object_range.size_bytes);
-        if (overflow != 0) return std.math.maxInt(u64);
-        collision_end = @max(collision_end, object_end);
-    }
-    return if (collision_end == 0) null else collision_end;
 }
 
 pub fn markForkCowVmasCommitted(self: anytype, owner: PrincipalId) void {
@@ -383,36 +388,80 @@ pub fn cloneVmaTableForFork(self: anytype, from: PrincipalId, to: PrincipalId) K
     const source_table = self.getVmaTable(from) orelse return KernelError.InvalidState;
     const dest_table = self.getVmaTable(to) orelse return KernelError.InvalidState;
     if (dest_table.active_count != 0) return KernelError.InvalidState;
-    for (0..source_table.active_count) |active_position| {
-        const entry_index = source_table.active_indices.get(@intCast(active_position)).?.*;
-        const entry = source_table.entries.get(@intCast(entry_index)).?.*;
-        try validateRamAdmission(self, entry.vmo, entry.vmo_offset, entry.size_bytes, entry.prot, entry.flags);
-        dest_table.reference_slots.prepareIndex(@intCast(entry_index), dest_table.allocator.?) catch return KernelError.OutOfFreePages;
-        dest_table.entries.prepareIndex(@intCast(entry_index), dest_table.allocator.?) catch return KernelError.OutOfFreePages;
-        dest_table.active_indices.prepareIndex(@intCast(source_table.active_count), dest_table.allocator.?) catch return KernelError.OutOfFreePages;
-    }
+    const fp = @import("../user_copy.zig").ForkProfile;
+    var costs: [4]u64 = @splat(0);
+    defer if (comptime fp.enabled) {
+        inline for (.{ fp.Counter.vma_validate, fp.Counter.vma_prepare, fp.Counter.vma_retain, fp.Counter.vma_install }, 0..) |field, i| fp.add(field, costs[i]);
+    };
+    var scratch_count: usize = 0;
+    // Both AS transaction locks keep source slots and the exclusion decision
+    // stable. Scratch owns only slot numbers, never VMO/COW references. The
+    // installed prefix owns those references; rollback must not release its
+    // active slots a second time through the uninstalled scratch suffix.
     errdefer {
+        var position = scratch_count;
+        while (position > dest_table.active_count) {
+            position -= 1;
+            dest_table.active_indices.release(.{ .index = @intCast(position), .generation = dest_table.active_indices.generation(@intCast(position)).? }) catch unreachable;
+        }
         while (dest_table.active_count != 0) {
             const vma_index: usize = @intCast(dest_table.active_indices.get(@intCast(dest_table.active_count - 1)).?.*);
-            const entry = (dest_table.entries.get(@intCast(vma_index)).?);
+            const entry = dest_table.entries.get(@intCast(vma_index)).?;
             const vmo_ref = entry.vmo;
             self.releaseVmaCowResources(entry, null);
             @TypeOf(self.*).clearVmaEntry(dest_table, vma_index);
             self.releaseNativeVmo(vmo_ref);
         }
     }
+    for (0..source_table.active_count) |position| {
+        const index = source_table.active_indices.get(@intCast(position)).?.*;
+        const entry = source_table.entries.get(index).?;
+        if (!entry.active) continue;
+        if (self.nativeVmoSlotConst(entry.vmo)) |vmo| if (vmo.kind == .thread_page) continue;
+        const start = if (comptime fp.enabled) fp.stamp() else 0;
+        try validateRamAdmission(self, entry.vmo, entry.vmo_offset, entry.size_bytes, entry.prot, entry.flags);
+        const after_validate = if (comptime fp.enabled) fp.stamp() else 0;
+        if (comptime fp.enabled) if (!fp.accumulate(&costs[0], start, after_validate)) fp.add(.overflow, 1);
+        // Claim each scratch slot before preparing the next block. Preparing
+        // all blocks first makes claimIndex repeatedly scan newer free blocks.
+        dest_table.active_indices.prepareIndex(@intCast(scratch_count), dest_table.allocator.?) catch return KernelError.OutOfFreePages;
+        _ = dest_table.active_indices.claimIndex(@intCast(scratch_count)) catch unreachable;
+        dest_table.active_indices.get(@intCast(scratch_count)).?.* = index;
+        scratch_count += 1;
+        if (comptime fp.enabled) if (!fp.accumulate(&costs[1], after_validate, fp.stamp())) fp.add(.overflow, 1);
+    }
+    const Sort = struct {
+        table: @TypeOf(dest_table),
+        pub fn lessThan(ctx: @This(), a: usize, b: usize) bool {
+            return ctx.table.active_indices.get(@intCast(a)).?.* < ctx.table.active_indices.get(@intCast(b)).?.*;
+        }
+        pub fn swap(ctx: @This(), a: usize, b: usize) void {
+            std.mem.swap(u32, ctx.table.active_indices.get(@intCast(a)).?, ctx.table.active_indices.get(@intCast(b)).?);
+        }
+    };
+    // Stable slot identities, not enumeration order, key the address/reference
+    // indexes. Sort just the private numbers, not retained objects or ranges.
+    // Ascending incremental preparation bounds fresh-child free-list searches
+    // to holes in the current block, without scanning sparse source capacity.
+    std.sort.heapContext(0, scratch_count, Sort{ .table = dest_table });
 
     var active_index: usize = 0;
-    while (active_index < source_table.active_count) : (active_index += 1) {
-        const entry_index: usize = @intCast(source_table.active_indices.get(@intCast(active_index)).?.*);
-        var source_entry = source_table.entries.get(@intCast(entry_index)).?.*;
-        if (!source_entry.active) continue;
+    while (active_index < scratch_count) : (active_index += 1) {
+        // Install overwrites only this already-read scratch position. Filtering
+        // above means no skip can shift the installed prefix over unread IDs.
+        const entry_index = dest_table.active_indices.get(@intCast(active_index)).?.*;
+        var source_entry = source_table.entries.get(entry_index).?.*;
+        const prepare_start = if (comptime fp.enabled) fp.stamp() else 0;
+        dest_table.reference_slots.prepareIndex(entry_index, dest_table.allocator.?) catch return KernelError.OutOfFreePages;
+        dest_table.entries.prepareIndex(entry_index, dest_table.allocator.?) catch return KernelError.OutOfFreePages;
+        if (comptime fp.enabled) if (!fp.accumulate(&costs[1], prepare_start, fp.stamp())) fp.add(.overflow, 1);
         // Prepare only the child during the fallible retain phase.  The
         // syscall commits the parent COW flags immediately before its PTE
         // write-protect pass, so a failed retain never mutates parent state.
         if (@TypeOf(self.*).forkCowEligible(&source_entry)) {
             source_entry.flags.fork_cow = true;
         }
+        const start = if (comptime fp.enabled) fp.stamp() else 0;
         try self.retainNativeVmo(source_entry.vmo);
         if (!source_entry.cow_table.isNull()) {
             self.retainNativeCowTable(source_entry.cow_table) catch |err| {
@@ -420,8 +469,14 @@ pub fn cloneVmaTableForFork(self: anytype, from: PrincipalId, to: PrincipalId) K
                 return err;
             };
         }
+        const after_retain = if (comptime fp.enabled) fp.stamp() else 0;
+        if (comptime fp.enabled) if (!fp.accumulate(&costs[2], start, after_retain)) fp.add(.overflow, 1);
         self.installVmaEntry(dest_table, entry_index, source_entry);
+        if (comptime fp.enabled) if (!fp.accumulate(&costs[3], after_retain, fp.stamp())) fp.add(.overflow, 1);
     }
+    std.debug.assert(dest_table.active_count == scratch_count);
+    // Fork snapshots a value, not shared placement state: either process may
+    // advance independently after the source/destination VM transaction ends.
     dest_table.next_user_map_va = source_table.next_user_map_va;
 }
 
@@ -592,7 +647,7 @@ pub fn nativeVmaDmaPinMode(
     const backing = self.nativeVmoSlotConst(entry.vmo) orelse return null;
     // Peer BAR memory is not ordinary RAM eligible for DMA page pinning, and
     // the kernel clock page must never become a device-visible IOMMU target.
-    if (backing.kind == .device_memory or backing.kind == .kernel_page or backing.kind == .pager) return null;
+    if (backing.kind == .device_memory or backing.kind == .kernel_page or backing.kind == .thread_page or backing.kind == .pager) return null;
     if (!entry.prot.read or (device_writes and !entry.prot.write)) return null;
     if (!entry.prot.write) return .read_only;
     if (entry.flags.private and
@@ -695,20 +750,49 @@ pub fn commitNativeVmaFaultMapping(
     candidate_paddr: u64,
     free_list: ?*FreePageList,
 ) ?NativeVmaFaultMapping {
-    if (plan.kind != .allocate_zero or candidate_paddr == 0 or (candidate_paddr & 0xFFF) != 0) return null;
-    const table = self.getVmaTable(owner) orelse return null;
+    return commitNativeVmaFaultMappingResult(self, owner, plan, candidate_paddr, free_list) catch null;
+}
+
+// AS + shared-VM exclusion keeps the entry and VMO alive through validation.
+// The caller owns candidate until this commit installs it; on error or when a
+// competing PFN wins, the caller must return candidate to PMM.
+pub fn commitNativeVmaFaultMappingResult(
+    self: anytype,
+    owner: PrincipalId,
+    plan: NativeVmaFaultPlan,
+    candidate_paddr: u64,
+    free_list: ?*FreePageList,
+) error{ Revalidate, OutOfMemory, Denied }!NativeVmaFaultMapping {
+    return commitFault(self, owner, plan, candidate_paddr, free_list, null);
+}
+
+pub fn commitFreshNativeVmaFaultMapping(self: anytype, owner: PrincipalId, plan: NativeVmaFaultPlan, fl: *FreePageList) error{ Revalidate, OutOfMemory, Denied }!NativeVmaFaultMapping {
+    const Context = struct {
+        state: @TypeOf(self),
+        owner: PrincipalId,
+        plan: NativeVmaFaultPlan,
+        fl: *FreePageList,
+        fn commit(c: @This(), fresh: *@import("vmo.zig").FreshFaultPage) error{ Revalidate, OutOfMemory, Denied }!NativeVmaFaultMapping {
+            return commitFault(c.state, c.owner, c.plan, 0, c.fl, fresh);
+        }
+    };
+    return @import("vmo.zig").withFreshFaultPage(self, fl, Context{ .state = self, .owner = owner, .plan = plan, .fl = fl }, Context.commit);
+}
+fn commitFault(self: anytype, owner: PrincipalId, plan: NativeVmaFaultPlan, candidate_paddr: u64, free_list: ?*FreePageList, fresh: ?*@import("vmo.zig").FreshFaultPage) error{ Revalidate, OutOfMemory, Denied }!NativeVmaFaultMapping {
+    if (plan.kind != .allocate_zero or (fresh == null and (candidate_paddr == 0 or (candidate_paddr & 0xFFF) != 0))) return error.Denied;
+    const table = self.getVmaTable(owner) orelse return error.Revalidate;
     const entry_index: usize = @intCast(plan.entry_index);
-    if (entry_index >= table.entries.capacity) return null;
-    const entry = (table.entries.get(@intCast(entry_index)) orelse return null);
-    if (!entry.active or plan.fault_page_va < entry.start_va or plan.fault_page_va >= entry.endVa()) return null;
-    if (!@TypeOf(self.*).nativeVmoRefsEqual(entry.vmo, plan.vmo)) return null;
+    if (entry_index >= table.entries.capacity) return error.Revalidate;
+    const entry = (table.entries.get(@intCast(entry_index)) orelse return error.Revalidate);
+    if (!entry.active or plan.fault_page_va < entry.start_va or plan.fault_page_va >= entry.endVa()) return error.Revalidate;
+    if (!@TypeOf(self.*).nativeVmoRefsEqual(entry.vmo, plan.vmo)) return error.Revalidate;
     const page_delta = (plan.fault_page_va - entry.start_va) / native_page_size;
     const vmo_page = (entry.vmo_offset / native_page_size) + page_delta;
-    if (vmo_page != plan.vmo_page_index) return null;
+    if (vmo_page != plan.vmo_page_index) return error.Revalidate;
 
     const paddr = self.entryDirtyPagePaddr(entry, plan.fault_page_va) orelse blk: {
-        if (!entry.flags.anonymous and !self.nativeVmoIsZeroOnDemand(entry.vmo)) return null;
-        break :blk self.resolveOrInstallNativeVmoPage(entry.vmo, @intCast(vmo_page), candidate_paddr, free_list) catch |err| {
+        if (!entry.flags.anonymous and !self.nativeVmoIsZeroOnDemand(entry.vmo)) return error.Denied;
+        break :blk (if (fresh) |page| @import("vmo.zig").resolveFreshNativeVmoPage(self, entry.vmo, @intCast(vmo_page), page, free_list.?) else self.resolveOrInstallNativeVmoPage(entry.vmo, @intCast(vmo_page), candidate_paddr, free_list)) catch |err| {
             // Host unit tests intentionally exhaust this table; port I/O is
             // available only in the guest. Keep the field diagnostic there.
             if (!builtin.is_test) {
@@ -735,7 +819,10 @@ pub fn commitNativeVmaFaultMapping(
                     }
                 }
             }
-            return null;
+            // Only reservePath/acquire metadata exhaustion becomes OutOfFreePages.
+            // TableFull is invalid store initialization (no allocation), so
+            // reporting it as OOM would make callers retry a permanent error.
+            return if (err == error.OutOfFreePages) error.OutOfMemory else error.Denied;
         };
     };
     return .{
@@ -743,6 +830,7 @@ pub fn commitNativeVmaFaultMapping(
         .prot = @TypeOf(self.*).nativeFaultMappingProt(entry),
     };
 }
+
 
 pub fn copyPhysicalPage(dst_paddr: u64, src_paddr: u64) bool {
     if (builtin.is_test) return true;
@@ -1241,8 +1329,34 @@ pub fn releasePrincipalNativeMemory(
     // process. Revoke every exact reference first so MMIO close-time unmaps
     // and DMA IOVA teardown complete before VMA pages return to PMM.
     self.revokeOwnedPinnedUserObjectsWithFreeList(owner, free_list);
+    if (self.getVmaTableConst(owner)) |table| {
+        const locked = lockPinIndex(owner);
+        defer unlockPinIndex(owner, locked);
+        // This live-table cleanup precedes architectural AS retirement.
+        // Empty post-retirement table teardown must not enter this borrower;
+        // all source pointers must be gone before its first retirement.
+        table.pinned_index.requireEmpty(table.pinned_objects.count) catch @panic("pin index survived owner retirement");
+    }
     self.releaseVmaTableForProcessIndexWithFreeList(index, free_list);
     self.releaseFdTableForProcessIndexWithFreeList(index, free_list);
+}
+
+// Source PT retirement precedes this removal. Do not transfer an identity
+// mapping (or its VMO reference) into a different AS incarnation on exec.
+pub fn dropThreadIdentityVmasForExec(self: anytype, owner: PrincipalId, free_list: *FreePageList) void {
+    const table = self.getVmaTable(owner) orelse return;
+    var position: usize = 0;
+    while (position < table.active_count) {
+        const index = table.active_indices.get(@intCast(position)).?.*;
+        const entry = table.entries.get(index).?;
+        const vmo = self.nativeVmoSlotConst(entry.vmo);
+        if (vmo != null and vmo.?.kind == .thread_page) {
+            const ref = entry.vmo;
+            self.releaseVmaCowResources(entry, free_list);
+            @TypeOf(self.*).clearVmaEntry(table, index);
+            self.releaseNativeVmoWithFreeList(ref, free_list);
+        } else position += 1;
+    }
 }
 
 pub fn replaceVmaTableForExec(
@@ -1285,13 +1399,30 @@ pub fn findFreeVma(table: *VmaTable) ?usize {
     return selectPreparedVmaIndex(table, 0, 0, false, &.{});
 }
 
+/// Host tests only: the slot-selection contract used by MAP_FIXED/mremap.
+pub fn selectPreparedVmaIndexForTest(table: *VmaTable, target_start: u64, target_size: u64, may_reuse_target_full: bool, excluded: []const usize) ?usize {
+    if (!builtin.is_test) @compileError("test-only VMA slot selection entry");
+    return selectPreparedVmaIndex(table, target_start, target_size, may_reuse_target_full, excluded);
+}
+
 pub fn installVmaEntry(self: anytype, table: *VmaTable, index: usize, entry: VmaEntry) void {
+    const fp = @import("../user_copy.zig").ForkProfile;
+    const entry_start = if (comptime fp.enabled) fp.stamp() else 0;
     const value = table.entries.claimIndex(@intCast(index)) catch unreachable;
+    if (comptime fp.enabled) {
+        const end = fp.stamp();
+        if (end < entry_start) fp.add(.overflow, 1) else fp.add(.claim_entry, end - entry_start);
+    }
     const was_active = value.active;
     const active_position = value.active_position;
     if (value.references) |old_pair| if (old_pair.address_node.linked) table.address_index.remove(value);
+    const reference_start = if (comptime fp.enabled) fp.stamp() else 0;
     const pair = table.reference_slots.claimIndex(@intCast(index)) catch unreachable;
-    references.Root.disconnect(&pair.vmo, true);
+    if (comptime fp.enabled) {
+        const end = fp.stamp();
+        if (end < reference_start) fp.add(.overflow, 1) else fp.add(.claim_reference, end - reference_start);
+    }
+    disconnectVmoAlias(pair);
     references.Root.disconnect(&pair.cow, true);
     pair.entry = value;
     pair.identity = .{ .kind = .vma, .owner = table.reference_owner, .owner_generation = table.reference_generation, .index = @intCast(index), .generation = table.entries.generation(@intCast(index)).? };
@@ -1305,7 +1436,12 @@ pub fn installVmaEntry(self: anytype, table: *VmaTable, index: usize, entry: Vma
     value.references = pair;
     self.refreshVmaReferences(value);
     if (!was_active and entry.active) {
+        const active_start = if (comptime fp.enabled) fp.stamp() else 0;
         const active = table.active_indices.claimIndex(@intCast(table.active_count)) catch unreachable;
+        if (comptime fp.enabled) {
+        const end = fp.stamp();
+        if (end < active_start) fp.add(.overflow, 1) else fp.add(.claim_active, end - active_start);
+    }
         active.* = @intCast(index);
         value.active_position = @intCast(table.active_count);
         table.active_count += 1;
@@ -1323,7 +1459,7 @@ pub fn clearVmaEntry(table: *VmaTable, index: usize) void {
         table.active_count -= 1;
     }
     if (entry.references) |pair| {
-        references.Root.disconnect(&pair.vmo, true);
+        disconnectVmoAlias(pair);
         references.Root.disconnect(&pair.cow, true);
         pair.entry = null;
         table.reference_slots.release(.{ .index = @intCast(index), .generation = table.reference_slots.generation(@intCast(index)).? }) catch unreachable;
@@ -1351,60 +1487,149 @@ pub fn vmaRangeOverlaps(table: *const VmaTable, start_va: u64, size_bytes: u64) 
     return table.overlaps(start_va, end_va);
 }
 
-pub fn findFreeUserMapVa(
-    self: anytype,
-    owner: PrincipalId,
-    size_bytes: u64,
-    seed: u64,
-) KernelError!u64 {
-    if (!@TypeOf(self.*).isPageAligned(size_bytes) or size_bytes == 0) return KernelError.InvalidState;
-    const base = @import("kernel_abi_root").process_abi.user_aslr_base_va;
-    const end = @import("kernel_abi_root").process_abi.user_aslr_end_va;
-    const granule = @import("kernel_abi_root").process_abi.user_aslr_granule;
-    if (end <= base) return KernelError.InvalidState;
-    const table = self.getVmaTable(owner) orelse return KernelError.InvalidState;
-    // This is only the preferred placement arena, not the process VA limit.
-    // A valid larger mapping must reach the caller's general free-range search
-    // just like an occupied arena; InvalidState would bypass that fallback.
-    if (size_bytes > end - base) return KernelError.TableFull;
-    const slots = ((end - base - size_bytes) / granule) + 1;
-    if (slots == 0) return KernelError.InvalidState;
-    _ = seed;
-    const cursor = if (table.next_user_map_va >= base and table.next_user_map_va + size_bytes <= end)
-        table.next_user_map_va
-    else
-        base;
-    var candidate = cursor;
-    while (candidate + size_bytes <= end) : (candidate += granule) {
-        if (!try @TypeOf(self.*).vmaRangeOverlaps(table, candidate, size_bytes) and
-            !self.rangeOverlapsPinnedUserObject(owner, candidate, size_bytes))
-        {
-            table.next_user_map_va = candidate + @TypeOf(self.*).pageAlignUp(size_bytes);
-            return candidate;
+// Native placement is kernel policy, not an ABI arena. Keep the historical
+// starting point while allowing the cursor to continue across its former end.
+// The former seed was discarded; retaining deterministic next-fit adds no new
+// ASLR policy and does not reduce the old placement entropy.
+pub const user_map_initial_va: u64 = 0x0000_0100_0000_0000;
+
+const MappingInterval = user_vm.MappingInterval;
+const UserMapBlockers = struct {
+    table: *VmaTable,
+    vma: ?*VmaEntry,
+    pins: [4]?*references.Node,
+    architectural: user_vm.ReservationBlockerIterator,
+    architectural_next: ?MappingInterval,
+    invalid_pin: bool = false,
+
+    fn init(table: *VmaTable, owner: PrincipalId, start: u64, end: u64) UserMapBlockers {
+        const architectural = user_vm.ReservationBlockerIterator.init(owner, start, end);
+        var result: UserMapBlockers = .{
+            .table = table,
+            .vma = table.address_index.first,
+            .pins = @splat(null),
+            .architectural = architectural,
+            .architectural_next = null,
+        };
+        for (&table.pinned_index.trees, 0..) |*tree, i| {
+            result.pins[i] = tree.first;
+            if (tree.root) |edge| result.invalid_pin = result.invalid_pin or edge.pin.invalid_count != 0;
         }
+        result.architectural_next = result.architectural.next();
+        return result;
     }
-    candidate = base;
-    while (candidate < cursor and candidate + size_bytes <= end) : (candidate += granule) {
-        if (!try @TypeOf(self.*).vmaRangeOverlaps(table, candidate, size_bytes) and
-            !self.rangeOverlapsPinnedUserObject(owner, candidate, size_bytes))
-        {
-            table.next_user_map_va = candidate + @TypeOf(self.*).pageAlignUp(size_bytes);
-            return candidate;
+
+    fn pinInterval(edge: *references.Node) MappingInterval {
+        return .{ .start = edge.range.start, .end = std.math.add(u64, edge.range.start, edge.range.size) catch std.math.maxInt(u64) };
+    }
+
+    fn next(self: *UserMapBlockers) ?MappingInterval {
+        // PinIndex's overflow rule is fail-closed for every queried address,
+        // even one before the malformed object's start. Preserve that rule
+        // while sharing the same union predicate with hint admission.
+        if (self.invalid_pin) {
+            self.invalid_pin = false;
+            return .{ .start = 0, .end = std.math.maxInt(u64) };
         }
+        var selected: ?MappingInterval = self.architectural_next;
+        var source: usize = 5;
+        if (self.vma) |entry| {
+            if (selected == null or entry.start_va < selected.?.start) {
+                selected = .{ .start = entry.start_va, .end = entry.endVa() };
+                source = 4;
+            }
+        }
+        for (self.pins, 0..) |pin, i| if (pin) |edge| {
+            const interval = pinInterval(edge);
+            if (selected == null or interval.start < selected.?.start) {
+                selected = interval;
+                source = i;
+            }
+        };
+        if (selected == null) return null;
+        if (source == 5) {
+            self.architectural_next = self.architectural.next();
+        } else if (source == 4) {
+            self.vma = self.table.address_index.successor(self.vma.?);
+        } else {
+            self.pins[source] = self.table.pinned_index.trees[source].successor(self.pins[source].?);
+        }
+        return selected;
     }
-    return KernelError.TableFull;
+};
+
+fn freePteGap(present: *user_vm.PresentUserMappingBlockerIterator, size: u64, start: u64, end: u64) ?u64 {
+    if (start >= end or size > end - start) return null;
+    present.seekPast(start);
+    var candidate = start;
+    while (present.nextBefore(candidate + size)) |blocker| {
+        if (blocker.end <= blocker.start or blocker.end <= candidate) continue;
+        if (blocker.start >= candidate + size) return candidate;
+        candidate = blocker.end;
+        if (candidate >= end or size > end - candidate) return null;
+    }
+    return candidate;
 }
 
-pub fn userMapRangeIsFree(
-    self: anytype,
-    owner: PrincipalId,
-    start_va: u64,
-    size_bytes: u64,
-) KernelError!bool {
+fn freeUserMapInSpan(table: *VmaTable, owner: PrincipalId, size: u64, start: u64, end: u64) ?u64 {
+    if (start >= end or size > end - start) return null;
+    var candidate = start;
+    var blockers = UserMapBlockers.init(table, owner, start, end);
+    var present = user_vm.PresentUserMappingBlockerIterator.init(owner, start, end);
+    // The six sorted metadata streams advance once per blocker. Whole VMA,
+    // reservation and pin intervals skip their PTEs: a TiB backed VMA costs
+    // one metadata step rather than a page walk. Only otherwise-free gaps
+    // inspect present PTE runs, including overlays without reservation records.
+    while (blockers.next()) |blocker| {
+        if (blocker.end <= blocker.start or blocker.end <= candidate) continue;
+        if (blocker.start >= candidate + size) {
+            if (freePteGap(&present, size, candidate, @min(end, blocker.start))) |free| return free;
+        }
+        // Address-bound objects may retain byte-sized BAR subranges. Round
+        // their end upward so skipping a pin never returns an unaligned VA.
+        const aligned_end = (std.math.add(u64, blocker.end, native_page_size - 1) catch return null) & ~(native_page_size - 1);
+        candidate = @max(candidate, aligned_end);
+        if (candidate >= end or size > end - candidate) return null;
+    }
+    return freePteGap(&present, size, candidate, end);
+}
+
+pub fn findFreeUserMapVa(self: anytype, owner: PrincipalId, size_bytes: u64) KernelError!u64 {
+    if (!@TypeOf(self.*).isPageAligned(size_bytes) or size_bytes == 0) return KernelError.InvalidState;
+    const table = self.getVmaTable(owner) orelse return KernelError.InvalidState;
+    const bounds = user_vm.userMappingPlacementBounds() orelse return KernelError.InvalidState;
+    if (size_bytes > bounds.end - bounds.start) return KernelError.TableFull;
+    // Callers hold K then the VM transaction through publication. Recursing
+    // into the owner's AS here follows the pin-index order (K -> AS), keeping
+    // VMA, pin, reservation and PTE cursors stable throughout the merged walk.
+    const locked = lockPinIndex(owner);
+    defer unlockPinIndex(owner, locked);
+    const initial = if (user_map_initial_va >= bounds.start and user_map_initial_va < bounds.end) user_map_initial_va else bounds.start;
+    const cursor = if (table.next_user_map_va >= bounds.start and table.next_user_map_va < bounds.end) table.next_user_map_va else initial;
+    const candidate = freeUserMapInSpan(table, owner, size_bytes, cursor, bounds.end) orelse
+        freeUserMapInSpan(table, owner, size_bytes, bounds.start, bounds.end) orelse return KernelError.TableFull;
+    // Search failure leaves the cursor unchanged. A successful selection
+    // consumes only cursor state, not a reservation: a later install failure
+    // may leave a hole, which the same wraparound walk can reuse.
+    table.next_user_map_va = candidate + size_bytes;
+    return candidate;
+}
+
+pub fn userMapRangeIsFree(self: anytype, owner: PrincipalId, start_va: u64, size_bytes: u64) KernelError!bool {
     if (!@TypeOf(self.*).isPageAligned(start_va) or !@TypeOf(self.*).isPageAligned(size_bytes) or size_bytes == 0) return KernelError.InvalidState;
-    const table = self.getVmaTableConst(owner) orelse return KernelError.InvalidState;
-    return !(try @TypeOf(self.*).vmaRangeOverlaps(table, start_va, size_bytes)) and
-        !self.rangeOverlapsPinnedUserObject(owner, start_va, size_bytes);
+    const end = try checkedEnd(start_va, size_bytes);
+    const table = self.getVmaTable(owner) orelse return KernelError.InvalidState;
+    const locked = lockPinIndex(owner);
+    defer unlockPinIndex(owner, locked);
+    // Hints and NOREPLACE use the same union as unspecified placement. Their
+    // legal address bounds remain the syscall's validation responsibility.
+    var blockers = UserMapBlockers.init(table, owner, start_va, end);
+    while (blockers.next()) |blocker| {
+        if (blocker.start >= end) break;
+        if (blocker.end > blocker.start and blocker.end > start_va) return false;
+    }
+    var present = user_vm.PresentUserMappingBlockerIterator.init(owner, start_va, end);
+    return present.nextBefore(end) == null;
 }
 
 /// Read-only admission check for a BAR overlay. The caller must hold the VM
@@ -1816,7 +2041,7 @@ pub fn validateRamAdmission(self: anytype, ref: NativeVmoRef, offset: u64, bytes
     const slot = self.nativeVmoSlotConst(ref) orelse return KernelError.InvalidState;
     // BAR authority and cache proof remain in device-memory admission; the
     // kernel clock page is never subject to RAM cache policy.
-    if (slot.kind == .device_memory or slot.kind == .kernel_page) return;
+    if (slot.kind == .device_memory or slot.kind == .kernel_page or slot.kind == .thread_page) return;
     const shadow = slot.kind == .anonymous and !slot.backing.parent.ref.isNull();
     const end = try @TypeOf(self.*).checkedEnd(offset, bytes);
     var position = offset;
@@ -1854,7 +2079,7 @@ test "MMIO overlay RAM VMA admission checks only resolved target PFNs including 
     const Fixture = struct {
         shadow: bool = false,
         const Slot = struct {
-            kind: enum { anonymous, device_memory, kernel_page, page_view } = .anonymous,
+            kind: enum { anonymous, device_memory, kernel_page, page_view, thread_page } = .anonymous,
             page_view_sparse: bool = false,
             backing: struct { parent: struct { ref: NativeVmoRef } },
         };
@@ -1933,6 +2158,8 @@ pub fn createVmaWithRetainedVmo(
     if (vmo.kind == .page_view and
         (!flags.shared or flags.private or flags.anonymous or
             !pageViewProtAllowed(max_prot, vmo.page_view_max_prot)))
+        return KernelError.InvalidState;
+    if (vmo.kind == .thread_page and !@import("../thread_identity.zig").mappingAllowed(vmo, owner, prot, max_prot, flags))
         return KernelError.InvalidState;
     if (vmo.kind == .kernel_page and !kernelPageMappingAllowed(prot, max_prot, flags))
         return KernelError.InvalidState;
@@ -2087,23 +2314,38 @@ fn selectPreparedVmaIndex(
     const active_end = std.math.add(usize, table.active_count, excluded.len) catch return null;
     if (active_end > std.math.maxInt(u32)) return null;
     table.active_indices.prepareIndex(@intCast(active_end), allocator) catch return null;
-    var index: u64 = 0;
-    while (index <= std.math.maxInt(u32)) : (index += 1) {
-        var skip = false;
-        for (excluded) |item| if (item == index) {
-            skip = true;
-            break;
-        };
-        if (skip or table.entries.isExhausted(@intCast(index))) continue;
-        if (table.entries.get(@intCast(index))) |entry| {
-            if (may_reuse_target_full and entryFullyCoveredByRange(entry, target_start, target_size)) return @intCast(index);
-            continue;
-        }
-        table.reference_slots.prepareIndex(@intCast(index), allocator) catch return null;
-        table.entries.prepareIndex(@intCast(index), allocator) catch return null;
-        return @intCast(index);
+    // Slot numbers carry no address/order meaning; callers need only a
+    // publishable index distinct from `excluded`. The unused-index list
+    // makes this O(excluded + 1) instead of a scan from slot 0, which cost
+    // O(VMA count) on every mmap/split/MAP_FIXED (Firefox: thousands).
+    // Prepared-but-unclaimed indices stay on that list; hence `excluded`.
+    var free = table.entries.freeIndices();
+    while (free.next()) |index| {
+        if (std.mem.indexOfScalar(usize, excluded, index) != null) continue;
+        return prepareVmaIndex(table, index, allocator);
     }
-    return null;
+    // No unused index: a VMA the target range fully replaces is cleared by
+    // the commit before its index is claimed again (MAP_FIXED/mremap only).
+    if (may_reuse_target_full and target_size != 0) {
+        const target_end = std.math.add(u64, target_start, target_size) catch return null;
+        var overlaps = table.overlapping(target_start, target_end);
+        while (overlaps.next()) |entry| {
+            if (!entryFullyCoveredByRange(entry, target_start, target_size)) continue;
+            const index: usize = @TypeOf(table.entries).indexOf(entry);
+            if (std.mem.indexOfScalar(usize, excluded, index) != null) continue;
+            return index;
+        }
+    }
+    // Append: the first index past capacity, grown by prepareIndex.
+    if (table.entries.capacity > std.math.maxInt(u32)) return null;
+    return prepareVmaIndex(table, @intCast(table.entries.capacity), allocator);
+}
+
+fn prepareVmaIndex(table: *VmaTable, index: u32, allocator: @import("../memory/owned_storage.zig").Allocator) ?usize {
+    // Both tables share the slot number; installVmaEntry claims both.
+    table.reference_slots.prepareIndex(index, allocator) catch return null;
+    table.entries.prepareIndex(index, allocator) catch return null;
+    return index;
 }
 
 fn prepareMiddleCut(
@@ -2355,6 +2597,8 @@ pub fn prepareFixedFdMmapIntoProcess(
     if (vmo.kind == .page_view and
         (!flags.shared or flags.private or flags.anonymous or
             !pageViewProtAllowed(max_prot, vmo.page_view_max_prot)))
+        return KernelError.InvalidState;
+    if (vmo.kind == .thread_page and !@import("../thread_identity.zig").mappingAllowed(vmo, target_owner, prot, max_prot, flags))
         return KernelError.InvalidState;
     if (vmo.kind == .kernel_page and !kernelPageMappingAllowed(prot, max_prot, flags))
         return KernelError.InvalidState;
@@ -2894,7 +3138,7 @@ pub fn mremapRangeWithFreeList(
     const target_start = if (fixed)
         new_start
     else if (new_size > old_size)
-        try self.findRandomizedFreeUserMapVa(owner, new_size, 0x4d52_454d_4150_0000)
+        try self.findFreeUserMapVa(owner, new_size)
     else
         old_start;
     var prepared = try self.prepareMremapWithFreeList(
@@ -2923,7 +3167,7 @@ pub fn refreshVmaReferences(self: anytype, entry: *VmaEntry) void {
     const range: references.Range = .{ .start = entry.start_va, .size = entry.size_bytes, .offset = entry.vmo_offset };
     if (pair.vmo.target != null) references.Root.update(&pair.vmo, pair.identity, range) else {
         const vmo = self.nativeVmoSlot(entry.vmo) orelse unreachable;
-        vmo.references.connect(&pair.vmo, pair.identity, range, true);
+        connectVmoAlias(vmo, pair, range);
     }
     if (!entry.cow_table.isNull()) {
         const cow = self.nativeCowTableSlot(entry.cow_table) orelse unreachable;
@@ -2931,4 +3175,25 @@ pub fn refreshVmaReferences(self: anytype, entry: *VmaEntry) void {
         if (pair.cow.target != null and pair.cow.target != &cow.references) references.Root.disconnect(&pair.cow, true);
         if (pair.cow.target != null) references.Root.update(&pair.cow, pair.identity, cow_range) else cow.references.connect(&pair.cow, pair.identity, cow_range, true);
     }
+}
+
+// The alias list borrows the reference body: K excludes publication/removal,
+// and the existing strong edge keeps its target alive for the whole borrow.
+fn connectVmoAlias(vmo: *types.NativeVmoSlot, pair: *types.VmaReferences, range: references.Range) void {
+    @import("../sync/lock_diagnostics.zig").assertKernelStateHeld();
+    std.debug.assert(pair.vmo.target == null and pair.vmo_alias_prev == null and pair.vmo_alias_next == null);
+    pair.vmo_alias_next = vmo.vma_alias_head;
+    if (vmo.vma_alias_head) |head| head.vmo_alias_prev = pair;
+    vmo.vma_alias_head = pair;
+    vmo.references.connect(&pair.vmo, pair.identity, range, true);
+}
+fn disconnectVmoAlias(pair: *types.VmaReferences) void {
+    @import("../sync/lock_diagnostics.zig").assertKernelStateHeld();
+    const target = pair.vmo.target orelse return;
+    const vmo: *types.NativeVmoSlot = @fieldParentPtr("references", target);
+    if (pair.vmo_alias_prev) |prev| prev.vmo_alias_next = pair.vmo_alias_next else vmo.vma_alias_head = pair.vmo_alias_next;
+    if (pair.vmo_alias_next) |next| next.vmo_alias_prev = pair.vmo_alias_prev;
+    pair.vmo_alias_prev = null;
+    pair.vmo_alias_next = null;
+    references.Root.disconnect(&pair.vmo, true);
 }

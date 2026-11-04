@@ -659,6 +659,7 @@ int lpr_control_install_fd(
         backend->handle = backend_id;
         backend->wait_fd.raw = -1;
         backend->lease_fd.raw = -1;
+        backend->ring_fd.raw = -1;
         break;
     }
     case LPR_FD_OPS_DMABUF: {

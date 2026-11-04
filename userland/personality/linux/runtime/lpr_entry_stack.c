@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: MIT */
 #include "lpr_entry_stack.h"
+#include "lpr_thread_page.h"
 #include "lpr_filed_internal.h"
 #include <personality/lpr_signal_stack.h>
 #include <pacha/poll.h>
@@ -76,7 +77,9 @@ static void collect_exited(void)
 
 static struct lpr_entry_context *current_context(void)
 {
-    const int64_t tid = lpr_pacha_syscall0(PACHAOS_SYSCALL_GETTID);
+    lpr_thread_page_initialize();
+    int64_t tid = (int64_t)lpr_thread_page_read();
+    if (tid <= 0) tid = lpr_pacha_syscall0(PACHAOS_SYSCALL_GETTID);
     if (tid <= 0) entry_failure();
     /* GETTID is a reusable scheduler slot, not an object generation. A new
      * clone enters here on the bootstrap stack before running user code.
@@ -160,6 +163,7 @@ uintptr_t lpr_entry_stack_acquire_bootstrap(void)
 void lpr_entry_stack_release_bootstrap(void) { spin_unlock(&lpr_entry_bootstrap_lock); }
 void lpr_entry_stack_after_fork_child(void)
 {
+    __atomic_store_n(&lpr_entry_single_stack_top, 0, __ATOMIC_RELEASE);
     /* Native fork does not transfer these private capabilities. Do not close
      * their copied numbers, which can already identify unrelated child FDs. */
     struct lpr_entry_context *context = lpr_entry_context_head;

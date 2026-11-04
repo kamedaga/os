@@ -142,6 +142,18 @@ int filed_storage_close(filed_runtime_t *rt, uint64_t handle)
     kb2_fs_response_t response;
     return filed_storage_request(rt, &r, NULL, 0, &response, NULL, 0);
 }
+/* Ask the owning VFS about the retained handle, never a filename convention.
+ * Failure only denies cache retention; it does not grant mapping authority. */
+int filed_storage_memory_backed(filed_runtime_t *rt,uint64_t handle)
+{
+    uint8_t bytes[KB2_FILESYSTEM_STATFS_SIZE];
+    kb2_fs_request_t request={.opcode=KB2_FILESYSTEM_OP_STATFS,.handle=handle};
+    kb2_fs_response_t response;
+    int status=filed_storage_request(rt,&request,NULL,0,&response,bytes,sizeof(bytes));
+    if (status) return status;
+    if (response.data_length!=sizeof(bytes)) return -71;
+    return rd(bytes+KB2_FILESYSTEM_STATFS_TYPE_OFFSET,8)==UINT64_C(0x01021994);
+}
 int filed_storage_executable_mapping(filed_runtime_t *rt,uint64_t handle)
 {
     uint8_t bytes[KB2_FILESYSTEM_STATFS_SIZE];

@@ -2,6 +2,7 @@
 
 #include "libuinet_backend.h"
 #include "netlink_socket.h"
+#include <pacha/readiness.h>
 #include "netd/ipc_protocol.h"
 #include "pacha/ipc.h"
 #include "pacha/trace.h"
@@ -53,19 +54,24 @@ static uint64_t g_netd_page_attachment_count;
  * Check only requests that can retain received capabilities, not every data
  * RPC. Leave room for a whole native message, including malformed requests,
  * so resource pressure can never block CLOSE behind an unreceivable head.
- * Backends retain received FDs; they do not allocate persistent native FDs
- * during dispatch. Reply/SCM_RIGHTS sends MOVE existing descriptors.
+ * Most backends retain received FDs. Readiness export additionally allocates
+ * one persistent writer cap; reserve that slot before dispatch as well.
  */
-static int netd_socket_admit_fds(uint64_t received, uint64_t retained)
+static int netd_socket_admit_fds_alloc(uint64_t received, uint64_t retained, uint64_t allocated)
 {
-    if (retained == 0) return 0;
+    if (retained == 0 && allocated == 0) return 0;
     if (retained > received) return -22;
     uint64_t available = received - retained;
-    for (pacha_fd_t fd = 16; fd < 256 && available < PACHA_IPC_MAX_TRANSFER_FDS; ++fd) {
+    for (pacha_fd_t fd = 16; fd < 256 && available < PACHA_IPC_MAX_TRANSFER_FDS + allocated; ++fd) {
         struct pacha_fd_info info;
         if (pacha_fd_get_info(fd, &info) != 0) ++available;
     }
-    return available >= PACHA_IPC_MAX_TRANSFER_FDS ? 0 : -24;
+    return available >= PACHA_IPC_MAX_TRANSFER_FDS + allocated ? 0 : -24;
+}
+
+static int netd_socket_admit_fds(uint64_t received, uint64_t retained)
+{
+    return netd_socket_admit_fds_alloc(received,retained,0);
 }
 
 static int netd_socket_handle_dup(uint64_t handle)
@@ -162,8 +168,13 @@ static int netd_socket_send_reply(
             return netd_socket_send_reply(op, reply_fd, request_id, -9, 0, NULL, 0);
         }
         transferred[i].fd = (uint64_t)(uint32_t)transfer_fds[i];
-        transferred[i].rights = info.rights;
-        transferred[i].transfer_flags = PACHA_IPC_TRANSFER_MOVE | PACHA_IPC_TRANSFER_INHERIT;
+        /* POLL exports an attenuated borrowed snapshot cap. The service
+         * keeps the writer cap for the socket lifetime; never MOVE it. */
+        transferred[i].rights = op == NETD_OP_POLL ?
+            PACHA_FD_RIGHT_INSPECT | PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_MAP_READ : info.rights;
+        transferred[i].transfer_flags = op == NETD_OP_POLL ?
+            PACHA_IPC_TRANSFER_PRIVATE | PACHA_IPC_TRANSFER_CLOEXEC :
+            PACHA_IPC_TRANSFER_MOVE | PACHA_IPC_TRANSFER_INHERIT;
     }
     const struct pacha_ipc_msg reply = {
         .word0 = PACHA_SERVICE_REPLY_MAGIC,
@@ -185,7 +196,7 @@ static int netd_socket_send_reply(
         pacha_trace4(PACHA_TRACE_COMPONENT_NETD, PACHA_TRACE_EVENT_NETD_SOCKET, reply_status != 0 ? PACHA_TRACE_CLASS_ERROR : PACHA_TRACE_CLASS_DEBUG, op, (uint64_t)reply_status, result, (uint64_t)(uint32_t)reply_fd);
     }
 
-    for (uint32_t i = 0; i < transfer_count; ++i)
+    if (op != NETD_OP_POLL) for (uint32_t i = 0; i < transfer_count; ++i)
         (void)pacha_fd_close(transfer_fds[i]);
     return reply_status;
 }
@@ -385,6 +396,17 @@ static int netd_socket_dispatch(
             return -22;
         }
         netd_poll_t *req = (netd_poll_t *)page;
+        if (req->reserved[0] == PACHA_READINESS_ARM) {
+            if (transferred_count != 1) return -22;
+            return netd_netlink_socket_arm(req->handle,transferred_fds[0]);
+        }
+        if (req->reserved[0] == PACHA_READINESS_EXPORT) {
+            if (!netd_netlink_socket_is_handle(req->handle)) return -95;
+            int status = netd_netlink_socket_readiness(req->handle, out_reply_fds);
+            if (!status) *out_reply_count = 1;
+            return status;
+        }
+        if (req->reserved[0]) return -22;
         uint32_t revents = 0;
         int32_t error = 0;
         int status = netd_netlink_socket_is_handle(req->handle) ?
@@ -565,9 +587,13 @@ static int netd_socket_dispatch_request(
 
 
     const int may_retain = request->word1 == NETD_OP_SOCKET ||
-        request->word1 == NETD_OP_ACCEPT || request->word1 == NETD_OP_DUP;
-    const int admission = netd_socket_admit_fds(request->fd_count,
-        may_retain ? transferred_count : 0);
+        request->word1 == NETD_OP_ACCEPT || request->word1 == NETD_OP_DUP ||
+        (request->word1 == NETD_OP_POLL && page &&
+         ((netd_poll_t *)page)->reserved[0] == PACHA_READINESS_ARM);
+    const int admission = netd_socket_admit_fds_alloc(request->fd_count,
+        may_retain ? transferred_count : 0,
+        request->word1 == NETD_OP_POLL && page &&
+        ((netd_poll_t *)page)->reserved[0] == PACHA_READINESS_EXPORT ? 1 : 0);
     if (admission != 0)
         return netd_socket_reject_request(request, fds, admission);
     uint64_t result = op_uses_page ? 0 : request->word2;
@@ -595,7 +621,9 @@ static int netd_socket_dispatch_request(
         ((request->word1 == NETD_OP_SOCKET &&
             result != 0) ||
          (request->word1 == NETD_OP_ACCEPT && result != 0) ||
-         (request->word1 == NETD_OP_DUP && transferred_count == 1));
+         (request->word1 == NETD_OP_DUP && transferred_count == 1) ||
+         (request->word1 == NETD_OP_POLL && transferred_count == 1 && page &&
+          ((netd_poll_t *)page)->reserved[0] == PACHA_READINESS_ARM));
     if (!transfer_retained)
         for (uint32_t i = 0; i < transferred_count; ++i)
             if (transferred_fds[i] >= 16) (void)pacha_fd_close(transferred_fds[i]);

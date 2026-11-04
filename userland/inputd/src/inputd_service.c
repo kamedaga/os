@@ -1,3 +1,4 @@
+#include <inputd/event_ring.h>
 #include "inputd_service.h"
 #include "input_namespace.h"
 #include "linux_subsystem/input/input.h"
@@ -363,11 +364,17 @@ int inputd_service_dispatch(
         void *payload = (uint8_t *)page + PACHA_SERVICE_HEADER_BYTES;
         switch (header.op) {
         case INPUTD_OP_OPEN:
-            if (header.payload_size >= sizeof(inputd_open_request_t)) {
+            if (header.payload_size >= sizeof(inputd_open_request_t) && request->fd_count == 3) {
                 const inputd_open_request_t *open = payload;
                 const pacha_fd_t notify_fd = request->fd_count >= 2 ? (pacha_fd_t)fds[1].fd : -1;
-                status = inputd_input_open(open->event_index, open->flags, notify_fd, &result);
-                if (status == 0) keep_fd = notify_fd;
+                struct inputd_event_ring *ring = pacha_mmap((pacha_fd_t)fds[2].fd,
+                    INPUTD_RING_BYTES, PACHA_PROT_READ | PACHA_PROT_WRITE, PACHA_MMAP_SHARED, 0);
+                status = ring ? inputd_input_open(open->event_index, open->flags, notify_fd, &result) : -22;
+                if (status == 0) {
+                    status = inputd_input_attach_ring(result, ring);
+                    if (status == 0) keep_fd = notify_fd;
+                }
+                if (status != 0 && ring) (void)pacha_munmap(ring, INPUTD_RING_BYTES);
             } else {
                 status = -22;
             }
@@ -389,11 +396,6 @@ int inputd_service_dispatch(
                 status = -22;
             }
             break;
-        case INPUTD_OP_READ:
-            status = header.payload_size >= sizeof(inputd_read_request_t) ?
-                inputd_input_read(payload) : -22;
-            if (status == 0) result = ((inputd_read_request_t *)payload)->event_count;
-            break;
         case INPUTD_OP_IOCTL:
             status = header.payload_size >= sizeof(inputd_ioctl_request_t) ?
                 inputd_input_ioctl(payload) : -22;
@@ -401,11 +403,6 @@ int inputd_service_dispatch(
                 const inputd_ioctl_request_t *ioctl_request = payload;
                 if (status == 0) result = ioctl_request->result_size;
             }
-            break;
-        case INPUTD_OP_POLL:
-            status = header.payload_size >= sizeof(inputd_poll_request_t) ?
-                inputd_input_poll(payload) : -22;
-            if (status == 0) result = ((inputd_poll_request_t *)payload)->revents;
             break;
         default:
             status = -95;

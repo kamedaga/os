@@ -72,6 +72,8 @@ var deferred_wakes: @import("sync/deferred_wake.zig").Table = .{};
 // changing the boot-time admission decision. Slot zero belongs to the BSP.
 var mmio_cache_snapshots: []mtrr.CacheSnapshot = &.{};
 var mmio_cache_matches: []u32 = &.{};
+const cpu_performance = @import("cpu_performance.zig");
+var cpu_performance_results: []cpu_performance.Result = &.{};
 var mmio_cache_online_mask: CpuSet = .{ .words = &.{}, .capacity = 0 };
 
 extern fn stageUserReturnFromFramePointerForCurrentCpu(frame_addr: usize, iret_offset: usize) callconv(.winapi) void;
@@ -105,6 +107,7 @@ pub fn kernelStaticStorageEndAddr() usize {
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(deferred_wakes), &deferred_wakes));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(mmio_cache_snapshots), &mmio_cache_snapshots));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(mmio_cache_matches), &mmio_cache_matches));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(cpu_performance_results), &cpu_performance_results));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(mmio_cache_online_mask), &mmio_cache_online_mask));
     return end;
 }
@@ -164,10 +167,25 @@ pub fn initCpuStorage(count: usize) !void {
     );
     mmio_cache_snapshots = try runtime.alloc(mtrr.CacheSnapshot, count);
     mmio_cache_matches = try runtime.alloc(u32, count);
+    cpu_performance_results = try runtime.alloc(cpu_performance.Result, count);
+    @memset(cpu_performance_results, .{});
     online_set = CpuSet.init(try runtime.alloc(usize, CpuSet.wordCount(count)), count);
     matching_set = CpuSet.init(try runtime.alloc(usize, CpuSet.wordCount(count)), count);
     broadcast_online_mask = CpuSet.init(try runtime.alloc(usize, CpuSet.wordCount(count)), count);
     mmio_cache_online_mask = CpuSet.init(try runtime.alloc(usize, CpuSet.wordCount(count)), count);
+}
+
+/// BSP-only, after startIdleAps returns. APs do not wait for serial/log locks;
+/// only rows published by started's release/acquire may be read here. An AP
+/// exception before publication is diagnosed by the existing exception path.
+pub fn logCpuPerformance() void {
+    for (cpu_performance_results, 0..) |*result, slot| {
+        if (slot != 0 and !isStarted(slot)) continue;
+        if (result.status == .not_run) continue;
+        var line: [512]u8 = undefined;
+        const text = cpu_performance.formatResult(&line, slot, result.*) catch @panic("HWP diagnostic line capacity");
+        @import("kernel_log.zig").write(text);
+    }
 }
 
 pub fn cpuInfo(cpu_slot: usize) ?CpuInfo {
@@ -445,6 +463,11 @@ fn setCpuState(cpu_slot: usize, state: CpuState) void {
 }
 
 pub fn startIdleAps(info: *BootInfo, kernel_cr3: u64) bool {
+    @import("realtime_clock.zig").assertCpuStartupOpen();
+    // BSP already has exception entry/stack mappings. HWP is local to each
+    // logical CPU; AP settings must never be emulated by a BSP loop.
+    cpu_performance_results[0] = cpu_performance.initializeCurrentCpu();
+    if (cpu_performance_results[0].failed()) return false;
     @import("realtime_clock.zig").registerCpu(0, x86_platform.kernelPointerPaddr);
     broadcast_online_mask.clear();
     mmio_cache_online_mask.clear();
@@ -469,6 +492,7 @@ pub fn startIdleAps(info: *BootInfo, kernel_cr3: u64) bool {
     while (i < info.lapic_count and cpu_slot < cpuCapacity()) : (i += 1) {
         const apic_id = info.lapic_ids[i];
         if (apic_id == bsp_id) continue;
+        @import("tsc_clock.zig").prepareAp();
         @atomicStore(u32, &ap_started[cpu_slot], 0, .release);
         @atomicStore(u32, &mmio_cache_matches[cpu_slot], 0, .release);
         runtimeLapicIdPtr(cpu_slot).* = 0xFFFFFFFF;
@@ -503,6 +527,7 @@ pub fn startIdleAps(info: *BootInfo, kernel_cr3: u64) bool {
         }
         var spins: u32 = 0;
         while (!isStarted(cpu_slot) and spins < 10000000) : (spins += 1) {
+            @import("tsc_clock.zig").progressAp(cpu_slot);
             asm volatile ("pause");
         }
         if (!isStarted(cpu_slot) or cpuState(cpu_slot) != .idle) {
@@ -575,6 +600,15 @@ fn apIdleEntry(cpu_slot: usize) callconv(.winapi) noreturn {
         while (true) asm volatile ("hlt");
     }
     x86_platform.loadInterruptTableForCurrentCpu();
+    // Execute after this AP's exception setup and before idle/started/online
+    // publication. A failed irreversible setup is not an online CPU. The
+    // existing started release/acquire also publishes the diagnostic result.
+    cpu_performance_results[cpu_slot] = cpu_performance.initializeCurrentCpu();
+    if (cpu_performance_results[cpu_slot].failed()) {
+        setCpuState(cpu_slot, .absent);
+        markStarted(cpu_slot);
+        while (true) asm volatile ("hlt");
+    }
     if (ap_syscall_entry) |entry_for_cpu| {
         x86_platform.enableSyscallEntry(entry_for_cpu(cpu_slot));
     }
@@ -598,9 +632,13 @@ fn apIdleEntry(cpu_slot: usize) callconv(.winapi) noreturn {
     @atomicStore(u32, &mmio_cache_matches[cpu_slot], @intFromBool(cache_matches), .release);
     runtimeLapicIdPtr(cpu_slot).* = lapic.localApicId();
     @import("realtime_clock.zig").registerCpu(cpu_slot, x86_platform.kernelPointerPaddr);
+    @import("tsc_clock.zig").apHandshake(cpu_slot);
     setCpuState(cpu_slot, .idle);
     markStarted(cpu_slot);
     lapic.disarmTimer();
+    // Epoch installation belongs to the BSP before any AP clock read or
+    // user dispatch. Startup evidence is already visible to that BSP.
+    @import("realtime_clock.zig").waitForClockInitialization();
     apIdleLoop(cpu_slot);
 }
 
@@ -1035,6 +1073,8 @@ fn recordDeferredWake(cpu_slot: usize, notify: bool) bool {
 }
 
 fn sendWake(cpu_slot: usize) bool {
+    const wf11 = @import("ipc_metric.zig").detailBegin();
+    defer @import("ipc_metric.zig").detailEnd(.ipi, wf11);
     @import("wake_trace.zig").record(.ipi_send, cpu_slot, 0, 0);
     // Nonzero only if an edge is still sent while this CPU owns K.
     const profile = @import("lock_profile.zig");
@@ -1072,6 +1112,15 @@ pub fn endKernelStateWakeDeferral() void {
     // token; continuing would strand its target in HLT.
     notify_wake[failed].failed();
     @panic("deferred notify wake IPI failed");
+}
+
+/// Boot publication must not leave deferred wake edges stranded on the BSP.
+pub fn assertKernelStateWakeDeferralEnded() void {
+    if (comptime !@import("sync/lock_diagnostics.zig").enabled) return;
+    if (deferred_wakes.capacity == 0) return;
+    const owner = currentCpuSlotIfKnown() orelse @import("sync/lock_diagnostics.zig").failure(error.UnknownCpu);
+    if (@atomicLoad(u8, &deferred_wakes.active[owner], .monotonic) != 0)
+        @import("sync/lock_diagnostics.zig").failure(error.RecordStillLinked);
 }
 
 /// Before the handler's ring-0 early return. Idle resumes its queue-check loop;

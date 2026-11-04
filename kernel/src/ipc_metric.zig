@@ -226,6 +226,8 @@ pub fn initCpuStorage(count: usize) !void {
     if (comptime !enabled) return;
     const storage = @import("diagnostic_cpu_storage.zig");
     try initCensus(count);
+    detail_rows = try storage.grow(DetailRow, detail_rows, count, @splat(.{}));
+    detail_view = @TypeOf(detail_view).init(detail_rows);
     try @import("notify_metric.zig").initCpuStorage(count);
     directions = try storage.grow(?Direction, directions, count, null);
     counters = try storage.grow([row_words]u64, counters, count, @splat(0));
@@ -293,12 +295,126 @@ pub fn recordElapsed(op: Op, cycles: u64) void {
     _ = @atomicRmw(u64, &counters[cpu][index + 1], .Add, cycles, .monotonic);
 }
 
+// Fixed diagnostics reuse the IPC profile gate/storage lifecycle; no scope
+// may survive a scheduling callback. A changed CPU or regressing counter is
+// missing evidence, never a wrapped latency attributed to the hot path.
+pub const Detail = enum { handle, enqueue, wake_select, claim, publication, pipe_write, runqueue_wake, ipi };
+const detail_count = @typeInfo(Detail).@"enum".fields.len;
+pub const DetailHist = extern struct {
+    buckets: [64]u64 = @splat(0),
+    count: u64 = 0, cycles: u64 = 0, maximum: u64 = 0, excluded: u64 = 0, overflow: u64 = 0,
+    pub fn record(self: *@This(), ticks: u64) void {
+        const bin = 63 - @clz(ticks | 1);
+        const old = @atomicRmw(u64, &self.buckets[bin], .Add, 1, .monotonic);
+        if (old == std.math.maxInt(u64)) @atomicStore(u64, &self.overflow, 1, .monotonic);
+        const old_count = @atomicRmw(u64, &self.count, .Add, 1, .monotonic);
+        const old_cycles = @atomicRmw(u64, &self.cycles, .Add, ticks, .monotonic);
+        if (old_count == std.math.maxInt(u64) or old_cycles > std.math.maxInt(u64) - ticks)
+            @atomicStore(u64, &self.overflow, 1, .monotonic);
+        _ = @atomicRmw(u64, &self.maximum, .Max, ticks, .monotonic);
+    }
+};
+const DetailRow = [detail_count]DetailHist;
+var detail_boot: [cpu_rows]DetailRow = @splat(@splat(.{}));
+var detail_rows: []DetailRow = &detail_boot;
+var detail_view = @import("diagnostic_cpu_storage.zig").Descriptor(DetailRow).init(&detail_boot);
+pub const DetailToken = if (enabled) struct { start: u64, cpu: usize } else void;
+comptime { if (enabled) @export(&detail_view, .{ .name = "wf11_detail_rows" }); }
+pub fn detailBegin() DetailToken {
+    if (comptime !enabled) return {};
+    return .{ .start = timestamp(), .cpu = smp.currentCpuSlot() };
+}
+fn finishDetail(h: *DetailHist, token_cpu: usize, end_cpu: usize, start: u64, end: u64) void {
+    if (token_cpu != end_cpu or end < start) {
+        _ = @atomicRmw(u64, &h.excluded, .Add, 1, .monotonic);
+        return;
+    }
+    h.record(end - start);
+}
+pub fn detailEnd(kind: Detail, token: DetailToken) void {
+    if (comptime !enabled) return;
+    if (token.cpu >= detail_rows.len) return;
+    finishDetail(&detail_rows[token.cpu][@intFromEnum(kind)], token.cpu, smp.currentCpuSlot(), token.start, timestamp());
+}
+// Only explicit diagnostic log reads call this. Hex bins have a strict byte
+// bound; readers difference complete bin snapshots, never cumulative p99s.
+pub fn sumDetail(h: *DetailHist, counter: *u64, value: u64) void {
+    const sum = @addWithOverflow(counter.*, value);
+    counter.* = sum[0]; h.overflow |= sum[1];
+}
+pub fn dumpDetailHistogram(index: usize, h: *const DetailHist) void {
+    if (comptime !enabled) return;
+    const log = @import("kernel_log.zig");
+    log.writeProfileFmt("wf11 h={} n={} ticks={} max={} excluded={} overflow={}\n", .{ index, h.count, h.cycles, h.maximum, h.excluded, h.overflow });
+    var base: usize = 0;
+    while (base < 64) : (base += 8) {
+        const v = h.buckets[base..][0..8];
+        log.writeProfileFmt("wf11 b={} i={} {x:0>16}{x:0>16}{x:0>16}{x:0>16}{x:0>16}{x:0>16}{x:0>16}{x:0>16}\n", .{ index, base, v[0],v[1],v[2],v[3],v[4],v[5],v[6],v[7] });
+    }
+}
+pub fn dumpWakeDetails() void {
+    if (comptime !enabled) return;
+    const log = @import("kernel_log.zig");
+    const id = timestamp();
+    log.writeProfileFmt("wf11 BEGIN id={} cpus={} row_bytes={} hist_bytes={} clock_hz={} kvm={} raw_tsc_hz={} bootstrap_tsc_hz={}\n", .{ id, detail_rows.len, @sizeOf(DetailRow), @sizeOf(DetailHist), clock.counterFrequencyHz(), clock.usesKvmClock(), @import("tsc_clock.zig").knownFrequency() orelse 0, clock.bootstrapCounterFrequencyHz() });
+    inline for (@typeInfo(Detail).@"enum".fields) |field| {
+        var h: DetailHist = .{};
+        for (detail_rows) |*row| {
+            const from = &row[field.value];
+            sumDetail(&h, &h.count, @atomicLoad(u64, &from.count, .monotonic));
+            sumDetail(&h, &h.cycles, @atomicLoad(u64, &from.cycles, .monotonic));
+            h.maximum = @max(h.maximum, @atomicLoad(u64, &from.maximum, .monotonic));
+            sumDetail(&h, &h.excluded, @atomicLoad(u64, &from.excluded, .monotonic));
+            h.overflow |= @atomicLoad(u64, &from.overflow, .monotonic);
+            for (&h.buckets, 0..) |*bin, i| {
+                const sum = @addWithOverflow(bin.*, @atomicLoad(u64, &from.buckets[i], .monotonic));
+                bin.* = sum[0]; h.overflow |= sum[1];
+            }
+        }
+        dumpDetailHistogram(field.value, &h);
+    }
+    // Reuse the existing phase census instead of stamping those paths twice.
+    inline for (.{ Op.send_enqueue, Op.send_wake, Op.copyin, Op.copyout, Op.handoff, Op.recv_message,
+        Op.request_build, Op.request_claim, Op.request_install, Op.request_copy, Op.request_complete,
+        Op.request_register, Op.request_block, Op.request_select, Op.request_switch, Op.request_pmm_alloc, Op.request_pmm_free,
+        Op.reply_build, Op.reply_claim, Op.reply_install, Op.reply_copy, Op.reply_complete,
+        Op.reply_register, Op.reply_block, Op.reply_select, Op.reply_switch, Op.reply_pmm_alloc, Op.reply_pmm_free,
+        Op.fast_success, Op.queued_success, Op.direct_delivery_success, Op.entry_call_success, Op.entry_reply_success }) |op| {
+        var n: u64 = 0; var ticks: u64 = 0;
+        for (counters) |*row| {
+            n +%= @atomicLoad(u64, &row[2 * @intFromEnum(op)], .monotonic);
+            ticks +%= @atomicLoad(u64, &row[2 * @intFromEnum(op) + 1], .monotonic);
+        }
+        log.writeProfileFmt("wf11 ipc={s} n={} ticks={}\n", .{ @tagName(op), n, ticks });
+    }
+    @import("lock_profile.zig").dumpWakeLocks();
+    @import("wake_trace.zig").dumpRecent();
+    log.writeProfileFmt("wf11 END id={} capture_ticks={}\n", .{ id, timestamp() -% id });
+}
+
+test "principal syscall counts wf11 histogram CPU and backwards rejection with boundary overflow" {
+    var h: DetailHist = .{};
+    finishDetail(&h, 0, 1, 1, 5);
+    finishDetail(&h, 0, 0, 5, 1);
+    try std.testing.expectEqual(@as(u64, 2), h.excluded);
+    try std.testing.expectEqual(@as(u64, 0), h.count);
+    h.record(0); h.record(1); h.record(2); h.record(std.math.maxInt(u64));
+    try std.testing.expectEqual(@as(u64, 2), h.buckets[0]);
+    try std.testing.expectEqual(@as(u64, 1), h.buckets[1]);
+    try std.testing.expectEqual(@as(u64, 1), h.buckets[63]);
+    try std.testing.expectEqual(@as(u64, 1), h.overflow);
+    h.overflow = 0;
+    h.buckets[3] = std.math.maxInt(u64);h.record(8);
+    try std.testing.expectEqual(@as(u64, 1), h.overflow);
+    try std.testing.expectEqual(@as(usize, 552), @sizeOf(DetailHist));
+}
+
 // QMP snapshots are live: a count/cycles pair is not one atomic transaction.
 // Use long interval differences as approximations, not exact per-call traces.
 pub fn staticEnd() usize {
     if (!enabled) return 0;
     var end: usize = 0;
-    inline for (.{ &counters, &syscall_counts, &counters_boot, &syscall_boot, &ipc_perf_layout, &counters_view, &syscall_counts_view, &principal_counts_present, &directions, &direction_boot, &reason_boot, &reasons, &route_boot, &routes, &route_view, &route_writers, &route_writers_boot, &route_writers_view }) |ptr| end = @max(end, @intFromPtr(ptr) + @sizeOf(@TypeOf(ptr.*)));
+    inline for (.{ &detail_boot, &detail_rows, &detail_view, &counters, &syscall_counts, &counters_boot, &syscall_boot, &ipc_perf_layout, &counters_view, &syscall_counts_view, &principal_counts_present, &directions, &direction_boot, &reason_boot, &reasons, &route_boot, &routes, &route_view, &route_writers, &route_writers_boot, &route_writers_view }) |ptr| end = @max(end, @intFromPtr(ptr) + @sizeOf(@TypeOf(ptr.*)));
     return @max(end, @import("notify_metric.zig").staticEnd());
 }
 

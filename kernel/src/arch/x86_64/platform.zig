@@ -170,6 +170,19 @@ pub export var pku_enabled: u64 = 0;
 /// it can execute them, or stay out (see smp AP start).
 pub var fsgsbase_enabled: u64 = 0;
 pub export var x86_rdtscp_supported: u64 = 0;
+var bootstrap_identity_aux: [1]u8 = .{0};
+var identity_aux_proof: []u8 = &bootstrap_identity_aux;
+
+pub fn threadIdentityCpuQualification() bool {
+    const online = @import("../../smp.zig").onlineCpuSet();
+    if (online.count() == 0) return false;
+    var next = online.next(0);
+    while (next) |cpu| {
+        next = online.next(cpu + 1);
+        if (cpu >= identity_aux_proof.len or @atomicLoad(u8, &identity_aux_proof[cpu], .acquire) != 1) return false;
+    }
+    return true;
+}
 
 fn staticStorageEnd(comptime T: type, ptr: *T) usize {
     return @intFromPtr(ptr) + @sizeOf(T);
@@ -231,6 +244,8 @@ pub fn kernelStaticStorageStartAddr() usize {
     start = minStaticStart(start, staticStorageStart(@TypeOf(invpcid_support), &invpcid_support));
     start = minStaticStart(start, staticStorageStart(@TypeOf(pku_enabled), &pku_enabled));
     start = minStaticStart(start, staticStorageStart(@TypeOf(x86_rdtscp_supported), &x86_rdtscp_supported));
+    start = minStaticStart(start, staticStorageStart(@TypeOf(bootstrap_identity_aux), &bootstrap_identity_aux));
+    start = minStaticStart(start, staticStorageStart(@TypeOf(identity_aux_proof), &identity_aux_proof));
     return start;
 }
 
@@ -279,6 +294,8 @@ pub fn kernelStaticStorageEndAddr() usize {
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(invpcid_support), &invpcid_support));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(pku_enabled), &pku_enabled));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(x86_rdtscp_supported), &x86_rdtscp_supported));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(bootstrap_identity_aux), &bootstrap_identity_aux));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(identity_aux_proof), &identity_aux_proof));
     return end;
 }
 
@@ -567,7 +584,8 @@ pub fn cr3WithUserPcid(raw_cr3: u64, pcid: u16) u64 {
 /// All user-return CR3 operands publish execution, even PCID-0/forced loads.
 /// Leaf invalidations clear remote retention and flush only active users;
 /// dormant CPUs must flush before reuse. Retirement, cache maintenance, PCID
-/// reuse and PCID-0 still rendezvous with every online CPU before reclamation.
+/// reuse and shared-root updates still rendezvous with every online CPU.
+/// Private PCID-0 entrants owe a flushing load and publish exposure too.
 /// Stored CR3s never contain NOFLUSH; add it only at this IF-clear boundary.
 pub fn userReturnCr3(cr3: u64, force_flush: bool) u64 {
     if (userReturnChecksEnabled()) assertUserReturnInterruptsOff();
@@ -968,21 +986,19 @@ pub fn invalidatePcidAddress(pcid: u12, va: u64) void {
 }
 
 pub fn writeCr3(value: u64) void {
-    var operand = value;
-    if (pcid_enabled != 0 and value & 4095 != 0) {
-        // Registration and its load are one CPU-local transaction. Otherwise
-        // an IPI could ACK between them, then this load retain stale entries.
-        var flags: u64 = undefined;
-        asm volatile ("pushfq; popq %[flags]; cli"
-            : [flags] "=r" (flags),
-            :
-            : .{ .memory = true });
-        if (!@import("../../tlb_residency.zig").enterRetained(@import("../../smp.zig").currentCpuSlot(), value)) operand &= ~(@as(u64, 1) << 63);
-        writeCr3ForMaintenance(operand);
-        if (flags & (1 << 9) != 0) asm volatile ("sti" ::: .{ .memory = true });
-        return;
-    }
-    writeCr3ForMaintenance(operand);
+    // Generic loads can restore a user root in ring 0 (copy helpers). Keep
+    // exposure publication and the hardware load indivisible to an IPI ACK,
+    // including PCID=0; retention alone is not an execution registration.
+    var flags: u64 = undefined;
+    asm volatile ("pushfq; popq %[flags]; cli"
+        : [flags] "=r" (flags),
+        :
+        : .{ .memory = true });
+    const Load = struct {
+        pub fn write(cr3: u64) void { writeCr3ForMaintenance(cr3); }
+    };
+    @import("../../tlb_residency.zig").loadKernelContext(Load, @import("../../smp.zig").currentCpuSlot(), value, kernel_cr3_value, pcid_enabled != 0);
+    if (flags & (1 << 9) != 0) asm volatile ("sti" ::: .{ .memory = true });
 }
 
 // Invalidation-only loads do not walk user mappings. Keeping them outside
@@ -1657,8 +1673,14 @@ fn installTssDescriptor(cpu_slot: usize) bool {
 
 fn loadGdtAndReloadSegmentsForCpuInternal(cpu_slot: usize) bool {
     if (!installTssDescriptor(cpu_slot)) return false;
-    if (cpuHasRdtscp()) {
-        writeMsr(msr_ia32_tsc_aux, @intCast(cpu_slot));
+    const aux_available = cpuHasRdtscp();
+    if (aux_available) writeMsr(msr_ia32_tsc_aux, @intCast(cpu_slot));
+    // Qualification is CPU-local, after AUX setup. A BSP CPUID bit alone
+    // cannot authorize instruction execution after migration to an AP.
+    if (cpu_slot < identity_aux_proof.len) {
+        const rdpid = cpuid(0).eax >= 7 and (cpuid(7).ecx & (@as(u32, 1) << 22)) != 0;
+        const valid = aux_available and rdpid and readMsr(msr_ia32_tsc_aux) == cpu_slot;
+        @atomicStore(u8, &identity_aux_proof[cpu_slot], @intFromBool(valid), .release);
     }
 
     const gdt_ptr = GdtPtr{
@@ -2256,6 +2278,9 @@ pub fn perCpuWindowVa(cpu: usize, way: usize) u64 {
     return cpu_window_base + (cpu * phys_copy_window_ways + way) * 4096;
 }
 pub fn initCpuStorage(count: usize) !void {
+    const identity_proofs = try cpu_runtime.alloc(u8, count);
+    identity_proofs[0] = identity_aux_proof[0];
+    identity_aux_proof = identity_proofs;
     const optimized = try cpu_runtime.alloc(bool, count);
     @memset(optimized, false);
     optimized[0] = xsaveopt_by_cpu[0];

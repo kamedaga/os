@@ -1,41 +1,41 @@
 {
   "kernel/src/kernel.zig": {
     "ensureFdTableCapacity": 2,
-    "fdEntryConst": 2,
-    "fdPayloadWithRights": 2,
-    "fdPayloadWithRightsConst": 2,
-    "fdTableForActiveProcess": 2,
-    "fdTableForActiveProcessConst": 2,
+    "releaseFdStorage": 2,
+    "reclaimFdStorage": 2,
     "fdTableForProcessIndex": 2,
     "fdTableForProcessIndexConst": 2,
     "getFdTable": 2,
     "getFdTableConst": 2,
-    "reclaimFdStorage": 2,
-    "releaseFdStorage": 2
+    "fdTableForActiveProcess": 2,
+    "fdTableForActiveProcessConst": 2,
+    "fdEntryConst": 2,
+    "fdPayloadWithRightsConst": 2,
+    "fdPayloadWithRights": 2
   },
   "kernel/src/scheduler_connection.zig": {
     "before_current_thread_leave": 13
   },
   "kernel/src/state/fd.zig": {
     "fdEntryConst": 11,
-    "fdPayloadWithRights": 5,
-    "fdPayloadWithRightsConst": 5,
-    "fdTableForActiveProcess": 10,
-    "fdTableForActiveProcessConst": 4,
     "fdTableForProcessIndex": 2,
-    "fdTableForProcessIndexConst": 1,
+    "fdTableForActiveProcess": 10,
     "getFdTable": 2,
-    "getFdTableConst": 2
+    "fdTableForActiveProcessConst": 4,
+    "getFdTableConst": 2,
+    "fdPayloadWithRights": 5,
+    "fdTableForProcessIndexConst": 1,
+    "fdPayloadWithRightsConst": 5
   },
   "kernel/src/state/fd_capability.zig": {
-    "fdEntryConst": 2,
-    "fdTableForProcessIndex": 2
+    "fdTableForProcessIndex": 2,
+    "fdEntryConst": 2
   },
   "kernel/src/state/ipc.zig": {
+    "fdTableForProcessIndexConst": 2,
     "fdEntryConst": 15,
     "fdPayloadWithRightsConst": 1,
-    "fdTableForActiveProcessConst": 4,
-    "fdTableForProcessIndexConst": 2
+    "fdTableForActiveProcessConst": 4
   },
   "kernel/src/state/pager.zig": {
     "fdPayloadWithRightsConst": 2,
@@ -50,43 +50,43 @@
     "fdPayloadWithRightsConst": 2
   },
   "kernel/src/state/process.zig": {
-    "ensureFdTableCapacity": 2,
-    "fdPayloadWithRights": 2,
-    "fdPayloadWithRightsConst": 2,
-    "fdTableForActiveProcess": 2,
-    "fdTableForActiveProcessConst": 2,
     "fdTableForProcessIndex": 2,
     "fdTableForProcessIndexConst": 2,
     "getFdTable": 2,
     "getFdTableConst": 1,
     "reclaimFdStorage": 2,
-    "releaseFdStorage": 1
+    "releaseFdStorage": 1,
+    "ensureFdTableCapacity": 2,
+    "fdTableForActiveProcessConst": 2,
+    "fdTableForActiveProcess": 2,
+    "fdPayloadWithRightsConst": 2,
+    "fdPayloadWithRights": 2
   },
   "kernel/src/state/reference_check.zig": {
     "fdTableForProcessIndex": 1
   },
   "kernel/src/state/vma.zig": {
-    "fdEntryConst": 3,
-    "fdTableForActiveProcessConst": 1,
     "fdTableForProcessIndex": 2,
-    "releaseFdStorage": 1
+    "releaseFdStorage": 1,
+    "fdEntryConst": 3,
+    "fdTableForActiveProcessConst": 1
   },
   "kernel/src/state/vmo.zig": {
     "fdEntryConst": 4,
     "fdTableForActiveProcess": 2
   },
   "kernel/src/syscall/capsule.zig": {
-    "fdEntryConst": 2,
+    "fdPayloadWithRightsConst": 7,
     "fdPayloadWithRights": 2,
-    "fdPayloadWithRightsConst": 6
+    "fdEntryConst": 2
   },
   "kernel/src/syscall/fd.zig": {
-    "before_current_thread_leave": 3,
-    "ensureFdTableCapacity": 1,
-    "fdEntryConst": 3,
-    "fdPayloadWithRightsConst": 8,
+    "fdPayloadWithRightsConst": 9,
+    "fdEntryConst": 4,
     "fdTableForActiveProcessConst": 1,
-    "getFdTableConst": 2
+    "before_current_thread_leave": 3,
+    "getFdTableConst": 2,
+    "ensureFdTableCapacity": 1
   },
   "kernel/src/syscall/native_ipc.zig": {
     "before_current_thread_leave": 6,
@@ -94,8 +94,8 @@
   },
   "kernel/src/syscall/process.zig": {
     "before_current_thread_leave": 6,
-    "ensureFdTableCapacity": 1,
     "getFdTableConst": 1,
+    "ensureFdTableCapacity": 1,
     "reacquire_kernel_state_lock": 3
   },
   "kernel/src/syscall/runtime.zig": {

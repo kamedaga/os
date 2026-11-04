@@ -2,6 +2,23 @@ const lock_diagnostics = @import("sync/lock_diagnostics.zig");
 const std = @import("std");
 const rtc = @import("rtc.zig");
 const hpet = @import("hpet.zig");
+const tsc = @import("tsc_clock.zig");
+
+// Source identity is independent of KVM MSR registration and RTC units.
+// A synthetic record must never turn pv_enabled on (that means 1GHz RTC).
+pub const Source = enum(u8) { none, kvm, tsc };
+var clock_source: Source = .none;
+var initialization_done: bool = false;
+var initialization_started: bool = false;
+var reference_prepared: bool = false;
+var reference_ready: bool = false;
+var tsc_hz: u64 = 0;
+var tsc_skew: u64 = 0;
+const fault_after_irqs: u32 = if (@import("builtin").os.tag == .freestanding)
+    @import("clock_test_options").fault_after_irqs
+else
+    0;
+var fault_irq_count: u32 = 0; // Diagnostic image only, BSP/IF=0.
 
 // The fallback clock is published by the BSP. The high-resolution HPET
 // counter is shared by all CPUs, so initialization proves one cache policy
@@ -53,6 +70,14 @@ const BootstrapCounter = struct {
         self.started = self.frequency_hz != 0;
     }
 
+    fn configure(self: *BootstrapCounter, hz: u64, value: u64, previous: u64) void {
+        self.frequency_hz = hz;
+        // Boot selection may already have started this source with Hz=0.
+        // Rebase after PIT calibration so neither an old epoch nor a false
+        // started flag can turn real elapsed time back into IRQ counting.
+        self.start(value, previous);
+    }
+
     fn tick(self: *const BootstrapCounter, value: u64, previous: u64) ?u64 {
         if (!self.started or self.frequency_hz == 0 or value < self.origin) return null;
         const elapsed = @as(u128, value - self.origin) * 1000 / self.frequency_hz;
@@ -75,12 +100,14 @@ const PvSlot = struct {
     time: PvTime align(64) = .{},
     registered: bool = false,
     stable: bool = false,
+    watchdog_ticks: u32 = 0, // Written only by this CPU's timer, IF clear.
 };
 // RTC/pvclock starts before MADT allocation. Only the BSP exists then;
 // transfer its registration into the runtime rows before starting any AP.
 var bsp_pv_slot: [1]PvSlot = @splat(.{});
 var pv_slots: []PvSlot = &bsp_pv_slot;
 pub fn initCpuStorage(count: usize) !void {
+    try tsc.initCpuStorage(count);
     const rows = try @import("arch/x86_64/cpu_runtime.zig").alloc(PvSlot, count);
     rows[0] = pv_slots[0];
     pv_slots = rows;
@@ -103,10 +130,9 @@ pub const ClockPageHeader = extern struct {
     reserved: [3]u64 = .{ 0, 0, 0 },
 };
 
-/// One whole page: user processes map it read-only, so nothing else may share
-/// it. Only vCPU 0's pvclock lives here; a stable-bit reader may use it from any
-/// CPU (as Linux's vDSO does), and keeping the other vCPUs' records in pv_slots
-/// avoids exposing them and keeps each record on its own cache line.
+/// One exclusive, read-only user page. pv0 is either KVM's vCPU-0 record or
+/// our immutable qualified TSC conversion. Stable bit 0 allows any online
+/// CPU's TSC; other KVM records stay private on their own cache lines.
 const ClockPage = extern struct {
     header: ClockPageHeader align(64) = .{},
     pv0: PvTime align(64) = .{},
@@ -150,6 +176,8 @@ const fast_read_window_ns: u64 = 4_000_000;
 /// the HPET anchors are installed from the floor.
 const PvMonotonic = struct {
     enabled: bool = false,
+    enable_attempted: bool = false,
+    close_requested: bool = false,
     page: *ClockPageHeader = &clock_page.header,
     fallback: HpetFallback = .{},
     publication_lock: u8 = 0,
@@ -163,7 +191,28 @@ const PvMonotonic = struct {
         return @atomicLoad(u64, &self.page.ceiling_ns, .acquire);
     }
 
+    fn closeRequested(self: *const PvMonotonic) bool {
+        return @atomicLoad(bool, &self.close_requested, .acquire);
+    }
+
+    fn requestClose(self: *PvMonotonic) void {
+        // Publish intent before promoting floor during lock contention. An
+        // in-flight publisher must not turn that promoted floor into another
+        // lease window, repeatedly advancing time without a valid conversion.
+        @atomicStore(bool, &self.close_requested, true, .seq_cst);
+    }
+
+    fn contendedFallbackFloor(self: *PvMonotonic) u64 {
+        // A rejected conversion has no trustworthy ns sample to publish.
+        // While close waits for the interrupted publication owner, returning
+        // the old floor could undercut an already accepted user fast value.
+        // The monotonically published ceiling bounds those values, and this
+        // same atomic-Max is already permitted outside the publication lock.
+        return publishMonotonic(&self.page.floor_ns, self.ceiling());
+    }
+
     fn tryPublishPv(self: *PvMonotonic, ns: u64) u64 {
+        if (self.closeRequested()) return self.contendedFallbackFloor();
         const diagnostic_if = lock_diagnostics.maskInterrupts();
         defer lock_diagnostics.restoreInterrupts(diagnostic_if);
         if (@cmpxchgStrong(u8, &self.publication_lock, 0, 1, .acquire, .monotonic) != null) {
@@ -179,6 +228,7 @@ const PvMonotonic = struct {
             @atomicStore(u8, &self.publication_lock, 0, .release);
         }
         if (self.fallback.state() != 0) return self.last();
+        if (self.closeRequested()) return self.contendedFallbackFloor();
         const published = publishMonotonic(&self.page.floor_ns, ns);
         self.raiseCeilingLocked(published);
         return published;
@@ -186,6 +236,10 @@ const PvMonotonic = struct {
 
     /// Caller holds publication_lock and has seen fallback phase 0.
     fn raiseCeilingLocked(self: *PvMonotonic, published: u64) void {
+        // The preceding floor atomic-Max is a full hardware barrier on x86.
+        // If a rejected reader promoted that floor, its prior close intent
+        // is visible here. Do not recycle a terminal floor into a new lease.
+        if (self.closeRequested()) return;
         if (published +| fast_read_window_ns / 2 <= self.page.ceiling_ns) return;
         @atomicStore(u64, &self.page.ceiling_ns, published +| fast_read_window_ns, .release);
     }
@@ -205,7 +259,8 @@ const PvMonotonic = struct {
             lock_diagnostics.releasing(&self.diagnostic_record);
             @atomicStore(u8, &self.publication_lock, 0, .release);
         }
-        if (self.fallback.state() != 0) return;
+        if (self.enable_attempted or self.fallback.state() != 0 or self.closeRequested()) return;
+        self.enable_attempted = true;
         self.page.pv_origin = pv_origin;
         self.page.ns_origin = ns_origin;
         _ = publishMonotonic(&self.page.floor_ns, ns_origin);
@@ -237,7 +292,15 @@ const PvMonotonic = struct {
 var pv_monotonic: PvMonotonic = .{};
 
 pub fn kernelStaticStorageEndAddr() usize {
-    var end = hpet.staticEnd();
+    var end = @max(hpet.staticEnd(), tsc.staticEnd());
+    end = @max(end, @intFromPtr(&clock_source) + @sizeOf(Source));
+    end = @max(end, @intFromPtr(&initialization_done) + @sizeOf(bool));
+    end = @max(end, @intFromPtr(&initialization_started) + @sizeOf(bool));
+    end = @max(end, @intFromPtr(&reference_prepared) + @sizeOf(bool));
+    end = @max(end, @intFromPtr(&reference_ready) + @sizeOf(bool));
+    end = @max(end, @intFromPtr(&tsc_hz) + 8);
+    end = @max(end, @intFromPtr(&tsc_skew) + 8);
+    end = @max(end, @intFromPtr(&fault_irq_count) + 4);
     end = @max(end, @intFromPtr(&clock) + @sizeOf(Clock));
     end = @max(end, @intFromPtr(&bootstrap_counter) + @sizeOf(BootstrapCounter));
     end = @max(end, @intFromPtr(&pv_slots) + @sizeOf(@TypeOf(pv_slots)));
@@ -248,26 +311,84 @@ pub fn kernelStaticStorageEndAddr() usize {
     return @max(end, @intFromPtr(&highres_realtime_offset_ns) + @sizeOf(u64));
 }
 
+// All CPU cache snapshots are complete, APs are parked, and no user has
+// dispatched. Initialize the existing HPET epoch once, then use mandatory
+// boot work before enable as a zero-wait, coarse reference interval.
+pub fn prepareHighResolution(rsdp: u64, mmio_allowed: *const fn (u64, u64) bool) void {
+    tsc.assertIrqsOff();
+    if (reference_prepared or initialization_started or @import("smp.zig").currentCpuSlot() != 0)
+        @panic("clock reference preparation order");
+    reference_prepared = true;
+    reference_ready = hpet.initialize(rsdp, mmio_allowed);
+    if (reference_ready) tsc.captureReference();
+}
+
 // Select only after all online CPUs have registered their own conversion.
 // HPET remains available for unsupported CPUs or a failed runtime snapshot.
-pub fn initializeHighResolution(
-    rsdp: u64,
-    mmio_allowed: *const fn (u64, u64) bool,
-) bool {
+pub fn initializeHighResolution() bool {
+    tsc.assertIrqsOff();
+    if (initialization_started) @panic("clock epoch initialization repeated");
+    initialization_started = true;
+    if (@import("smp.zig").currentCpuSlot() != 0) @panic("clock epoch requires BSP");
+    // APs publish idle/started, then park at waitForClockInitialization.
+    // No user dispatch or other clock reader may overlap epoch installation.
+    const online = @import("smp.zig").onlineCpuSet();
+    for (0..online.capacity) |cpu| {
+        if (online.contains(cpu) and @import("smp.zig").cpuState(cpu) != .idle)
+            @panic("clock epoch requires pre-dispatch idle CPUs");
+    }
+    defer @atomicStore(bool, &initialization_done, true, .release);
+    defer tsc.logSelection();
     bootstrap_counter.start(readCounter(), @import("scheduler_connection.zig").lapic_tick_count);
     // A clocksource does not require a calibrated LAPIC clockevent. If PIT
     // calibration fails, HPET still supplies elapsed time and tick catch-up.
-    if (!hpet.initialize(rsdp, mmio_allowed)) return false;
+    if (!reference_prepared or !reference_ready) return false;
     const now = hpet.monotonicNs() orelse return false;
     highres_realtime_offset_ns = (unixTimeSeconds() *| 1_000_000_000) -| now;
-    const online = @import("smp.zig").onlineCpuSet();
+    tsc.logQualification();
     if (online.count() != 0 and allOnlineClocksStable(online)) {
         if (readPvCounter(slotTime(0), true)) |pv_now| {
             // Pair the KVM clock with the existing monotonic epoch. KVM's
             // system_time is not the HPET epoch and must never be returned raw.
+            clock_source = .kvm;
             pv_monotonic.enable(pv_now, hpet.monotonicNs() orelse return false);
         }
+    } else if (tsc.allOnlineVerified(online) and syntheticPageUnowned()) {
+        if (tsc.calibrate()) |calibration| {
+            const conversion = tsc.conversion(calibration.hz) orelse return true;
+            const counter = readCounter();
+            // Backdate by >=4 round trips plus 10ms, so even a CPU at the
+            // measured skew bound cannot read counter < stamp at publication.
+            const margin = calibration.skew *| 4 +| calibration.hz / 100;
+            if (counter < margin) return true;
+            tsc_hz = calibration.hz;
+            clock.frequency_hz = tsc_hz;
+            bootstrap_counter.frequency_hz = tsc_hz;
+            bootstrap_counter.start(counter, @import("scheduler_connection.zig").lapic_tick_count);
+            tsc_skew = calibration.skew;
+            const margin_ns = pvNanoseconds(margin, conversion.multiplier, conversion.shift, 0) orelse return true;
+            clock_page.pv0 = .{ .version = 2, .tsc_timestamp = counter - margin, .system_time = (hpet.monotonicNs() orelse return true) -| margin_ns, .multiplier = conversion.multiplier, .shift = conversion.shift, .flags = 1 };
+            // Synthetic pv0 is immutable for the page's lifetime. system_time
+            // compensates the backdating; pv_origin then removes the arbitrary
+            // record epoch. HPET is read AFTER pv_now: only the BSP reads clocks
+            // here, so the monotonic floor cannot race or regress at enable.
+            const pv_now = readPvCounter(&clock_page.pv0, true) orelse return true;
+            const ns_now = hpet.monotonicNs() orelse return true;
+            clock_source = .tsc;
+            std.debug.assert(tsc.allOnlineVerified(online));
+            pv_monotonic.enable(pv_now, ns_now);
+            @import("kernel_log.zig").writeFmt("clock: tsc hz={} source=cpuid15 crystal-tolerance-ppm=unspecified skew-bound-cycles={} verified-cpus={} runtime-HPET-watchdog=off\n", .{ tsc_hz, tsc_skew, online.count() });
+        } else {
+            @import("kernel_log.zig").write("clock: tsc no known crystal frequency; keep HPET\n");
+        }
     }
+    return true;
+}
+
+fn syntheticPageUnowned() bool {
+    // A partially registered KVM setup must not leave an MSR producer writing
+    // into what we advertise as an immutable synthetic pv0.
+    for (pv_slots) |*slot| if (@atomicLoad(bool, &slot.registered, .acquire)) return false;
     return true;
 }
 
@@ -308,20 +429,37 @@ const HpetFallback = struct {
 };
 
 fn fallbackMonotonicNs() u64 {
+    const phase = pv_monotonic.fallback.state();
+    if (phase == 0) return pv_monotonic.contendedFallbackFloor();
+    // Observe the phase before floor: beginFallback publishes the ceiling
+    // floor before its release of phase 1. A floor loaded before that acquire
+    // could still undercut a fast value while another CPU installs anchors.
     const last = pv_monotonic.last();
-    if (pv_monotonic.fallback.state() != 2) return last;
+    if (phase != 2) return last;
     const raw = hpet.monotonicNs() orelse return last;
     return publishMonotonic(&pv_monotonic.page.floor_ns, pv_monotonic.fallback.sample(raw, last));
 }
 
 fn stablePvNs(slot: usize) ?u64 {
+    if (clock_source == .tsc) {
+        const value = readPvCounter(&clock_page.pv0, true) orelse return null;
+        return pvEpochNs(value, pv_monotonic.page.pv_origin, pv_monotonic.page.ns_origin);
+    }
     if (!@atomicLoad(bool, &pv_slots[slot].registered, .acquire)) return null;
     const value = readPvCounter(slotTime(slot), true) orelse return null;
     return pvEpochNs(value, pv_monotonic.page.pv_origin, pv_monotonic.page.ns_origin);
 }
 
 pub fn monotonicNs() ?u64 {
+    if (comptime !@import("builtin").is_test) {
+        if (!@atomicLoad(bool, &initialization_done, .acquire))
+            std.debug.assert(@import("smp.zig").currentCpuSlot() == 0);
+    }
     if (!@atomicLoad(bool, &pv_monotonic.enabled, .acquire)) return hpet.monotonicNs();
+    if (pv_monotonic.closeRequested()) {
+        enterFallback();
+        return fallbackMonotonicNs();
+    }
     if (pv_monotonic.fallback.state() != 0) return fallbackMonotonicNs();
     const slot = @import("smp.zig").currentCpuSlotIfKnown();
     const local = if (slot) |s| stablePvNs(s) else null;
@@ -333,14 +471,81 @@ pub fn monotonicNs() ?u64 {
         // An IRQ that interrupts publication returns the last value, never spins.
         return pv_monotonic.tryPublishPv(ns);
     }
-    if (pv_monotonic.beginFallback()) {
-        // HPET and PV need not advance at identical rates. Never publish raw
-        // HPET into the PV floor and then wait for PV to catch up.
-        const raw = hpet.monotonicNs() orelse 0;
-        // beginFallback already lifted the floor to the fast-read ceiling.
-        pv_monotonic.fallback.finish(raw, pv_monotonic.last());
-    }
+    requestFallback();
     return fallbackMonotonicNs();
+}
+
+fn enterFallback() void {
+    if (pv_monotonic.beginFallback()) {
+        // HPET and conversion need not share an epoch or rate. The close
+        // already raised floor to the last ceiling before anchoring raw HPET.
+        const raw = hpet.monotonicNs() orelse 0;
+        pv_monotonic.fallback.finish(raw, pv_monotonic.last());
+        @import("kernel_log.zig").write("clock: monotonic=hpet fast=0 conversion-rejected\n");
+    }
+}
+
+fn requestFallback() void {
+    pv_monotonic.requestClose();
+    // An interrupt must never wait for a publication it may have interrupted.
+    // The pending bit retries at every clock read and subsequent timer IRQ.
+    enterFallback();
+}
+
+pub fn assertCpuStartupOpen() void {
+    if (@atomicLoad(bool, &initialization_done, .acquire)) @panic("CPU startup after clock qualification sealed");
+}
+
+pub fn waitForClockInitialization() void {
+    // Maintenance IPIs must still acknowledge boot-root/TLB withdrawal. The
+    // local timer is disarmed, and the ring-0 IPI path cannot dispatch users.
+    // PAUSE avoids a lost wakeup when the BSP only publishes the release flag.
+    while (!@atomicLoad(bool, &initialization_done, .acquire))
+        asm volatile ("sti; pause; cli" ::: .{ .memory = true });
+}
+
+pub fn monotonicSourceName() []const u8 {
+    if (!@atomicLoad(bool, &pv_monotonic.enabled, .acquire) or pv_monotonic.fallback.state() != 0) return "hpet";
+    return @tagName(clock_source);
+}
+
+// Called on every CPU's real timer IRQ, before scheduler work, with IF clear.
+// IRQ count (not TSC elapsed time) checks the architectural premises even if
+// TSC stalls. HPET may stop in PC10 and is never a runtime reference here.
+pub fn serviceTimerClock() void {
+    if (comptime fault_after_irqs != 0) {
+        if (@import("smp.zig").currentCpuSlot() == 0 and
+            @atomicLoad(bool, &pv_monotonic.enabled, .acquire) and pv_monotonic.fallback.state() == 0)
+        {
+            fault_irq_count += 1;
+            if (fault_irq_count >= fault_after_irqs) {
+                // Exercise the real close/rebase/publication path without
+                // corrupting a live immutable record or writing TSC MSRs.
+                @import("kernel_log.zig").write("clock: test fault conversion rejected\n");
+                requestFallback();
+                return;
+            }
+        }
+    }
+    if (clock_source != .tsc) return;
+    if (pv_monotonic.closeRequested()) {
+        enterFallback();
+        return;
+    }
+    if (pv_monotonic.fallback.state() != 0) return;
+    const slot = @import("smp.zig").currentCpuSlot();
+    if (!tsc.allOnlineVerified(@import("smp.zig").onlineCpuSet())) {
+        requestFallback();
+        return;
+    }
+    pv_slots[slot].watchdog_ticks += 1;
+    if (pv_slots[slot].watchdog_ticks < 1024) return;
+    pv_slots[slot].watchdog_ticks = 0;
+    const failure = tsc.runtimeFailure(slot);
+    if (failure != .none) {
+        @import("kernel_log.zig").writeFmt("clock: tsc runtime-rejected cpu={} reason={s}\n", .{ slot, @tagName(failure) });
+        requestFallback();
+    }
 }
 
 pub fn resolutionNs() ?u64 {
@@ -397,9 +602,21 @@ pub fn configureCounter(cycles: u64, pit_ticks: u64, pit_hz: u64) void {
     if (cpuid(0x80000000).eax < 0x80000007 or
         (cpuid(0x80000007).edx & (1 << 8)) == 0) return;
     const hz = frequencyFromMeasurement(cycles, pit_ticks, pit_hz) orelse 0;
-    clock.frequency_hz = hz;
-    // Independent of RTC readiness and later KVM realtime setup.
-    bootstrap_counter.frequency_hz = hz;
+    // PIT is an independent boot-time reference for CPUs without CPUID15.
+    // Preserve any already-selected CPUID conversion; this BSP-only source
+    // never grants a measured cross-CPU clock or rewrites a published pv page.
+    // RTC runtime initialization still owns KVM's independent 1GHz units.
+    const authoritative = if (clock_source == .tsc) tsc_hz else hz;
+    if (clock_source != .kvm) clock.frequency_hz = authoritative;
+    configureBootstrapCounter(authoritative);
+}
+
+// Called on the BSP before user dispatch after successful calibration. This
+// counter belongs only to tick catch-up: it must not overwrite KVM's 1GHz
+// realtime units or replace a published cross-CPU clock-page conversion.
+pub fn configureBootstrapCounter(hz: u64) void {
+    const authoritative = if (clock_source == .tsc) tsc_hz else hz;
+    bootstrap_counter.configure(authoritative, readCounter(), @import("scheduler_connection.zig").lapic_tick_count);
 }
 
 pub fn bootstrapFallbackTick(previous: u64) u64 {
@@ -470,6 +687,10 @@ fn readPvCounter(time: *const PvTime, require_stable: bool) ?u64 {
 
 // Called on the CPU being registered, before publishing that CPU as online.
 pub fn registerCpu(slot: usize, kernel_pointer_paddr: *const fn (usize) ?u64) void {
+    // Runtime hotplug/resume is not implemented. Refuse startup after sealing
+    // the qualified online set rather than silently extending the stable bit.
+    assertCpuStartupOpen();
+    tsc.captureCpu(slot);
     if (slot >= pv_slots.len or @atomicLoad(bool, &pv_slots[slot].registered, .acquire)) return;
     const vendor = cpuid(0x40000000);
     if (vendor.eax >= 0x40000001 and vendor.ebx == 0x4b4d564b and
@@ -508,11 +729,14 @@ fn allOnlineClocksStable(online: @import("cpu_set.zig").CpuSet) bool {
 }
 
 pub fn usesStableKvmClock() bool {
-    return @atomicLoad(bool, &pv_monotonic.enabled, .acquire) and pv_monotonic.fallback.state() == 0;
+    return clock_source == .kvm and @atomicLoad(bool, &pv_monotonic.enabled, .acquire) and pv_monotonic.fallback.state() == 0;
 }
 
 pub fn initialize(kernel_pointer_paddr: *const fn (usize) ?u64) void {
-    registerCpu(0, kernel_pointer_paddr);
+    // Runtime wiring initializes RTC seconds after high-resolution boot
+    // selection. Startup already registered every KVM slot; never recapture
+    // evidence or replace the synthetic record after its publication.
+    if (!@atomicLoad(bool, &initialization_done, .acquire)) registerCpu(0, kernel_pointer_paddr);
     if (@atomicLoad(bool, &pv_slots[0].registered, .acquire)) {
         const seconds = rtc.unixTimeSeconds();
         if (readPvCounter(slotTime(0), false)) |counter| {
@@ -728,6 +952,59 @@ test "fast reads cannot reopen after a fallback began (counterexample C)" {
     try std.testing.expect(modelFastRead(&header, 2_000) == null);
 }
 
+test "clock enable is once only and cannot replace a published epoch" {
+    var header: ClockPageHeader = .{};
+    var time: PvMonotonic = .{ .page = &header };
+    time.enable(50, 1000);
+    const before = header;
+    time.enable(50000, 1);
+    try std.testing.expectEqualDeep(before, header);
+}
+
+test "TSC architecture fault injection retries contention then closes above fast ceiling" {
+    var header: ClockPageHeader = .{};
+    var time: PvMonotonic = .{ .page = &header };
+    time.enable(100, 1000);
+    const accepted = modelFastRead(&header, 100 + fast_read_window_ns - 1).?;
+    try std.testing.expectEqual(tsc.RuntimeFailure.adjust_changed, tsc.classifyRuntime(true, 42, 43));
+    time.publication_lock = 1;
+    try std.testing.expect(!time.beginFallback());
+    try std.testing.expectEqual(@as(u32, 1), header.fast);
+    time.publication_lock = 0;
+    try std.testing.expect(time.beginFallback());
+    time.fallback.finish(20_000_000_000, time.last());
+    try std.testing.expectEqual(@as(u32, 0), header.fast);
+    try std.testing.expect(time.fallback.sample(20_000_000_000, time.last()) >= accepted);
+    try std.testing.expect(time.fallback.sample(20_000_000_100, time.last()) >= header.ceiling_ns);
+    time.enable(0, 0);
+    try std.testing.expectEqual(@as(u32, 0), header.fast);
+}
+
+test "rejected clock awaiting a contended close returns at least accepted fast values" {
+    var header: ClockPageHeader = .{};
+    var time: PvMonotonic = .{ .page = &header };
+    time.enable(0, 1000);
+    const accepted = modelFastRead(&header, fast_read_window_ns - 1).?;
+    const terminal_ceiling = header.ceiling_ns;
+    time.requestClose();
+    time.publication_lock = 1;
+    try std.testing.expect(!time.beginFallback());
+    try std.testing.expect(time.contendedFallbackFloor() >= accepted);
+    try std.testing.expectEqual(@as(u32, 1), header.fast);
+    time.publication_lock = 0;
+    // Repeated publications cannot recycle the promoted floor into fresh
+    // windows and advance time indefinitely while the close is pending.
+    for (0..100) |_| _ = time.tryPublishPv(header.floor_ns + 1);
+    try std.testing.expectEqual(terminal_ceiling, header.ceiling_ns);
+    const later_fast = modelFastRead(&header, header.ceiling_ns - 1001).?;
+    time.publication_lock = 1;
+    try std.testing.expect(time.contendedFallbackFloor() >= later_fast);
+    time.publication_lock = 0;
+    try std.testing.expect(time.beginFallback());
+    time.fallback.finish(0, time.last());
+    try std.testing.expect(time.fallback.sample(0, time.last()) >= later_fast);
+}
+
 test "ceiling seen by a completed fast read bounds the fallback anchor" {
     var header: ClockPageHeader = .{};
     var time: PvMonotonic = .{ .page = &header };
@@ -762,4 +1039,27 @@ test "lock admission clock publication enable blocking and runtime try" {
     try std.testing.expect(time.beginFallback());
     try std.testing.expect(!time.diagnostic_record.linked);
     lock_diagnostics.assertRootEmpty();
+}
+
+test "PIT calibration starts an initially unknown BSP clock and rebases safely" {
+    var source: BootstrapCounter = .{};
+    source.start(100, 7);
+    try std.testing.expect(source.tick(1000, 7) == null);
+    source.configure(3_500_000_000, 9000, 7);
+    try std.testing.expectEqual(@as(?u64, 1007), source.tick(9000 + 3_500_000_000, 7));
+    source.configure(2_000_000_000, 12_000, 1007);
+    try std.testing.expectEqual(@as(?u64, 2007), source.tick(12_000 + 2_000_000_000, 1007));
+    source.configure(0, 0, 2007);
+    try std.testing.expect(source.tick(4_000_000_000, 2007) == null);
+}
+
+test "known-frequency BSP fallback starts without an HPET epoch" {
+    var source: BootstrapCounter = .{};
+    source.start(100, 0);
+    try std.testing.expect(!source.started);
+    // initializeHighResolution can return before installing any high-res
+    // epoch; successful CPUID-based LAPIC qualification supplies the Hz.
+    source.configure(2_918_400_000, 1000, 0);
+    try std.testing.expectEqual(@as(?u64, 1000), source.tick(1000 + 2_918_400_000, 0));
+    try std.testing.expectEqual(@as(?u64, 1100), source.tick(1000 + 2_918_400_000 + 291_840_000, 1000));
 }

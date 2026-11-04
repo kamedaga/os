@@ -69,6 +69,10 @@ typedef enum lpr_exec_stage_metric_id {
     LPR_EXEC_STAGE_START_THREAD_CREATE,
     LPR_EXEC_STAGE_START_THREAD_START,
     LPR_EXEC_STAGE_TOTAL_BEFORE_REPLY,
+#if defined(FILED_EXEC_STAGE_REPORT) && FILED_EXEC_STAGE_REPORT
+    LPR_EXEC_STAGE_PATCH_TEXT,
+    LPR_EXEC_STAGE_COPY_ZERO,
+#endif
     LPR_EXEC_STAGE_MAX,
 } lpr_exec_stage_metric_id_t;
 
@@ -119,6 +123,10 @@ static lpr_exec_stage_metric_t lpr_exec_stage_metrics[LPR_EXEC_STAGE_MAX] = {
     [LPR_EXEC_STAGE_START_THREAD_CREATE] = { .name = "start_thread_create" },
     [LPR_EXEC_STAGE_START_THREAD_START] = { .name = "start_thread_start" },
     [LPR_EXEC_STAGE_TOTAL_BEFORE_REPLY] = { .name = "total_before_reply" },
+#if defined(FILED_EXEC_STAGE_REPORT) && FILED_EXEC_STAGE_REPORT
+    [LPR_EXEC_STAGE_PATCH_TEXT] = { .name = "patch_text" },
+    [LPR_EXEC_STAGE_COPY_ZERO] = { .name = "copy_zero" },
+#endif
 };
 static lpr_exec_one_metric_t lpr_exec_one_metrics[LPR_EXEC_ONE_METRIC_SLOTS];
 static uint64_t lpr_exec_one_metric_count;
@@ -274,6 +282,56 @@ void filed_exec_linux_lpr_dump_metrics(void)
     }
     lpr_exec_map_dump_metrics();
 }
+
+#if defined(FILED_EXEC_STAGE_REPORT) && FILED_EXEC_STAGE_REPORT
+int filed_exec_stage_report_store(filed_runtime_t *, const uint8_t *, size_t);
+static uint64_t exec_open_cycles;
+void filed_exec_linux_lpr_profile_open(uint64_t cycles) { exec_open_cycles = cycles; }
+static void lpr_exec_export_profile(filed_runtime_t *runtime,
+    const filed_exec_path_t *request, const uint64_t before[LPR_EXEC_STAGE_MAX])
+{
+    int enabled = 0;
+    for (uint64_t i = 0; i < request->envc; ++i) {
+        const char *value = filed_exec_string(request, request->envp[i]);
+        if (value && !strcmp(value, "PACHA_FILED_EXEC_PROFILE=1")) enabled = 1;
+    }
+    if (!enabled) return;
+    /* Only the serialized exec owner uses this diagnostic ring. It contains
+     * numeric stage deltas, no argv/env or borrowed file/VMO references. */
+    static struct { uint64_t sequence, tsc, path, open_cycles, cycles[LPR_EXEC_STAGE_MAX]; } rows[8];
+    static uint64_t count;
+    static char text[32768];
+    uint64_t logical = count++;
+    unsigned slot = logical % 8;
+    rows[slot].sequence = logical;
+    rows[slot].tsc = lpr_exec_now_cycles();
+    rows[slot].path = pacha_trace_name_id(request->path);
+    rows[slot].open_cycles = exec_open_cycles;
+    for (unsigned i = 0; i < LPR_EXEC_STAGE_MAX; ++i)
+        rows[slot].cycles[i] = lpr_exec_stage_metrics[i].total_cycles - before[i];
+    size_t used = 0;
+    for (uint64_t n = count > 8 ? count - 8 : 0; n < count; ++n) {
+        unsigned k = n % 8;
+        int bytes = snprintf(text + used, sizeof(text) - used,
+            "EXEC seq=%llu tsc=%llu path_id=%llu open_permissions=%llu\n",
+            (unsigned long long)rows[k].sequence, (unsigned long long)rows[k].tsc,
+            (unsigned long long)rows[k].path, (unsigned long long)rows[k].open_cycles);
+        if (bytes < 0 || (size_t)bytes >= sizeof(text) - used) return;
+        used += bytes;
+        for (unsigned i = 0; i < LPR_EXEC_STAGE_MAX; ++i) {
+            bytes = snprintf(text + used, sizeof(text) - used, "STAGE %llu %s %llu\n",
+                (unsigned long long)n, lpr_exec_stage_metrics[i].name,
+                (unsigned long long)rows[k].cycles[i]);
+            if (bytes < 0 || (size_t)bytes >= sizeof(text) - used) return;
+            used += bytes;
+        }
+    }
+    /* Explicit diagnostic only: export is outside the recorded exec stages.
+     * A report failure never changes the caller's exec result. Normal builds
+     * perform no report I/O and are used for before/after performance. */
+    (void)filed_exec_stage_report_store(runtime, (const uint8_t *)text, used);
+}
+#endif
 
 static void lpr_exec_record_one_metric(
     const filed_exec_path_t *request,
@@ -572,6 +630,11 @@ static int filed_exec_linux_lpr_handle_mode(
     char executable_path[LPR_EXEC_MAX_INTERP_BYTES];
     struct pacha_process_fd_grant prepared[PACHA_PROCESS_CREATE_MAX_GRANTS];
     uint64_t prepared_count = 0;
+#if defined(FILED_EXEC_STAGE_REPORT) && FILED_EXEC_STAGE_REPORT
+    uint64_t mc3_before[LPR_EXEC_STAGE_MAX];
+    for (unsigned i = 0; i < LPR_EXEC_STAGE_MAX; ++i)
+        mc3_before[i] = lpr_exec_stage_metrics[i].total_cycles;
+#endif
     size_t script_prefix_length = 0;
 #if defined(FILED_GUI_PROFILE) && FILED_GUI_PROFILE
     uint64_t gui_stage_before[LPR_EXEC_STAGE_MAX];
@@ -718,6 +781,9 @@ static int filed_exec_linux_lpr_handle_mode(
                     lpr_exec_stage_metrics[i].name, (unsigned long long)span);
         }
     }
+#endif
+#if defined(FILED_EXEC_STAGE_REPORT) && FILED_EXEC_STAGE_REPORT
+    lpr_exec_export_profile(runtime, request, mc3_before);
 #endif
     filed_exec_payload_destroy(&resolved_request);
     return 0;

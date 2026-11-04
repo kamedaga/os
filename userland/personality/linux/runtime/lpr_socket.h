@@ -41,6 +41,8 @@ int64_t lpr_linux_poll_current(uint64_t fds, uint64_t nfds, unsigned *wait_not_r
 int64_t lpr_linux_ppoll(uint64_t fds, uint64_t nfds, uint64_t timeout_ts, uint64_t sigmask, uint64_t sigsetsize, unsigned *wait_not_ready __attribute__((unused)));
 int64_t lpr_linux_select(uint64_t nfds, uint64_t readfds, uint64_t writefds, uint64_t exceptfds, uint64_t timeout, unsigned *wait_not_ready __attribute__((unused)));
 int64_t lpr_linux_pselect6(uint64_t nfds, uint64_t readfds, uint64_t writefds, uint64_t exceptfds, uint64_t timeout, uint64_t sigmask, unsigned *wait_not_ready __attribute__((unused)));
+struct unix_poll_sequence;
+int64_t lpr_socket_poll_sequence(uint64_t fd, uint32_t events, struct unix_poll_sequence *sequence);
 void lpr_netd_profile_dump(void);
 
 #endif

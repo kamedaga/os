@@ -27,3 +27,8 @@ int filed_exec_linux_lpr_prepare_self(
 
 void filed_exec_linux_lpr_dump_metrics(void);
 int filed_exec_linux_lpr_prewarm(struct filed_runtime *runtime);
+
+#if defined(FILED_EXEC_STAGE_REPORT) && FILED_EXEC_STAGE_REPORT
+/* Serialized request-owner timing, not a transport/ABI operation. */
+void filed_exec_linux_lpr_profile_open(uint64_t cycles);
+#endif

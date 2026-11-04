@@ -1,6 +1,26 @@
 {
   "note": "Syntactic review tripwire, not a lifetime proof; inherited_table callers require semantic audit.",
   "readers": {
+    "initializeStaticStorage": {
+      "exclusion": "table",
+      "calls": { "threadDirectory": 1 }
+    },
+    "initializeThreadContextWithReadyState": {
+      "exclusion": "table",
+      "calls": { "threadContextLocked": 1 }
+    },
+    "expireFutexPiWait": {
+      "exclusion": "table",
+      "calls": { "threadContextLocked": 1 }
+    },
+    "futexPiOperation": {
+      "exclusion": "table",
+      "calls": { "threadContextLocked": 3 }
+    },
+    "runnableHandoffContextLocked": {
+      "exclusion": "inherited_table",
+      "calls": { "threadContextLocked": 1 }
+    },
     "claimedWaitOutput": {
       "exclusion": "table",
       "calls": {
@@ -446,13 +466,7 @@
         "threadContextLocked": 2
       }
     },
-    "tryFusedKeyedWakeLocked": {
-      "exclusion": "inherited_table",
-      "calls": {
-        "threadContextLocked": 2
-      }
-    },
-    "handoffOnlyReadyLocked": {
+    "tryFusedIpcNotifyWakeLocked": {
       "exclusion": "inherited_table",
       "calls": {
         "threadContextLocked": 2

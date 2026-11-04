@@ -11,6 +11,7 @@
 #include <kobox2/virtqueue_x86_64.h>
 #include <pacha/capsule.h>
 #include <pacha/ipc.h>
+#include <pacha/pressure.h>
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -620,6 +621,35 @@ const struct ph_bootfs *filed_storage_owner_archive(const struct filed_storage_o
     return owner ? &owner->archive : NULL;
 }
 
+/* The boot parent grants this private export channel only to FileD. Its
+ * peer is held by seed0root, never published as an ordinary FS endpoint.
+ * Retain EXPORT_FD until owner exit, so its peer is a FileD death witness. */
+static int export_pressure(struct filed_storage_owner *owner) {
+    struct pacha_fd_info info = {0};
+    if (pacha_fd_get_info(PACHA_PRESSURE_EXPORT_FD, &info)) return 0;
+    if (info.kind != PACHA_FD_KIND_CHANNEL) return -EINVAL;
+    struct pacha_ipc_channel_pair pair = {.a=-1, .b=-1};
+    int error = pacha_ipc_channel_create(&pair, PACHA_PRESSURE_RIGHTS | PACHA_FD_RIGHT_TRANSFER, 0);
+    if (error) return error;
+    struct ph_ipc_packet bind = {.operation=PACHA_PRESSURE_BIND,
+        .generation=owner->identity.generation, .fd_count=1,
+        .fds={{.fd=pair.b, .rights=PACHA_PRESSURE_RIGHTS, .flags=PACHA_FD_FLAG_CLOEXEC}}};
+    error = send_packet(owner, &bind);
+    if (!error) {
+        uint64_t watch = PACHA_FD_RIGHT_INSPECT | PACHA_FD_RIGHT_WAIT |
+            PACHA_FD_RIGHT_POLL | PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_TRANSFER;
+        struct pacha_ipc_fd fds[2] = {
+            {.fd=pair.a, .rights=PACHA_PRESSURE_RIGHTS | PACHA_FD_RIGHT_TRANSFER,
+                .flags=PACHA_FD_FLAG_CLOEXEC},
+            {.fd=owner->launch.process.fd, .rights=watch, .flags=PACHA_FD_FLAG_CLOEXEC}};
+        struct pacha_ipc_msg message = {.word0=PACHA_PRESSURE_REGISTER,
+            .word1=owner->identity.generation, .fds=fds, .fd_count=2};
+        error = pacha_ipc_send(PACHA_PRESSURE_EXPORT_FD, &message);
+    }
+    (void)pacha_fd_close(pair.a); (void)pacha_fd_close(pair.b);
+    return error;
+}
+
 int filed_storage_owner_start(struct filed_storage_owner *owner)
 {
     if (!owner || owner->started || owner->failed || owner->boot.phase) return -EINVAL;
@@ -688,6 +718,7 @@ int filed_storage_owner_start(struct filed_storage_owner *owner)
         PH_FS_QUEUE_NOTIFY, owner->config.queue_arena_bytes, 0, 0);
     if (!error) error = open_queue(owner, &owner->credentials, 2, PH_FS_OWNER_BIND,
         PH_FS_OWNER_NOTIFY, owner->config.queue_arena_bytes, 0, 0);
+    if (!error) error = export_pressure(owner);
     if (error) owner->failed = 1;
     else owner->started = 1;
     return error;

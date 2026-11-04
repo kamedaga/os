@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: MIT */
 /* Test-image-only probe of the public inputd IPC. QMP supplies HID events. */
-#include <inputd/ipc_protocol.h>
+#include <inputd/event_buffer.h>
 #include <pacha/ipc.h>
 #include <pacha/service_abi.h>
 
@@ -12,6 +12,9 @@ struct probe {
     pacha_fd_t endpoint, page_fd, timer_fd;
     void *page;
     uint64_t request_id;
+    pacha_fd_t ring_fd;
+    struct { uint64_t handle; struct inputd_event_buffer buffer; } rings[3];
+    unsigned ring_count;
 };
 
 static int invoke(struct probe *probe, uint32_t op, uint32_t size,
@@ -22,7 +25,7 @@ static int invoke(struct probe *probe, uint32_t op, uint32_t size,
         .header_size = sizeof(pacha_service_envelope_t), .service_id = INPUTD_SERVICE_ID,
         .op = op, .flags = PACHA_SERVICE_FLAG_PAGE_PAYLOAD,
         .request_id = id, .trace_id = id, .payload_size = size};
-    struct pacha_ipc_fd fds[2] = {{.fd = (uint64_t)probe->page_fd,
+    struct pacha_ipc_fd fds[3] = {{.fd = (uint64_t)probe->page_fd,
         .rights = PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_TRANSFER |
             PACHA_FD_RIGHT_MAP_READ | PACHA_FD_RIGHT_MAP_WRITE}};
     unsigned count = 1;
@@ -31,6 +34,10 @@ static int invoke(struct probe *probe, uint32_t op, uint32_t size,
             .rights = PACHA_FD_RIGHT_INSPECT | PACHA_FD_RIGHT_CLOSE |
                 PACHA_FD_RIGHT_SEND | PACHA_FD_RIGHT_WAIT | PACHA_FD_RIGHT_POLL};
         count = 2;
+    }
+    if (op == INPUTD_OP_OPEN && probe->ring_fd >= 16) {
+        fds[count++] = (struct pacha_ipc_fd){.fd = (uint64_t)probe->ring_fd,
+            .rights = PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_MAP_READ | PACHA_FD_RIGHT_MAP_WRITE};
     }
     const struct pacha_ipc_msg request = {.word0 = PACHA_SERVICE_REQUEST_MAGIC,
         .word3 = id, .fds = fds, .fd_count = count};
@@ -65,27 +72,33 @@ static int open_event(struct probe *probe, unsigned index,
     inputd_open_request_t *request = (void *)((uint8_t *)probe->page +
         PACHA_SERVICE_HEADER_BYTES);
     *request = (inputd_open_request_t){.event_index = index};
-    int result = invoke(probe, INPUTD_OP_OPEN, sizeof(*request), pair.b, handle);
+    struct inputd_event_buffer buffer;
+    int result = inputd_event_buffer_create(&buffer);
+    if (result) { (void)pacha_fd_close(pair.a); (void)pacha_fd_close(pair.b); return result; }
+    probe->ring_fd = buffer.fd;
+    result = invoke(probe, INPUTD_OP_OPEN, sizeof(*request), pair.b, handle);
     (void)pacha_fd_close(pair.b);
-    if (result) { (void)pacha_fd_close(pair.a); return result; }
+    probe->ring_fd = -1;
+    if (result) { inputd_event_buffer_close(&buffer); (void)pacha_fd_close(pair.a); return result; }
+    probe->rings[probe->ring_count].buffer = buffer;
+    probe->rings[probe->ring_count++].handle = *handle;
     *notify = pair.a;
     return 0;
 }
 
 static int read_event(struct probe *probe, uint64_t handle,
     int *key, int *relative) {
-    inputd_read_request_t *request = (void *)((uint8_t *)probe->page +
-        PACHA_SERVICE_HEADER_BYTES);
-    memset(request, 0, sizeof(*request));
-    request->handle = handle;
-    request->event_capacity = INPUTD_EVENT_CAPACITY;
-    uint64_t count = 0;
-    int result = invoke(probe, INPUTD_OP_READ, sizeof(*request), -1, &count);
+    struct inputd_event_ring *ring = NULL;
+    for (unsigned i=0;i<probe->ring_count;i++) if(probe->rings[i].handle==handle)ring=probe->rings[i].buffer.ring;
+    if(!ring)return -9;
+    inputd_input_event_t events[INPUTD_EVENT_CAPACITY];
+    int count = inputd_ring_read(ring, events, INPUTD_EVENT_CAPACITY);
+    int result = count < 0 ? count : 0;
     if (result == -11) return 0;
     if (result) return result;
-    if (count != request->event_count || count > INPUTD_EVENT_CAPACITY) return -5;
+    if (count > INPUTD_EVENT_CAPACITY) return -5;
     for (size_t i = 0; i < count; i++) {
-        const inputd_input_event_t *event = &request->events[i];
+        const inputd_input_event_t *event = &events[i];
         if (event->type == 1 && event->code == 30 && event->value == 1)
             *key = 1;
         if (event->type == 2 && event->code <= 1 && event->value != 0)
@@ -157,6 +170,7 @@ int seed0root_usb_input_smoke(pacha_fd_t endpoint) {
         fflush(stdout);
     }
 done:
+    for(unsigned i=0;i<probe.ring_count;i++)inputd_event_buffer_close(&probe.rings[i].buffer);
     for (unsigned i = 0; i < 3; i++)
         if (notify[i] >= 16) (void)pacha_fd_close(notify[i]);
     (void)pacha_fd_close(timer_fd);

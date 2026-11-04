@@ -10,6 +10,9 @@
 #include "../userland/personality/linux/runtime/lpr_entry_stack.c"
 
 static uint64_t test_tid = 1, next_fd = 16;
+void lpr_thread_page_initialize(void) {}
+uint64_t lpr_thread_page_read(void) { return 0; }
+uintptr_t lpr_entry_single_stack_top;
 static unsigned closed, unmapped;
 static uint64_t exited_fd;
 void *lpr_memset(void *p, int v, size_t n) { return memset(p, v, n); }
@@ -94,7 +97,9 @@ int main(void)
     assert(closed == 1 && unmapped == 1);
     assert(lpr_entry_context_head->next->tid == 2 && !lpr_entry_context_head->next->next);
     /* Copied PRIVATE fd numbers are not capabilities in a fork child. */
+    lpr_entry_single_stack_top = (uintptr_t)first;
     lpr_entry_stack_after_fork_child();
+    assert(!lpr_entry_single_stack_top);
     assert(!lpr_entry_context_head && closed == 1 && unmapped == 3);
     assert(!lpr_entry_context_lock && !lpr_entry_bootstrap_lock);
     puts("LPR_ENTRY_STACK: relocation, independent stacks, exited reclamation and fork cleanup PASS");

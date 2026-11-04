@@ -8,6 +8,20 @@
 #include <inputd/ipc_protocol.h>
 #include <inputd/source_protocol.h>
 
+/* Private producer-history operations, never IPC payloads. */
+typedef struct inputd_read_request {
+    uint64_t handle;
+    uint32_t event_capacity;
+    uint32_t event_count;
+    inputd_input_event_t events[INPUTD_EVENT_CAPACITY];
+} inputd_read_request_t;
+
+typedef struct inputd_poll_request {
+    uint64_t handle;
+    uint32_t events;
+    uint32_t revents;
+} inputd_poll_request_t;
+
 enum {
     INPUTD_INPUT_CAP_KEYBOARD = 1u << 0,
     INPUTD_INPUT_CAP_RELATIVE = 1u << 1,
@@ -95,3 +109,6 @@ void inputd_input_handle_wait_event(
     const struct inputd_wait_source *source,
     uint64_t revents);
 void inputd_input_flush_notifications(void);
+
+struct inputd_event_ring;
+int inputd_input_attach_ring(uint64_t handle, struct inputd_event_ring *ring);

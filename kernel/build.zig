@@ -77,6 +77,16 @@ fn freestandingClang(b: *std.Build) []const u8 {
         (b.graph.environ_map.get("CAPOS_FREESTANDING_CC") orelse "clang");
 }
 
+fn addHostTestCommand(b: *std.Build, argv: []const []const u8) *std.Build.Step.Run {
+    const run = b.addSystemCommand(argv);
+    // Inherited stdio takes Zig's global stderr lock for the whole command.
+    // Capture diagnostics so independent checks can overlap, but always rerun:
+    // these scripts inspect sources beyond their explicitly declared inputs.
+    run.expectExitCode(0);
+    run.has_side_effects = true;
+    return run;
+}
+
 pub fn build(b: *std.Build) void {
     const scheduler_test_filter = b.option([]const u8, "scheduler-test-filter", "Select scheduler host regressions");
     const target = b.standardTargetOptions(.{});
@@ -117,35 +127,47 @@ pub fn build(b: *std.Build) void {
 
     const run_unit_tests = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "Run kernel unit tests");
-    const memory_test = b.addSystemCommand(&.{"bash"});
+    const physical_fixture_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("src/physical_access_fixture_test.zig"),
+        .target = b.graph.host,
+        .optimize = .Debug,
+    }) });
+    const physical_fixture_run = b.addRunArtifact(physical_fixture_tests);
+    test_step.dependOn(&physical_fixture_run.step);
+    b.step("test-physical-fixture", "Test sparse physical backing isolation and first-touch publication").dependOn(&physical_fixture_run.step);
+    const memory_test = addHostTestCommand(b, &.{"bash"});
     memory_test.addFileArg(b.path("../tests/run-kernel-memory-unit.sh"));
     test_step.dependOn(&memory_test.step);
     test_step.dependOn(&run_unit_tests.step);
-    const tlb_protocol_test = b.addSystemCommand(&.{"python3"});
+    const tlb_protocol_test = addHostTestCommand(b, &.{"python3"});
     tlb_protocol_test.addFileArg(b.path("../tests/test_tlb_lazy_protocol.py"));
     test_step.dependOn(&tlb_protocol_test.step);
     b.step("test-state", "Run kernel state lifecycle tests").dependOn(&run_unit_tests.step);
 
-    const address_boundary_check = b.addSystemCommand(&.{"python3"});
+    const address_boundary_check = addHostTestCommand(b, &.{"python3"});
     address_boundary_check.addFileArg(b.path("../tests/check_kernel_address_boundaries.py"));
     address_boundary_check.addArg(b.graph.zig_exe);
     test_step.dependOn(&address_boundary_check.step);
-    const ipc_register_check = b.addSystemCommand(&.{"python3"});
+    const boundary_source_tests = addHostTestCommand(b, &.{ "python3", "-m", "unittest", "discover", "-s" });
+    boundary_source_tests.addDirectoryArg(b.path("../tests"));
+    boundary_source_tests.addArgs(&.{ "-p", "test_kernel_boundary_source.py" });
+    test_step.dependOn(&boundary_source_tests.step);
+    const ipc_register_check = addHostTestCommand(b, &.{"python3"});
     ipc_register_check.addFileArg(b.path("../tests/check_ipc_register_abi.py"));
     test_step.dependOn(&ipc_register_check.step);
-    const wait_boundary_check = b.addSystemCommand(&.{"python3"});
+    const wait_boundary_check = addHostTestCommand(b, &.{"python3"});
     wait_boundary_check.addFileArg(b.path("../tests/check_uninterruptible_wait_contract.py"));
     test_step.dependOn(&wait_boundary_check.step);
-    const storage_boundary_check = b.addSystemCommand(&.{"python3"});
+    const storage_boundary_check = addHostTestCommand(b, &.{"python3"});
     storage_boundary_check.addFileArg(b.path("../tests/check_kernel_storage_boundaries.py"));
     test_step.dependOn(&storage_boundary_check.step);
-    const ipc_cost_boundary_check = b.addSystemCommand(&.{"python3"});
+    const ipc_cost_boundary_check = addHostTestCommand(b, &.{"python3"});
     ipc_cost_boundary_check.addFileArg(b.path("../tests/check_ipc_fast_cost_boundaries.py"));
     test_step.dependOn(&ipc_cost_boundary_check.step);
-    const ipc_endpoint_boundary_check = b.addSystemCommand(&.{"python3"});
+    const ipc_endpoint_boundary_check = addHostTestCommand(b, &.{"python3"});
     ipc_endpoint_boundary_check.addFileArg(b.path("../tests/check_ipc_endpoint_boundaries.py"));
     test_step.dependOn(&ipc_endpoint_boundary_check.step);
-    const fd_capability_boundary_check = b.addSystemCommand(&.{"python3"});
+    const fd_capability_boundary_check = addHostTestCommand(b, &.{"python3"});
     fd_capability_boundary_check.addFileArg(b.path("../tests/check_fd_capability_boundaries.py"));
     test_step.dependOn(&fd_capability_boundary_check.step);
     const scratch_tests = b.addTest(.{ .root_module = b.createModule(.{
@@ -183,6 +205,12 @@ pub fn build(b: *std.Build) void {
     const vmo_storage_run = b.addRunArtifact(vmo_storage_tests);
     test_step.dependOn(&vmo_storage_run.step);
     b.step("test-vmo-storage", "Test the private VMO metadata lifecycle").dependOn(&vmo_storage_run.step);
+    const discard_mod = b.createModule(.{ .root_source_file = b.path("src/discard_pages_test.zig"), .target = b.graph.host, .optimize = .Debug });
+    discard_mod.addImport("kernel_abi_root", kernel_abi_root_mod);
+    const discard_run = b.addRunArtifact(b.addTest(.{ .root_module = discard_mod, .filters = &.{"discard ownership"} }));
+    test_step.dependOn(&discard_run.step);
+    b.step("test-discard", "Test discarded physical-page ownership and retry").dependOn(&discard_run.step);
+
     const lock_profile_mod = b.createModule(.{ .root_source_file = b.path("src/lock_profile_test.zig"), .target = b.graph.host, .optimize = .Debug });
     lock_profile_mod.addImport("kernel_abi_root", kernel_abi_root_mod);
     // The checked CPU-capacity path reaches platform code; LLVM supports its
@@ -225,10 +253,10 @@ pub fn build(b: *std.Build) void {
     const bsp_cpu_identity_tests = b.addTest(.{ .root_module = bsp_cpu_identity_mod, .filters = &.{ "BSP stack CPU identity", "BSP stack painting" } });
     const bsp_cpu_identity_run = b.addRunArtifact(bsp_cpu_identity_tests);
     test_step.dependOn(&bsp_cpu_identity_run.step);
-    const scratch_boundary_check = b.addSystemCommand(&.{"python3"});
+    const scratch_boundary_check = addHostTestCommand(b, &.{"python3"});
     scratch_boundary_check.addFileArg(b.path("../tests/check_kernel_boot_scratch_boundaries.py"));
     test_step.dependOn(&scratch_boundary_check.step);
-    const scratch_snapshot_tests = b.addSystemCommand(&.{"python3"});
+    const scratch_snapshot_tests = addHostTestCommand(b, &.{"python3"});
     scratch_snapshot_tests.addFileArg(b.path("../tests/test_kernel_boot_scratch_snapshot.py"));
     test_step.dependOn(&scratch_snapshot_tests.step);
     const kernel_log_test_mod = b.createModule(.{
@@ -266,15 +294,70 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     mmio_overlay_mod.addImport("kernel_abi_root", kernel_abi_root_mod);
+    const host_vm_check_options = b.addOptions();
+    host_vm_check_options.addOption(bool, "user_return_checks_enabled", false);
+    mmio_overlay_mod.addOptions("kernel_lock_check_options", host_vm_check_options);
     addVerifiedSchedulerHostObject(b, mmio_overlay_mod, "../verified/scheduling/src/pacha_eevdf.c", "pacha_eevdf.o");
     // Real syscall dispatch links x86 trap assembly; the self-hosted backend
     // cannot encode it. Host fixtures fail if those privileged entries execute.
     const vm_test_filter = b.option([]const u8, "vm-test-filter", "Filter native VM host tests");
-    const mmio_overlay_tests = b.addTest(.{ .root_module = mmio_overlay_mod, .filters = if (vm_test_filter) |filter| &.{filter} else &.{ "MMIO overlay", "VM Hooks reject", "RAM cache source", "RAM cache preparation", "CPU membership", "MADT", "resident roots", "both registration", "zero retention", "CPU storage preserves", "shootdown mailbox", "generated syscall", "direct syscall entry", "direct IPC kinds" }, .use_llvm = true });
+    const mmio_overlay_tests = b.addTest(.{ .root_module = mmio_overlay_mod, .filters = if (vm_test_filter) |filter| &.{filter} else &.{ "thread identity", "MMIO overlay", "VM Hooks reject", "RAM cache source", "RAM cache preparation", "CPU membership", "MADT", "PCID zero", "private shootdown", "private user leaves", "resident roots", "both registration", "zero retention", "CPU storage preserves", "shootdown mailbox", "generated syscall", "direct syscall entry", "direct IPC kinds" }, .use_llvm = true });
     mmio_overlay_tests.stack_size = 64 * 1024 * 1024;
+    const pin_lock_tests = b.addTest(.{ .root_module = mmio_overlay_mod, .filters = &.{"MMIO overlay pin index actual AS K"}, .use_llvm = true, .test_runner = .{ .path = b.path("src/lock_diagnostics_test_runner.zig"), .mode = .server } });
+    pin_lock_tests.root_module.addImport("standard_test_runner", b.createModule(.{ .root_source_file = .{ .cwd_relative = b.pathJoin(&.{ b.graph.zig_lib_directory.path.?, "compiler/test_runner.zig" }) }, .target = target, .optimize = optimize }));
+    pin_lock_tests.stack_size = 64 * 1024 * 1024;
+    b.step("test-pin-locks", "Exercise pin mutations with actual K and AS lock diagnostics").dependOn(&b.addRunArtifact(pin_lock_tests).step);
+    const boot_lock_step = b.step("test-boot-k", "Test boot K ownership and missing-K mutation with diagnostics");
+    const boot_lock_tests = b.addTest(.{ .root_module = mmio_overlay_mod, .filters = &.{"boot K construction"}, .use_llvm = true, .test_runner = .{ .path = b.path("src/lock_diagnostics_test_runner.zig"), .mode = .server } });
+    boot_lock_tests.stack_size = 64 * 1024 * 1024;
+    boot_lock_step.dependOn(&b.addRunArtifact(boot_lock_tests).step);
+    const boot_no_k = b.addTest(.{ .root_module = mmio_overlay_mod, .filters = &.{"boot K mutation without hold"}, .use_llvm = true, .test_runner = .{ .path = b.path("src/lock_diagnostics_test_runner.zig"), .mode = .server } });
+    boot_no_k.stack_size = 64 * 1024 * 1024;
+    const boot_no_k_check = addHostTestCommand(b, &.{"python3"});
+    boot_no_k_check.addFileArg(b.path("../tests/check_shared_pte_panic.py"));
+    boot_no_k_check.addArtifactArg(boot_no_k);
+    boot_no_k_check.addArg("NotHeld");
+    boot_lock_step.dependOn(&boot_no_k_check.step);
+    const discard_lock_tests = b.addTest(.{ .root_module = mmio_overlay_mod, .filters = &.{"MMIO overlay discard"}, .use_llvm = true, .test_runner = .{ .path = b.path("src/lock_diagnostics_test_runner.zig"), .mode = .server } });
+    discard_lock_tests.stack_size = 64 * 1024 * 1024;
+    b.step("test-discard-locks", "Exercise discard with real K AS shared and retirement locks").dependOn(&b.addRunArtifact(discard_lock_tests).step);
+
+    const stage5_tests = b.addTest(.{ .root_module = mmio_overlay_mod, .filters = &.{ "stage5", "stage4b" }, .use_llvm = true, .test_runner = .{ .path = b.path("src/lock_diagnostics_test_runner.zig"), .mode = .server } });
+    stage5_tests.stack_size = 64 * 1024 * 1024;
+    b.step("test-stage5", "Test mixed-cache arena holes and populate retries under real locks").dependOn(&b.addRunArtifact(stage5_tests).step);
+
+    const shared_discard_step = b.step("test-shared-discard", "Test shared VMO withdrawal and aliases");
+    const shared_abi_check = addHostTestCommand(b, &.{"bash"});
+    shared_abi_check.addFileArg(b.path("../tests/run-vmo-discard-abi-unit.sh"));
+    shared_discard_step.dependOn(&shared_abi_check.step);
+    inline for (.{ "shared PTE rejection slot", "shared PTE rejection descriptor" }) |filter| {
+        const negative = b.addTest(.{ .root_module = mmio_overlay_mod, .filters = &.{filter}, .use_llvm = true });
+        negative.stack_size = 64 * 1024 * 1024;
+        const check = addHostTestCommand(b, &.{"python3"});
+        check.addFileArg(b.path("../tests/check_shared_pte_panic.py"));
+        check.addArtifactArg(negative);
+        shared_discard_step.dependOn(&check.step);
+    }
+    inline for (.{ "shared alias rejection without K", "shared descriptor rejection without AS loan" }) |filter| {
+        const negative = b.addTest(.{ .root_module = mmio_overlay_mod, .filters = &.{filter}, .use_llvm = true, .test_runner = .{ .path = b.path("src/lock_diagnostics_test_runner.zig"), .mode = .server } });
+        negative.stack_size = 64 * 1024 * 1024;
+        const check = addHostTestCommand(b, &.{"python3"});
+        check.addFileArg(b.path("../tests/check_shared_pte_panic.py"));
+        check.addArtifactArg(negative);
+        check.addArg("NotHeld");
+        shared_discard_step.dependOn(&check.step);
+    }
+    const shared_discard_tests = b.addTest(.{ .root_module = mmio_overlay_mod, .filters = &.{"shared discard"}, .use_llvm = true, .test_runner = .{ .path = b.path("src/lock_diagnostics_test_runner.zig"), .mode = .server } });
+    shared_discard_tests.stack_size = 64 * 1024 * 1024;
+    shared_discard_step.dependOn(&b.addRunArtifact(shared_discard_tests).step);
+
     const run_mmio_overlay = b.addRunArtifact(mmio_overlay_tests);
     test_step.dependOn(&run_mmio_overlay.step);
     b.step("test-ram-cache-plan", "Test native VM and RAM-cache page-table transactions").dependOn(&run_mmio_overlay.step);
+    const identity_tests = b.addTest(.{ .root_module = mmio_overlay_mod, .filters = &.{"thread identity"}, .use_llvm = true });
+    identity_tests.stack_size = 64 * 1024 * 1024;
+    b.step("test-thread-page", "Test current-thread publication, lifetime and admission").dependOn(&b.addRunArtifact(identity_tests).step);
+
     const ram_cache_tests = b.addTest(.{ .root_module = b.createModule(.{
         .root_source_file = b.path("src/memory/ram_cache_policy.zig"),
         .target = b.graph.host,
@@ -322,14 +405,49 @@ pub fn build(b: *std.Build) void {
     realtime_clock_mod.addImport("kernel_abi_root", kernel_abi_root_mod);
     const realtime_clock_tests = b.addTest(.{ .root_module = realtime_clock_mod });
     test_step.dependOn(&b.addRunArtifact(realtime_clock_tests).step);
+    const tsc_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("src/tsc_clock.zig"),
+        .target = target,
+        .optimize = optimize,
+    }) });
+    tsc_tests.root_module.addImport("kernel_abi_root", kernel_abi_root_mod);
+    const tsc_run = b.addRunArtifact(tsc_tests);
+    test_step.dependOn(&tsc_run.step);
+    const cpu_performance_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("src/cpu_performance.zig"), .target = target, .optimize = optimize,
+    }) });
+    const cpu_performance_run = b.addRunArtifact(cpu_performance_tests);
+    test_step.dependOn(&cpu_performance_run.step);
+    b.step("test-cpu-performance", "Test Intel HWP admission, requests and irreversible failure paths").dependOn(&cpu_performance_run.step);
+    const test_clock = b.step("test-clock", "Test clock qualification, bounds and fallback");
+    test_clock.dependOn(&tsc_run.step);
+    test_clock.dependOn(&b.addRunArtifact(realtime_clock_tests).step);
+    const ring_fixture_mod = b.createModule(.{ .root_source_file = b.path("src/kernel_log_ring_test.zig"), .target = target, .optimize = optimize });
+    ring_fixture_mod.addImport("kernel_abi_root", kernel_abi_root_mod);
+    const ring_fixture_run = b.addRunArtifact(b.addTest(.{ .root_module = ring_fixture_mod }));
+    test_step.dependOn(&ring_fixture_run.step);
+    test_clock.dependOn(&ring_fixture_run.step);
     for ([_][]const u8{ "src/hpet.zig", "src/lapic.zig", "src/clockevent.zig", "src/acpi_tables.zig", "src/acpi_ivrs.zig", "src/acpi_dmar.zig", "src/elf_loader.zig", "src/pci.zig" }) |source| {
         const clock_test_mod = b.createModule(.{
-            .root_source_file = b.path(source),
+            .root_source_file = b.path(if (std.mem.eql(u8, source, "src/pci.zig")) "src/pci_test_root.zig" else source),
             .target = target,
             .optimize = optimize,
         });
         clock_test_mod.addImport("kernel_abi_root", kernel_abi_root_mod);
-        test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = clock_test_mod })).step);
+        if (std.mem.eql(u8, source, "src/pci.zig"))
+            addVerifiedSchedulerHostObject(b, clock_test_mod, "../verified/scheduling/src/pacha_eevdf.c", "pacha_eevdf_pci_test.o");
+        // Several roots transitively include naked x86 entry stubs and PKRU /
+        // XRSTOR instructions unsupported by Zig's self-hosted x86 encoder.
+        const run = b.addRunArtifact(b.addTest(.{
+            .root_module = clock_test_mod,
+            .use_llvm = true,
+            .filters = if (std.mem.eql(u8, source, "src/pci.zig")) &.{
+                "PCI", "MCFG", "ECAM", "config address", "authorized BAR",
+                "partial 64-bit BAR", "routed interrupt", "IRQ release",
+            } else &.{},
+        }));
+        test_step.dependOn(&run.step);
+        if (std.mem.eql(u8, source, "src/lapic.zig") or std.mem.eql(u8, source, "src/clockevent.zig")) test_clock.dependOn(&run.step);
     }
     const vtd_test_mod = b.createModule(.{
         .root_source_file = b.path("src/vtd.zig"),
@@ -420,7 +538,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_scheduler_runqueue_tests.step);
 
     const scheduler_context_test_mod = b.createModule(.{
-        .root_source_file = b.path("src/scheduler_connection.zig"),
+        .root_source_file = b.path("src/scheduler_test.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -431,7 +549,7 @@ pub fn build(b: *std.Build) void {
         // Handoff negative tests reach the PKRU save/restore instructions;
         // Zig's self-hosted x86 backend cannot encode rdpkru/wrpkru yet.
         .use_llvm = true,
-        .filters = if (scheduler_test_filter) |filter| &.{filter} else &.{ "migration waits", "preferred wake", "controlled thread context", "yield handoff", "futex", "context transfer", "IPC direct", "clock read admission", "AP block", "IPC notify", "thread storage", "uninterruptible wait", "deadline" },
+        .filters = if (scheduler_test_filter) |filter| &.{filter} else &.{ "wake preemption", "migration waits", "preferred wake", "controlled thread context", "yield handoff", "futex", "context transfer", "IPC direct", "clock read admission", "AP block", "IPC notify", "thread storage", "uninterruptible wait", "deadline" },
     });
     test_step.dependOn(&b.addRunArtifact(scheduler_context_tests).step);
     const signal_delivery_tests = b.addTest(.{
@@ -492,11 +610,18 @@ pub fn build(b: *std.Build) void {
         .root_module = ranked_scheduler_mod,
         .test_runner = .{ .path = b.path("src/lock_diagnostics_test_runner.zig"), .mode = .server },
         .use_llvm = true,
-        .filters = if (scheduler_test_filter) |filter| &.{filter} else &.{ "migration waits", "preferred wake", "controlled thread context", "yield handoff", "futex", "context transfer", "IPC direct", "clock read admission", "AP block", "IPC notify", "thread storage", "uninterruptible wait", "deadline" },
+        .filters = if (scheduler_test_filter) |filter| &.{filter} else &.{ "wake preemption", "migration waits", "preferred wake", "controlled thread context", "yield handoff", "futex", "context transfer", "IPC direct", "clock read admission", "AP block", "IPC notify", "thread storage", "uninterruptible wait", "deadline" },
     });
     const ranked_scheduler_run = b.addRunArtifact(ranked_scheduler_tests);
     test_step.dependOn(&ranked_scheduler_run.step);
     const lock_test_step = b.step("test-lock-order", "Run lock-order negatives and actual ranked scheduler paths");
+    // The focused scheduler target reuses both ordinary and ranked tests;
+    // unrelated kernel-fixture/checker failures cannot hide their results.
+    const scheduler_step = b.step("test-scheduler", "Run ordinary and checked scheduler publication/transfer regressions");
+    scheduler_step.dependOn(&run_scheduler_runqueue_tests.step);
+    scheduler_step.dependOn(&b.addRunArtifact(uninterruptible_wait_tests).step);
+    scheduler_step.dependOn(&b.addRunArtifact(scheduler_context_tests).step);
+    scheduler_step.dependOn(&ranked_scheduler_run.step);
     lock_test_step.dependOn(&ranked_scheduler_run.step);
     lock_test_step.dependOn(&b.addRunArtifact(lock_order_tests).step);
     lock_test_step.dependOn(&bsp_cpu_identity_run.step);
@@ -512,7 +637,7 @@ pub fn build(b: *std.Build) void {
         .root_module = ranked_kernel_mod,
         .test_runner = .{ .path = b.path("src/lock_diagnostics_test_runner.zig"), .mode = .server },
         .use_llvm = true,
-        .filters = &.{ "lock admission", "lock ordering", "MMIO overlay", "shootdown interrupt guard", "lifecycle admission", "process timer index", "PIT deadline", "futex fused collector", "VT-d withdrawal contract", "AMD IOMMU withdrawal contract", "FD capability", "thread storage IPC", "IPC endpoint", "IPC direct" },
+        .filters = &.{ "lock admission", "lock ordering", "MMIO overlay", "shootdown interrupt guard", "lifecycle admission", "process timer index", "PIT deadline", "futex plain", "VT-d withdrawal contract", "AMD IOMMU withdrawal contract", "FD capability", "thread storage IPC", "IPC endpoint", "IPC direct" },
     });
     const ipc_endpoint_tests = b.addTest(.{
         .root_module = ranked_kernel_mod,
@@ -527,15 +652,15 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&ranked_kernel_run.step);
     lock_test_step.dependOn(&ranked_kernel_run.step);
     b.step("test-lock-kernel", "Run lock ordering actual kernel lock callers").dependOn(&ranked_kernel_run.step);
-    const lock_boundary_check = b.addSystemCommand(&.{"python3"});
+    const lock_boundary_check = addHostTestCommand(b, &.{"python3"});
     lock_boundary_check.addFileArg(b.path("../tests/check_kernel_lock_boundaries.py"));
     test_step.dependOn(&lock_boundary_check.step);
     lock_test_step.dependOn(&lock_boundary_check.step);
-    const cpu_codegen_tests = b.addSystemCommand(&.{ "python3", "-m", "unittest", "discover", "-s" });
+    const cpu_codegen_tests = addHostTestCommand(b, &.{ "python3", "-m", "unittest", "discover", "-s" });
     cpu_codegen_tests.addDirectoryArg(b.path("../tests"));
     cpu_codegen_tests.addArgs(&.{ "-p", "test_kernel_cpu_identity_codegen.py" });
     test_step.dependOn(&cpu_codegen_tests.step);
-    const frame_codegen_tests = b.addSystemCommand(&.{ "python3", "-m", "unittest", "discover", "-s" });
+    const frame_codegen_tests = addHostTestCommand(b, &.{ "python3", "-m", "unittest", "discover", "-s" });
     frame_codegen_tests.addDirectoryArg(b.path("../tests"));
     frame_codegen_tests.addArgs(&.{ "-p", "test_kernel_stack_frames.py" });
     test_step.dependOn(&frame_codegen_tests.step);
@@ -570,6 +695,9 @@ pub fn build(b: *std.Build) void {
     const stack_paint_options = b.addOptions();
     stack_paint_options.addOption(bool, "stack_high_water_enabled", b.option(bool, "stack-high-water", "Paint unused CPU stacks at boot for host-side high-water diagnostics") orelse false);
     const kernel_debug = b.option(bool, "kernel-debug", "Keep kernel debug information and symbols in the boot ELF") orelse false;
+    // Keep lookup metadata without enabling debug user-return checks. This
+    // lets release/profile-off code pass the same machine-code gates.
+    const kernel_symbols = b.option(bool, "kernel-symbols", "Keep ELF lookup metadata without runtime debug checks") orelse false;
     const kernel_lock_check_options = b.addOptions();
     kernel_lock_check_options.addOption(bool, "user_return_checks_enabled", kernel_debug);
     kernel_lock_check_options.addOption(bool, "reference_checks_enabled", b.option(bool, "kernel-reference-checks", "Compare maintained references with old table scans (migration only)") orelse false);
@@ -585,6 +713,9 @@ pub fn build(b: *std.Build) void {
     ipc_profile_options.addOption(bool, "ipc_enabled", b.option(bool, "ipc-profile", "Enable per-CPU native IPC diagnostic counters") orelse false);
     const wake_trace_enabled = b.option(bool, "wake-trace", "Enable bounded per-CPU wake timelines for stopped-QEMU diagnosis") orelse false;
     ipc_profile_options.addOption(bool, "wake_trace_enabled", wake_trace_enabled);
+    const wake_test_affinity = b.option(u8, "scheduler-test-affinity", "Diagnostic only: initapp 1=all CPU0, 2=main CPU0/workers CPU1") orelse 0;
+    if (wake_test_affinity > 2) @panic("invalid scheduler-test-affinity");
+    ipc_profile_options.addOption(u8, "wake_test_affinity", wake_test_affinity);
     const normal_checkpoint_options = b.addOptions();
     normal_checkpoint_options.addOption([]const u8, "name", "off");
     const limine_mod = b.createModule(.{
@@ -596,7 +727,7 @@ pub fn build(b: *std.Build) void {
         .red_zone = false,
         // Profile snapshots resolve exact ELF symbols. Keep this host artifact;
         // strip its boot copy and verify identical PT_LOAD bytes before boot.
-        .strip = !kernel_debug and !smp_profile_enabled and !wake_trace_enabled,
+        .strip = !kernel_symbols and !kernel_debug and !smp_profile_enabled and !wake_trace_enabled,
     });
     const kernel_boot_api_mod = b.createModule(.{
         .root_source_file = b.path("src/bootloader_api.zig"),
@@ -605,6 +736,11 @@ pub fn build(b: *std.Build) void {
         .code_model = .kernel,
         .red_zone = false,
     });
+    const clock_test_options = b.addOptions();
+    clock_test_options.addOption(u32, "fault_after_irqs", b.option(u32, "clock-test-fault-after-irqs", "Diagnostic image only: reject the conversion after BSP timer IRQs (0 disables)") orelse 0);
+    clock_test_options.addOption(bool, "lapic_stop_pit", b.option(bool, "lapic-test-stop-pit", "Diagnostic image only: inject a stopped PIT counter during LAPIC calibration") orelse false);
+    clock_test_options.addOption(bool, "lapic_reject_tsc", b.option(bool, "lapic-test-reject-tsc", "Diagnostic image only: reject qualified LAPIC TSC source") orelse false);
+    kernel_boot_api_mod.addOptions("clock_test_options", clock_test_options);
     const diag_font_files = b.addWriteFiles();
     const diag_font_source = diag_font_files.add("font.zig", "pub const bytes: []const u8 = @embedFile(\"font.psf\");\n");
     _ = diag_font_files.addCopyFile(b.path("../.artifacts/third_party/libvterm-0.3.3/build/font.psf"), "font.psf");
@@ -653,7 +789,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     }) });
     test_step.dependOn(&b.addRunArtifact(xstate_transition_test).step);
-    const scalar_tests = b.addSystemCommand(&.{ "python3", "-m", "unittest", "discover", "-s", "../tests", "-p", "test_kernel_scalar_codegen.py" });
+    const scalar_tests = addHostTestCommand(b, &.{ "python3", "-m", "unittest", "discover", "-s", "../tests", "-p", "test_kernel_scalar_codegen.py" });
     test_step.dependOn(&scalar_tests.step);
     const frame_codegen_check = b.addSystemCommand(&.{"python3"});
     frame_codegen_check.addFileArg(b.path("../tests/check_kernel_stack_frames.py"));

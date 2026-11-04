@@ -291,6 +291,7 @@ int64_t lpr_backend_read(const lpr_fd_pin_t *pin, uint64_t buf, uint64_t count, 
             }
         }
         *(uint64_t *)(uintptr_t)buf = consumed;
+        lpr_event_counter_publish(event, 4u);
         lpr_event_backend_notify(event);
 #if defined(LPR_GLYCIN_DIAG) && LPR_GLYCIN_DIAG
         if (__atomic_load_n(&lpr_glycin_diag_armed, __ATOMIC_ACQUIRE) != 0u) {

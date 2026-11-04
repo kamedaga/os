@@ -5,7 +5,7 @@ const smp = @import("smp.zig");
 const platform = @import("arch/x86_64/platform.zig");
 const hist = @import("smp_histogram.zig");
 pub const Kind = enum(u8) { other, process, fork, exec, map, unmap, fd, ipc, futex, runtime, capsule, irq, teardown, fd_table, fd_close, fd_dup, fd_get_info, fd_set_flags, fd_read, fd_write, fd_readv, fd_writev, fd_fcntl, fd_poll, fd_wait_many, fd_ioctl, fd_stat, eventfd_create, pipe_create, timerfd_create, timerfd_settime, timerfd_gettime, vmo_create, vmo_grow, vmo_cache_policy, vmo_create_page_view, vmo_revoke, ipc_endpoint_create, ipc_channel_create, ipc_send, ipc_recv, ipc_call, ipc_reply, ipc_recv_wait, ipc_notify, ipc_notify_wait };
-pub const Stage = enum(u8) { prepare, commit, retire, copy, zero, pmm, pmm_wait, pt_prepare, ipi_ack, wake_ipi, vm_wait, timer_publish, poll_scan, wait_register, wait_set, park, leave_cleanup, waiter_scan, group_scan, wait_group, reg_task, reg_pipe, reg_ipc, retire_address_spaces, retire_invocation_storage, retire_reference_storage, retire_cancellations, retire_device_memory, retire_ram_cache, retire_persistent_waiters, retire_pending_returns, retire_reference_audit, leave_cancellations, leave_persistent_waiters, leave_device_memory, leave_ram_cache, futex_wait_total, futex_wake_total, futex_wake_wait_total, futex_requeue_total, futex_validate, futex_lock, futex_user_word, futex_registration, futex_hint, futex_scan, futex_wake_dispatch, futex_timer_park, futex_cleanup, futex_empty_wake, futex_wait_mismatch, futex_removal, futex_growth, futex_zero_wake, futex_key_hash };
+pub const Stage = enum(u8) { prepare, commit, retire, copy, zero, pmm, pmm_wait, pt_prepare, ipi_ack, wake_ipi, vm_wait, timer_publish, poll_scan, wait_register, wait_set, park, leave_cleanup, waiter_scan, group_scan, wait_group, reg_task, reg_pipe, reg_ipc, retire_address_spaces, retire_invocation_storage, retire_reference_storage, retire_cancellations, retire_device_memory, retire_ram_cache, retire_persistent_waiters, retire_pending_returns, retire_reference_audit, leave_cancellations, leave_persistent_waiters, leave_device_memory, leave_ram_cache, futex_wait_total, futex_wake_total, futex_wake_wait_total, futex_requeue_total, futex_validate, futex_lock, futex_user_word, futex_registration, futex_hint, futex_scan, futex_wake_dispatch, futex_timer_park, futex_cleanup, futex_empty_wake, futex_wait_mismatch, futex_removal, futex_growth, futex_zero_wake, futex_key_hash, dma_conflict, dma_pages, dma_iommu, dma_fd_publish, dma_exit_retire };
 pub const FutexOp = enum(u8) { wait, wake, wake_wait, requeue };
 pub const FutexOutcome = enum(u8) { empty_wake, zero_wake, wait_mismatch };
 const kinds = @typeInfo(Kind).@"enum".fields.len;
@@ -839,4 +839,51 @@ pub fn fragmentationFailure(caller: PmmCaller, requested: usize, minimum: u64, l
     }
     buffer[len] = '\n';
     @import("serial.zig").writeRaw(buffer[0 .. len + 1]);
+}
+
+/// Caller owns K, after finishing user-header copy/AS exclusion. Completed
+/// syscall stage totals are committed before K release; the snapshot excludes
+/// the current log reader and never resets epochs or live tokens.
+pub fn dumpDmaStages() void {
+    if (comptime !enabled) return;
+    const log = @import("kernel_log.zig");
+    const started = now();
+    const generation = epoch();
+    log.writeProfileFmt("net12-dma BEGIN id={} epoch={} cpus={}\n", .{ started, generation, stage_totals.len });
+    inline for (.{ Stage.dma_conflict, Stage.dma_pages, Stage.dma_iommu, Stage.dma_fd_publish, Stage.dma_exit_retire }) |stage| {
+        var total: [3]u64 = @splat(0);
+        for (stage_totals) |*cpu| for (cpu) |*kind| for (0..3) |column| {
+            total[column] +%= @atomicLoad(u64, &kind[@intFromEnum(stage)][column], .monotonic);
+        };
+        log.writeProfileFmt("net12-dma stage={s} count={} inclusive={} exclusive={}\n", .{ @tagName(stage), total[0], total[1], total[2] });
+    }
+    log.writeProfileFmt("net12-dma END id={} epoch={} capture_cycles={}\n", .{ started, generation, now() -% started });
+}
+
+// Existing K wait/hold distributions, coarsened only for bounded log export.
+// Indices 8..15: SEND, CALL, FD_WRITE, FD_WRITEV, each wait then hold.
+// No reset or epoch change: a live reader is approximate and excludes itself
+// from these opcode series. Stopped-QEMU readers retain the full histograms.
+pub fn dumpWakeLocks() void {
+    if (comptime !enabled or !@import("ipc_metric.zig").enabled) return;
+    const metric = @import("ipc_metric.zig");
+    inline for (.{ Kind.ipc_send, Kind.ipc_call, Kind.fd_write, Kind.fd_writev }, 0..) |kind, index| {
+        inline for (0..2) |phase| {
+            var output: metric.DetailHist = .{};
+            for (distributions) |*row| {
+                const from = &row[@intFromEnum(kind) * 2 + phase];
+                metric.sumDetail(&output, &output.count, @atomicLoad(u64, &from.count, .monotonic));
+                metric.sumDetail(&output, &output.cycles, @atomicLoad(u64, &from.cycles, .monotonic));
+                output.maximum = @max(output.maximum, @atomicLoad(u64, &from.maximum, .monotonic));
+                metric.sumDetail(&output, &output.excluded, @atomicLoad(u64, &from.excluded, .monotonic));
+                output.overflow |= @atomicLoad(u64, &from.overflow, .monotonic);
+                for (&from.buckets, 0..) |*bin, i| {
+                    const coarse = if (i < 16) 63 - @clz(@as(u64, i) | 1) else 4 + (i - 16) / 8;
+                    const sum = @addWithOverflow(output.buckets[coarse], @as(u64, @atomicLoad(u32, bin, .monotonic)));
+                    output.buckets[coarse] = sum[0]; output.overflow |= sum[1];
+                }
+            }
+            metric.dumpDetailHistogram(8 + index * 2 + phase, &output);
+        }
+    }
 }

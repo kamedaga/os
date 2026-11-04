@@ -1,10 +1,12 @@
 #include "netlink_socket.h"
 #include "libuinet_backend.h"
+#include <pacha/readiness.h>
 
 #include "pacha/abi.h"
 #include "pacha/ipc.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #define NETD_NETLINK_HANDLE_BIT (1ull << 62)
@@ -17,6 +19,10 @@ typedef struct netd_netlink_message {
     uint8_t data[NETD_NETLINK_MESSAGE_BYTES];
 } netd_netlink_message_t;
 
+struct netd_netlink_watch {
+    struct netd_netlink_watch *next;
+    pacha_fd_t fd;
+};
 typedef struct netd_netlink_socket_state {
     uint64_t handle;
     uint32_t refs;
@@ -28,6 +34,9 @@ typedef struct netd_netlink_socket_state {
     uint16_t queue_head;
     uint16_t queue_len;
     pacha_fd_t notify_fd;
+    pacha_fd_t readiness_fd;
+    struct pacha_readiness *readiness;
+    struct netd_netlink_watch *watches;
     netd_netlink_message_t queue[NETD_NETLINK_QUEUE_CAPACITY];
 } netd_netlink_socket_state_t;
 
@@ -49,6 +58,13 @@ static netd_netlink_socket_state_t *find_socket(uint64_t handle)
 static void destroy_socket(netd_netlink_socket_state_t *socket)
 {
     if (socket == NULL) return;
+    while (socket->watches) {
+        struct netd_netlink_watch *watch=socket->watches;
+        socket->watches=watch->next;
+        (void)pacha_fd_close(watch->fd);free(watch);
+    }
+    if (socket->readiness) (void)pacha_munmap(socket->readiness, PACHA_READINESS_BYTES);
+    if (socket->readiness_fd >= 16) (void)pacha_fd_close(socket->readiness_fd);
     if (socket->notify_fd >= 16) (void)pacha_fd_close(socket->notify_fd);
     memset(socket, 0, sizeof(*socket));
 }
@@ -59,6 +75,8 @@ int netd_netlink_socket_collect_wait_sources(struct pacha_service_wait_set *wait
     for (unsigned i = 0; i < NETD_NETLINK_MAX; i++) {
         const netd_netlink_socket_state_t *socket = &sockets[i];
         if (socket->handle == 0 || socket->notify_fd < 16) continue;
+        for (const struct netd_netlink_watch *w=socket->watches;w;w=w->next)
+            if (pacha_service_wait_add(wait_set,w->fd,PACHA_FD_EVENT_HANGUP)) return -24;
         if (pacha_service_wait_add(
                 wait_set, socket->notify_fd, PACHA_FD_EVENT_HANGUP) != 0)
             return -24;
@@ -72,6 +90,14 @@ void netd_netlink_socket_reap_hangups(
     for (unsigned i = 0; i < NETD_NETLINK_MAX; i++) {
         netd_netlink_socket_state_t *socket = &sockets[i];
         if (socket->handle == 0 || socket->notify_fd < 16) continue;
+        struct netd_netlink_watch **cursor=&socket->watches;
+        while (*cursor) {
+            struct netd_netlink_watch *watch=*cursor;
+            if (!(pacha_service_wait_revents(wait_set,watch->fd)&PACHA_FD_EVENT_HANGUP)) {
+                cursor=&watch->next;continue;
+            }
+            *cursor=watch->next;(void)pacha_fd_close(watch->fd);free(watch);
+        }
         if ((pacha_service_wait_revents(wait_set, socket->notify_fd) &
              PACHA_FD_EVENT_HANGUP) == 0) continue;
         const uint64_t handle = socket->handle;
@@ -81,8 +107,21 @@ void netd_netlink_socket_reap_hangups(
     }
 }
 
-static int notify(netd_netlink_socket_state_t *socket)
+static int notify(netd_netlink_socket_state_t *socket, uint32_t events)
 {
+    if (socket && socket->readiness) {
+        __atomic_store_n(&socket->readiness->names,
+            socket->pid | ((uint64_t)socket->groups<<32),__ATOMIC_RELEASE);
+        uint32_t ready = socket->queue_len ? NETD_POLLIN : 0;
+        if (!socket->protocol && socket->queue_len < NETD_NETLINK_QUEUE_CAPACITY) ready |= NETD_POLLOUT;
+        /* A queue operation can introduce a new edge while the level stays
+         * readable. Publish before the sticky notification, even if coalesced. */
+        pacha_readiness_publish_events(socket->readiness, ready, events);
+    }
+    if (socket) for (struct netd_netlink_watch *w=socket->watches;w;w=w->next) {
+        const struct pacha_ipc_msg wake={.word0=UINT64_C(0x554556454e545244)};
+        (void)pacha_ipc_send(w->fd,&wake);
+    }
     if (socket == NULL || socket->notify_fd < 16 || socket->notify_pending || socket->queue_len == 0)
         return 0;
     const struct pacha_ipc_msg message = {
@@ -143,6 +182,8 @@ int netd_netlink_socket_bind(netd_netlink_bind_t *request)
     socket->pid = request->pid = pid;
     socket->groups = request->groups;
     socket->bound = 1;
+    if(socket->readiness) __atomic_store_n(&socket->readiness->names,
+        socket->pid | ((uint64_t)socket->groups<<32),__ATOMIC_RELEASE);
     return 0;
 }
 
@@ -167,7 +208,7 @@ int netd_netlink_socket_recv(netd_io_t *request, size_t capacity, size_t *out_re
         socket->queue_head = (uint16_t)((socket->queue_head + 1u) % NETD_NETLINK_QUEUE_CAPACITY);
         socket->queue_len--;
         socket->notify_pending = 0;
-        (void)notify(socket);
+        (void)notify(socket, 0);
     }
     return 0;
 }
@@ -306,7 +347,7 @@ int netd_netlink_publish_device(uint64_t device)
         message->data[length++] = '\0';
         message->length = (uint16_t)length;
         socket->queue_len++;
-        (void)notify(socket);
+        (void)notify(socket, NETD_POLLIN);
         delivered++;
     }
     printf("[netd] uevent device=%llu action=%s subscribers=%u\n",
@@ -466,7 +507,50 @@ int netd_netlink_socket_send(const netd_io_t *request, size_t *out_sent)
         socket->queue[tail] = pending[i];
         ++socket->queue_len;
     }
-    (void)notify(socket);
+    (void)notify(socket, NETD_POLLIN);
     *out_sent = request->length;
+    return 0;
+}
+
+int netd_netlink_socket_readiness(uint64_t handle, pacha_fd_t *out)
+{
+    netd_netlink_socket_state_t *socket = find_socket(handle);
+    if (!socket || !out) return -9;
+    if (!socket->readiness) {
+        const uint64_t rights = PACHA_FD_RIGHT_INSPECT | PACHA_FD_RIGHT_CLOSE |
+            PACHA_FD_RIGHT_MAP_READ | PACHA_FD_RIGHT_MAP_WRITE | PACHA_FD_RIGHT_TRANSFER;
+        pacha_fd_t fd = pacha_vmo_create(PACHA_READINESS_BYTES, rights, 0);
+        if (fd < 16) return -12;
+        struct pacha_readiness *page = pacha_mmap(fd, PACHA_READINESS_BYTES,
+            PACHA_PROT_READ | PACHA_PROT_WRITE, PACHA_MMAP_SHARED, 0);
+        if (!page) { (void)pacha_fd_close(fd); return -12; }
+        page->identity = handle;
+        socket->readiness_fd = fd;
+        socket->readiness = page;
+        (void)notify(socket, 0);
+    }
+    *out = socket->readiness_fd;
+    return 0;
+}
+
+int netd_netlink_socket_arm(uint64_t handle, pacha_fd_t fd)
+{
+    netd_netlink_socket_state_t *socket=find_socket(handle);
+    if (!socket) return -9;
+    struct pacha_fd_info info;
+    const uint64_t required=PACHA_FD_RIGHT_SEND | PACHA_FD_RIGHT_WAIT |
+        PACHA_FD_RIGHT_POLL | PACHA_FD_RIGHT_CLOSE;
+    if (fd < 16 || pacha_fd_get_info(fd,&info) || info.kind!=PACHA_FD_KIND_CHANNEL ||
+        (info.rights&required)!=required) return -9;
+    /* Each blocking invocation owns a distinct doorbell. A sibling reader
+     * cannot consume its wake between registration and the local recheck. */
+    unsigned count=0;
+    for(unsigned i=0;i<NETD_NETLINK_MAX;i++)
+        for(struct netd_netlink_watch*w=sockets[i].watches;w;w=w->next)count++;
+    if(count>=256) return -24;
+    struct netd_netlink_watch *watch=calloc(1,sizeof(*watch));
+    if(!watch)return -12;
+    *watch=(struct netd_netlink_watch){.next=socket->watches,.fd=fd};
+    socket->watches=watch;
     return 0;
 }
