@@ -40,6 +40,8 @@ const (
 type PartitionRegion struct {
 	FirstLBA uint64
 	LastLBA  uint64
+	// Unique partition GUID in GPT's on-disk (mixed-endian) byte order.
+	PartitionUUID [16]byte
 }
 
 type Layout struct {
@@ -137,7 +139,9 @@ func OpenPartitionRegion(file *os.File, partitionIndex int) (PartitionRegion, er
 	if last < first {
 		return PartitionRegion{}, errors.New("invalid partition region")
 	}
-	return PartitionRegion{FirstLBA: first, LastLBA: last}, nil
+	region := PartitionRegion{FirstLBA: first, LastLBA: last}
+	copy(region.PartitionUUID[:], entry[16:32])
+	return region, nil
 }
 
 func ComputeLayout(region PartitionRegion) (Layout, error) {

@@ -488,7 +488,13 @@ static int64_t lpr_proc_write_mounts(uint64_t fd, unsigned *wait_not_ready)
     lpr_linux_statfs_t root;
     int64_t status=lpr_linux_statfs((uintptr_t)"/",(uintptr_t)&root);
     if (status) return status;
-    const char *type=root.f_type==0x01021994 ? "tmpfs" : "ext4";
+    const char *type="unknown";
+    switch (root.f_type) {
+    case 0xef53: type="ext4"; break;
+    case 0x58465342: type="xfs"; break;
+    case 0x9123683e: type="btrfs"; break;
+    case 0x01021994: type="tmpfs"; break;
+    }
     status=lpr_proc_write_string(fd,"rootfs / ",wait_not_ready);
     if (!status) status=lpr_proc_write_string(fd,type,wait_not_ready);
     if (!status) status=lpr_proc_write_string(fd," rw,relatime 0 0\n",wait_not_ready);

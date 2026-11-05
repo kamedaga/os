@@ -2327,7 +2327,9 @@ static int prepare_filed_storage_bootstrap(
         out_bootstrap == NULL ||
         filed_endpoint_fd < 16 ||
         bootstrap->bootfs_fd < 16 || bootstrap->bootfs_size < 104 ||
-        !storage_root_uuid_valid(bootstrap->root_uuid))
+        !storage_root_uuid_valid(bootstrap->root_partuuid) ||
+        !storage_root_uuid_valid(bootstrap->root_uuid) ||
+        !storage_root_fstype_valid(bootstrap->root_fstype))
     {
         return -1;
     }
@@ -2338,7 +2340,9 @@ static int prepare_filed_storage_bootstrap(
     out_bootstrap->control_fd = (uint64_t)(uint32_t)filed_endpoint_fd;
     out_bootstrap->bootfs_fd = bootstrap->bootfs_fd;
     out_bootstrap->bootfs_size = bootstrap->bootfs_size;
+    memcpy(out_bootstrap->root_partuuid, bootstrap->root_partuuid, 16);
     memcpy(out_bootstrap->root_uuid, bootstrap->root_uuid, 16);
+    memcpy(out_bootstrap->root_fstype, bootstrap->root_fstype, sizeof(out_bootstrap->root_fstype));
     out_bootstrap->sandbox_ram_bytes = bootstrap->sandbox_ram_bytes;
     out_bootstrap->queue_size = bootstrap->queue_size;
     out_bootstrap->queue_arena_bytes = bootstrap->queue_arena_bytes;
@@ -4747,7 +4751,9 @@ static int launch_filed_with_path(const storage_seed0root_bootstrap_t *bootstrap
         bootstrap->service_ready_channel_fd < 16 ||
         bootstrap->power_channel_fd < 16 ||
         bootstrap->bootfs_fd < 16 || bootstrap->bootfs_size < 104 ||
-        !storage_root_uuid_valid(bootstrap->root_uuid)) {
+        !storage_root_uuid_valid(bootstrap->root_partuuid) ||
+        !storage_root_uuid_valid(bootstrap->root_uuid) ||
+        !storage_root_fstype_valid(bootstrap->root_fstype)) {
         fprintf(stderr,
             "[seed0root] bootstrap unavailable magic=0x%llx device_fd=%llu ready_fd=%llu service_ready_fd=%llu filed_fd=%llu size=%llu bootfs_fd=%llu\n",
             (unsigned long long)bootstrap->magic,
@@ -5498,7 +5504,9 @@ int main(int argc, char **argv)
         bootstrap.filed_image_fd < 16 ||
         bootstrap.filed_image_size == 0 ||
         bootstrap.bootfs_fd < 16 || bootstrap.bootfs_size < 104 ||
-        !storage_root_uuid_valid(bootstrap.root_uuid))
+        !storage_root_uuid_valid(bootstrap.root_partuuid) ||
+        !storage_root_uuid_valid(bootstrap.root_uuid) ||
+        !storage_root_fstype_valid(bootstrap.root_fstype))
     {
         fprintf(stderr, "[seed0root] bootstrap invalid status=%d\n", bootstrap_status);
         fflush(stderr);

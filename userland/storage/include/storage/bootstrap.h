@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdint.h>
+#include <string.h>
 
 enum {
     STORAGE_SEED0ROOT_BOOTSTRAP_MAGIC = 0x315254424f4f5453ull,
@@ -18,7 +19,11 @@ typedef struct storage_seed0root_bootstrap {
      * before any filesystem RPC exists; v1 module handoffs are not retained. */
     uint64_t bootfs_fd;
     uint64_t bootfs_size;
+    /* GPT GUID bytes select the partition; the FS UUID below remains the
+     * executable-cache identity, including when this partition is reformatted. */
+    uint8_t root_partuuid[16];
     uint8_t root_uuid[16];
+    char root_fstype[8];
     uint64_t sandbox_ram_bytes;
     uint64_t queue_size;
     uint64_t queue_arena_bytes;
@@ -40,15 +45,17 @@ typedef struct storage_filed_bootstrap {
     uint64_t unix_path_fd;
     uint64_t bootfs_fd;
     uint64_t bootfs_size;
+    uint8_t root_partuuid[16];
     uint8_t root_uuid[16];
+    char root_fstype[8];
     uint64_t sandbox_ram_bytes;
     uint64_t queue_size;
     uint64_t queue_arena_bytes;
 } storage_filed_bootstrap_t;
 
-_Static_assert(sizeof(storage_seed0root_bootstrap_t) == 152,
+_Static_assert(sizeof(storage_seed0root_bootstrap_t) == 176,
     "storage seed0root bootstrap private ABI");
-_Static_assert(sizeof(storage_filed_bootstrap_t) == 88,
+_Static_assert(sizeof(storage_filed_bootstrap_t) == 112,
     "storage filed bootstrap private ABI");
 
 static inline int storage_root_uuid_valid(const uint8_t uuid[16])
@@ -56,4 +63,13 @@ static inline int storage_root_uuid_valid(const uint8_t uuid[16])
     unsigned nonzero = 0;
     for (unsigned i = 0; i < 16; ++i) nonzero |= uuid[i];
     return nonzero != 0;
+}
+
+/* A fixed, terminated mount type is policy, never a request to auto-probe or
+ * load arbitrary filesystems. Zero padding is part of this private record. */
+static inline int storage_root_fstype_valid(const char type[8])
+{
+    return !memcmp(type, "ext4\0\0\0", 8) ||
+        !memcmp(type, "xfs\0\0\0\0", 8) ||
+        !memcmp(type, "btrfs\0\0", 8);
 }

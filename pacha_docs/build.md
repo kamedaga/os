@@ -255,8 +255,7 @@ kernel をビルド:
 
 rootfs を再生成して反映:
 
-注意: 現在の ext4 実装は差分同期ではない。新しく生成した ext4 を
-rootfs パーティション全体へ書き込むため、manifest にないゲスト内の変更や
+注意: ext4 / XFS / Btrfs の同期は rootfs を再生成するため、manifest にないゲスト内の変更や
 ファイルは保持されない。必要なデータを退避してから実行する。
 `build userland`（`--no-rootfs` なし）と `qemu --prepare` にも同じ注意が必要。
 
@@ -264,11 +263,38 @@ rootfs パーティション全体へ書き込むため、manifest にないゲ�
 ./pacgo sync rootfs
 ```
 
+`disk.partitions.rootfs.format` は `ext4` / `xfs` / `btrfs` を指定する。
+ext4 は従来の mkfs.ext4 / debugfs 経路を使う。XFS / Btrfs は Linux の FUSE で
+対象パーティションと読み取り専用の manifest ツリーを公開し、mkfs のディレクトリ
+取り込み機能から直接書き込む。rootfs の追加コピーやホスト側の XFS / Btrfs マウントは行わない。
+ホストには `/dev/fuse`、一般ユーザーで利用できる `fusermount3`、非特権 user namespace、
+`unshare` と各 FS の作成・検査ツールが必要。sudo は使用しない。
+Nix の xfsprogs には、nodev 上のデバイスノードを内容を読まずに取り込む修正を含めている。
+
+`./pacgo fsck rootfs` は設定した種類に応じて `e2fsck -fn` / `xfs_repair -n` /
+`btrfs check --readonly` を実行する。FUSE の読み取り専用パーティションを使うため、
+検査用の全パーティションコピーは作らず、自動修復も行わない。
+
 bootfs / ESP を更新:
 
 ```bash
 ./pacgo sync bootfs
 ```
+
+ディスク root の起動先は、設定した GPT エントリーの PARTUUID から決める。
+BOOTFS の `/etc/pacha/root-partuuid` は GPT 上の GUID の生バイト 16 bytes、
+`/etc/pacha/root-uuid` は ext4 / XFS / Btrfs の FS UUID 16 bytes を保持する。後者は FileD の
+実行ファイルキャッシュ識別用で、マウント後の FS UUID と一致しない場合は停止する。
+`/etc/pacha/root-fstype` は `ext4` / `xfs` / `btrfs` のいずれかの名前を保持する。
+Btrfs ではメタデータ UUID ではなく FSID を使う。3 種類を同じ storage パッケージで
+提供し、指定した種類でのみマウントする。tmpfs root と一時ディレクトリの配置は共通。
+許可された PCI 配下で PARTUUID が一意に一致しない場合も停止し、番号や FS UUID による
+代替選択はしない。root を再フォーマットした場合は BOOTFS も更新する。
+
+新規ディスクの disk GUID / partition GUID はランダムに生成する。既存ディスクを
+開く際や rootfs の再生成時には GUID を書き換えない。この変更前の BOOTFS は
+PARTUUID / FS 種別を持たないため、`storage_boot`、`seed0root`、FileD、storage sandbox/core を
+一緒に再ビルドして BOOTFS を更新する。PachaOS の syscall ABI に変更はない。
 
 ## QEMU
 

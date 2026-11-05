@@ -251,6 +251,8 @@ func writeFilesystemWithProgress(file *os.File, region PartitionRegion, filesyst
 		return WriteFAT32WithProgress(file, layout, manifest, span)
 	case "ext4":
 		return WriteExt4WithProgress(file, region, manifest, span)
+	case "xfs", "btrfs":
+		return WriteRootlessWithProgress(file, region, filesystem, manifest, span)
 	default:
 		return WriteResult{}, fmt.Errorf("unsupported filesystem format %q", filesystem)
 	}

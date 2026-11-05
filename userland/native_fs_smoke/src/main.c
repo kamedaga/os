@@ -38,7 +38,8 @@ int main(int argc,char **argv,char **envp)
 {
     if(argc>=2 && !strcmp(argv[1],"--child")) return child(argc,argv,envp);
     CHECK(argc>=1 && !strcmp(argv[0],"/sbin/native_fs_smoke.elf"));
-    const char *directory="/tmp/native-fs-cutover-smoke";
+    /* /tmp is a tmpfs submount even for disk roots; exercise the actual root FS. */
+    const char *directory="/root/native-fs-cutover-smoke";
     CHECK(!mkdir(directory,0700));
     int dir=open(directory,O_RDONLY|O_DIRECTORY|O_CLOEXEC);
     CHECK(dir>=0);
@@ -59,10 +60,13 @@ int main(int argc,char **argv,char **envp)
     void *snapshot=mmap(NULL,length,PROT_READ,MAP_PRIVATE,file,0);
     CHECK(snapshot!=MAP_FAILED && !memcmp(snapshot,data,length));
     CHECK(!munmap(snapshot,length));
-    /* Shared page-cache export is unsupported;
-     * successful private snapshots must not masquerade as MAP_SHARED. */
-    void *unsupported=mmap(NULL,length,PROT_READ,MAP_SHARED,file,0);
-    CHECK(unsupported==MAP_FAILED && errno==EOPNOTSUPP);
+    /* Shared exports use page-sized ranges. Check actual page-cache aliasing,
+     * not the obsolete cutover expectation that all MAP_SHARED calls fail. */
+    unsigned char *shared_view=mmap(NULL,4096,PROT_READ,MAP_SHARED,file,0);
+    CHECK(shared_view!=MAP_FAILED && !memcmp(shared_view,data,4096));
+    data[0]^=0xff;
+    CHECK(pwrite(file,data,1,0)==1 && shared_view[0]==data[0]);
+    CHECK(!munmap(shared_view,4096));
     CHECK(lseek(file,0,SEEK_SET)==0);
     int duplicate=dup(file);CHECK(duplicate>=0);
     CHECK(read(file,back,7)==7 && !memcmp(back,data,7));
@@ -94,6 +98,9 @@ int main(int argc,char **argv,char **envp)
     /* The child must use inherited file descriptions after unlink, not reopen
      * a pathname and accidentally hide broken exec handle transfer. */
     CHECK(!unlinkat(dir,"exec",0) && !close(dir) && !rmdir(directory));
+    /* A second boot must see completed cleanup, even when the test runner
+     * powers the VM off immediately after the child's success marker. */
+    CHECK(!syncfs(inherited));
     free(data);free(back);
     puts("[native-fs-smoke] public-libc bytes=20000 read=ok write=ok dup=ok descriptors=300 lifecycle=ok");
     CHECK(!fflush(stdout));

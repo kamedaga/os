@@ -17,6 +17,25 @@ let
       runHook postInstall
     '';
   };
+  # mkfs -p must inspect device metadata without opening devices on nodev
+  # inputs. Keep O_PATH and use the full path for its xattr fallback.
+  xfsprogs = pkgs.xfsprogs.overrideAttrs (old: {
+    patches = (old.patches or []) ++ [ (pkgs.writeText "xfs-rootdir-special-files.patch" ''
+--- a/mkfs/proto.c
++++ b/mkfs/proto.c
+@@ -1684,3 +1684 @@
+-	if (!S_ISSOCK(file_stat.st_mode) &&
+-	    !S_ISLNK(file_stat.st_mode)  &&
+-	    !S_ISFIFO(file_stat.st_mode)) {
++	if (S_ISREG(file_stat.st_mode) || S_ISDIR(file_stat.st_mode)) {
+@@ -1733 +1731 @@
+-		fname = entry->d_name;
++		fname = path_buf;
+@@ -1741 +1739 @@
+-		fname = entry->d_name;
++		fname = path_buf;
+    '') ];
+  });
   clangFreestanding = pkgs.llvmPackages.clang-unwrapped;
   linuxLlvm18 = pkgs.runCommand "capabilityos-linux-llvm-18"
     { nativeBuildInputs = [ pkgs.makeWrapper ]; } ''
@@ -56,7 +75,7 @@ let
     '';
 in
 {
-  inherit zig;
+  inherit zig xfsprogs;
   inherit clangFreestanding;
   inherit linuxLlvm18;
   inherit coqCompCertContrib;
@@ -70,6 +89,9 @@ in
     coqVstTools
     dosfstools
     e2fsprogs
+    xfsprogs
+    btrfs-progs
+    util-linux
     e2tools
     elfutils
     fakeroot

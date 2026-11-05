@@ -12,6 +12,46 @@ import (
 	"capabilityos/pack/internal/config"
 )
 
+func TestSealedPackageIncludesWholeModuleClosure(t *testing.T) {
+	workspace := &config.Workspace{Root: t.TempDir(), Artifacts: ".artifacts",
+		AppsMap: map[string]config.App{"package": {ID: "package", Out: "package"}}}
+	app, _ := workspace.App("package")
+	dir := workspace.ArtifactPath(app)
+	if err := os.MkdirAll(filepath.Join(dir, "modules"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"core.so", "modules/xfs.ko", "modules/btrfs.ko", "modules/new-dependency.ko"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("payload"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	spec := Spec{Files: map[string]string{"/srv/kobox2/ramfs": "package"}}
+	files, err := expandLiveArtifacts(workspace, spec)
+	if err != nil || len(files) != 4 || files["/srv/kobox2/ramfs/modules/new-dependency.ko"].filename == "" {
+		t.Fatalf("incomplete package: %+v %v", files, err)
+	}
+	workspace.AppsMap["file"] = config.App{ID: "file", Out: "file"}
+	fileApp, _ := workspace.App("file")
+	if err := os.MkdirAll(filepath.Dir(workspace.ArtifactPath(fileApp)), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(workspace.ArtifactPath(fileApp), []byte("payload"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	spec.Files["/srv/kobox2/ramfs/core.so"] = "file"
+	if _, err := expandLiveArtifacts(workspace, spec); err == nil {
+		t.Fatal("accepted duplicate package file")
+	}
+	delete(spec.Files, "/srv/kobox2/ramfs/core.so")
+	// A symlink in a closure must never pull arbitrary host files into bootfs.
+	if err := os.Symlink("/etc/passwd", filepath.Join(dir, "modules/escape.ko")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := expandLiveArtifacts(workspace, spec); err == nil {
+		t.Fatal("accepted package symlink")
+	}
+}
+
 func TestAuthorizedKeyRequiresSingleUnrestrictedEd25519Line(t *testing.T) {
 	payload := make([]byte, 51)
 	binary.BigEndian.PutUint32(payload[:4], 11)

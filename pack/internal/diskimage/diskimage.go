@@ -1,7 +1,7 @@
 package diskimage
 
 import (
-	"crypto/sha256"
+	"crypto/rand"
 	"encoding/binary"
 	"fmt"
 	"hash/crc32"
@@ -48,7 +48,6 @@ type partitionPlan struct {
 var (
 	efiSystemTypeGUID = guid("c12a7328-f81f-11d2-ba4b-00a0c93ec93b")
 	linuxDataTypeGUID = guid("0fc63daf-8483-4772-8e79-3d69d8477de4")
-	diskGUID          = guid("c3992f6d-5d5f-4f4d-9406-c0a5f8220f01")
 )
 
 func Ensure(workspace *config.Workspace) (Result, error) {
@@ -178,6 +177,10 @@ func writeProtectiveMBR(file *os.File, sectorCount uint64) error {
 }
 
 func writeGPT(file *os.File, sectorCount uint64, plans []partitionPlan) error {
+	diskID, err := randomGUID()
+	if err != nil {
+		return err
+	}
 	entries := make([]byte, gptEntryCount*gptEntrySize)
 	for _, plan := range plans {
 		offset := (plan.Index - 1) * gptEntrySize
@@ -186,7 +189,10 @@ func writeGPT(file *os.File, sectorCount uint64, plans []partitionPlan) error {
 		}
 		entry := entries[offset : offset+gptEntrySize]
 		copy(entry[0:16], plan.TypeGUID[:])
-		unique := partitionGUID(plan.Name)
+		unique, err := randomGUID()
+		if err != nil {
+			return err
+		}
 		copy(entry[16:32], unique[:])
 		binary.LittleEndian.PutUint64(entry[32:40], plan.FirstLBA)
 		binary.LittleEndian.PutUint64(entry[40:48], plan.LastLBA)
@@ -201,13 +207,13 @@ func writeGPT(file *os.File, sectorCount uint64, plans []partitionPlan) error {
 		return err
 	}
 	lastUsable := sectorCount - 34
-	if err := writeGPTHeader(file, primaryHeaderLBA, sectorCount-1, primaryHeaderLBA, sectorCount-1, 34, lastUsable, primaryEntriesLBA, entriesCRC); err != nil {
+	if err := writeGPTHeader(file, primaryHeaderLBA, sectorCount-1, primaryHeaderLBA, sectorCount-1, 34, lastUsable, primaryEntriesLBA, diskID, entriesCRC); err != nil {
 		return err
 	}
-	return writeGPTHeader(file, sectorCount-1, primaryHeaderLBA, primaryHeaderLBA, sectorCount-1, 34, lastUsable, backupEntriesLBA, entriesCRC)
+	return writeGPTHeader(file, sectorCount-1, primaryHeaderLBA, primaryHeaderLBA, sectorCount-1, 34, lastUsable, backupEntriesLBA, diskID, entriesCRC)
 }
 
-func writeGPTHeader(file *os.File, currentLBA, backupLBA, firstUsable, lastDiskLBA, firstPartLBA, lastUsable, entriesLBA uint64, entriesCRC uint32) error {
+func writeGPTHeader(file *os.File, currentLBA, backupLBA, firstUsable, lastDiskLBA, firstPartLBA, lastUsable, entriesLBA uint64, diskID [16]byte, entriesCRC uint32) error {
 	header := make([]byte, sectorBytes)
 	copy(header[0:8], "EFI PART")
 	binary.LittleEndian.PutUint32(header[8:12], 0x00010000)
@@ -216,7 +222,7 @@ func writeGPTHeader(file *os.File, currentLBA, backupLBA, firstUsable, lastDiskL
 	binary.LittleEndian.PutUint64(header[32:40], backupLBA)
 	binary.LittleEndian.PutUint64(header[40:48], firstPartLBA)
 	binary.LittleEndian.PutUint64(header[48:56], lastUsable)
-	copy(header[56:72], diskGUID[:])
+	copy(header[56:72], diskID[:])
 	binary.LittleEndian.PutUint64(header[72:80], entriesLBA)
 	binary.LittleEndian.PutUint32(header[80:84], gptEntryCount)
 	binary.LittleEndian.PutUint32(header[84:88], gptEntrySize)
@@ -228,13 +234,16 @@ func writeGPTHeader(file *os.File, currentLBA, backupLBA, firstUsable, lastDiskL
 	return err
 }
 
-func partitionGUID(name string) [16]byte {
-	sum := sha256.Sum256([]byte("CapabilityOS:" + name))
+func randomGUID() ([16]byte, error) {
 	var id [16]byte
-	copy(id[:], sum[:16])
-	id[6] = (id[6] & 0x0f) | 0x40
+	if _, err := rand.Read(id[:]); err != nil {
+		return id, fmt.Errorf("generate GPT GUID: %w", err)
+	}
+	// GPT stores the first three GUID fields little-endian, including the
+	// version field. Generate only on creation so reformatting keeps PARTUUID.
+	id[7] = (id[7] & 0x0f) | 0x40
 	id[8] = (id[8] & 0x3f) | 0x80
-	return id
+	return id, nil
 }
 
 func guid(text string) [16]byte {

@@ -14,7 +14,7 @@
 #define PH_SANDBOX_STORAGE_DEVICES_ADDRESS UINT64_C(0x49000000)
 #define PH_SANDBOX_CHANNEL_FD 16
 #define PH_SANDBOX_LOG_FD 17
-enum { PH_FS_ROOT_EXT4 = 0, PH_FS_ROOT_TMPFS = 1 };
+enum { PH_FS_ROOT_DISK = 0, PH_FS_ROOT_TMPFS = 1 };
 struct ph_sandbox_config {
     /* Development builds must agree on the exact launch record extent.
      * This is a bounds check, not an ABI generation or compatibility promise. */
@@ -30,10 +30,12 @@ struct ph_sandbox_config {
     uint64_t firmware_address, firmware_size;
     uint8_t firmware_sha256[32];
     uint64_t log_endpoint_fd;
-    /* Storage authority is immutable launch policy. UUID selects only among
+    /* Storage authority is immutable launch policy. PARTUUID selects only among
      * devices descending from the transferred PCI capabilities. Queue/RAM
      * budgets are resources, never pathname/file-size limits. */
-    uint8_t root_uuid[16];
+    uint8_t root_partuuid[16];
+    uint8_t root_uuid[16]; /* Validate FileD's cache identity after mounting. */
+    char root_fstype[8];
     uint64_t fs_channel_id, fs_owner_channel_id, fs_arena_bytes, ram_bytes;
     uint32_t fs_queue_size, fs_root_kind;
     /* ph_device_authority[] lives in a separately authenticated read-only

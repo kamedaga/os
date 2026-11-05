@@ -3,7 +3,6 @@ package cli
 import (
 	"bytes"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -220,14 +219,11 @@ func fsckCommand(ctx *context) *cobra.Command {
 func fsckRootfsCommand(ctx *context) *cobra.Command {
 	return &cobra.Command{
 		Use:   "rootfs",
-		Short: "Run e2fsck against the ext4 rootfs partition",
+		Short: "Check the rootfs partition read-only (ext4, XFS or Btrfs)",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			partition, ok := ctx.workspace.Disk.Partitions["rootfs"]
 			if !ok {
 				return fmt.Errorf("missing disk.partitions.rootfs")
-			}
-			if strings.ToLower(partition.Format) != "ext4" {
-				return fmt.Errorf("rootfs fsck currently supports ext4, got %q", partition.Format)
 			}
 			diskPath := ctx.workspace.Path(ctx.workspace.Disk.Image)
 			locks, err := imagelock.Acquire(diskPath)
@@ -245,43 +241,14 @@ func fsckRootfsCommand(ctx *context) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			partitionBytes := (region.LastLBA - region.FirstLBA + 1) * 512
-			if partitionBytes == 0 || partitionBytes > uint64(^uint(0)>>1) {
-				return fmt.Errorf("invalid rootfs partition size: %d", partitionBytes)
-			}
-
-			tempDir := ctx.workspace.Path(ctx.workspace.Artifacts, "tmp")
-			if err := os.MkdirAll(tempDir, 0o755); err != nil {
-				return err
-			}
-			imagePath := filepath.Join(tempDir, "rootfs-fsck.ext4")
-			image, err := os.Create(imagePath)
-			if err != nil {
-				return err
-			}
-			reader := io.NewSectionReader(
-				disk,
-				int64(region.FirstLBA*512),
-				int64(partitionBytes))
-			if _, err := io.Copy(image, reader); err != nil {
-				_ = image.Close()
-				return err
-			}
-			if err := image.Close(); err != nil {
-				return err
-			}
-			defer os.Remove(imagePath)
-
 			ui.Task("fsck:rootfs")
-			fsck := exec.Command("e2fsck", "-fn", imagePath)
-			output, err := fsck.CombinedOutput()
-			if err != nil {
-				return fmt.Errorf("e2fsck failed: %w\n%s", err, string(output))
+			if err := rootsync.CheckFilesystem(disk, region, partition.Format); err != nil {
+				return err
 			}
 			ui.KeyValues("Rootfs fsck", [][2]string{
 				{"disk", ctx.workspace.Rel(diskPath)},
 				{"partition", fmt.Sprint(partition.Index)},
-				{"filesystem", "ext4"},
+				{"filesystem", partition.Format},
 				{"state", "clean"},
 			})
 			return nil
@@ -916,7 +883,7 @@ func syncRootfsCommand(ctx *context) *cobra.Command {
 	var noBuild bool
 	cmd := &cobra.Command{
 		Use:   "rootfs",
-		Short: "Write generated rootfs manifest to its partition (ext4: full rewrite, discards unmanaged files)",
+		Short: "Write generated rootfs manifest to its partition (ext4/XFS/Btrfs: full rewrite, discards unmanaged files)",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			var userland buildsys.UserlandResult
 			if !noBuild {

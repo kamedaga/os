@@ -61,6 +61,45 @@ static int close_handle(uint64_t handle)
     return call((kb2_fs_request_t){.opcode=KB2_FILESYSTEM_OP_CLOSE,.handle=handle},
         NULL,NULL,NULL,0,NULL,0,&response);
 }
+static const char persistence_path[]="/root/filed-persistence-probe";
+static int verify_previous_writeback(void)
+{
+    kb2_fs_response_t response;
+    int status=call((kb2_fs_request_t){.opcode=KB2_FILESYSTEM_OP_OPENAT2},
+        persistence_path,NULL,NULL,0,NULL,0,&response);
+    if(status==-ENOENT) {
+        RAW_MARK("[filed-smoke/raw] persistence first boot\n");
+        return 0;
+    }
+    CHECK(!status);
+    uint64_t file=response.handle;
+    unsigned char bytes[4096];
+    const size_t size=20000+4096;
+    for(size_t offset=0;offset<size;) {
+        size_t count=size-offset;
+        if(count>sizeof(bytes)) count=sizeof(bytes);
+        CHECK(!call((kb2_fs_request_t){.opcode=KB2_FILESYSTEM_OP_PREAD,
+            .handle=file,.offset=(int64_t)offset,.length=count},NULL,NULL,
+            NULL,0,bytes,sizeof(bytes),&response));
+        CHECK(response.data_length==count);
+        for(size_t i=0;i<count;++i) {
+            size_t index=offset+i;
+            unsigned char expected=index<20000 ? (unsigned char)(index*17+3) : 0;
+            if(!index) expected^=0xff;
+            CHECK(bytes[i]==expected);
+        }
+        offset+=count;
+    }
+    CHECK(!call((kb2_fs_request_t){.opcode=KB2_FILESYSTEM_OP_PREAD,
+        .handle=file,.offset=(int64_t)size,.length=1},NULL,NULL,
+        NULL,0,bytes,sizeof(bytes),&response));
+    CHECK(response.data_length==0);
+    CHECK(!close_handle(file));
+    CHECK(!call((kb2_fs_request_t){.opcode=KB2_FILESYSTEM_OP_UNLINKAT},
+        persistence_path,NULL,NULL,0,NULL,0,&response));
+    RAW_MARK("[filed-smoke/raw] persistence verified after reboot\n");
+    return 0;
+}
 static int smoke(void)
 {
     kb2_fs_response_t response;
@@ -69,6 +108,27 @@ static int smoke(void)
         NULL,NULL,NULL,0,NULL,0,&response);
     RAW_STATUS("[filed-smoke/raw] HELLO status",status);
     CHECK(!status);
+    uint8_t filesystem[KB2_FILESYSTEM_STATFS_SIZE];
+    CHECK(!call((kb2_fs_request_t){.opcode=KB2_FILESYSTEM_OP_STATFS},
+        NULL,NULL,NULL,0,filesystem,sizeof(filesystem),&response));
+    CHECK(response.data_length==sizeof(filesystem));
+    uint64_t root_type=rd64(filesystem+KB2_FILESYSTEM_STATFS_TYPE_OFFSET);
+    CHECK(root_type==0xef53 || root_type==0x58465342 ||
+        root_type==0x9123683e || root_type==0x01021994);
+    const char *temporary[]={"/tmp","/run","/dev/shm","/sys","/dev/dri"};
+    for(size_t i=0;i<sizeof(temporary)/sizeof(temporary[0]);++i) {
+        CHECK(!call((kb2_fs_request_t){.opcode=KB2_FILESYSTEM_OP_OPENAT2,
+            .flags=O_PATH|O_DIRECTORY},temporary[i],NULL,NULL,0,NULL,0,&response));
+        uint64_t temporary_handle=response.handle;
+        CHECK(!call((kb2_fs_request_t){.opcode=KB2_FILESYSTEM_OP_STATFS,.handle=temporary_handle},
+            NULL,NULL,NULL,0,filesystem,sizeof(filesystem),&response));
+        CHECK(response.data_length==sizeof(filesystem) &&
+            rd64(filesystem+KB2_FILESYSTEM_STATFS_TYPE_OFFSET)==0x01021994);
+        CHECK(!close_handle(temporary_handle));
+    }
+    printf("[filed-smoke] root filesystem type=0x%llx tmpfs-submounts=ok\n",
+        (unsigned long long)root_type);
+    CHECK(!verify_previous_writeback());
     RAW_MARK("[filed-smoke/raw] OPEN begin\n");
     status=call((kb2_fs_request_t){.opcode=KB2_FILESYSTEM_OP_OPENAT2},
         "/sbin/filed.elf",NULL,NULL,0,NULL,0,&response);
@@ -80,12 +140,13 @@ static int smoke(void)
         .length=sizeof(magic)},NULL,NULL,NULL,0,magic,sizeof(magic),&response));
     CHECK(response.data_length==4 && !memcmp(magic,"\177ELF",4));
     CHECK(!close_handle(image));
-    /* This fixture owns one scratch directory. O_EXCL rejects stale evidence
+    /* /root exercises the persistent root; /tmp is a separate tmpfs.
+     * This fixture owns one scratch directory. O_EXCL rejects stale evidence
      * instead of silently reusing a prior run's filesystem state. */
     CHECK(!call((kb2_fs_request_t){.opcode=KB2_FILESYSTEM_OP_MKDIRAT,.mode=0700},
-        "/tmp/filed-new-abi-smoke",NULL,NULL,0,NULL,0,&response));
+        "/root/filed-new-abi-smoke",NULL,NULL,0,NULL,0,&response));
     CHECK(!call((kb2_fs_request_t){.opcode=KB2_FILESYSTEM_OP_OPENAT2,
-        .flags=O_PATH|O_DIRECTORY},"/tmp/filed-new-abi-smoke",NULL,NULL,0,NULL,0,&response));
+        .flags=O_PATH|O_DIRECTORY},"/root/filed-new-abi-smoke",NULL,NULL,0,NULL,0,&response));
     uint64_t directory=response.handle;
     CHECK(!call((kb2_fs_request_t){.opcode=KB2_FILESYSTEM_OP_OPENAT2,
         .handle=directory,.flags=O_CREAT|O_EXCL|O_RDWR,.mode=0600},
@@ -108,12 +169,38 @@ static int smoke(void)
     CHECK(!call((kb2_fs_request_t){.opcode=KB2_FILESYSTEM_OP_PREAD,
         .handle=file,.length=length},NULL,NULL,NULL,0,readback,length,&response));
     CHECK(response.data_length==length && !memcmp(data,readback,length));
+    /* Exercise the root FS's page_mkwrite/dirty/writeback hooks, including
+     * iomap and CoW filesystems, through the actual shared-cache protocol. */
+    kb2_fs_request_t shared_request={.opcode=KB2_FILESYSTEM_OP_SHARED_FILE_VMO,
+        .handle=file,.length=4096,.flags=1,.mask=3};
+    pacha_fd_t shared_fd=-1;
+    size_t shared_count=1;
+    CHECK(!filedfs_call(endpoint,&shared_request,NULL,NULL,NULL,0,NULL,0,
+        &response,NULL,0,&shared_fd,&shared_count));
+    CHECK(response.result>=0 && shared_count==1 && shared_fd>=16);
+    long shared_address=pacha_syscall6(PACHA_VM_SYSCALL_MMAP,shared_fd,0,4096,
+        PACHA_PROT_READ|PACHA_PROT_WRITE,PACHA_MMAP_SHARED,0);
+    CHECK(shared_address>=4096);
+    unsigned char *shared=(void *)(uintptr_t)shared_address;
+    CHECK(!memcmp(shared,data,4096));
+    data[0]^=0xff;
+    shared[0]=data[0];
+    CHECK(!call((kb2_fs_request_t){.opcode=KB2_FILESYSTEM_OP_FSYNC,.handle=file},
+        NULL,NULL,NULL,0,NULL,0,&response));
+    CHECK(!call((kb2_fs_request_t){.opcode=KB2_FILESYSTEM_OP_PREAD,
+        .handle=file,.length=4096},NULL,NULL,NULL,0,readback,length,&response));
+    CHECK(response.data_length==4096 && !memcmp(data,readback,4096));
+    CHECK(!pacha_syscall2(PACHA_VM_SYSCALL_MUNMAP,shared_address,4096));
+    CHECK(!pacha_syscall1(PACHA_FD_SYSCALL_CLOSE,shared_fd));
+    RAW_MARK("[filed-smoke/raw] shared writeback=ok\n");
     uint8_t stat[KB2_FILESYSTEM_STATX_SIZE];
     CHECK(!call((kb2_fs_request_t){.opcode=KB2_FILESYSTEM_OP_STATX,
         .handle=file,.flags=AT_EMPTY_PATH,.mask=0x7ff},NULL,NULL,NULL,0,
         stat,sizeof(stat),&response));
     CHECK(response.data_length==sizeof(stat) &&
         rd64(stat+KB2_FILESYSTEM_STATX_SIZE_OFFSET)==length);
+    CHECK((stat[KB2_FILESYSTEM_STATX_MODE_OFFSET] |
+        ((unsigned)stat[KB2_FILESYSTEM_STATX_MODE_OFFSET+1]<<8))==0100600);
     CHECK(!call((kb2_fs_request_t){.opcode=KB2_FILESYSTEM_OP_DUP,.handle=file},
         NULL,NULL,NULL,0,NULL,0,&response));
     uint64_t duplicate=response.handle;
@@ -128,6 +215,20 @@ static int smoke(void)
     CHECK(!call((kb2_fs_request_t){.opcode=KB2_FILESYSTEM_OP_FCNTL,.handle=duplicate,
         .flags=F_GETFL},NULL,NULL,NULL,0,NULL,0,&response));
     CHECK((response.result&(O_APPEND|O_NONBLOCK))==(O_APPEND|O_NONBLOCK));
+    /* Create a hole well beyond EOF, read it, then shrink away the distant
+     * extent before extending again. The retained file checks this on reboot. */
+    CHECK(!call((kb2_fs_request_t){.opcode=KB2_FILESYSTEM_OP_FCNTL,.handle=file,
+        .flags=F_SETFL,.length=0},NULL,NULL,NULL,0,NULL,0,&response));
+    CHECK(!call((kb2_fs_request_t){.opcode=KB2_FILESYSTEM_OP_PWRITE,.handle=file,
+        .offset=1<<20,.length=1},NULL,NULL,data,1,NULL,0,&response));
+    CHECK(response.result==1);
+    memset(readback,1,4096);
+    CHECK(!call((kb2_fs_request_t){.opcode=KB2_FILESYSTEM_OP_PREAD,.handle=file,
+        .offset=65536,.length=4096},NULL,NULL,NULL,0,readback,length,&response));
+    CHECK(response.data_length==4096);
+    for(size_t i=0;i<4096;++i) CHECK(readback[i]==0);
+    CHECK(!call((kb2_fs_request_t){.opcode=KB2_FILESYSTEM_OP_FTRUNCATE,.handle=file,
+        .offset=(int64_t)length},NULL,NULL,NULL,0,NULL,0,&response));
     CHECK(!call((kb2_fs_request_t){.opcode=KB2_FILESYSTEM_OP_FTRUNCATE,.handle=file,
         .offset=(int64_t)(length+4096)},NULL,NULL,NULL,0,NULL,0,&response));
     memset(readback,1,4096);
@@ -146,6 +247,14 @@ static int smoke(void)
     CHECK(!call((kb2_fs_request_t){.opcode=KB2_FILESYSTEM_OP_READLINKAT,
         .handle=directory,.length=length},"link",NULL,NULL,0,readback,length,&response));
     CHECK(response.data_length==1 && readback[0]=='a');
+    CHECK(!call((kb2_fs_request_t){.opcode=KB2_FILESYSTEM_OP_LINKAT,
+        .handle=directory},"a",persistence_path,NULL,0,NULL,0,&response));
+    CHECK(!call((kb2_fs_request_t){.opcode=KB2_FILESYSTEM_OP_OPENAT2,
+        .flags=O_RDONLY|O_DIRECTORY},"/root",NULL,NULL,0,NULL,0,&response));
+    uint64_t root_directory=response.handle;
+    CHECK(!call((kb2_fs_request_t){.opcode=KB2_FILESYSTEM_OP_FSYNC,
+        .handle=root_directory},NULL,NULL,NULL,0,NULL,0,&response));
+    CHECK(!close_handle(root_directory));
     char too_long[257];memset(too_long,'x',256);too_long[256]=0;
     CHECK(call((kb2_fs_request_t){.opcode=KB2_FILESYSTEM_OP_OPENAT2,.handle=directory},
         too_long,NULL,NULL,0,NULL,0,&response)==-ENAMETOOLONG);
@@ -158,7 +267,7 @@ static int smoke(void)
             .handle=directory},names[i],NULL,NULL,0,NULL,0,&response));
     CHECK(!close_handle(directory));
     CHECK(!call((kb2_fs_request_t){.opcode=KB2_FILESYSTEM_OP_UNLINKAT,.flags=AT_REMOVEDIR},
-        "/tmp/filed-new-abi-smoke",NULL,NULL,0,NULL,0,&response));
+        "/root/filed-new-abi-smoke",NULL,NULL,0,NULL,0,&response));
     free(data);free(readback);
     RAW_STATUS("[filed-smoke/raw] completed checks",checks);
     static const char write_probe[]="[filed-smoke/fd-write] raw write probe\n";

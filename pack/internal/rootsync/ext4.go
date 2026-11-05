@@ -41,7 +41,7 @@ func WriteExt4WithProgress(disk *os.File, region PartitionRegion, manifest Manif
 		return WriteResult{}, err
 	}
 
-	if err := runExt4Tool(
+	if err := runFilesystemTool(
 		"mkfs.ext4",
 		"-q",
 		"-F",
@@ -60,13 +60,13 @@ func WriteExt4WithProgress(disk *os.File, region PartitionRegion, manifest Manif
 	if err != nil {
 		return WriteResult{}, err
 	}
-	if err := runExt4Tool("debugfs", "-w", "-f", cmdPath, imagePath); err != nil {
+	if err := runFilesystemTool("debugfs", "-w", "-f", cmdPath, imagePath); err != nil {
 		return WriteResult{}, err
 	}
 	if span != nil {
 		span.Set(int64(len(manifest.Dirs)+len(manifest.Files)+3), "checking ext4 image")
 	}
-	if err := runExt4Tool("e2fsck", "-fn", imagePath); err != nil {
+	if err := runFilesystemTool("e2fsck", "-fn", imagePath); err != nil {
 		return WriteResult{}, err
 	}
 
@@ -177,7 +177,7 @@ func copyImageToPartition(disk *os.File, imagePath string, region PartitionRegio
 	}
 }
 
-func runExt4Tool(name string, args ...string) error {
+func runFilesystemTool(name string, args ...string) error {
 	cmd := exec.Command(name, args...)
 	output, err := cmd.CombinedOutput()
 	if err != nil {

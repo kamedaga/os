@@ -575,8 +575,11 @@ static int create_owner(pacha_fd_t bootfs_fd, uint64_t bootfs_size,
     struct filed_storage_owner **out)
 {
     if (!out || !bootstrap || bootfs_fd < 16 ||
-        (ram_root ? (bootstrap->device_fd || storage_root_uuid_valid(bootstrap->root_uuid)) :
-         (bootstrap->device_fd < 16 || !storage_root_uuid_valid(bootstrap->root_uuid))) ||
+        (ram_root ? (bootstrap->device_fd || storage_root_uuid_valid(bootstrap->root_partuuid) ||
+                     storage_root_uuid_valid(bootstrap->root_uuid) || bootstrap->root_fstype[0]) :
+         (bootstrap->device_fd < 16 || !storage_root_uuid_valid(bootstrap->root_partuuid) ||
+          !storage_root_uuid_valid(bootstrap->root_uuid) ||
+          !storage_root_fstype_valid(bootstrap->root_fstype))) ||
         !bootstrap->sandbox_ram_bytes ||
         bootstrap->queue_size > UINT32_MAX || !bootstrap->queue_arena_bytes) return -EINVAL;
     *out = NULL;
@@ -667,12 +670,14 @@ int filed_storage_owner_start(struct filed_storage_owner *owner)
         .resource_count = owner->ram_root ? 0 : 1, .device = owner->device,
         .storage_devices_address = owner->ram_root ? 0 : PH_SANDBOX_STORAGE_DEVICES_ADDRESS,
         .storage_device_count = owner->ram_root ? 0 : 1,
-        .fs_root_kind = owner->ram_root ? PH_FS_ROOT_TMPFS : PH_FS_ROOT_EXT4,
+        .fs_root_kind = owner->ram_root ? PH_FS_ROOT_TMPFS : PH_FS_ROOT_DISK,
         .fs_channel_id = 1, .fs_owner_channel_id = 2,
         .fs_arena_bytes = owner->config.queue_arena_bytes,
         .ram_bytes = owner->config.sandbox_ram_bytes,
         .fs_queue_size = (uint32_t)owner->config.queue_size};
+    memcpy(sandbox.root_partuuid, owner->config.root_partuuid, 16);
     memcpy(sandbox.root_uuid, owner->config.root_uuid, 16);
+    memcpy(sandbox.root_fstype, owner->config.root_fstype, sizeof(sandbox.root_fstype));
     const struct gpud_launch_blob storage_devices = {.bytes = &owner->device,
         .size = sizeof(owner->device), .address = PH_SANDBOX_STORAGE_DEVICES_ADDRESS};
     struct ph_owner_boot_config start = {.controller = owner->controller,

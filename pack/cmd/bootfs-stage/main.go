@@ -13,7 +13,7 @@ import (
 func main() {
 	manifest := flag.String("manifest", "", "selected bootfs manifest")
 	output := flag.String("output", "", "new archive output (must not exist)")
-	disk := flag.String("disk", "", "configured raw disk, opened read-only for root UUID")
+	disk := flag.String("disk", "", "configured raw disk, opened read-only for root PARTUUID and filesystem UUID")
 	partition := flag.Int("root-partition", 2, "configured root partition index")
 	ram := flag.Uint64("ram", 512<<20, "sandbox memory policy in bytes")
 	depth := flag.Uint64("queue-size", 64, "split-ring depth")

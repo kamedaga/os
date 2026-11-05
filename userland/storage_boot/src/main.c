@@ -955,7 +955,8 @@ static int start_loaded_process(
 }
 
 static int launch_seed0root(const struct storage_boot_config *boot_config,
-    const struct ph_bootfs *archive, const uint8_t root_uuid[16],
+    const struct ph_bootfs *archive, const uint8_t root_partuuid[16],
+    const uint8_t root_uuid[16], const char root_fstype[8],
     const uint64_t storage_policy[3])
 {
     const unsigned char *image = NULL, *filed_image = NULL;
@@ -989,7 +990,9 @@ static int launch_seed0root(const struct storage_boot_config *boot_config,
         .framebuffer_pitch = boot_config->framebuffer_pitch,
     };
     storage_seed0root_bootstrap_t bootstrap_package = bootstrap;
+    memcpy(bootstrap_package.root_partuuid, root_partuuid, 16);
     memcpy(bootstrap_package.root_uuid, root_uuid, 16);
+    memcpy(bootstrap_package.root_fstype, root_fstype, sizeof(bootstrap_package.root_fstype));
     const pacha_fd_t bootstrap_fd = create_inherited_vmo_from_bytes(&bootstrap_package, sizeof(bootstrap_package), "seed0root bootstrap fd");
     if (bootstrap_fd < 16) {
         (void)pacha_fd_close(filed_image_fd);
@@ -1046,12 +1049,21 @@ int main(int argc, char **argv)
     error = ph_bootfs_open(&archive, (pacha_fd_t)config.bootfs_fd, config.bootfs_size);
     const unsigned char *bytes = NULL;
     size_t size = 0;
-    uint8_t root_uuid[16];
+    uint8_t root_partuuid[16], root_uuid[16];
+    char root_fstype[8] = {0};
     uint64_t policy[3] = {0};
+    if (!error) error = ph_bootfs_find(&archive, "/etc/pacha/root-partuuid", &bytes, &size);
+    if (!error && size == sizeof(root_partuuid)) memcpy(root_partuuid, bytes, sizeof(root_partuuid));
+    else if (!error) error = -22;
+    if (!error && !storage_root_uuid_valid(root_partuuid)) error = -22;
     if (!error) error = ph_bootfs_find(&archive, "/etc/pacha/root-uuid", &bytes, &size);
     if (!error && size == sizeof(root_uuid)) memcpy(root_uuid, bytes, sizeof(root_uuid));
     else if (!error) error = -22;
     if (!error && !storage_root_uuid_valid(root_uuid)) error = -22;
+    if (!error) error = ph_bootfs_find(&archive, "/etc/pacha/root-fstype", &bytes, &size);
+    if (!error && size && size < sizeof(root_fstype)) memcpy(root_fstype, bytes, size);
+    else if (!error) error = -22;
+    if (!error && !storage_root_fstype_valid(root_fstype)) error = -22;
     if (!error) error = ph_bootfs_find(&archive, "/etc/pacha/storage-policy", &bytes, &size);
     if (!error && size != 24) error = -22;
     if (!error) {
@@ -1071,9 +1083,9 @@ int main(int argc, char **argv)
             if (!policy[0]) error=-22;
         }
     }
-    /* Linux selects the UUID among the authorized PCI descendants. The
+    /* Linux selects the PARTUUID among the authorized PCI descendants. The
      * bootstrap loader neither opens a disk nor guesses a GPT partition. */
-    if (!error) error = launch_seed0root(&config, &archive, root_uuid, policy);
+    if (!error) error = launch_seed0root(&config, &archive, root_partuuid, root_uuid, root_fstype, policy);
     int closed = ph_bootfs_close(&archive);
     (void)pacha_fd_close((pacha_fd_t)config.bootfs_fd);
     if (!error) error = closed;

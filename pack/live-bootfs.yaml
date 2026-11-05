@@ -120,12 +120,4 @@ files:
   /usr/lib/kobox/linux_virtio_pci.ko: kobox_linux_virtio_pci
   /usr/lib/kobox/linux_virtio_console.ko: kobox_linux_virtio_console
   # One current filesystem core, sealed without any PCI resource grant.
-  /srv/kobox2/ramfs/sandbox.elf: ramfs_sandbox
-  /srv/kobox2/ramfs/core.so: ramfs_core
-  /srv/kobox2/ramfs/manifest.bin: ramfs_manifest
-  /srv/kobox2/ramfs/modules/crc16.ko: ramfs_crc16
-  /srv/kobox2/ramfs/modules/ext4.ko: ramfs_ext4
-  /srv/kobox2/ramfs/modules/jbd2.ko: ramfs_jbd2
-  /srv/kobox2/ramfs/modules/mbcache.ko: ramfs_mbcache
-  /srv/kobox2/ramfs/modules/nvme.ko: ramfs_nvme
-  /srv/kobox2/ramfs/modules/nvme_core.ko: ramfs_nvme_core
+  /srv/kobox2/ramfs: kobox2_ramfs_package

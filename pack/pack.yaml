@@ -36,6 +36,7 @@ startupManifest:
 rootfsDirs: ["/cmd", "/bin", "/sbin", "/usr", "/usr/bin", "/usr/lib", "/usr/libexec", "/usr/lib/uutils", "/srv", "/dev", "/dev/dri", "/dev/input", "/dev/shm", "/etc", "/etc/apk", "/etc/apk/keys", "/etc/ssl", "/etc/ssl/certs", "/etc/fastfetch", "/proc", "/proc/sys", "/proc/sys/kernel", "/sys", "/sys/dev", "/sys/dev/block", "/sys/dev/char", "/sys/class", "/sys/class/drm", "/sys/class/input", "/tmp", "/var", "/var/cache", "/var/cache/apk", "/var/log", "/lib", "/lib/linux", "/lib/pacha", "/lib/apk", "/lib/apk/db", "/var/lib", "/var/lib/apk", "/opt", "/opt/apk-offline", "/opt/apk-offline/bin", "/opt/apk-offline/lib", "/home", "/root/Desktop", "/share", "/share/fastfetch", "/share/fonts", "/run", "/etc/polkit-1/rules.d", "/usr/local/share/polkit-1/rules.d", "/etc/polkit-1/actions", "/usr/local/share/polkit-1/actions"]
 skip:
   apps:
+    - "kobox2_ramfs_package"
     - "ramfs_sandbox"
     - "ramfs_core"
     - "ramfs_manifest"
@@ -2249,6 +2250,9 @@ apps:
   ramfs_nvme_core:
     file: {recipe: ramfs_package, path: ".artifacts/kobox2-ramfs-production/package/modules/nvme_core.ko"}
     out: "RNVME_C.KO"
+  kobox2_ramfs_package:
+    file: {recipe: ramfs_package, path: ".artifacts/kobox2-ramfs-production/package"}
+    out: "K2RAMFS"
   kobox2_storage_package:
     file: {recipe: storage_sandbox, path: ".artifacts/kobox2-storage-production/package"}
     out: "K2STORAGE"

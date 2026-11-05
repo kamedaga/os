@@ -135,7 +135,7 @@ func renderManifest(manifestPath string, opts Options, span progress.Span) ([]by
 			return nil, 0, err
 		}
 		for _, existing := range items {
-			if existing.ImagePath == "/etc/pacha/root-uuid" || existing.ImagePath == "/etc/pacha/storage-policy" {
+			if existing.ImagePath == "/etc/pacha/root-fstype" || existing.ImagePath == "/etc/pacha/root-partuuid" || existing.ImagePath == "/etc/pacha/root-uuid" || existing.ImagePath == "/etc/pacha/storage-policy" {
 				return nil, 0, fmt.Errorf("storage launch policy must be generated from the configured disk")
 			}
 		}

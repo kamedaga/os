@@ -606,7 +606,9 @@ void ph_main(void) {
     fs_mount_config = (struct kobox_linux_fs_mount_config){
         .size = sizeof(fs_mount_config), .generation = config->identity.generation,
         .root_kind = config->fs_root_kind};
+    memcpy(fs_mount_config.root_partuuid, config->root_partuuid, sizeof(config->root_partuuid));
     memcpy(fs_mount_config.root_uuid, config->root_uuid, sizeof(config->root_uuid));
+    memcpy(fs_mount_config.root_fstype, config->root_fstype, sizeof(config->root_fstype));
 #endif
 #if PH_SANDBOX_BLOCK
     const struct ph_block_write_policy *policy = (void *)PH_BLOCK_POLICY_ADDRESS;
