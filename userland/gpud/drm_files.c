@@ -1,8 +1,16 @@
 /* SPDX-License-Identifier: MIT */
 #include "drm_files.h"
+#include "emfile_diag.h"
 
 #include <errno.h>
 #include <string.h>
+
+static size_t emfile_files_used(const struct gpud_drm_files *files) {
+    size_t used = 0;
+    for (size_t i = 0; i < files->limit; ++i)
+        used += files->files[i].state != GPUD_DRM_FILE_FREE;
+    return used;
+}
 
 static int generation_check(const struct gpud_drm_files *files, uint64_t generation) {
     if (!files || !files->generation)
@@ -54,8 +62,11 @@ int gpud_drm_file_open_begin(struct gpud_drm_files *files,
         return error;
     if (!handle_out)
         return -EINVAL;
-    if (files->handle_sequence == UINT64_MAX)
+    if (files->handle_sequence == UINT64_MAX) {
+        gpud_emfile_diag("files-handle-sequence", files->handle_sequence, UINT64_MAX,
+            emfile_files_used(files));
         return -EMFILE;
+    }
     for (size_t i = 0; i < files->limit; ++i) {
         struct gpud_drm_file *file = &files->files[i];
         if (file->state != GPUD_DRM_FILE_FREE)
@@ -65,6 +76,8 @@ int gpud_drm_file_open_begin(struct gpud_drm_files *files,
         *handle_out = file->handle;
         return 0;
     }
+    gpud_emfile_diag("files-open-slots", emfile_files_used(files), files->limit,
+        files->generation);
     return -EMFILE;
 }
 
@@ -99,8 +112,10 @@ int gpud_drm_file_dup(struct gpud_drm_files *files,
     int error = resolve(files, generation, handle, &file);
     if (error)
         return error;
-    if (file->references == UINT32_MAX)
+    if (file->references == UINT32_MAX) {
+        gpud_emfile_diag("files-dup-references", file->references, UINT32_MAX, handle);
         return -EMFILE;
+    }
     ++file->references;
     return 0;
 }

@@ -1,4 +1,5 @@
 #include "../lpr_filed_internal.h"
+#include "../lpr_fd/emfile_diag.h"
 #include "../support/browser_diag.h"
 #include "allocate.h"
 #include "device.h"
@@ -601,7 +602,7 @@ int lpr_control_install_fd(
 {
     const uint64_t state_bytes = lpr_backend_state_bytes_for_ops(ops_id);
     if (fd > LPR_LINUX_FD_MAX || state_bytes == 0) {
-        return -LPR_LINUX_EMFILE;
+        return lpr_fd_emfile_result("fd-install-invalid", lpr_fd_table_capacity);
     }
     const int ensure_status = lpr_fd_table_ensure_fd(fd);
     if (ensure_status != 0) {
@@ -610,7 +611,7 @@ int lpr_control_install_fd(
     uint16_t existing_flags = 0;
     if (lpr_fd_table_get_fd_flags(&lpr_control_fd_table, (uint32_t)fd, &existing_flags) == 0) {
         lpr_browser_diag("install-occupied", fd, ops_id, existing_flags);
-        return -LPR_LINUX_EMFILE;
+        return lpr_fd_emfile_result("fd-install-occupied", lpr_fd_table_capacity);
     }
     void *state = lpr_backend_state_alloc(state_bytes);
     if (state == 0) {
@@ -733,7 +734,7 @@ int lpr_control_install_fd(
     if (lpr_fd_table_install_at(&lpr_control_fd_table, (uint32_t)fd, &install) != 0) {
         lpr_browser_diag("install-race", fd, ops_id, lpr_fd_table_capacity);
         (void)lpr_backend_state_free(state, state_bytes);
-        return -LPR_LINUX_EMFILE;
+        return lpr_fd_emfile_result("fd-install-race", lpr_fd_table_capacity);
     }
     return 0;
 }
@@ -990,7 +991,7 @@ int lpr_pipe_track_native_fd(
     const struct pacha_fd_info *info)
 {
     if (fd > LPR_LINUX_FD_MAX || info == 0) {
-        return -LPR_LINUX_EMFILE;
+        return lpr_fd_emfile_result("pipe-track-invalid", lpr_fd_table_capacity);
     }
     const int ensure_status = lpr_fd_table_ensure_fd(fd);
     if (ensure_status != 0) {
@@ -1068,11 +1069,11 @@ int lpr_fd_slot_alloc_from(uint64_t min_fd)
     uint64_t fd = min_fd;
     for (;;) {
         if (fd >= lpr_fd_table_soft_limit(&lpr_control_fd_table))
-            return -LPR_LINUX_EMFILE;
+            return lpr_fd_emfile_result("fd-alloc-soft-limit", lpr_fd_table_capacity);
         if (fd >= lpr_fd_table_capacity) {
             const int status = lpr_fd_table_ensure_fd(fd);
             if (status != 0) {
-                return status == -LPR_LINUX_EINVAL ? -LPR_LINUX_EMFILE : status;
+                return status == -LPR_LINUX_EINVAL ? lpr_fd_emfile_result("fd-alloc-grow-einval", lpr_fd_table_capacity) : status;
             }
         }
         while (fd < lpr_fd_table_capacity) {
@@ -1083,7 +1084,7 @@ int lpr_fd_slot_alloc_from(uint64_t min_fd)
         }
         if (lpr_fd_table_capacity >= lpr_fd_table_soft_limit(&lpr_control_fd_table)) {
             lpr_browser_diag("linux-fd-full", min_fd, fd, lpr_fd_table_capacity);
-            return -LPR_LINUX_EMFILE;
+            return lpr_fd_emfile_result("fd-alloc-table-full", lpr_fd_table_capacity);
         }
     }
 }

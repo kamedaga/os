@@ -1,6 +1,7 @@
 #include "lpr_memory.h"
 #include "lpr_filed_internal.h"
 #include "lpr_mlock.h"
+#include "lpr_fault_diag.h"
 
 #include <pachaos/abi.h>
 
@@ -42,12 +43,16 @@ int64_t lpr_linux_mremap(
         lpr_mlock_vm_end();
         return -LPR_LINUX_EOPNOTSUPP;
     }
+    lpr_fault_map_begin(old_address, old_size);
+    if (target) lpr_fault_map_begin(target, new_size);
     const int64_t result = lpr_drm_native_mremap(
         old_address,
         old_size,
         new_size,
         flags,
         target);
+    if (target) lpr_fault_map_end();
+    lpr_fault_map_end();
     lpr_mlock_vm_end();
     if (result >= 4096) {
         return result;

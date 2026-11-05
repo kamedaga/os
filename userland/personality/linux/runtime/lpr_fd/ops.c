@@ -1,4 +1,5 @@
 #include <inputd/event_ring.h>
+#include "../lpr_fd/emfile_diag.h"
 #include "../lpr_filed_internal.h"
 #include "../support/browser_diag.h"
 #include "device.h"
@@ -749,7 +750,7 @@ int lpr_fd_transfer_stage_batch(
             const uint64_t capacity = lpr_fd_table_capacity;
             if (capacity >= lpr_fd_table_soft_limit(&lpr_control_fd_table) ||
                 lpr_fd_table_ensure_capacity(capacity + item_count) != 0) {
-                status = -LPR_LINUX_EMFILE;
+                status = lpr_fd_emfile_result("fd-scm-stage-batch", lpr_fd_table_capacity);
                 break;
             }
         }

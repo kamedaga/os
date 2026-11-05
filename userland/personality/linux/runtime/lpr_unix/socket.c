@@ -1,4 +1,5 @@
 #include "socket.h"
+#include "../lpr_fd/emfile_diag.h"
 #include "cache.h"
 #include <unixd/profile.h>
 #include "diagnostic.h"
@@ -100,7 +101,7 @@ static int64_t create(uint64_t type_flags, uint64_t protocol, int pair, uint64_t
     while (lpr_fd_table_alloc_batch(&lpr_control_fd_table, 0, installs, count, NULL, 0, fds) != 0) {
         const uint64_t capacity = lpr_fd_table_capacity;
         if (capacity >= lpr_fd_table_soft_limit(&lpr_control_fd_table) || lpr_fd_table_ensure_capacity(capacity + count) != 0) {
-            status = -EMFILE; goto fail;
+            status = lpr_fd_emfile_result("unix-socket-fd-alloc", lpr_fd_table_capacity); goto fail;
         }
     }
     if (!pair) return fds[0];

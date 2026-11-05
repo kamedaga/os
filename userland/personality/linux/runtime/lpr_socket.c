@@ -1,4 +1,5 @@
 #include "lpr_socket.h"
+#include "support/emfile_diag.h"
 
 #include "lpr_filed_internal.h"
 #include "lpr_fd/allocate.h"
@@ -725,7 +726,8 @@ static int64_t lpr_netd_page_attach(pacha_fd_t page_fd)
         if (pair[1] >= 16)
             (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, pair[1]);
         return pair_status != 0 ? lpr_negative_status(pair_status) :
-            -LPR_LINUX_EMFILE;
+            ({ lpr_emfile_diag("socketpair-invalid-pair", UINT64_MAX, UINT64_MAX,
+                (pair[0] << 32) | (uint32_t)pair[1]); -LPR_LINUX_EMFILE; });
     }
 
     struct pacha_ipc_fd attach_fds[2];

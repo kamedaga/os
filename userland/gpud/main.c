@@ -3,6 +3,7 @@
 #include <gpud/boot_config.h>
 #include "bootstrap.h"
 #include "drm_service.h"
+#include "emfile_diag.h"
 #include "launch.h"
 #include "lifecycle.h"
 #include "package.h"
@@ -28,6 +29,26 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+
+/* One native generation owner binds the authenticated log endpoint. */
+static pacha_fd_t emfile_log_fd = -1;
+void gpud_emfile_diag_emit(const char *site, uint64_t used, uint64_t limit,
+    uint64_t detail) {
+    if (used == UINT64_MAX && limit == UINT64_MAX) {
+        struct pacha_fd_table_info info = {0};
+        if (!pacha_fd_table(0, &info)) {
+            used = info.capacity - info.free_slots;
+            limit = info.capacity;
+        }
+    }
+    char line[224];
+    int n = snprintf(line, sizeof(line),
+        "EMFILE gpud %s used=%llu limit=%llu detail=%llu",
+        site, (unsigned long long)used, (unsigned long long)limit,
+        (unsigned long long)detail);
+    if (n > 0 && (size_t)n < sizeof(line) && emfile_log_fd >= 16)
+        (void)pacha_log_emit(emfile_log_fd, PACHA_LOG_SOURCE_GPUD, line, (size_t)n);
+}
 
 enum { GPUD_RESOURCE_SET_ID = 1, GPUD_SANDBOX_ID = 1 };
 
@@ -815,6 +836,7 @@ static int start_generation(const struct gpud_boot_config *config,
     current->service.backend_client = sandbox_config.client_id;
     current->service.profile_kind = profile_kind;
     current->service.log_endpoint_fd = (pacha_fd_t)config->log_endpoint_fd;
+    emfile_log_fd = current->service.log_endpoint_fd;
     current->service.gpu.ipc = &current->ipc;
     current->service.gpu.channel = &current->gpu_channel;
     current->service.gpu.mapping = current->gpu_mapping;

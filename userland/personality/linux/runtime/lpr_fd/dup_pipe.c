@@ -1,4 +1,5 @@
 #include "../lpr_filed_internal.h"
+#include "../lpr_fd/emfile_diag.h"
 #include "allocate.h"
 
 void lpr_fd_after_fork_child(void)
@@ -268,7 +269,7 @@ int64_t lpr_linux_dup_into(uint64_t fd, int target_fd, uint64_t min_fd, uint64_t
             const uint64_t capacity = lpr_fd_table_capacity;
             if (capacity >= lpr_fd_table_soft_limit(&lpr_control_fd_table) ||
                 lpr_fd_table_ensure_capacity(min_fd >= capacity ? min_fd + 1 : capacity + 1))
-                return -LPR_LINUX_EMFILE;
+                return lpr_fd_emfile_result("fd-dup-alloc", lpr_fd_table_capacity);
         }
     }
     const uint64_t new_fd = (uint64_t)(uint32_t)target_fd;

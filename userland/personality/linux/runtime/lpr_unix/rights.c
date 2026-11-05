@@ -1,4 +1,5 @@
 #include "rights.h"
+#include "../lpr_fd/emfile_diag.h"
 #include "diagnostic.h"
 #include <unixd/profile.h>
 #include "../lpr_filed_internal.h"
@@ -215,7 +216,7 @@ static int stage_socket(const struct unix_control *claim,
         while (lpr_fd_table_stage_batch(&lpr_control_fd_table, &install, 1, fd) != 0) {
             const uint64_t capacity = lpr_fd_table_capacity;
             if (capacity >= lpr_fd_table_soft_limit(&lpr_control_fd_table) || lpr_fd_table_ensure_capacity(capacity + 1) != 0) {
-                status = -EMFILE; break;
+                status = lpr_fd_emfile_result("unix-rights-stage", lpr_fd_table_capacity); break;
             }
         }
     }

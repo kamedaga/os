@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: MIT */
 #include "drm_service.h"
+#include "emfile_diag.h"
 #include "drm_control.h"
 #include "drm_reply.h"
 #include "../kobox2_adapter/gpu_event_message.h"
@@ -13,6 +14,19 @@
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
+
+static size_t emfile_leases_used(const struct gpud_drm_service *s) {
+    size_t used = 0;
+    for (size_t i = 0; i < GPUD_DRM_OBJECT_LEASES_MAX; ++i)
+        used += s->object_leases[i].object_id != 0;
+    return used;
+}
+static size_t emfile_watches_used(const struct gpud_drm_service *s) {
+    size_t used = 0;
+    for (size_t i = 0; i < GPUD_DRM_REFERENCES_MAX; ++i)
+        used += s->watches[i].handle != 0;
+    return used;
+}
 
 #if defined(GPUD_DRM_RPC_PROFILE) && GPUD_DRM_RPC_PROFILE
 static pacha_fd_t rpc_profile_log_fd = -1;
@@ -172,6 +186,9 @@ static int reply_to_client(struct gpud_drm_service *service, pacha_fd_t fd,
         *delivered = 0;
     service->reply_attempted = 1;
     int rc = pacha_ipc_reply(fd, message);
+    if (rc == -EMFILE)
+        gpud_emfile_diag("reply-transfer-native-emfile", UINT64_MAX, UINT64_MAX,
+            message->fd_count);
     /* A canceled CALL is not an unknown transport result. Never finalize its
      * transferred leases or attempt a second reply; reclaim the pending transfer
      * through the same owner cleanup and keep independent GPU clients alive. */
@@ -1376,8 +1393,11 @@ static int adopt_prime(struct gpud_drm_service *service, uint64_t token, uint32_
     if (!token || find_prime(service, token) || find_mapping(service, token))
         return -EPROTO;
     struct gpud_drm_object_lease *lease = empty_object_lease(service);
-    if (!lease)
+    if (!lease) {
+        gpud_emfile_diag("adopt_prime-leases", emfile_leases_used(service),
+            GPUD_DRM_OBJECT_LEASES_MAX, service->correlation);
         return -EMFILE;
+    }
     int error = gpud_gpu_rpc_take_dma_buf(
         &service->gpu, service->correlation, token, &received);
     if (error)
@@ -1451,8 +1471,11 @@ static int prime_export_request(struct gpud_drm_service *service,
             GPUD_DRM_PRIMES_MAX);
         return -ENOSPC;
     }
-    if (!empty_object_lease(service))
+    if (!empty_object_lease(service)) {
+        gpud_emfile_diag("prime_export_request-leases", emfile_leases_used(service),
+            GPUD_DRM_OBJECT_LEASES_MAX, service->correlation);
         return -EMFILE;
+    }
     const uint64_t generation = service->files.generation;
     struct gpud_drm_binding binding;
     int error = gpud_drm_file_acquire(
@@ -1564,14 +1587,35 @@ static int prime_acquire_request(struct gpud_drm_service *service,
                 PACHA_FD_RIGHT_POLL, 0))
         return -EINVAL;
     struct gpud_drm_object_lease *lease = empty_object_lease(service);
-    if (!lease)
+    if (!lease) {
+        gpud_emfile_diag("prime_acquire_request-leases", emfile_leases_used(service),
+            GPUD_DRM_OBJECT_LEASES_MAX, service->correlation);
         return -EMFILE;
+    }
+    struct gpud_ready_source *source = NULL;
+    int error = 0;
+    if (service->ready) {
+        error = gpud_ready_add(service->ready, (pacha_fd_t)fd,
+            PACHA_FD_EVENT_HANGUP, READY_LEASE, lease, &source);
+        if (error) {
+            int removed = gpud_ready_remove(&source);
+            if (!removed)
+                return error;
+            /* The observer may still own this FD. Retain the lease for
+             * terminal teardown instead of letting packet cleanup close it. */
+            error = service->error = gpud_drm_files_fault(
+                &service->files, service->files.generation, removed);
+        }
+        service->lease_free_head = lease->free_next;
+        prime->lease_count++;
+    }
     *lease = (struct gpud_drm_object_lease) {
         .object_id = token,
         .fd = (pacha_fd_t)fd,
+        .source = source,
     };
     service->received.fds[1].fd = PH_IPC_NO_FD;
-    return 0;
+    return error;
 }
 
 static int mmap_request(struct gpud_drm_service *service,
@@ -1594,8 +1638,11 @@ static int mmap_request(struct gpud_drm_service *service,
             !(mapping->rights & KB2_GPU_SPAN_RIGHT_WRITE)))
         return -EINVAL;
     struct gpud_drm_object_lease *lease = empty_object_lease(service);
-    if (!lease)
+    if (!lease) {
+        gpud_emfile_diag("mmap_request-leases", emfile_leases_used(service),
+            GPUD_DRM_OBJECT_LEASES_MAX, service->correlation);
         return -EMFILE;
+    }
     const uint64_t lease_rights = PACHA_FD_RIGHT_TRANSFER |
         PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_WAIT | PACHA_FD_RIGHT_POLL;
     struct pacha_ipc_channel_pair pair = {.a = -1, .b = -1};
@@ -1740,8 +1787,11 @@ static int dispatch_request(struct gpud_drm_service *service,
                 PH_IPC_CHANNEL_RIGHTS | PACHA_FD_RIGHT_CLOSE, 0))
             return -EINVAL;
         struct gpud_drm_watch *watch = empty_watch(service);
-        if (!watch)
+        if (!watch) {
+            gpud_emfile_diag("open-watches", emfile_watches_used(service),
+                GPUD_DRM_REFERENCES_MAX, service->correlation);
             return -EMFILE;
+        }
         struct gpud_drm_control pending = {0};
         size_t size;
         int error = gpud_drm_open_prepare(&service->files, generation,
@@ -1859,8 +1909,11 @@ static int dispatch_request(struct gpud_drm_service *service,
                         PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_WAIT | PACHA_FD_RIGHT_POLL, 0))
                     return -EINVAL;
                 watch = empty_watch(service);
-                if (!watch)
+                if (!watch) {
+                    gpud_emfile_diag("dup-watches", emfile_watches_used(service),
+                        GPUD_DRM_REFERENCES_MAX, service->correlation);
                     return -EMFILE;
+                }
             }
             int error = gpud_drm_file_dup(
                 &service->files, generation, request->handle);
@@ -1952,6 +2005,10 @@ static int dispatch(struct gpud_drm_service *service,
     int status = dispatch_request(service, header, payload, result,
         transfer, inline_ioctl);
     service->active_request_sequence = 0;
+    if (status == -EMFILE) {
+        gpud_emfile_diag("dispatch-native-fd-snapshot",
+            UINT64_MAX, UINT64_MAX, header->op);
+    }
     if (sequence) {
         char line[128];
         int length = snprintf(line, sizeof(line),

@@ -1,4 +1,5 @@
 #include "../lpr_filed_internal.h"
+#include "../lpr_fault_diag.h"
 #if defined(LPR_BOOT_DIAGNOSTICS) && LPR_BOOT_DIAGNOSTICS
 #include "../lpr_common/boot_diagnostic.h"
 #define LPR_BOOT_FAILURE(stage, raw) \
@@ -295,6 +296,12 @@ void lpr_linux_process_state_init(void)
     if (lpr_linux_next_pid <= lpr_linux_current_pid) {
         lpr_linux_next_pid = lpr_linux_current_pid + 1;
     }
+    /* Resolve optional diagnostic identity during ordinary bootstrap, never
+     * by doing a supervisor RPC from a synchronous fault or signal frame. */
+    lprs_process_query_t info;
+    if (lpr_supervisor_enabled &&
+        !lpr_supervisor_query_process((uint64_t)lpr_linux_current_pid, &info))
+        lpr_fault_comm_record(info.comm);
 }
 
 lpr_linux_process_entry_t *lpr_linux_process_find(int32_t linux_pid)

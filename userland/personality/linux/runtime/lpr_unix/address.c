@@ -1,4 +1,5 @@
 #include "socket.h"
+#include "../lpr_fd/emfile_diag.h"
 #include <unixd/profile.h>
 #include "diagnostic.h"
 #include "../lpr_filed_internal.h"
@@ -236,7 +237,7 @@ int64_t lpr_unix_socket_accept(uint64_t fd, uint64_t address, uint64_t length, u
     lpr_linux_fd_t result;
     while (lpr_fd_table_alloc(&lpr_control_fd_table, 0, &install, &result) != 0) {
         if (lpr_fd_table_capacity >= LPR_FD_TABLE_MAX_SIZE ||
-            lpr_fd_table_ensure_capacity(lpr_fd_table_capacity + 1) != 0) { status = -EMFILE; goto fail; }
+            lpr_fd_table_ensure_capacity(lpr_fd_table_capacity + 1) != 0) { status = lpr_fd_emfile_result("unix-accept-fd-alloc", lpr_fd_table_capacity); goto fail; }
     }
     return result;
 fail:

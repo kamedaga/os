@@ -1,3 +1,4 @@
+#include "emfile_diag.h"
 /* SPDX-License-Identifier: MIT */
 #include "drm_control.h"
 #include "drm_reply.h"
@@ -114,8 +115,13 @@ int gpud_drm_control_complete(struct gpud_drm_files *files,
                                           &completion))
         return gpud_drm_files_fault(files, pending->generation, -EPROTO);
     int error = gpud_drm_status_errno(completion.status);
-    if (completion.status == KB2_GPU_STATUS_LIMIT)
+    if (completion.status == KB2_GPU_STATUS_LIMIT) {
+        size_t used = 0;
+        for (size_t i = 0; i < files->limit; ++i)
+            used += files->files[i].state != GPUD_DRM_FILE_FREE;
+        gpud_emfile_diag("session-limit-to-emfile", used, files->limit, pending->opcode);
         error = -EMFILE;
+    }
     int result;
     if (pending->opcode == KB2_GPU_OPCODE_SESSION_OPEN) {
         result = gpud_drm_file_open_finish(

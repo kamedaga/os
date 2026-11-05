@@ -4,6 +4,7 @@
 #include "lpr_wait_trace.h"
 #include "lpr_vsyscall.h"
 #include "lpr_entry_stack.h"
+#include "lpr_fault_diag.h"
 
 __asm__(
     ".pushsection .text\n"
@@ -161,6 +162,8 @@ extern void lpr_async_signal_restorer(void);
 extern void lpr_syscall_entry(void);
 extern char lpr_runtime_text_start[];
 extern char lpr_runtime_text_end[];
+
+#include "lpr_fault_diag.inc"
 
 #if defined(LPR_SIGNAL_SOURCE_DIAG) && LPR_SIGNAL_SOURCE_DIAG
 static char *lpr_signal_diag_append_text(
@@ -701,6 +704,10 @@ static void *lpr_signal_prepare(void *native_raw, uint64_t stack_top, int synchr
     }
 
     const uint32_t sig = (uint32_t)native->signo;
+    /* Log at reception, including signals consumed by sigwait/mask/ignore.
+     * Native pending bits carry no sender identity (also true for PDEATHSIG). */
+    if (!synchronous && sig == 4)
+        lpr_fault_emit(sig, &native->context, 1, 0, 0, 0);
     if (sig != LPR_LINUX_SIGALRM) {
         lpr_signal_source_diag(
             "native-frame",
@@ -876,29 +883,16 @@ static uint32_t lpr_fault_linux_signal(uint64_t vector, uint64_t error_code)
     }
 }
 
-_Noreturn void lpr_linux_fault_prepare(void *raw)
+struct lpr_fault_frame {
+    lpr_pacha_signal_frame_t signal;
+    uint64_t vector, error_code, address;
+};
+
+/* Keep the 1 KiB synthetic frame off the diagnostic call chain: the native
+ * fault runtime stack is only 4 KiB, including the raw Linux write backend. */
+__attribute__((noinline)) static _Noreturn void lpr_fault_enter_linux_handler(
+    struct lpr_fault_frame *fault, uint32_t sig)
 {
-    struct lpr_fault_frame {
-        lpr_pacha_signal_frame_t signal;
-        uint64_t vector, error_code, address;
-    } *fault = raw;
-    if (!fault || fault->signal.magic != PACHAOS_PROCESS_SIGNAL_FRAME_MAGIC ||
-        fault->signal.size != PACHAOS_PROCESS_FAULT_FRAME_SIZE || fault->signal.signo ||
-        fault->signal.xstate_features != PACHAOS_PROCESS_SIGNAL_XSTATE_FEATURE_MASK)
-        lpr_linux_exit_for_signal(11);
-    const uintptr_t clock_copy = lpr_clock_copy_fault_target(fault->vector,
-        fault->error_code, fault->signal.context.rip);
-    if (clock_copy) {
-        fault->signal.context.rip = clock_copy;
-        lpr_native_signal_return(&fault->signal);
-    }
-    const uintptr_t vsyscall = lpr_vsyscall_fault_target(fault->vector,
-        fault->error_code, fault->signal.context.rip);
-    if (vsyscall) {
-        fault->signal.context.rip = vsyscall;
-        lpr_native_signal_return(&fault->signal);
-    }
-    const uint32_t sig = lpr_fault_linux_signal(fault->vector, fault->error_code);
     if (lpr_linux_sigactions[sig].handler == LPR_LINUX_SIG_IGN ||
         (lpr_linux_signal_mask & lpr_linux_signal_bit(sig)))
         lpr_linux_exit_for_signal(sig);
@@ -918,6 +912,31 @@ _Noreturn void lpr_linux_fault_prepare(void *raw)
     fault->signal.context.rax = (uintptr_t)body;
     fault->signal.context.rsp = (uintptr_t)body - 8;
     lpr_native_signal_return(&fault->signal);
+}
+_Noreturn void lpr_linux_fault_prepare(void *raw)
+{
+    struct lpr_fault_frame *fault = raw;
+    if (!fault || fault->signal.magic != PACHAOS_PROCESS_SIGNAL_FRAME_MAGIC ||
+        fault->signal.size != PACHAOS_PROCESS_FAULT_FRAME_SIZE || fault->signal.signo ||
+        fault->signal.xstate_features != PACHAOS_PROCESS_SIGNAL_XSTATE_FEATURE_MASK)
+        lpr_linux_exit_for_signal(11);
+    const uintptr_t clock_copy = lpr_clock_copy_fault_target(fault->vector,
+        fault->error_code, fault->signal.context.rip);
+    if (clock_copy) {
+        fault->signal.context.rip = clock_copy;
+        lpr_native_signal_return(&fault->signal);
+    }
+    const uintptr_t vsyscall = lpr_vsyscall_fault_target(fault->vector,
+        fault->error_code, fault->signal.context.rip);
+    if (vsyscall) {
+        fault->signal.context.rip = vsyscall;
+        lpr_native_signal_return(&fault->signal);
+    }
+    const uint32_t sig = lpr_fault_linux_signal(fault->vector, fault->error_code);
+    if (sig == 4 || sig == 11 || sig == 7 || sig == 8)
+        lpr_fault_emit(sig, &fault->signal.context, 0,
+            fault->vector, fault->error_code, fault->address);
+    lpr_fault_enter_linux_handler(fault, sig);
 }
 
 _Noreturn void lpr_linux_rt_sigreturn_body(void *body_raw)

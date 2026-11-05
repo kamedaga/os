@@ -1,4 +1,5 @@
 #include "../lpr_filed_internal.h"
+#include "../lpr_fd/emfile_diag.h"
 #include "../lpr_vfs/session.h"
 
 
@@ -224,11 +225,11 @@ int lpr_fd_table_ensure_capacity(uint64_t required_capacity)
         return 0;
     }
     if (required_capacity > LPR_FD_TABLE_MAX_SIZE) {
-        return -LPR_LINUX_EMFILE;
+        return lpr_fd_emfile_result("fd-grow-above-max", lpr_fd_table_capacity);
     }
     const uint64_t new_capacity = lpr_fd_table_next_capacity(required_capacity);
     if (new_capacity == 0) {
-        return -LPR_LINUX_EMFILE;
+        return lpr_fd_emfile_result("fd-grow-no-capacity", lpr_fd_table_capacity);
     }
     uint64_t entry_offset = 0;
     uint64_t ofd_offset = 0;

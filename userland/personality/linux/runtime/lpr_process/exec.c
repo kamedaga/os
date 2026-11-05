@@ -1,3 +1,4 @@
+#include "../support/emfile_diag.h"
 #include "../lpr_filed_internal.h"
 #include "../support/browser_diag.h"
 #include "../lpr_fd/device.h"
@@ -1255,8 +1256,12 @@ static int lpr_transaction_track_lease(
     pacha_fd_t fd)
 {
     if (transaction == 0 || fd < 16 || transaction->prepared_leases == 0 ||
-        transaction->prepared_lease_count >= transaction->prepared_lease_capacity)
+        transaction->prepared_lease_count >= transaction->prepared_lease_capacity) {
+        lpr_emfile_diag("transaction-track-lease",
+            transaction ? transaction->prepared_lease_count : 0,
+            transaction ? transaction->prepared_lease_capacity : 0, (uint32_t)fd);
         return -LPR_LINUX_EMFILE;
+    }
     transaction->prepared_leases[transaction->prepared_lease_count++] =
         (lpr_prepared_lease_t){ .pin_index = pin_index, .fd = fd };
     return 0;
@@ -1759,6 +1764,9 @@ int64_t lpr_filed_exec_self(filed_exec_path_t *exec,
         transaction->manifest_fd, request.opcode, result, result);
 #endif
     (void)lpr_pacha_syscall2(PACHAOS_SYSCALL_MUNMAP, mapped, mapped_bytes);
+    if (result == -LPR_LINUX_EMFILE)
+        lpr_emfile_diag("filed-exec-self-reply", transaction->prepared_lease_count,
+            transaction->prepared_lease_capacity, transaction->pin_count);
     if (result) return result;
     if (returned[0] < 16 || returned[1] < 16 || returned[2] < 16) {
         for (unsigned i = 0; i < 3; ++i)

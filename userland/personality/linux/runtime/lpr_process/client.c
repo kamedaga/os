@@ -218,6 +218,8 @@ int64_t lpr_process_client_call_with_transfer_rights(
             0,
             reply.word2,
             "lpr process supervisor returned error");
+        if ((int64_t)reply.word1 == -LPR_LINUX_EMFILE)
+            lpr_emfile_diag("supervisor-reply", UINT64_MAX, UINT64_MAX, op);
         return (int64_t)reply.word1;
     }
     if ((out_reply_fd == 0 && reply.fd_count != 0) ||

@@ -3,6 +3,7 @@
 #include "lpr_linux_syscall.h"
 #include "lpr_filed_internal.h"
 #include "lpr_memory.h"
+#include "lpr_fault_diag.h"
 #include "lpr_mlock.h"
 #include "lpr_random.h"
 #include "lpr_socket.h"
@@ -2558,10 +2559,31 @@ int64_t lpr_linux_mmap(
     uint64_t fd,
     uint64_t offset, unsigned *wait_not_ready __attribute__((unused)))
 {
-    if ((flags & LPR_LINUX_MAP_ANONYMOUS) != 0) {
-        return lpr_backend_mmap(addr, len, prot, flags, fd, offset, wait_not_ready);
+    const uint64_t rounded = len <= UINT64_MAX - 4095 ? (len + 4095) & ~4095ull : 0;
+    /* Retain the original backend while mapping and naming it. A concurrent
+     * close/reuse must never give an old mapping the new FD's filename. */
+    lpr_fd_pin_t name_pin;
+    int name_pinned = (prot & LPR_LINUX_PROT_EXEC) &&
+        !(flags & LPR_LINUX_MAP_ANONYMOUS) && fd <= LPR_LINUX_FD_MAX &&
+        !lpr_fd_table_pin(&lpr_control_fd_table, (uint32_t)fd, &name_pin);
+    const uint64_t epoch = lpr_fault_map_begin((flags & LPR_LINUX_MAP_FIXED) ? addr : 0,
+        (flags & LPR_LINUX_MAP_FIXED) ? rounded : 0);
+    int64_t result = (flags & LPR_LINUX_MAP_ANONYMOUS) ?
+        lpr_backend_mmap(addr, len, prot, flags, fd, offset, wait_not_ready) :
+        lpr_fd_dispatch_mmap(addr, len, prot, flags, fd, offset, wait_not_ready);
+    if (result >= 4096 && name_pinned && name_pin.ops_id == LPR_FD_OPS_FILED && name_pin.state) {
+        lpr_fd_pin_t current;
+        if (!lpr_fd_table_pin(&lpr_control_fd_table, (uint32_t)fd, &current)) {
+            if (current.ofd_index == name_pin.ofd_index &&
+                current.ofd_generation == name_pin.ofd_generation)
+                lpr_fault_map_record((uint64_t)result, rounded, offset,
+                    ((const lpr_filed_backend_t *)name_pin.state)->handle, epoch);
+            lpr_fd_unpin(&current);
+        }
     }
-    return lpr_fd_dispatch_mmap(addr, len, prot, flags, fd, offset, wait_not_ready);
+    lpr_fault_map_end();
+    if (name_pinned) lpr_fd_unpin(&name_pin);
+    return result;
 }
 
 static int64_t lpr_dispatch_msync(uint64_t addr, uint64_t len, uint64_t flags)
@@ -2754,8 +2776,10 @@ static int64_t lpr_sys_munmap(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3
     }
     const int64_t lock_status=lpr_mlock_vm_begin();
     if (lock_status) return lock_status;
+    lpr_fault_map_begin(a0, a1 <= UINT64_MAX - 4095 ? (a1 + 4095) & ~4095ull : UINT64_MAX);
     const int64_t result = lpr_linux_pacha_status_to_errno(
         lpr_drm_native_munmap(a0, a1));
+    lpr_fault_map_end();
     if (!result) lpr_mlock_forget(a0,a1);
     lpr_mlock_vm_end();
     lpr_trace_mmap_call("munmap", a0, a1, 0, 0, 0, 0, result);

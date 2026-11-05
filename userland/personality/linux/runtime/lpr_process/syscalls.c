@@ -1,5 +1,6 @@
 #include "../lpr_input/wire.h"
 #include "../lpr_filed_internal.h"
+#include "../lpr_fd/emfile_diag.h"
 #include "../lpr_gui_detail.h"
 #include "../lpr_unix/cache.h"
 #include "../lpr_vfs/control_cache.h"
@@ -111,6 +112,8 @@ static void lpr_exec_diag(const char *path)
 static int64_t lpr_fork_fail(
     const char *stage, int64_t status)
 {
+    if (status == -LPR_LINUX_EMFILE)
+        lpr_fd_emfile(stage, lpr_fd_table_capacity);
     char line[128];
     char *out = line;
     const char *end = line + sizeof(line);

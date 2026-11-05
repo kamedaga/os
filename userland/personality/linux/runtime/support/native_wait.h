@@ -1,6 +1,7 @@
 #pragma once
 
 #include "syscall.h"
+#include "emfile_diag.h"
 #include <pacha/abi.h>
 #include <pacha/ipc.h>
 #include <pacha/status.h>
@@ -25,6 +26,9 @@ static inline int lpr_native_wait_pair_flags(
     {
         if (pair[0] >= 16) (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, pair[0]);
         if (pair[1] >= 16) (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, pair[1]);
+        if (status == 0)
+            lpr_emfile_diag("channel-invalid-pair", UINT64_MAX, UINT64_MAX,
+                (pair[0] << 32) | (uint32_t)pair[1]);
         return status == 0 ? -PACHA_LINUX_EMFILE : (int)pacha_kernel_status_to_errno(status);
     }
     *out_local = (pacha_fd_t)pair[0];

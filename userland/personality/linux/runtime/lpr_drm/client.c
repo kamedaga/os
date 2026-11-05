@@ -1,3 +1,4 @@
+#include "../support/emfile_diag.h"
 #include "../lpr_filed_internal.h"
 #include "dmabuf.h"
 #include "../support/unmap_profile.h"
@@ -391,6 +392,8 @@ static int64_t lpr_drm_map_received(
         }
     if (lease_index == LPR_DRM_MAPPING_LEASE_CAPACITY) {
         lpr_state_unlock(&lpr_drm_mapping_lock);
+        lpr_emfile_diag("drm-mapping-leases", LPR_DRM_MAPPING_LEASE_CAPACITY,
+            LPR_DRM_MAPPING_LEASE_CAPACITY, 0);
         return -LPR_LINUX_EMFILE;
     }
     const int64_t mapped = lpr_pacha_syscall6(
@@ -544,6 +547,8 @@ static int lpr_drm_event_cookie_register(
     }
     if (free_slot == LPR_DRM_EVENT_COOKIE_CAPACITY) {
         lpr_state_unlock(&lpr_drm_event_cookie_lock);
+        lpr_emfile_diag("drm-event-cookies", LPR_DRM_EVENT_COOKIE_CAPACITY,
+            LPR_DRM_EVENT_COOKIE_CAPACITY, handle);
         return -LPR_LINUX_EMFILE;
     }
     uint64_t token;
@@ -823,6 +828,8 @@ static int64_t lpr_gpud_drm_call_transfers_many(
             if (reply_fds[i].fd >= 16)
                 (void)lpr_pacha_syscall1(
                     PACHAOS_SYSCALL_FD_CLOSE, reply_fds[i].fd);
+        if (reply_header->status == -LPR_LINUX_EMFILE)
+            lpr_emfile_diag("gpud-reply", UINT64_MAX, UINT64_MAX, op);
         return reply_header->status != 0 ? reply_header->status : -LPR_LINUX_EIO;
     }
     for (uint32_t i = 0; i < reply.fd_count; ++i)
